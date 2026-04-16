@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>VSpider Canvas 狙击靶场</title>
+    <style>
+        body { margin: 0; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #1e1e1e; color: white; font-family: sans-serif; flex-direction: column; }
+        canvas { background-color: #333; border: 2px solid #666; margin-top: 20px; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+        #status { font-size: 24px; font-weight: bold; color: #00ff00; }
+    </style>
+</head>
+<body>
+    <div id="status">📡 等待 VSpider 狙击...</div>
+    <canvas id="arena" width="800" height="600"></canvas>
+
+    <script>
+        const canvas = document.getElementById('arena');
+        const ctx = canvas.getContext('2d');
+        const status = document.getElementById('status');
+        
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2;
+        const targetRadius = 40;
+
+        // 画一个红色的靶心
+        function drawTarget(color) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, targetRadius, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.lineWidth = 4;
+            ctx.strokeStyle = '#fff';
+            ctx.stroke();
+        }
+        drawTarget('#ff4757'); // 初始红色
+
+        // 监听画布的点击事件
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const clickX = e.clientX - rect.left;
+            const clickY = e.clientY - rect.top;
+            
+            // 计算点击位置到靶心的距离 (勾股定理)
+            const distance = Math.sqrt((clickX - centerX)**2 + (clickY - centerY)**2);
+
+            if (distance <= targetRadius) {
+                status.innerText = "🎯 暴击！命中红心！无选择器定位测试通过！";
+                status.style.color = "#ffa502";
+                drawTarget('#2ed573'); // 命中变绿
+            } else {
+                status.innerText = `💥 偏了！你点在了坐标: (${Math.round(clickX)}, ${Math.round(clickY)})`;
+                status.style.color = "#ff4757";
+            }
+        });
+    </script>
+</body>
+</html>

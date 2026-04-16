@@ -1,0 +1,42 @@
+{
+  "version": 4,
+  "replayable": true,
+  "reason": "",
+  "trail": [
+    {
+      "action": "type",
+      "xpath": "//*[@id=\"nav-searchform\"]/div[1]/input[1]",
+      "type_value": "AI Agent 智能体"
+    },
+    {
+      "action": "press_key",
+      "type_value": "Enter"
+    },
+    {
+      "action": "click",
+      "xpath": "//*[@id=\"i_cecream\"]/div[1]/div[2]/div[1]/div[3]/div[1]/div[1]/div[1]/button[2]",
+      "type_value": ""
+    },
+    {
+      "action": "click",
+      "xpath": "//*[@id=\"i_cecream\"]/div[1]/div[2]/div[2]/div[1]/div[1]/div[1]/div[1]/div[1]/div[2]/a[1]",
+      "type_value": ""
+    },
+    {
+      "action": "press_key",
+      "type_value": "Space"
+    },
+    {
+      "action": "press_key",
+      "type_value": "f"
+    }
+  ],
+  "fail_count": 0,
+  "max_failures": 2,
+  "completes_task": true,
+  "source_url": "https://www.bilibili.com/",
+  "source_goal": "这是一场纯物理连招与多标签页的 RPA 极速测试。请严格按以下步骤执行：1. 在 Bilibili 首页顶部的搜索框中，输入 'AI Agent 智能体'。2. 使用 press_key 动作发送 'Enter' 键触发搜索（注意：这会弹出一个新的搜索结果标签页，系统会自动跟进）。3. 在新弹出的搜索结果页中，找到并点击 '最多播放' 按钮进行排序。4. 排序刷新后，点击列表中的第一个视频封面（注意：这会再次弹出一个新的视频播放标签页）。5. 在最新的视频播放页中，点击网页任意空白处或播放器获取焦点，然后使用 press_key 发送 'Space'（空格键）来暂停/播放视频。6. 再次使用 press_key 发送 'f' 键，尝试将视频全屏。7. 任务完成，输出 done。",
+  "core_goal": "这是一场纯物理连招与多标签页的 RPA 极速测试。请严格按以下步骤执行：1. 在 Bilibili 首页顶部的搜索框中，输入 'AI Agent 智能体'。2. 使用 press_key 动作发送 'Enter' 键触发搜索（注意：这会弹出一个新的搜索结果标签页，系统会自动跟进）。3. 在新弹出的搜索结果页中，找到并点击 '最多播放' 按钮进行排序。4. 排序刷新后，点击列表中的第一个视频封面（注意：这会再次弹出一个新的视频播放标签页）。5. 在最新的视频播放页中，点击网页任意空白处或播放器获取焦点，然后使用 press_key 发送 'Space'（空格键）来暂停/播放视频。6. 再次使用 press_key 发送 'f' 键，尝试将视频全屏。7. 任务完成，输出 done。",
+  "normalized_url": "https://www.bilibili.com/",
+  "normalized_goal": "这是一场纯物理连招与多标签页的 rpa 极速测试。请严格按以下步骤执行： 在 bilibili 首页顶部的搜索框中，输入 ai agent 智能体。 使用 press_key 动作发送 enter 键触发搜索（注意：这会弹出一个新的搜索结果标签页，系统会自动跟进）。 在新弹出的搜索结果页中，找到并点击 最多播放 按钮进行排序。 排序刷新后，点击列表中的第一个视频封面（注意：这会再次弹出一个新的视频播放标签页）。 在最新的视频播放页中，点击网页任意空白处或播放器获取焦点，然后使用 press_key 发送 space（空格键）来暂停/播放视频。 再次使用 press_key 发送 f 键，尝试将视频全屏。 任务完成，输出 done。"
+}

@@ -1,0 +1,38 @@
+{
+  "version": 3,
+  "replayable": true,
+  "reason": "",
+  "trail": [
+    {
+      "action": "click",
+      "xpath": "//*[@id=\"s-top-left\"]/a[1]",
+      "type_value": ""
+    },
+    {
+      "action": "close_tab",
+      "type_value": "",
+      "required_memory_keys": [
+        "news_title"
+      ]
+    },
+    {
+      "action": "type",
+      "xpath": "//*[@id=\"chat-textarea\"]",
+      "type_value": "时政新闻眼丨密集会晤四国政要，习近平为何多次提到“战略定力”？",
+      "required_memory_keys": [
+        "news_title"
+      ],
+      "type_value_template": "{{news_title}}"
+    },
+    {
+      "action": "press_key",
+      "type_value": "Enter",
+      "required_memory_keys": [
+        "news_title"
+      ]
+    }
+  ],
+  "fail_count": 0,
+  "max_failures": 2,
+  "completes_task": true
+}

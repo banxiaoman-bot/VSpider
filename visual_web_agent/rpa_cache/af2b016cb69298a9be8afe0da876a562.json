@@ -1,0 +1,43 @@
+{
+  "version": 4,
+  "replayable": true,
+  "reason": "",
+  "trail": [
+    {
+      "action": "click",
+      "xpath": "//*[@id=\"app\"]/div[1]/div[2]/div[2]/ul[1]/div[1]/div[2]/p[1]",
+      "type_value": ""
+    },
+    {
+      "action": "close_tab",
+      "type_value": "",
+      "required_memory_keys": [
+        "video_1_info"
+      ]
+    },
+    {
+      "action": "click",
+      "xpath": "//*[@id=\"app\"]/div[1]/div[2]/div[2]/ul[1]/div[2]/div[2]/p[1]",
+      "type_value": "",
+      "required_memory_keys": [
+        "video_1_info"
+      ]
+    },
+    {
+      "action": "close_tab",
+      "type_value": "",
+      "required_memory_keys": [
+        "video_1_info",
+        "video_2_info"
+      ]
+    }
+  ],
+  "fail_count": 0,
+  "max_failures": 2,
+  "completes_task": true,
+  "source_url": "https://www.bilibili.com/v/popular/all/",
+  "source_goal": "这是一场多标签页循环与记忆库的动态压力测试。请严格执行以下循环：1. 在当前热门视频列表页，找到并点击排名第 1 的视频封面，进入详情页。2. 在新弹出的视频播放页中，使用 save_to_memory 提取该视频的'UP主名字'或'视频标题'，存入记忆库（key='video_1_info'）。3. 提取成功后，使用 close_tab 关闭当前播放页。4. 确认系统自动退回列表页后，找到并点击排名第 2 的视频封面，进入详情页。5. 提取第 2 部视频的'UP主名字'或'视频标题'存入记忆库（key='video_2_info'），然后再次使用 close_tab 关闭详情页。6. 成功回到排行榜列表页后，输出 done 结束任务。",
+  "core_goal": "这是一场多标签页循环与记忆库的动态压力测试。请严格执行以下循环：1. 在当前热门视频列表页，找到并点击排名第 1 的视频封面，进入详情页。2. 在新弹出的视频播放页中，使用 save_to_memory 提取该视频的'UP主名字'或'视频标题'，存入记忆库（key='video_1_info'）。3. 提取成功后，使用 close_tab 关闭当前播放页。4. 确认系统自动退回列表页后，找到并点击排名第 2 的视频封面，进入详情页。5. 提取第 2 部视频的'UP主名字'或'视频标题'存入记忆库（key='video_2_info'），然后再次使用 close_tab 关闭详情页。6. 成功回到排行榜列表页后，输出 done 结束任务。",
+  "normalized_url": "https://www.bilibili.com/v/popular/all",
+  "normalized_goal": "这是一场多标签页循环与记忆库的动态压力测试。请严格执行以下循环： 在当前热门视频列表页，找到并点击排名第 1 的视频封面，进入详情页。 在新弹出的视频播放页中，使用 save_to_memory 提取该视频的up主名字或视频标题，存入记忆库（key=video_1_info）。 提取成功后，使用 close_tab 关闭当前播放页。 确认系统自动退回列表页后，找到并点击排名第 2 的视频封面，进入详情页。 提取第 2 部视频的up主名字或视频标题存入记忆库（key=video_2_info），然后再次使用 close_tab 关闭详情页。 成功回到排行榜列表页后，输出 done 结束任务。"
+}

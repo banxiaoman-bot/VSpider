@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+browser_data/
+downloads/
+screenshots/
+
+# 日志文件
+*.log
+run.*.log
+
+# 输出文件
+*.xlsx
+output_*.xlsx
+
+# 测试文件
+test_page.html
