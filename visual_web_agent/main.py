@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit
 from dotenv import load_dotenv
@@ -153,6 +154,28 @@ def _build_rpa_match_metadata(url: str, goal: str) -> dict:
         "normalized_url": _normalize_url_for_rpa(url),
         "normalized_goal": _normalize_goal_for_rpa(core_goal),
     }
+
+
+def _parse_goal_target_count(goal: str) -> int | None:
+    """
+    从用户目标中解析出目标数据条数。
+
+    支持格式示例：
+    - "获取新闻列表前90条" → 90
+    - "抓取100条评论" → 100
+    - "提取前50个商品" → 50
+    - "获取全部内容" → None（不确定数量）
+
+    Returns:
+        解析出的目标数量，未指定则返回 None。
+    """
+    m = re.search(r'(?:前|共|取|抓)\s*(\d+)\s*(?:条|个|项|篇|则)', goal)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s*(?:条|个|项|篇|则)\s*(?:数据|内容|信息|记录|新闻|商品|评论)', goal)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _goal_should_skip_rpa(goal: str) -> tuple[bool, str]:
@@ -1055,6 +1078,8 @@ def _compact_rpa_trail(trail: list[dict]) -> list[dict]:
         return (
             (prev.get("action") or "") == (cur.get("action") or "")
             and (prev.get("xpath") or "") == (cur.get("xpath") or "")
+            and (prev.get("ax_role") or "") == (cur.get("ax_role") or "")
+            and (prev.get("ax_name") or "") == (cur.get("ax_name") or "")
             and prev.get("target_id") == cur.get("target_id")
             and (prev.get("type_value") or "") == (cur.get("type_value") or "")
             and (prev.get("type_value_template") or "") == (cur.get("type_value_template") or "")
@@ -1073,6 +1098,87 @@ def _compact_rpa_trail(trail: list[dict]) -> list[dict]:
         compacted.append(dict(step))
 
     return compacted
+
+
+# ── 动态内容阈值：ax_name 超过此长度视为动态内容（新闻标题/商品名等），
+#    语义定位器大概率与当前页面不匹配，应快速降级到 XPath 结构寻址 ──
+_DYNAMIC_CONTENT_NAME_THRESHOLD = 12
+
+
+def _is_dynamic_content_step(step: dict) -> bool:
+    """
+    判断当前步骤是否涉及动态内容。
+
+    动态内容特征：
+      1. save_to_memory 动作 — 值一定随页面内容变化
+      2. ax_name 长度 > 12 — 长文本通常为新闻标题、商品名等时效性内容
+    """
+    if step.get("action") == "save_to_memory":
+        return True
+    ax_name = str(step.get("ax_name") or "").strip()
+    if len(ax_name) > _DYNAMIC_CONTENT_NAME_THRESHOLD:
+        return True
+    return False
+
+
+async def _resolve_composite_locator(page, step: dict, timeout_ms: int):
+    """
+    复合定位器：Priority 1 语义定位 → Priority 2 XPath 兜底。
+
+    ★ 动态内容智能降级：
+      当 step 被判定为动态内容（长 ax_name / save_to_memory）时，
+      Priority 1 的 timeout 从默认值压缩到 100ms，实现近乎立即降级到 XPath。
+      这样不会死等"昨天的新闻标题"，而是直接用 XPath 物理结构定位。
+    """
+    from playwright.async_api import Error as PlaywrightError
+
+    ax_role = str(step.get("ax_role") or "").strip().lower()
+    ax_name = str(step.get("ax_name") or "").strip()
+    xpath = str(step.get("xpath") or "").strip()
+    is_dynamic = _is_dynamic_content_step(step)
+
+    # ── Priority 1: 语义定位器（get_by_role + name） ──
+    # 动态内容：timeout 压缩到 100ms 快速降级；
+    # 纯粹无 ax_name 的 save_to_memory 直接跳过 Priority 1。
+    if ax_role and ax_name:
+        semantic_timeout = 100 if is_dynamic else timeout_ms
+        if is_dynamic:
+            logger.info(
+                f"[RPA DYNAMIC] 检测到动态内容 (ax_name={ax_name!r}, len={len(ax_name)})，"
+                f"语义定位 timeout 压缩至 {semantic_timeout}ms，将快速降级到 XPath"
+            )
+        try:
+            semantic_loc = page.get_by_role(ax_role, name=ax_name).first
+            await semantic_loc.wait_for(state="visible", timeout=semantic_timeout)
+            return semantic_loc, f"role={ax_role!r}, name={ax_name!r}"
+        except PlaywrightError as sem_err:
+            logger.debug(
+                f"[RPA REPLAY] semantic locator failed, will try xpath: {type(sem_err).__name__}: {sem_err}"
+            )
+        except Exception as sem_err:
+            logger.debug(
+                f"[RPA REPLAY] semantic locator failed, will try xpath: {type(sem_err).__name__}: {sem_err}"
+            )
+
+    # ── Priority 2: XPath 物理结构定位 ──
+    if xpath:
+        try:
+            xpath_loc = page.locator(f"xpath={xpath}").first
+            await xpath_loc.wait_for(state="visible", timeout=timeout_ms)
+            return xpath_loc, f"xpath={xpath}"
+        except PlaywrightError as xpath_err:
+            logger.debug(
+                f"[RPA REPLAY] xpath locator failed: {type(xpath_err).__name__}: {xpath_err}"
+            )
+        except Exception as xpath_err:
+            logger.debug(
+                f"[RPA REPLAY] xpath locator failed: {type(xpath_err).__name__}: {xpath_err}"
+            )
+
+    raise RuntimeError(
+        "Composite locator failed on current page: "
+        f"role={ax_role!r}, name={ax_name!r}, xpath={xpath!r}"
+    )
 
 
 def _normalize_rpa_cache_payload(payload) -> dict:
@@ -1213,12 +1319,8 @@ async def _replay_rpa(
                 await asyncio.sleep(0.8)
 
             elif act == "click":
-                xpath = step["xpath"]
-                logger.info(f"[RPA REPLAY] {step_label}: xpath={xpath}")
-                loc = page.locator(f"xpath={xpath}")
-                if await loc.count() == 0:
-                    raise RuntimeError(f"cached locator missing on current page: {xpath}")
-                await loc.wait_for(state="visible", timeout=_RPA_TIMEOUT)
+                loc, locator_desc = await _resolve_composite_locator(page, step, _RPA_TIMEOUT)
+                logger.info(f"[RPA REPLAY] {step_label}: {locator_desc}")
                 await loc.click(timeout=_RPA_TIMEOUT)
                 # click 可能触发导航或弹新标签页，优先等待当前激活页稳定
                 active_page = browser._page if browser._page and not browser._page.is_closed() else page
@@ -1226,16 +1328,18 @@ async def _replay_rpa(
                 await asyncio.sleep(0.8)
 
             elif act == "type":
-                xpath = step["xpath"]
                 val = step.get("type_value_template") or step.get("type_value", "")
                 val = _resolve_replay_template(str(val), workflow_memory)
-                logger.info(f"[RPA REPLAY] {step_label}: xpath={xpath} <- {val!r}")
-                loc = page.locator(f"xpath={xpath}")
-                if await loc.count() == 0:
-                    raise RuntimeError(f"cached locator missing on current page: {xpath}")
-                await loc.wait_for(state="visible", timeout=_RPA_TIMEOUT)
+                loc, locator_desc = await _resolve_composite_locator(page, step, _RPA_TIMEOUT)
+                logger.info(f"[RPA REPLAY] {step_label}: {locator_desc} <- {val!r}")
                 await loc.fill(val, timeout=_RPA_TIMEOUT)
                 await asyncio.sleep(0.3)
+
+            elif act == "hover":
+                loc, locator_desc = await _resolve_composite_locator(page, step, _RPA_TIMEOUT)
+                logger.info(f"[RPA REPLAY] {step_label}: {locator_desc}")
+                await loc.hover(timeout=_RPA_TIMEOUT)
+                await asyncio.sleep(0.5)
 
             elif act == "click_point":
                 # ── click_point 无 Playwright 自动等待，必须手动保证页面就绪 ──
@@ -1295,6 +1399,94 @@ async def _replay_rpa(
                 logger.info(f"[RPA REPLAY] {step_label}: wait {wait_secs}s")
                 await asyncio.sleep(wait_secs)
 
+            elif act == "save_to_memory":
+                # ═══════════════════════════════════════════════════════════
+                # ★ save_to_memory 回放：动态重提取（绝不使用缓存硬编码值）
+                #
+                # 问题：录制时 type_value 记录的是当时页面的具体文本
+                #       （如"总书记引领强国之路｜以质图强..."），但回放时
+                #       页面内容已经变化，必须从当前最新页面重新提取。
+                #
+                # 策略：
+                #   1. 用复合定位器（快速降级到 XPath）在当前页面找到目标元素
+                #   2. 从元素的 innerText / value 提取最新文本
+                #   3. 将 fresh_text 写入 workflow_memory
+                # ═══════════════════════════════════════════════════════════
+                memory_key = (
+                    step.get("memory_key")
+                    or step.get("type_value_template", "").strip("{}")
+                    or ""
+                ).strip()
+                if not memory_key:
+                    memory_key = f"temp_var_{int(time.time())}"
+                    logger.warning(
+                        f"[RPA DYNAMIC] save_to_memory 缺少 memory_key，"
+                        f"自动生成: {memory_key!r}"
+                    )
+
+                # 尝试从当前页面动态提取最新文本
+                fresh_text = ""
+                try:
+                    loc, locator_desc = await _resolve_composite_locator(
+                        page, step, _RPA_TIMEOUT
+                    )
+                    # 提取最新文本：优先 innerText，次选 input value
+                    raw_text = await loc.evaluate(
+                        """el => {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            const val  = (el.value || '').trim();
+                            return text || val || '';
+                        }"""
+                    )
+                    # 清理隐藏字符、多余换行、首尾空格
+                    fresh_text = re.sub(
+                        r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "",
+                        str(raw_text or ""),
+                    ).strip()
+                    fresh_text = re.sub(r"\s+", " ", fresh_text).strip()
+                    logger.info(
+                        f"[RPA DYNAMIC] 重新从页面提取了最新文本: "
+                        f"{fresh_text!r} (via {locator_desc})"
+                    )
+                    print(
+                        f"\033[1;36m🔄 [RPA DYNAMIC]\033[0m "
+                        f"从当前页面重新提取了最新文本: "
+                        f"\033[32m{fresh_text[:80]!r}\033[0m"
+                    )
+                except Exception as extract_err:
+                    logger.warning(
+                        f"[RPA DYNAMIC] 页面元素定位失败，"
+                        f"无法动态提取文本: {extract_err}"
+                    )
+                    # 降级：尝试用缓存的 type_value 作为最后手段
+                    cached_val = (step.get("type_value") or "").strip()
+                    if cached_val:
+                        fresh_text = cached_val
+                        logger.warning(
+                            f"[RPA DYNAMIC] 降级使用缓存文本: {fresh_text!r}"
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"save_to_memory 回放失败：既无法从页面提取，"
+                            f"缓存也无 type_value. 错误: {extract_err}"
+                        )
+
+                # 写入 workflow_memory
+                if fresh_text and workflow_memory is not None:
+                    workflow_memory[memory_key] = fresh_text
+                    workflow_memory["latest_memory"] = fresh_text
+                    logger.info(
+                        f"[RPA DYNAMIC] Memory 已更新: "
+                        f"{memory_key!r} = {fresh_text!r}"
+                    )
+                elif not fresh_text:
+                    logger.warning(
+                        f"[RPA DYNAMIC] save_to_memory 提取结果为空，"
+                        f"未写入 workflow_memory"
+                    )
+
+                await asyncio.sleep(0.3)
+
             elif act == "smooth_scroll":
                 direction = (step.get("type_value") or "down").strip().lower()
                 if direction == "up":
@@ -1307,10 +1499,14 @@ async def _replay_rpa(
 
             elif act == "remove_element":
                 xpath = step.get("xpath", "")
+                ax_role = step.get("ax_role", "")
+                ax_name = step.get("ax_name", "")
                 if not xpath:
                     logger.debug(f"[RPA REPLAY] {step_label}: remove_element skipped (no xpath)")
                 else:
-                    logger.info(f"[RPA REPLAY] {step_label}: remove_element xpath={xpath}")
+                    logger.info(
+                        f"[RPA REPLAY] {step_label}: remove_element role={ax_role!r}, name={ax_name!r}, xpath={xpath}"
+                    )
                     try:
                         loc = page.locator(f"xpath={xpath}")
                         if await loc.count() > 0:
@@ -1322,6 +1518,20 @@ async def _replay_rpa(
                     except Exception as _rm_err:
                         # 删除失败不阻断整个 RPA 回放，仅警告
                         logger.warning(f"[RPA REPLAY] remove_element soft-fail: {_rm_err}")
+
+            elif act == "select":
+                val = step.get("type_value_template") or step.get("type_value", "")
+                val = _resolve_replay_template(str(val), workflow_memory)
+                loc, locator_desc = await _resolve_composite_locator(page, step, _RPA_TIMEOUT)
+                logger.info(f"[RPA REPLAY] {step_label}: {locator_desc} <- {val!r}")
+                try:
+                    await loc.select_option(label=val, timeout=_RPA_TIMEOUT)
+                except Exception:
+                    try:
+                        await loc.select_option(value=val, timeout=_RPA_TIMEOUT)
+                    except Exception:
+                        await loc.select_option(index=0, timeout=_RPA_TIMEOUT)
+                await asyncio.sleep(0.5)
 
             else:
                 logger.debug(f"[RPA REPLAY] {step_label}: skipping unsupported action")
@@ -1523,9 +1733,16 @@ async def run_agent(
         logger.info(f"[MAX STEPS] {MAX_STEPS}")
         logger.info(f"{'=' * 60}")
 
-        # 追踪最近两步的 (action, target_id)，用于检测死循环
-        _last_actions: list[tuple[str, int]] = []
-        _extract_count = 0  # 连续 extract 次数，超过 2 次强制 done
+        # 滑窗：记录最近 6 步的 (action, target_id, landing_url)，用于检测点击死循环
+        # 升级为 URL-aware：只有"同一 ID 被点击 ≥ 3 次 **且** 着陆 URL 完全相同"才判定死循环，
+        # 翻页 / A-B 循环切换等 URL 在变化的合法重复不再误伤。
+        _last_actions: list[tuple[str, int, str]] = []
+        _LOOP_GUARD_WINDOW = 6
+        _loop_guard_blocked_ids: set[int] = set()  # 触发过 LOOP GUARD 的 target_id，后续直接拦截
+        _extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
+        _total_extracted_rows = 0  # 跨页累加的总行数
+        _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
+        _extracted_page_urls: set = set()  # 已成功提取数据的不同页面 URL 集合
 
         # ── 自愈计数器 ────────────────────────────────────────────────
         # 连续执行失败超过 _MAX_CONSECUTIVE_ERRORS 次时强制转 ask_human
@@ -1708,8 +1925,8 @@ async def run_agent(
                 # 旧的 _force_vision_next_step 信号在双模态下已失效，这里消耗掉以保持语义干净
                 _force_vision_next_step = False
 
-                print("\033[1;36m🧠 [HYBRID]\033[0m 同步采集 SoM 截图 + 精简 DOM 树，融合决策")
-                logger.info("[HYBRID] Collecting SoM screenshot + compact DOM tree for fused VLM decision")
+                print("\033[1;36m🧠 [HYBRID]\033[0m 同步采集 SoM 截图 + 无障碍语义树 (AX Tree)，融合决策")
+                logger.info("[HYBRID] Collecting SoM screenshot + accessibility tree for fused VLM decision")
 
                 screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
                 _log_screenshot_path = (
@@ -1717,33 +1934,38 @@ async def run_agent(
                 )
 
                 try:
-                    text_dom = await browser.extract_text_dom()
-                except Exception as _dom_err:
+                    ax_tree_text = await browser.extract_accessibility_tree()
+                except Exception as _ax_err:
                     logger.warning(
-                        f"[HYBRID] 精简 DOM 提取失败，本轮仅凭截图决策: {_dom_err}"
+                        f"[HYBRID] AX Tree 提取失败，本轮仅凭截图决策: {_ax_err}"
                     )
-                    text_dom = ""
+                    ax_tree_text = ""
 
-                # 兜底：防止超大 DOM 树撑爆 Token
-                if text_dom and len(text_dom) > 15000:
-                    _orig_len = len(text_dom)
-                    text_dom = text_dom[:15000] + "\n...[WARNING: DOM过长已截断]..."
+                # 兜底：防止超大 AX Tree 撑爆 Token
+                if ax_tree_text and len(ax_tree_text) > 15000:
+                    _orig_len = len(ax_tree_text)
+                    ax_tree_text = ax_tree_text[:15000] + "\n...[WARNING: AX Tree 过长已截断]..."
                     logger.warning(
-                        f"[HYBRID] DOM 长度 {_orig_len} 超过 15000 阈值，已截断以保护上下文窗口"
+                        f"[HYBRID] AX Tree 长度 {_orig_len} 超过 15000 阈值，已截断以保护上下文窗口"
                     )
 
-                dom_block = ""
-                if text_dom:
-                    dom_block = (
-                        "\n\n【辅助信息：页面精简 DOM 树】\n"
-                        "请结合截图中的红色数字标记 (SoM ID)，参考以下 DOM 元素属性"
-                        "（标签类型、placeholder、文本、隐藏值）做出更精准的决策；"
-                        "DOM 行首的 [ID: N] 与截图里的红框数字一一对应。\n"
-                        f"{text_dom}\n"
+                ax_block = ""
+                if ax_tree_text:
+                    ax_block = (
+                        "\n\n=====================================\n"
+                        "【辅助信息：页面无障碍语义树 (AX Tree)】\n"
+                        "以下是当前页面的纯语义结构，过滤了所有样式噪音。\n"
+                        "  · 第一段 [交互元素 (SoM ID 映射)] 的 [ID: N] 与截图红框数字一一对应，\n"
+                        "    重点参考每个元素的 Role 和 Name。\n"
+                        "  · 第二段 [页面语义快照] 提供整体 AX 结构，辅助理解上下文。\n"
+                        "  ⚠ 执行 extract 时，**必须从 AX Tree 中读取文本数据**（标题、数值、描述），\n"
+                        "    而非仅靠截图 OCR。被浮层遮挡的元素在 AX Tree 中仍然存在。\n"
+                        f"{ax_tree_text}\n"
+                        "====================================="
                     )
 
                 input_descriptions = (
-                    (input_descriptions or "") + dom_block + _page_hint + _tabs_hint
+                    (input_descriptions or "") + ax_block + _page_hint + _tabs_hint
                 )
 
                 decisions = await vlm.ask(
@@ -1755,6 +1977,214 @@ async def run_agent(
                 )
 
                 _log_decision = decisions
+
+                # ── extract+null 即时自动提取 ────────────────────────────
+                # 借鉴 browser-use 架构：VLM 只需给出 extract 意图，
+                # 数据由系统从 AX Tree 自动提取，不再浪费步数等 VLM 重试。
+                _has_extract_downgrade = any(
+                    d.get("__extract_downgraded") for d in decisions
+                )
+                if _has_extract_downgrade:
+                    _extract_null_streak += 1
+                    # ── 同页去重：如果当前 URL 已成功提取过，不再重复提取 ──
+                    _current_auto_url = browser.current_url
+                    if _current_auto_url in _extracted_page_urls:
+                        logger.warning(
+                            f"[EXTRACT AUTO DEDUP] 当前页面已提取过，跳过重复提取: "
+                            f"{_current_auto_url}"
+                        )
+                        _dedup_pag_links = browser.find_pagination_links()
+                        if _dedup_pag_links:
+                            _pag_hint = "\n".join(
+                                f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                                for p in _dedup_pag_links
+                            )
+                            vlm.inject_error_feedback(
+                                f"⚠️ 当前页面（{_current_auto_url}）的数据已经提取过了，"
+                                f"不会重复提取。\n"
+                                f"系统在当前页面发现了以下翻页链接：\n{_pag_hint}\n"
+                                f"【立即操作】请点击上述翻页链接翻页，例如："
+                                f"click(target_id={_dedup_pag_links[0]['id']})\n"
+                                f"⚠️ 必须使用上述精确的 ID，不要猜测其他 ID！"
+                            )
+                        else:
+                            vlm.inject_error_feedback(
+                                f"⚠️ 当前页面（{_current_auto_url}）的数据已经提取过了，"
+                                f"不会重复提取。\n"
+                                "当前页面未发现翻页链接。\n"
+                                "如果任务需要更多数据，请尝试向下滚动查找翻页按钮。\n"
+                                "如果已完成所有页的提取，请直接输出 done 结束任务。"
+                            )
+                        continue  # 跳到下一步重新截图
+                    logger.warning(
+                        f"[EXTRACT AUTO] VLM 输出 extract+null "
+                        f"(第 {_extract_null_streak} 次)，启动 AX Tree 自动提取"
+                    )
+                    try:
+                        # ── 通过 AX Tree 获取全页语义文本（优于 innerText）──
+                        # AX Tree 天然过滤 script/style/广告噪音，只保留语义内容
+                        _ax_text = await browser.extract_page_text_via_ax_tree()
+                        if not _ax_text:
+                            # AX Tree 失败时降级为 innerText
+                            _page_for_extract = await browser._ensure_active_page(
+                                reason="extract auto fallback to innerText"
+                            )
+                            _ax_text = await _page_for_extract.evaluate(
+                                "() => document.body.innerText"
+                            )
+                            _ax_text = (_ax_text or "")[:16000]
+                            logger.info("[EXTRACT AUTO] AX Tree 为空，降级使用 innerText")
+
+                        # ── 尝试用纯文本 VLM 调用结构化提取 ──
+                        _structured_auto = await vlm.extract_structured_data(
+                            page_text=_ax_text,
+                            goal=goal,
+                        )
+                        if _structured_auto and isinstance(_structured_auto, list) and len(_structured_auto) > 0:
+                            _auto_extracted = _structured_auto
+                            _new_rows = len(_auto_extracted)
+                            logger.info(
+                                f"[EXTRACT AUTO] 全页结构化提取成功，共 {_new_rows} 条"
+                            )
+                        else:
+                            # 结构化失败，降级为原始文本 blob
+                            _auto_extracted = {
+                                "source": "auto_extract_from_ax_tree",
+                                "page_url": browser.current_url,
+                                "page_text": _ax_text[:8000],
+                            }
+                            _new_rows = 1
+                            logger.info(
+                                f"[EXTRACT AUTO] 结构化提取未返回数据，"
+                                f"降级保存原始 AX Tree 文本 (长度={len(_ax_text)})"
+                            )
+                        saved_path = save_to_excel(
+                            _auto_extracted, _vlm_output,
+                        )
+                        _total_extracted_rows += _new_rows
+                        _extract_count += 1
+                        _extracted_page_urls.add(browser.current_url)
+                        # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放
+                        _rpa_cache_allowed = False
+                        _rpa_skip_reason = "contains auto-extract steps"
+                        logger.info(
+                            f"[EXTRACT AUTO] Saved to: {saved_path} "
+                            f"(累计 {_total_extracted_rows} 条)"
+                        )
+                        print(
+                            f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
+                            f"VLM 未填充数据，系统已从 AX Tree 全页提取 "
+                            f"\033[36m{_new_rows}\033[0m 条数据。"
+                            f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
+                        )
+                        _log_decision = [{
+                            "action": "extract",
+                            "extracted_data": _auto_extracted,
+                        }]
+                        # 将降级的 wait 动作替换为已完成的 extract
+                        # 不需要执行内层动作循环，直接跳到翻页引导
+                        decisions = _log_decision
+                    except Exception as _auto_err:
+                        logger.error(
+                            f"[EXTRACT AUTO] 自动提取失败: {_auto_err}"
+                        )
+                    # 无论是否成功，注入智能翻页/结束引导
+                    _auto_pages = len(_extracted_page_urls)
+                    _target_count = _parse_goal_target_count(goal)
+                    _reached_target = (
+                        _target_count is not None
+                        and _total_extracted_rows >= _target_count
+                    )
+                    if _reached_target:
+                        # 已达到用户指定的目标数量，强烈建议 done
+                        vlm.inject_error_feedback(
+                            f"✅ 系统已自动提取当前页数据。"
+                            f"你已经成功提取了 {_auto_pages} 个不同页面的数据"
+                            f"（累计 {_total_extracted_rows} 条）。\n"
+                            f"用户要求获取 {_target_count} 条数据，"
+                            f"当前已累计 {_total_extracted_rows} 条，"
+                            f"**已达到目标**！请立即输出 done 结束任务。"
+                        )
+                    elif _auto_pages >= 2 and _target_count is not None:
+                        # 已提取 2+ 页但未达标，明确要求继续
+                        _pag_links = browser.find_pagination_links()
+                        if _pag_links:
+                            _pag_hint = "\n".join(
+                                f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                                for p in _pag_links
+                            )
+                            vlm.inject_error_feedback(
+                                f"✅ 系统已自动提取当前页数据。"
+                                f"已提取 {_auto_pages} 个页面"
+                                f"（累计 {_total_extracted_rows} 条），"
+                                f"但用户要求 {_target_count} 条，"
+                                f"还差 {_target_count - _total_extracted_rows} 条。\n"
+                                f"系统发现了翻页链接：\n{_pag_hint}\n"
+                                f"【立即操作】请继续点击翻页链接加载下一页，例如："
+                                f"click(target_id={_pag_links[0]['id']})\n"
+                                f"⚠️ 必须使用上述精确的 ID！"
+                            )
+                        else:
+                            vlm.inject_error_feedback(
+                                f"✅ 系统已自动提取当前页数据。"
+                                f"已提取 {_auto_pages} 个页面"
+                                f"（累计 {_total_extracted_rows} 条），"
+                                f"但用户要求 {_target_count} 条，"
+                                f"还差 {_target_count - _total_extracted_rows} 条。\n"
+                                "请向下滚动查找翻页按钮后继续翻页提取。"
+                            )
+                    elif _auto_pages >= 2:
+                        # 不确定目标数量，让 VLM 自行判断
+                        vlm.inject_error_feedback(
+                            f"✅ 系统已自动提取当前页数据。"
+                            f"你已经成功提取了 {_auto_pages} 个不同页面的数据"
+                            f"（累计 {_total_extracted_rows} 条）。\n"
+                            "请仔细回顾用户的原始任务要求，"
+                            "判断是否需要继续翻页提取更多数据。\n"
+                            "如果已满足用户需求，请输出 done 结束任务。"
+                        )
+                    else:
+                        _pag_links = browser.find_pagination_links()
+                        if _pag_links:
+                            _pag_hint = "\n".join(
+                                f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                                for p in _pag_links
+                            )
+                            vlm.inject_error_feedback(
+                                f"✅ 系统已自动提取当前页数据"
+                                f"（已提取 {_auto_pages} 个页面，"
+                                f"累计 {_total_extracted_rows} 条）。\n"
+                                f"系统在当前页面发现了以下翻页链接：\n{_pag_hint}\n"
+                                f"【立即操作】请点击翻页链接加载下一页，例如："
+                                f"click(target_id={_pag_links[0]['id']})\n"
+                                f"⚠️ 必须使用上述精确的 ID，不要猜测其他 ID！"
+                            )
+                        else:
+                            vlm.inject_error_feedback(
+                                f"✅ 系统已自动提取当前页数据"
+                                f"（已提取 {_auto_pages} 个页面，"
+                                f"累计 {_total_extracted_rows} 条）。\n"
+                                "当前页面未发现翻页链接，可能已是最后一页。\n"
+                                "如果任务还需要更多数据，请尝试向下滚动查找翻页按钮。\n"
+                                "如果已完成所有页的提取，请直接输出 done 结束任务。"
+                            )
+                    # 跳过内层动作循环（因为 extract 已自动完成）
+                    # 但如果连续太多次自动提取同一页面，强制结束
+                    if _extract_null_streak >= 3:
+                        logger.warning(
+                            "[EXTRACT AUTO] 连续 3 次自动提取，强制结束任务"
+                        )
+                        _run_succeeded = True
+                        _task_completed = True
+                        break
+                    continue  # 跳到下一步重新截图
+                else:
+                    if _extract_null_streak > 0:
+                        logger.info(
+                            f"[EXTRACT AUTO] extract+null 连击已中断 "
+                            f"(was {_extract_null_streak})"
+                        )
+                    _extract_null_streak = 0
 
                 # ── 内层动作循环：依次执行批次中的每个动作 ──────────────────
                 # break → 中止本批次，进入下一步（重新截图）
@@ -1877,26 +2307,200 @@ async def run_agent(
                         )
                         break
 
-                    # 4. 数据提取
+                    # 4. 数据提取（跨页累加模式）
                     if action == "extract":
                         _rpa_cache_allowed = False
                         _rpa_skip_reason = "contains extract steps"
                         extracted = decision.get("extracted_data")
+                        _current_url = browser.current_url
+
+                        # ── 同页去重：如果当前 URL 已经提取过，跳过 ──
+                        if _current_url in _extracted_page_urls:
+                            # Step 0：先判断是否已达用户指定的数量目标，优先引导 done
+                            _target_count_pre = _parse_goal_target_count(goal)
+                            _pre_reached = (
+                                _target_count_pre is not None
+                                and _total_extracted_rows >= _target_count_pre
+                            )
+                            logger.warning(
+                                "[EXTRACT DEDUP] 当前页面已提取过，跳过重复提取"
+                            )
+                            _n_pages = len(_extracted_page_urls)
+                            if _pre_reached:
+                                # ✅ 已达目标：不再建议翻页/滚动，立即要求 done
+                                vlm.inject_error_feedback(
+                                    f"✅ 你已累计提取 {_total_extracted_rows} 条数据，"
+                                    f"已达成用户要求的 {_target_count_pre} 条。\n"
+                                    f"请立即输出 action=done 结束任务，不要再 extract、"
+                                    f"不要翻页、不要滚动。"
+                                )
+                            elif _n_pages >= 2:
+                                # 已提取 2+ 页面，强烈建议 done
+                                vlm.inject_error_feedback(
+                                    f"⚠️ 当前页面数据已经提取过了！\n"
+                                    f"你已经成功提取了 {_n_pages} 个不同页面的数据"
+                                    f"（累计 {_total_extracted_rows} 条）。\n"
+                                    "请回顾用户的原始任务要求：如果用户要求的页数已经提取完毕，"
+                                    "请立即输出 done 结束任务！\n"
+                                    "只有当用户明确要求更多页面时才继续翻页。"
+                                )
+                            else:
+                                vlm.inject_error_feedback(
+                                    "⚠️ 当前页面数据已经提取过了！你正在重复提取同一页面！\n"
+                                    "系统已帮你跳过。请立即执行以下操作之一：\n"
+                                    "1. smooth_scroll(target_id=0, type_value='down') 向下滚动找到【下一页】按钮\n"
+                                    "2. 找到并 click 【下一页】按钮翻页\n"
+                                    "3. 如果所有页提取完毕，输出 done 结束任务"
+                                )
+                            # 仅在未达目标时才自动滚动寻找分页按钮
+                            if not _pre_reached:
+                                try:
+                                    _scroll_page = await browser._ensure_active_page(
+                                        reason="auto scroll for pagination"
+                                    )
+                                    await _scroll_page.evaluate(
+                                        "window.scrollBy({top: 600, behavior: 'smooth'})"
+                                    )
+                                    logger.info("[EXTRACT DEDUP] 已自动向下滚动 600px")
+                                except Exception:
+                                    pass
+                            break
+
                         if extracted:
-                            logger.info(f"[EXTRACT] Data extracted: {extracted}")
+                            # ── AX Tree 全页结构化提取：突破视口限制 ──
+                            # VLM 只能看到视口中的 ~10 条，但一页通常有 20+ 条数据。
+                            # 通过 AX Tree 获取全页语义文本，用纯文本 VLM 调用结构化提取全部数据。
+                            try:
+                                _full_page_text = await browser.extract_page_text_via_ax_tree()
+                                if not _full_page_text:
+                                    # AX Tree 失败时降级为 innerText
+                                    _page_for_full = await browser._ensure_active_page(
+                                        reason="extract fallback to innerText"
+                                    )
+                                    _full_page_text = await _page_for_full.evaluate(
+                                        "() => document.body.innerText"
+                                    )
+                                    logger.info("[EXTRACT FULL] AX Tree 为空，降级使用 innerText")
+                                _full_extracted = await vlm.extract_structured_data(
+                                    page_text=_full_page_text,
+                                    goal=goal,
+                                    example_data=extracted,
+                                )
+                                if _full_extracted and len(_full_extracted) > len(
+                                    extracted if isinstance(extracted, list) else [extracted]
+                                ):
+                                    logger.info(
+                                        f"[EXTRACT FULL] AX Tree 全页提取 {len(_full_extracted)} 条 "
+                                        f"vs VLM 视口 {len(extracted) if isinstance(extracted, list) else 1} 条，"
+                                        f"采用全页数据"
+                                    )
+                                    extracted = _full_extracted
+                                elif _full_extracted:
+                                    logger.info(
+                                        f"[EXTRACT FULL] AX Tree 全页 {len(_full_extracted)} 条 "
+                                        f"≤ VLM {len(extracted) if isinstance(extracted, list) else 1} 条，"
+                                        f"保留 VLM 原始数据"
+                                    )
+                            except Exception as _full_err:
+                                logger.warning(
+                                    f"[EXTRACT FULL] 全页提取失败，使用 VLM 原始数据: {_full_err}"
+                                )
+
+                            # 统计本次新增行数
+                            _new_rows = len(extracted) if isinstance(extracted, list) else 1
+                            _total_extracted_rows += _new_rows
+                            logger.info(
+                                f"[EXTRACT] 本次提取 {_new_rows} 条，"
+                                f"累计已提取 {_total_extracted_rows} 条"
+                            )
+                            # save_to_excel 内部已支持追加写入 + 去重
                             saved_path = save_to_excel(extracted, _vlm_output)
                             logger.info(f"[EXTRACT] Saved to: {saved_path}")
+                            print(
+                                f"\033[1;32m✅ [EXTRACT]\033[0m "
+                                f"成功追加 \033[36m{_new_rows}\033[0m 条数据。"
+                                f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
+                            )
                             _extract_count += 1
+                            _extracted_page_urls.add(_current_url)
                         else:
                             logger.warning("[EXTRACT] No extracted_data in VLM response")
 
-                        # 连续 extract 且无翻页动作 → VLM 没有调 done，强制结束
-                        # 注意：翻页场景中两次 extract 之间有 click，_extract_count 会被清零，
-                        # 所以阈值=1 对翻页任务是安全的（不会提前中断）
-                        if _extract_count >= 1:
+                        # ── 智能翻页/结束引导（根据已提取页数 + 目标数量决定建议） ──
+                        _n_pages = len(_extracted_page_urls)
+                        _target_count_b = _parse_goal_target_count(goal)
+                        _reached_target_b = (
+                            _target_count_b is not None
+                            and _total_extracted_rows >= _target_count_b
+                        )
+                        if _reached_target_b:
+                            vlm.inject_error_feedback(
+                                f"✅ 你已成功提取 {_n_pages} 个不同页面的数据"
+                                f"（累计 {_total_extracted_rows} 条）。\n"
+                                f"用户要求获取 {_target_count_b} 条数据，"
+                                f"当前已达到目标！请立即输出 done 结束任务。"
+                            )
+                        elif _n_pages >= 2 and _target_count_b is not None:
+                            _pag_links_c = browser.find_pagination_links()
+                            if _pag_links_c:
+                                _pag_hint_c = "\n".join(
+                                    f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                                    for p in _pag_links_c
+                                )
+                                vlm.inject_error_feedback(
+                                    f"✅ 你已成功提取 {_n_pages} 个页面"
+                                    f"（累计 {_total_extracted_rows} 条），"
+                                    f"但用户要求 {_target_count_b} 条，"
+                                    f"还差 {_target_count_b - _total_extracted_rows} 条。\n"
+                                    f"系统发现了翻页链接：\n{_pag_hint_c}\n"
+                                    f"【立即操作】请继续翻页，例如："
+                                    f"click(target_id={_pag_links_c[0]['id']})"
+                                )
+                            else:
+                                vlm.inject_error_feedback(
+                                    f"✅ 你已成功提取 {_n_pages} 个页面"
+                                    f"（累计 {_total_extracted_rows} 条），"
+                                    f"但用户要求 {_target_count_b} 条，"
+                                    f"还差 {_target_count_b - _total_extracted_rows} 条。\n"
+                                    "请向下滚动查找翻页按钮后继续翻页提取。"
+                                )
+                        elif _n_pages >= 2:
+                            vlm.inject_error_feedback(
+                                f"✅ 你已成功提取 {_n_pages} 个不同页面的数据"
+                                f"（累计 {_total_extracted_rows} 条）。\n"
+                                "请仔细回顾用户的原始任务要求，"
+                                "判断是否需要继续翻页提取更多数据。\n"
+                                "如果已满足用户需求，请输出 done 结束任务。"
+                            )
+                        elif _extract_count > 0:
+                            _pag_links_b = browser.find_pagination_links()
+                            if _pag_links_b:
+                                _pag_hint_b = "\n".join(
+                                    f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                                    for p in _pag_links_b
+                                )
+                                vlm.inject_error_feedback(
+                                    f"✅ 你已成功提取当前页数据"
+                                    f"（第 {_n_pages} 个页面，累计 {_total_extracted_rows} 条）。\n"
+                                    f"系统在当前页面发现了以下翻页链接：\n{_pag_hint_b}\n"
+                                    f"【立即操作】请点击翻页链接加载下一页，例如："
+                                    f"click(target_id={_pag_links_b[0]['id']})\n"
+                                    f"⚠️ 必须使用上述精确的 ID，不要猜测其他 ID！"
+                                )
+                            else:
+                                vlm.inject_error_feedback(
+                                    f"✅ 你已成功提取当前页数据"
+                                    f"（第 {_n_pages} 个页面，累计 {_total_extracted_rows} 条）。\n"
+                                    "当前页面未发现翻页链接，可能已是最后一页。\n"
+                                    "如果任务还需要更多数据，请尝试向下滚动查找翻页按钮。\n"
+                                    "如果已完成所有页的提取，请直接输出 done 结束任务。"
+                                )
+
+                        # 连续 extract 守卫（防止 VLM 不翻页也不 done 陷入死循环）
+                        if _extract_count >= 3:
                             logger.warning(
-                                "[EXTRACT GUARD] extract succeeded but VLM did not call done, "
-                                "forcing task completion."
+                                "[EXTRACT GUARD] 连续 extract 无翻页动作，"
+                                f"已累积 {_total_extracted_rows} 条数据，强制结束任务。"
                             )
                             _run_succeeded = True
                             _task_completed = True
@@ -1905,7 +2509,9 @@ async def run_agent(
                         # 提取后中止本批次，下一步重新截图（VLM 可能还需要翻页提取更多）
                         break
                     else:
-                        _extract_count = 0  # 任何非 extract 动作都重置计数器（含翻页 click）
+                        # 翻页动作（click/scroll/smooth_scroll）重置连续 extract 计数
+                        if action in ("click", "scroll", "smooth_scroll"):
+                            _extract_count = 0
 
                     # 5. 记忆库日志（save_to_memory 动作由 execute_action 内部写入 workflow_memory）
                     if action == "save_to_memory":
@@ -1919,9 +2525,11 @@ async def run_agent(
                         text_dom_for_done = ""
                         if _goal_is_plain_search_task(goal):
                             try:
-                                text_dom_for_done = await browser.extract_text_dom()
-                            except Exception as _done_dom_err:
-                                logger.debug(f"[DONE GUARD] text DOM snapshot skipped: {_done_dom_err}")
+                                # 用 AX Tree 代替旧的 DOM 文本快照 —— name 字段里仍然包含搜索结果链接标题，
+                                # 对 _search_goal_done_looks_premature 的子串检测来说是等价的信息源。
+                                text_dom_for_done = await browser.extract_accessibility_tree()
+                            except Exception as _done_ax_err:
+                                logger.debug(f"[DONE GUARD] AX tree snapshot skipped: {_done_ax_err}")
                         if _search_goal_done_looks_premature(
                             goal,
                             start_url,
@@ -1969,6 +2577,16 @@ async def run_agent(
                                         f"{len(merged_trail)} → {len(compacted_trail)} steps"
                                     )
                                 cache_meta = _build_rpa_match_metadata(start_url, goal)
+                                # 提取类任务（获取/提取/抓取/extract）的轨迹不应声称
+                                # 回放即可完成任务，必须保留 VLM 提取步骤
+                                _is_extract_goal = bool(re.search(
+                                    r"获取|提取|抓取|采集|爬取|extract|scrape|crawl",
+                                    goal, re.IGNORECASE,
+                                ))
+                                _trail_has_extract = any(
+                                    s.get("action") == "extract" for s in compacted_trail
+                                )
+                                _completes = not (_is_extract_goal and not _trail_has_extract)
                                 cache_payload = {
                                     "version": 4,
                                     "replayable": _rpa_cache_allowed and bool(compacted_trail),
@@ -1976,7 +2594,7 @@ async def run_agent(
                                     "trail": compacted_trail if (_rpa_cache_allowed and compacted_trail) else [],
                                     "fail_count": 0,
                                     "max_failures": 2,
-                                    "completes_task": True,
+                                    "completes_task": _completes,
                                     **cache_meta,
                                 }
                                 _write_rpa_cache_payload(_rpa_exact_path, cache_payload)
@@ -2000,40 +2618,6 @@ async def run_agent(
                         break
 
                     # 7. 执行浏览器操作
-
-                    # Python 层兜底：连续三步点击同一元素 → 判定为卡死，自动注入反馈逃脱
-                    cur_action_key = (action, decision.get("target_id", 0))
-                    if (
-                        action == "click"
-                        and len(_last_actions) >= 2
-                        and _last_actions[-1] == cur_action_key
-                        and _last_actions[-2] == cur_action_key
-                    ):
-                        logger.warning(
-                            f"[LOOP GUARD] 检测到动作死循环，已自动拦截！"
-                            f"target_id={cur_action_key[1]} 连续点击 3 次，交由 VLM 自主反思。"
-                        )
-                        _page_summary = await browser.get_active_page_summary()
-                        _loop_guard_msg = (
-                            f"🚨 严重警告：你陷入了操作死循环！\n"
-                            f"系统检测到你连续多次尝试了完全相同的动作"
-                            f"（点击元素 #{cur_action_key[1]}），但页面没有任何有效进展。"
-                            f"这个元素大概率是无效的、被前端禁用的，或者是诱导点击的陷阱。\n"
-                            f"【系统强制指令】：绝对禁止在下一步中再次尝试点击或操作该元素！"
-                            f"请立刻观察最新截图，寻找其他完全不同的路径。"
-                            f"如果当前页面已经明显达到用户目标状态"
-                            f"（如表单已提交、已跳转到结果页、已进入目标标签页、已完成下载/导出），"
-                            f"请直接输出 action=done 结束任务。"
-                        )
-                        if _page_summary:
-                            _loop_guard_msg += f"\n【当前页面摘要】{_page_summary}"
-                        vlm.inject_error_feedback(_loop_guard_msg)
-                        _last_actions.clear()
-                        break  # 中止本批次，进入下一步（重新截图，让 VLM 看着报错重新决策）
-
-                    _last_actions.append(cur_action_key)
-                    if len(_last_actions) > 3:
-                        _last_actions.pop(0)
 
                     _raw_type_value = str(decision.get("type_value") or "")
                     _placeholder_keys = _extract_placeholder_keys(_raw_type_value)
@@ -2065,12 +2649,113 @@ async def run_agent(
                                     f"{_placeholder} → \033[32m{_mem_v!r}\033[0m"
                                 )
 
+                    # ── LOOP GUARD 前置拦截：已进入黑名单的 target_id 直接阻断 ───
+                    _click_target_id = decision.get("target_id", 0)
+                    if action in ("click", "click_new_tab") and _click_target_id in _loop_guard_blocked_ids:
+                        logger.warning(
+                            f"[LOOP GUARD] 前置拦截：target_id={_click_target_id} 已在黑名单，跳过执行"
+                        )
+                        _block_msg = (
+                            f"🚫 系统强制拦截：元素 #{_click_target_id} 已被 LOOP GUARD 封禁！\n"
+                            f"该元素此前已被检测为死循环陷阱，本次点击已被直接取消（未执行）。\n"
+                            f"【强制指令】立刻停止对 #{_click_target_id} 的一切操作！\n"
+                            f"请仔细观察最新截图，选择一个**完全不同的元素**继续任务 ——\n"
+                            f"例如跳过广告，点击下方的第二个/第三个搜索结果；\n"
+                            f"或者如果任务实际已完成（结果页已打开、标签已切换），请直接 action=done。"
+                        )
+                        vlm.inject_error_feedback(_block_msg)
+                        # 方案②：前置拦截也标注历史，让 VLM 下一轮看到"本次未执行"
+                        vlm.annotate_last_result(
+                            f"🚫 被LOOP GUARD前置拦截(#{_click_target_id}在黑名单), 未执行"
+                        )
+                        break  # 不执行，直接进入下一步重新截图+决策
+
+                    # ── 预采样：记录 execute_action 前的标签数与 URL，供结果回填 ──
+                    _pre_pages_count = (
+                        len(browser._context.pages) if browser._context else 0
+                    )
+                    _pre_url = browser.current_url
+
                     # ── 自愈执行：捕获 ActionExecutionError 并注入 VLM 反馈 ──────────
                     try:
                         active_page = await browser.execute_action(decision, workflow_memory)
                         if active_page is not None:
                             # execute_action 内部已更新 browser._page，此处仅做日志追踪
                             logger.debug(f"[TAB GUARD] Active page after action: {(active_page.url or 'about:blank')[:80]}")
+
+                        # ── 标签页切换感知：将 Tab Guard 切换事件注入 VLM 反馈 ──────
+                        _tab_switched_this_step = bool(browser._tab_switch_notice)
+                        if browser._tab_switch_notice:
+                            vlm.inject_error_feedback(browser._tab_switch_notice)
+                            logger.info(f"[TAB SWITCH] Injected page-switch notice for next VLM step")
+                            browser._tab_switch_notice = None
+
+                        # ── URL-aware LOOP GUARD（后置检测）──────────────────────
+                        # 在 execute_action 之后才能拿到真正的 landing URL，
+                        # 只有「同一 ID 被点击 ≥ 3 次 **且** 着陆 URL 完全相同」才判定死循环，
+                        # 翻页（URL 递增）或 A/B 循环切换（URL 交替变化）不再误伤。
+                        _landing_url = browser.current_url
+                        _cur_action_key = (action, decision.get("target_id", 0), _landing_url)
+                        _click_repeat_count = (
+                            _last_actions.count(_cur_action_key) + 1  # 本次也计入
+                            if action in ("click", "click_new_tab") and _cur_action_key[1] != 0
+                            else 0
+                        )
+                        _last_actions.append(_cur_action_key)
+                        if len(_last_actions) > _LOOP_GUARD_WINDOW:
+                            _last_actions.pop(0)
+
+                        # ── 方案②：把本次执行结果回填到 VLM 历史，让下一轮决策看见「已做什么」 ──
+                        _post_pages_count = (
+                            len(browser._context.pages) if browser._context else 0
+                        )
+                        _outcome_parts: list[str] = []
+                        if _landing_url and _landing_url != _pre_url:
+                            _outcome_parts.append(f"跳转 url={_landing_url[:80]}")
+                        else:
+                            _outcome_parts.append(f"url 未变 ({_landing_url[:60]})")
+                        if _post_pages_count != _pre_pages_count:
+                            _outcome_parts.append(
+                                f"标签 {_pre_pages_count}→{_post_pages_count}"
+                            )
+                        if _tab_switched_this_step:
+                            _outcome_parts.append("触发TabGuard切换")
+                        vlm.annotate_last_result("✅ " + " | ".join(_outcome_parts))
+
+                        if _click_repeat_count >= 3:
+                            logger.warning(
+                                f"[LOOP GUARD] 检测到动作死循环（URL-aware）！"
+                                f"target_id={_cur_action_key[1]} 在最近 {_LOOP_GUARD_WINDOW} 步内"
+                                f"被点击 {_click_repeat_count} 次且着陆 URL 相同 "
+                                f"({_landing_url[:80]}), 交由 VLM 自主反思。"
+                            )
+                            _page_summary = await browser.get_active_page_summary()
+                            _loop_guard_msg = (
+                                f"🚨 严重警告：你陷入了操作死循环！\n"
+                                f"系统检测到你在最近 {_LOOP_GUARD_WINDOW} 步里已经"
+                                f"{_click_repeat_count} 次点击了同一个元素 #{_cur_action_key[1]}，"
+                                f"且每次点击后着陆的 URL 完全相同（{_landing_url[:120]}），"
+                                f"说明页面没有任何有效进展。"
+                                f"这个元素大概率是无效的、被前端禁用的、或者是诱导点击的陷阱"
+                                f"（例如 SEM/广告链接，点开后又被 close_tab 撤销）。\n"
+                                f"【系统强制指令】：绝对禁止在下一步中再次尝试点击或操作该元素！"
+                                f"请立刻观察最新截图，寻找其他完全不同的路径 —— "
+                                f"例如改点击**第二个/第三个**搜索结果（跳过广告位），"
+                                f"或换一个关键词重新搜索。"
+                                f"如果当前页面已经明显达到用户目标状态"
+                                f"（如表单已提交、已跳转到结果页、已进入目标标签页、已完成下载/导出），"
+                                f"请直接输出 action=done 结束任务。"
+                            )
+                            if _page_summary:
+                                _loop_guard_msg += f"\n【当前页面摘要】{_page_summary}"
+                            vlm.inject_error_feedback(_loop_guard_msg)
+                            _loop_guard_blocked_ids.add(_cur_action_key[1])
+                            logger.info(
+                                f"[LOOP GUARD] target_id={_cur_action_key[1]} 已加入黑名单，"
+                                f"后续点击将被前置拦截。当前黑名单: {_loop_guard_blocked_ids}"
+                            )
+                            break  # 中止本批次，进入下一步（重新截图，让 VLM 看着报错重新决策）
+
                         _login_intercepted = await _run_preflight_login(
                             browser,
                             goal,
@@ -2111,6 +2796,8 @@ async def run_agent(
                             f"[SELF-HEAL] Action failed ({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}): "
                             f"{err_msg}"
                         )
+                        # 方案②：失败也回填历史，避免 VLM 误以为动作已经成功
+                        vlm.annotate_last_result(f"❌ 失败: {err_msg[:80]}")
 
                         if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                             # 连续失败达到上限，交人工处理

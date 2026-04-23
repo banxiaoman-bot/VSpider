@@ -32,9 +32,11 @@ from playwright_stealth import Stealth
 try:
     from . import config
     from .data_manager import save_intercepted_data
+    from .vlm_client import VSpiderAction
 except ImportError:
     import config
     from data_manager import save_intercepted_data
+    from vlm_client import VSpiderAction
 
 # ── 网络资源拦截配置 ────────────────────────────────────────────────────────
 # 策略：拦截媒体流和字体（体积大、对 SoM 截图无意义），保留 image（视觉模式需要）。
@@ -217,6 +219,8 @@ class BrowserEnv:
         self._intercepted_data: list | None = None       # 首次命中的数据快照
         self._upload_file: Path | None = None   # --upload-file 预配置路径
         self._last_action_error: Exception | None = None  # 自愈：记录本轮操作异常
+        self._tab_switch_notice: str | None = None  # 标签页切换感知通知
+        self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
         # ── RPA 肌肉记忆：记录本次任务每步成功动作的真实 XPath / 坐标 ──────
         self.rpa_trail: list[dict] = []
 
@@ -224,6 +228,29 @@ class BrowserEnv:
         """清空本次任务的 RPA 动作轨迹，在任务开始前调用。"""
         self.rpa_trail.clear()
         logger.debug("[RPA] Trail cleared")
+
+    def find_pagination_links(self) -> list[dict]:
+        """
+        从最近一轮 SoM 标记结果中查找翻页链接。
+
+        扫描 ``_last_som_elements`` 中 name/text 匹配翻页关键词的元素，
+        返回 ``[{"id": 81, "name": "More", "role": "link"}, ...]``。
+        """
+        import re as _re
+        _PAG_RE = _re.compile(
+            r'^(more|next|下一页|下页|next\s*page|load\s*more|›|»|▶|→|older)$',
+            _re.IGNORECASE,
+        )
+        hits: list[dict] = []
+        for el in self._last_som_elements:
+            name = (el.get("name") or "").strip()
+            if _PAG_RE.match(name):
+                hits.append({
+                    "id": el.get("id"),
+                    "name": name,
+                    "role": el.get("role") or el.get("tag") or "?",
+                })
+        return hits
 
     async def _get_xpath(self, handle) -> str:
         """
@@ -234,19 +261,27 @@ class BrowserEnv:
         """
         _XPATH_JS = """
         (el) => {
+            const nodeName = (node) => (node && (node.localName || node.tagName) ? String(node.localName || node.tagName).toLowerCase() : '');
+            const esc = (value) => JSON.stringify(String(value));
             function getXPath(e) {
                 if (!e || e.nodeType !== 1) return '';
-                if (e.id) return '//*[@id="' + e.id + '"]';
-                if (e === document.body) return '/html/body';
-                let ix = 0;
-                const siblings = e.parentNode ? e.parentNode.childNodes : [];
-                for (let i = 0; i < siblings.length; i++) {
-                    const sib = siblings[i];
-                    if (sib === e)
-                        return getXPath(e.parentNode) + '/' + e.tagName.toLowerCase() + '[' + (ix + 1) + ']';
-                    if (sib.nodeType === 1 && sib.tagName === e.tagName) ix++;
+                if (e.id) return '//*[@id=' + esc(e.id) + ']';
+                if (e === document.documentElement) return '/html[1]';
+                if (e === document.body) return '/html[1]/body[1]';
+                const segments = [];
+                let current = e;
+                while (current && current.nodeType === 1 && current !== document.documentElement) {
+                    const tag = nodeName(current);
+                    let index = 1;
+                    let sibling = current.previousElementSibling;
+                    while (sibling) {
+                        if (nodeName(sibling) === tag) index += 1;
+                        sibling = sibling.previousElementSibling;
+                    }
+                    segments.unshift('/' + tag + '[' + index + ']');
+                    current = current.parentElement;
                 }
-                return '';
+                return '/html[1]' + segments.join('');
             }
             return getXPath(el);
         }
@@ -256,6 +291,173 @@ class BrowserEnv:
         except Exception as _xe:
             logger.debug(f"[RPA] XPath extraction failed (non-fatal): {_xe}")
             return ""
+
+    # ── CDP AX Tree（替代 Playwright 1.58 已移除的 page.accessibility）──────
+    async def _get_ax_tree_via_cdp(
+        self, page: Page, interesting_only: bool = True
+    ) -> dict | None:
+        """
+        通过 Chrome DevTools Protocol 获取完整 Accessibility Tree。
+
+        Playwright ≥ 1.58 移除了 ``page.accessibility.snapshot()``，
+        此方法使用 ``Accessibility.getFullAXTree`` CDP 命令替代，
+        并将 CDP 扁平节点列表重建为与旧 API 兼容的树形 dict。
+
+        Args:
+            page: 当前活动页。
+            interesting_only: True 时过滤掉 ignored / generic / none 等
+                              装饰性容器节点（仅保留有语义价值的节点）。
+
+        Returns:
+            与旧 ``page.accessibility.snapshot()`` 格式兼容的树形 dict，
+            失败时返回 None。
+        """
+        cdp = None
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            result = await cdp.send("Accessibility.getFullAXTree")
+            nodes = result.get("nodes", [])
+            if not nodes:
+                return None
+
+            # ── 1. 将 CDP 扁平节点转为简洁 dict ──
+            by_id: dict[str, dict] = {}
+            for raw in nodes:
+                nid = raw.get("nodeId")
+                if nid is None:
+                    continue
+                role_val = (raw.get("role") or {}).get("value", "")
+                name_val = (raw.get("name") or {}).get("value", "")
+                val_obj = raw.get("value") or {}
+                entry: dict = {"role": role_val, "name": name_val}
+                if val_obj.get("value") is not None:
+                    entry["value"] = str(val_obj["value"])
+                for prop in raw.get("properties", []):
+                    pname = prop.get("name", "")
+                    pval = (prop.get("value") or {}).get("value")
+                    if pname and pval is not None:
+                        entry[pname] = pval
+                entry["_cids"] = raw.get("childIds", [])
+                entry["_ign"] = raw.get("ignored", False)
+                by_id[nid] = entry
+
+            # ── 2. 递归重建树 ──
+            SKIP_ROLES = frozenset(
+                {"none", "presentation", "generic", "InlineTextBox", "LineBreak"}
+            )
+
+            def _to_tree(nid: str) -> dict | list | None:
+                node = by_id.get(nid)
+                if node is None:
+                    return None
+                children: list[dict] = []
+                for cid in node["_cids"]:
+                    child = _to_tree(cid)
+                    if child is None:
+                        continue
+                    if isinstance(child, list):
+                        children.extend(child)
+                    else:
+                        children.append(child)
+                # interesting_only 模式下跳过被忽略/装饰性节点，
+                # 但保留其子节点向上传递
+                if interesting_only and (
+                    node["_ign"] or node["role"] in SKIP_ROLES
+                ):
+                    return children or None
+                out = {k: v for k, v in node.items() if not k.startswith("_")}
+                if children:
+                    out["children"] = children
+                return out
+
+            root = _to_tree(nodes[0]["nodeId"])
+            if isinstance(root, list):
+                return {"role": "RootWebArea", "name": "", "children": root}
+            return root
+
+        except Exception as e:
+            logger.warning(f"[AX CDP] 通过 CDP 获取 AX Tree 失败: {e}")
+            return None
+        finally:
+            if cdp:
+                try:
+                    await cdp.detach()
+                except Exception:
+                    pass
+
+    async def _get_accessibility_signature(self, page: Page, handle) -> tuple[str, str]:
+        """提取元素的语义角色与可访问名称，优先走轻量 JS 提取。"""
+        _AX_JS = r"""
+        (el) => {
+            const clean = (value) => (value || '')
+                .toString()
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 120);
+
+            const implicitRole = (node) => {
+                if (!node || !node.tagName) return '';
+                const tag = node.tagName.toLowerCase();
+                const type = (node.getAttribute && (node.getAttribute('type') || '') || '').toLowerCase();
+                const role = clean(node.getAttribute && node.getAttribute('role'));
+                if (role) return role.toLowerCase();
+                if (tag === 'a' && node.hasAttribute && node.hasAttribute('href')) return 'link';
+                if (tag === 'button') return 'button';
+                if (tag === 'summary') return 'button';
+                if (tag === 'textarea') return 'textbox';
+                if (tag === 'select') return 'combobox';
+                if (tag === 'input') {
+                    if (['button', 'submit', 'reset'].includes(type)) return 'button';
+                    if (type === 'checkbox') return 'checkbox';
+                    if (type === 'radio') return 'radio';
+                    if (type === 'search') return 'searchbox';
+                    if (type === 'range') return 'slider';
+                    return 'textbox';
+                }
+                if (node.isContentEditable) return 'textbox';
+                if (tag === 'img') return 'img';
+                if (tag === 'option') return 'option';
+                return tag;
+            };
+
+            const accessibleName = (node) => {
+                if (!node || !node.getAttribute) return '';
+                const labelledBy = clean(node.getAttribute('aria-labelledby'));
+                if (labelledBy) {
+                    const parts = labelledBy.split(/\s+/)
+                        .map((id) => document.getElementById(id))
+                        .filter(Boolean)
+                        .map((n) => clean(n.textContent));
+                    const joined = clean(parts.join(' '));
+                    if (joined) return joined;
+                }
+                const ariaLabel = clean(node.getAttribute('aria-label'));
+                if (ariaLabel) return ariaLabel;
+                const title = clean(node.getAttribute('title'));
+                if (title) return title;
+                const placeholder = clean(node.getAttribute('placeholder'));
+                if (placeholder) return placeholder;
+                const alt = clean(node.getAttribute('alt'));
+                if (alt) return alt;
+                const text = clean(node.textContent);
+                if (text) return text;
+                return '';
+            };
+
+            return { role: implicitRole(el), name: accessibleName(el) };
+        }
+        """
+        role = ""
+        name = ""
+        try:
+            raw = await handle.evaluate(_AX_JS)
+            if isinstance(raw, dict):
+                role = str(raw.get("role") or "").strip().lower()
+                name = str(raw.get("name") or "").strip()
+        except Exception as _xe:
+            logger.debug(f"[RPA] AX JS signature extraction failed (non-fatal): {_xe}")
+
+        return role, name
 
     def _track_background_task(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -273,6 +475,11 @@ class BrowserEnv:
 
         dismiss_js = r"""
 () => {
+    const host = (location.hostname || '').toLowerCase();
+    if (host.endsWith('baidu.com') || host.endsWith('baidu.cn')) {
+        return { dismissed: 0, hidden: 0 };
+    }
+
     const PERMISSION_PATTERNS = [
         /麦克风/, /语音/, /语音搜索/, /使用语音进行搜索/,
         /microphone/i, /voice search/i, /use your microphone/i,
@@ -314,6 +521,13 @@ class BrowserEnv:
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
         const position = style.position || '';
+        const tag = (el.tagName || '').toLowerCase();
+        const id = (el.id || '').toLowerCase();
+        if (tag === 'html' || tag === 'body') return false;
+        if (id === 'wrapper' || id === 'head-wrapper' || id === 's_wrap') return false;
+        if (rect.width >= window.innerWidth * 0.95 && rect.height >= window.innerHeight * 0.95) {
+            return false;
+        }
         const zIndex = Number.parseInt(style.zIndex || '0', 10) || 0;
         const centeredX = Math.abs((rect.left + rect.width / 2) - (window.innerWidth / 2)) < window.innerWidth * 0.4;
         const centeredY = Math.abs((rect.top + rect.height / 2) - (window.innerHeight / 2)) < window.innerHeight * 0.4;
@@ -328,6 +542,12 @@ class BrowserEnv:
 
     function hideElement(el) {
         if (!el || !el.style) return false;
+        const tag = (el.tagName || '').toLowerCase();
+        const id = (el.id || '').toLowerCase();
+        if (tag === 'html' || tag === 'body') return false;
+        if (id === 'wrapper' || id === 'head-wrapper' || id === 's_wrap') return false;
+        const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { width: 0, height: 0 };
+        if (rect.width >= window.innerWidth * 0.95 && rect.height >= window.innerHeight * 0.95) return false;
         el.style.setProperty('display', 'none', 'important');
         el.style.setProperty('visibility', 'hidden', 'important');
         el.style.setProperty('opacity', '0', 'important');
@@ -372,7 +592,7 @@ class BrowserEnv:
     let hidden = 0;
     const seen = new WeakSet();
     const containers = document.querySelectorAll(
-        'dialog, [role="dialog"], [aria-modal="true"], .modal, .popup, .popover, .overlay, .mask, .drawer, section, div'
+        'dialog, [role="dialog"], [aria-modal="true"], .modal, .popup, .popover, .overlay, .mask, .drawer'
     );
 
     for (const container of containers) {
@@ -406,6 +626,135 @@ class BrowserEnv:
                 logger.info(
                     f"[PERMISSION GUARD] Cleared permission surface "
                     f"(dismissed={dismissed}, hidden={hidden})"
+                    f"{f' | {reason}' if reason else ''}"
+                )
+        return handled
+
+    async def _dismiss_login_popup(self, reason: str = "") -> bool:
+        """
+        清除站内登录引导弹窗（非权限类浮层）。
+
+        很多站点（如 B 站、知乎）在未登录时会弹出"登录后你可以..."的浮层，
+        遮挡列表内容导致 VLM 提取漏单。此方法在截图前自动移除。
+        """
+        page = await self._ensure_active_page(reason=f"login popup sweep {reason}".strip())
+        if not page:
+            return False
+
+        _LOGIN_POPUP_JS = r"""
+() => {
+    // 登录引导弹窗的典型特征词
+    const LOGIN_HINTS = [
+        /登录后/i, /登录.*可以/i, /登录.*体验/i, /请先登录/i,
+        /sign\s*in/i, /log\s*in/i, /注册.*登录/i, /立即登录/i,
+        /登录.*注册/i, /首次使用/i, /login.*to\s+continue/i,
+    ];
+
+    // 安全列表：不能隐藏的根级容器
+    const SAFE_IDS = new Set([
+        'app', 'root', '__next', 'wrapper', 'head-wrapper',
+        's_wrap', 'main', 'content',
+    ]);
+
+    function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 20 || r.height < 20) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden'
+            && parseFloat(s.opacity || '1') > 0.05;
+    }
+
+    function isFloating(el) {
+        const s = window.getComputedStyle(el);
+        const pos = s.position || '';
+        const z = parseInt(s.zIndex || '0', 10) || 0;
+        return pos === 'fixed' || pos === 'absolute' || z >= 50
+            || el.matches('[role="dialog"], dialog, [aria-modal="true"]');
+    }
+
+    function matchLogin(text) {
+        const t = (text || '').replace(/\s+/g, ' ').trim().slice(0, 600);
+        return t && LOGIN_HINTS.some(p => p.test(t));
+    }
+
+    let hidden = 0;
+    // 查找所有浮动层
+    const candidates = document.querySelectorAll(
+        '[role="dialog"], dialog, [aria-modal="true"], ' +
+        '.modal, .popup, .popover, .overlay, .mask, .drawer, ' +
+        '.login-panel, .login-tip, .login-guide, .unlogin-popover'
+    );
+
+    for (const el of candidates) {
+        if (!isVisible(el)) continue;
+        const id = (el.id || '').toLowerCase();
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'html' || tag === 'body' || SAFE_IDS.has(id)) continue;
+        // 不能是全屏容器
+        const r = el.getBoundingClientRect();
+        if (r.width >= window.innerWidth * 0.9 && r.height >= window.innerHeight * 0.9) continue;
+
+        const text = el.innerText || el.textContent || '';
+        if (!matchLogin(text)) continue;
+        if (!isFloating(el)) continue;
+
+        // 尝试点击关闭按钮
+        const closeBtn = el.querySelector(
+            '[class*="close"], [aria-label*="关闭"], [aria-label*="Close"], ' +
+            '.close-btn, .modal-close, .dialog-close'
+        );
+        if (closeBtn) {
+            try { closeBtn.click(); } catch(_) {}
+        }
+        // ── 语义级隐身 (Semantic Invisibility) ──────────────────────
+        // 不使用 el.remove()：React/Vue 等 SPA 框架的 Virtual DOM
+        // 与真实 DOM 保持双向同步，暴力移除节点会导致 VDOM 状态树
+        // 不一致，轻则局部渲染异常，重则整页白屏崩溃。
+        // 改用五重属性注入，同时满足：
+        //   ① 视觉不可见（display:none + opacity:0）
+        //   ② AX Tree 不可达（aria-hidden + inert）
+        //   ③ 物理不可交互（pointer-events:none + inert）
+        //   ④ 前端框架 VDOM 状态不受影响（节点仍在 DOM 树中）
+        try {
+            el.style.setProperty('display', 'none', 'important');
+            el.style.setProperty('opacity', '0', 'important');
+            el.style.setProperty('pointer-events', 'none', 'important');
+            el.setAttribute('aria-hidden', 'true');
+            el.inert = true;
+        } catch(_) {}
+        hidden += 1;
+
+        // 语义级隐身相邻遮罩背景（保护 VDOM，不做 remove）
+        for (const sib of [el.previousElementSibling, el.nextElementSibling]) {
+            if (!sib || sib === document.body || !isVisible(sib)) continue;
+            const sr = sib.getBoundingClientRect();
+            if (sr.width >= window.innerWidth * 0.7 && sr.height >= window.innerHeight * 0.5) {
+                try {
+                    sib.style.setProperty('display', 'none', 'important');
+                    sib.style.setProperty('opacity', '0', 'important');
+                    sib.style.setProperty('pointer-events', 'none', 'important');
+                    sib.setAttribute('aria-hidden', 'true');
+                    sib.inert = true;
+                } catch(_) {}
+            }
+        }
+    }
+
+    return { hidden };
+}
+"""
+        handled = False
+        for frame in page.frames:
+            try:
+                result = await frame.evaluate(_LOGIN_POPUP_JS)
+            except Exception:
+                continue
+            if isinstance(result, dict) and result.get("hidden", 0) > 0:
+                handled = True
+                logger.info(
+                    f"[LOGIN POPUP GUARD] Dismissed login popup "
+                    f"(hidden={result['hidden']})"
                     f"{f' | {reason}' if reason else ''}"
                 )
         return handled
@@ -786,62 +1135,69 @@ Object.defineProperty(navigator, 'languages', {
 (function () {
     'use strict';
 
-    // 关键字匹配：id 或 className 中包含这些词的元素将被自动隐藏
-    const KILL_KEYWORDS = [
-        'cookie-banner', 'cookie_banner', 'cookiebanner', 'cookie-notice',
-        'cookie-consent', 'cookie_consent', 'gdpr', 'accept-cookies',
-        'app-download', 'app_download', 'appdownload', 'app-banner',
-        'download-app', 'open-app', 'openapp',
-        'login-modal', 'login_modal', 'loginModal',
-        'login-wall', 'signin-modal', 'signup-modal',
-        'subscribe-modal', 'subscribe-popup', 'newsletter-popup',
-        'ad-float', 'float-ad', 'floatad', 'floating-ad',
-        'pop-overlay', 'popoverlay', 'modal-overlay', 'mask-layer',
-        'privacy-banner', 'privacy-notice', 'privacy-popup',
-        'notification-bar', 'push-notification-bar',
-    ];
-
-    // CSS 属性选择器：直接通过 id/class 精确命中
-    const KILL_SELECTORS = [
-        '#cookie-banner', '#cookieBanner', '#cookie-notice', '#cookieNotice',
-        '#app-download-bar', '#appDownloadBar',
-        '#gdpr-banner', '#gdprBanner',
-        '.cookie-banner', '.cookie-notice', '.cookie-bar',
-        '.app-download-float', '.app-banner-float',
-        '.login-modal-overlay', '.modal-backdrop',
-        '.privacy-overlay', '.subscribe-overlay',
-        '[id*="cookie"][id*="banner"]',
-        '[class*="cookie"][class*="banner"]',
-        '[id*="gdpr"]', '[class*="gdpr"]',
+    // 仅允许非常明确的弹窗/浮层命名，避免误伤主干页面
+    const adSelectors = [
+        '#cookie-banner',
+        '#cookie-notice',
+        '.accept-cookies-button',
+        '.gdpr-banner',
+        'div[id^="ad-"]',
+        'div[class*="app-download-float"]',
+        'div[class*="tb-float-"]',
+        'div[class*="login-modal-mask"]:not(body):not(html)',
+        '.bottom-bar-download'
     ].join(', ');
 
-    function matchesKillList(el) {
+    const MAX_ANCESTOR_DEPTH = 10;
+
+    function getAncestorDepth(el) {
         try {
-            const id = (el.id || '').toLowerCase();
-            const cls = (el.className && typeof el.className === 'string')
-                ? el.className.toLowerCase() : '';
-            return KILL_KEYWORDS.some(kw => id.includes(kw) || cls.includes(kw));
+            let depth = 0;
+            let node = el;
+            while (node && node.parentElement) {
+                depth += 1;
+                node = node.parentElement;
+                if (depth > MAX_ANCESTOR_DEPTH) break;
+            }
+            return depth;
         } catch (_) { return false; }
+    }
+
+    function canHideElement(el) {
+        try {
+            if (!el || !el.getBoundingClientRect) return false;
+            const tag = (el.tagName || '').toLowerCase();
+            const id = (el.id || '').toLowerCase();
+            if (tag === 'html' || tag === 'body') return false;
+            if (id === 'wrapper' || id === 'head-wrapper' || id === 's_wrap') return false;
+            const rect = el.getBoundingClientRect();
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (!viewportWidth || !viewportHeight) return false;
+            if (getAncestorDepth(el) > MAX_ANCESTOR_DEPTH) return false;
+            if (rect.width >= viewportWidth * 0.8) return false;
+            if (rect.height >= viewportHeight * 0.8) return false;
+            return true;
+            }
+        catch (_) { return false; }
     }
 
     function silenceEl(el) {
         try {
+            if (!canHideElement(el)) {
+                console.log('拦截器放过了一个巨大的疑似误伤元素:', el);
+                return;
+            }
             if (el.style) {
                 el.style.setProperty('display', 'none', 'important');
-                el.style.setProperty('visibility', 'hidden', 'important');
-                el.style.setProperty('opacity', '0', 'important');
             }
         } catch (_) {}
     }
 
-    function scanAndKill() {
+    function scanAndKill(root) {
         try {
-            // 精确选择器命中
-            document.querySelectorAll(KILL_SELECTORS).forEach(silenceEl);
-            // 关键字遍历（兜底覆盖奇葩命名）
-            document.querySelectorAll('div, aside, section, dialog, [class]').forEach(el => {
-                if (matchesKillList(el)) silenceEl(el);
-            });
+            const scope = root && root.querySelectorAll ? root : document;
+            scope.querySelectorAll(adSelectors).forEach(silenceEl);
         } catch (_) {}
     }
 
@@ -857,16 +1213,10 @@ Object.defineProperty(navigator, 'languages', {
         for (const m of mutations) {
             for (const node of m.addedNodes) {
                 if (node.nodeType !== 1) continue; // 只处理 Element
-                if (matchesKillList(node)) { silenceEl(node); continue; }
-                // 检查新插入节点内部的子元素
-                if (node.querySelectorAll) {
-                    try {
-                        node.querySelectorAll(KILL_SELECTORS).forEach(silenceEl);
-                        node.querySelectorAll('[class]').forEach(el => {
-                            if (matchesKillList(el)) silenceEl(el);
-                        });
-                    } catch (_) {}
+                if (node.matches && node.matches(adSelectors)) {
+                    silenceEl(node);
                 }
+                scanAndKill(node);
             }
         }
     });
@@ -874,8 +1224,12 @@ Object.defineProperty(navigator, 'languages', {
     observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
 """
-        await self._context.add_init_script(_POPUP_KILLER_JS)
-        logger.info("Popup killer init script injected at context level")
+        ENABLE_POPUP_KILLER = False  # 临时关闭，排查百度首页白板问题
+        if ENABLE_POPUP_KILLER:
+            await self._context.add_init_script(_POPUP_KILLER_JS)
+            logger.info("Popup killer init script injected at context level")
+        else:
+            logger.info("Popup killer init script disabled for diagnostics")
 
         _PERMISSION_GUARD_JS = """
 (() => {
@@ -1061,6 +1415,54 @@ Object.defineProperty(navigator, 'languages', {
         except Exception:
             return False  # 检测失败时不干预，让 VLM 自己判断
 
+    @staticmethod
+    def _format_som_element(el: dict) -> str:
+        """
+        将 SoM v6 单条元素字典格式化为标准化描述行。
+
+        输出格式：
+          [ID: 15] Role: button, Name: "提交表单", State: disabled | type=submit | 关联信息: ...
+
+        兼容 v5：如果缺少 role/name/state 字段，回退到 tag+text 格式。
+        """
+        eid = el.get("id", "?")
+        role = (el.get("role") or el.get("tag") or "?").strip()
+        name = (el.get("name") or el.get("text") or "").strip()
+        state_str = (el.get("state") or "").strip()
+
+        # 主体行：[ID: N] Role: xxx, Name: "yyy", State: zzz
+        parts = [f"Role: {role}"]
+        if name:
+            parts.append(f'Name: "{name[:80]}"')
+        if state_str:
+            parts.append(f"State: {state_str}")
+
+        line = f"[ID: {eid}] " + ", ".join(parts)
+
+        # 附加 inputDesc
+        desc = (el.get("inputDesc") or "").strip()
+        if desc:
+            line += f" | {desc}"
+
+        # 附加 parentContext
+        parent_ctx = (el.get("parentContext") or "").strip()
+        if parent_ctx:
+            line += f" | 关联信息: {parent_ctx}"
+
+        # 风险提示：语音/拍照/扫码等辅助入口
+        risk_text = " ".join(part for part in (name, desc, parent_ctx) if part)
+        if re.search(
+            r"语音|麦克风|microphone|voice|camera|相机|拍照|图片搜索|以图搜图|扫码|扫一扫|lens",
+            risk_text,
+            flags=re.IGNORECASE,
+        ):
+            line += (
+                " | 风险提示: 语音/拍照/扫码等辅助入口，"
+                "除非目标明确要求，否则不要优先点击"
+            )
+
+        return line
+
     async def mark_and_screenshot(self, step: int = 0) -> tuple[str, str]:
         """
         注入 SoM 标记脚本并截取全屏截图。
@@ -1074,6 +1476,7 @@ Object.defineProperty(navigator, 'languages', {
         logger.info(f"[Step {step}] Waiting for page to stabilize before screenshot...")
         await self._wait_for_page_stable()
         await self._dismiss_permission_surfaces(reason=f"before screenshot step={step}")
+        await self._dismiss_login_popup(reason=f"before screenshot step={step}")
 
         # _wait_for_page_stable / _dismiss_permission_surfaces 期间可能发生 tab 关闭或 popup 切换
         # （典型场景：RPA close_tab 后紧跟 VLM 循环，navigation 仍在进行中）。
@@ -1113,6 +1516,7 @@ Object.defineProperty(navigator, 'languages', {
 
         # 重新拿一次 frames —— 上面如果换了 page，原来的 frame 列表已失效
         frames_to_eval = list(page.frames)
+        all_som_elements: list[dict] = []
 
         for frame in frames_to_eval:
             try:
@@ -1122,40 +1526,75 @@ Object.defineProperty(navigator, 'languages', {
                     current_id = result.get('nextId', current_id)
                     element_map = result.get('resultMap', [])
                     total_elements += len(element_map)
-                    
-                    for el in element_map:
-                        desc = (el.get("inputDesc") or "").strip()
-                        label = (el.get("text") or "").strip()
-                        if desc:
-                            if label and label not in desc:
-                                desc = f"{desc} | 文本: {label[:80]}"
-                        elif label:
-                            desc = label[:80]
+                    all_som_elements.extend(element_map)
 
-                        if desc:
-                            parent_ctx = el.get("parentContext", "")
-                            ctx_suffix = f" | 关联信息: {parent_ctx}" if parent_ctx else ""
-                            risk_text = " ".join(part for part in (desc, parent_ctx) if part)
-                            risk_suffix = ""
-                            if re.search(
-                                r"语音|麦克风|microphone|voice|camera|相机|拍照|图片搜索|以图搜图|扫码|扫一扫|lens",
-                                risk_text,
-                                flags=re.IGNORECASE,
-                            ):
-                                risk_suffix = (
-                                    " | 风险提示: 语音/拍照/扫码等辅助入口，"
-                                    "除非目标明确要求，否则不要优先点击"
-                                )
-                            input_descriptions.append(
-                                f"[ID: {el['id']}] {el['tag'].upper()} -> {desc}{ctx_suffix}{risk_suffix}"
-                            )
+                    for el in element_map:
+                        input_descriptions.append(
+                            self._format_som_element(el)
+                        )
             except Exception as eval_err:
                 logger.warning(f"Frame evaluation failed: {eval_err}")
+
+        # 缓存本轮 SoM 结果，供翻页引导等后续逻辑查找特定元素
+        self._last_som_elements = all_som_elements
 
         logger.info(
             f"[Step {step}] SoM injected across {injected_frames} frames, "
             f"marked {total_elements} interactive elements"
         )
+
+        # ── SoM 零元素重试：tab 切换 / visibilitychange 重渲染可能导致暂时性空白 ──
+        if total_elements == 0 and not page.is_closed():
+            _page_url = (page.url or "").strip()
+            if _page_url and not _page_url.startswith("about:"):
+                # 诊断：获取页面 DOM 状态，帮助排查是"真空白"还是"过渡态"
+                try:
+                    _diag = await page.evaluate("""() => ({
+                        url: location.href,
+                        title: document.title,
+                        bodyChildren: document.body ? document.body.childElementCount : -1,
+                        bodyTextLen: document.body ? (document.body.innerText || '').length : -1,
+                        readyState: document.readyState,
+                        visibility: document.visibilityState,
+                    })""")
+                    logger.warning(
+                        f"[SoM RETRY] 0 元素但页面非 about:blank，诊断: {_diag}"
+                    )
+                except Exception:
+                    logger.warning("[SoM RETRY] 0 元素，诊断信息获取失败")
+
+                # 等待 3 秒让页面完成可能的 visibilitychange 重渲染
+                logger.info("[SoM RETRY] 等待 3 秒后重试 SoM 注入...")
+                await asyncio.sleep(3)
+                await self._clear_som_overlays()
+
+                # 重新注入 SoM
+                current_id = 1
+                total_elements = 0
+                input_descriptions.clear()
+                injected_frames = 0
+                frames_to_eval = list(page.frames)
+
+                for frame in frames_to_eval:
+                    try:
+                        result = await frame.evaluate(self._som_js, current_id)
+                        if result and isinstance(result, dict):
+                            injected_frames += 1
+                            current_id = result.get("nextId", current_id)
+                            element_map = result.get("resultMap", [])
+                            total_elements += len(element_map)
+
+                            for el in element_map:
+                                input_descriptions.append(
+                                    self._format_som_element(el)
+                                )
+                    except Exception as _retry_err:
+                        logger.warning(f"[SoM RETRY] Frame evaluation failed: {_retry_err}")
+
+                logger.info(
+                    f"[SoM RETRY] 重试结果: {injected_frames} frames, "
+                    f"{total_elements} interactive elements"
+                )
 
         # 让红框 / 标签有 500ms 绘制时间。使用进程侧 sleep 而非 page.wait_for_timeout：
         # 后者在 Page 已关闭（TargetClosedError）时会把异常抛到主循环外面。
@@ -1560,19 +1999,326 @@ Object.defineProperty(navigator, 'languages', {
         )
         return dom_text
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Accessibility Tree 语义化提取 (新一代图文双模态的文本侧)
+    # ─────────────────────────────────────────────────────────────────────
+    # 设计分两段输出：
+    #   [A] ID 映射段：遍历 document.querySelectorAll('[data-som-id]')，按
+    #       ARIA 规范推导 role/name/value/state —— 每一行形如
+    #       `[ID: 12] Role: button, Name: "搜索", State: ...`
+    #       保留截图红框 ↔ ID ↔ execute_action 选择器的三方锁死。
+    #   [B] 语义快照段：CDP Accessibility.getFullAXTree
+    #       过滤掉 generic / 无 name/value 的装饰节点，缩进输出整页的 AX Tree
+    #       作为 VLM 的页面结构语境。
+    # AX Tree 相比 HTML DOM 的优势：过滤 style/script/class 等视觉噪音，
+    # 天然只保留语义节点，Token 消耗显著降低。
+
+    @staticmethod
+    def _flatten_ax_tree_for_extract(
+        node: dict, out: list[str], depth: int = 0, max_depth: int = 15,
+    ) -> None:
+        """
+        递归扁平化 AX Tree 节点为纯语义文本行（专用于数据提取）。
+
+        与 _flatten_ax_tree() 的区别：
+        - 不输出 Role/State 等交互属性标签，只保留 name/value 纯文本
+        - 更深的递归层数（15 层 vs 12 层），确保不遗漏嵌套内容
+        - 去重：连续重复的文本行不重复输出
+        """
+        if not isinstance(node, dict) or depth > max_depth:
+            return
+
+        name = (node.get("name") or "").strip()
+        value = (node.get("value") or "").strip()
+
+        # 只输出有语义内容的节点
+        text = name or value
+        if text:
+            line = "  " * min(depth, 4) + text[:200]
+            # 去重：避免父子节点的 name 完全相同导致重复行
+            if not out or out[-1].strip() != line.strip():
+                out.append(line)
+
+        for child in node.get("children") or []:
+            BrowserEnv._flatten_ax_tree_for_extract(child, out, depth + 1, max_depth)
+
+    async def extract_page_text_via_ax_tree(self) -> str:
+        """
+        通过无障碍树 (AX Tree) 提取页面全部语义文本（专用于数据提取场景）。
+
+        相比 document.body.innerText 的优势：
+        - 天然过滤 script/style/class/广告脚本等噪音
+        - 只保留语义节点的纯文本内容
+        - 覆盖全页（不受视口限制）
+        - 结构化缩进保留层级关系
+
+        相比截图 + VLM 的优势：
+        - 不受 1280×800 视口限制，一次拿到整页 20+ 条数据
+        - 纯文本 token 效率远高于图片
+
+        Returns:
+            页面语义文本（纯文本，无 Role/State 标签），最大 16000 字符。
+            失败时返回空字符串。
+        """
+        page = await self._ensure_active_page(reason="ax tree extraction for data")
+        if not page:
+            return ""
+
+        try:
+            # interesting_only=False 获取更完整的语义树
+            # 包括 StaticText 等纯文本节点，确保列表数据不遗漏
+            ax_root = await self._get_ax_tree_via_cdp(page, interesting_only=False)
+            if not ax_root:
+                logger.warning("[AX Extract] accessibility.snapshot 返回空")
+                return ""
+
+            lines: list[str] = []
+            self._flatten_ax_tree_for_extract(ax_root, lines)
+
+            text = "\n".join(lines)
+            logger.info(
+                f"[AX Extract] 从 AX Tree 提取 {len(lines)} 行语义文本 "
+                f"({len(text)} 字符)"
+            )
+            return text[:16000]
+
+        except Exception as e:
+            logger.warning(f"[AX Extract] AX Tree 提取失败: {e}")
+            return ""
+
+    @staticmethod
+    def _flatten_ax_tree(
+        node: dict, out: list[str], depth: int = 0, max_depth: int = 12
+    ) -> None:
+        """递归扁平化 Playwright AX 快照节点为缩进文本行。"""
+        if not isinstance(node, dict) or depth > max_depth:
+            return
+
+        role = (node.get("role") or "").strip()
+        name = (node.get("name") or "").strip()
+        value = (node.get("value") or "").strip()
+        description = (node.get("description") or "").strip()
+
+        # 过滤规则：role 为 RootWebArea/generic/none 且无 name/value/desc 的纯容器节点
+        # 不输出，但子节点继续递归（保留语义深度不破坏）。
+        is_noise_container = (
+            role in ("RootWebArea", "generic", "none", "") and not (name or value or description)
+        )
+
+        if not is_noise_container:
+            parts = [f"Role: {role or '?'}"]
+            if name:
+                parts.append(f'Name: "{name[:80]}"')
+            if value:
+                parts.append(f'Value: "{value[:40]}"')
+            if description and description != name:
+                parts.append(f'Desc: "{description[:60]}"')
+
+            states: list[str] = []
+            if node.get("disabled"):
+                states.append("disabled")
+            checked = node.get("checked")
+            if checked in (True, "true", "mixed"):
+                states.append(f"checked={checked}")
+            expanded = node.get("expanded")
+            if expanded in (True, False, "true", "false"):
+                states.append(f"expanded={expanded}")
+            if node.get("focused"):
+                states.append("focused")
+            if node.get("required"):
+                states.append("required")
+            if node.get("selected"):
+                states.append("selected")
+            if states:
+                parts.append(f"State: {','.join(states)}")
+
+            out.append("  " * depth + ", ".join(parts))
+
+        # 噪音容器不加深度，避免层级被 generic 不必要地拉深
+        next_depth = depth if is_noise_container else depth + 1
+        for child in node.get("children") or []:
+            BrowserEnv._flatten_ax_tree(child, out, next_depth, max_depth)
+
+    async def extract_accessibility_tree(self) -> str:
+        """
+        提取页面的无障碍语义树，用作 VLM 图文融合决策的文本侧输入。
+
+        前置条件：与 extract_text_dom 相同，调用前 mark_and_screenshot 需已完成，
+        确保 [data-som-id] 已注入 —— 只有这样 ID 映射段才能拿到红框一一对应的编号。
+
+        Returns:
+            多行字符串，由两段组成：
+              [交互元素 (SoM ID 映射)]  ← 每行一个 `[ID: N] Role/Name/Value/State`
+              [页面语义快照 (AX Tree)]  ← Playwright accessibility.snapshot 的缩进平铺
+            若两段都空，返回 ""（调用方负责降级）。
+        """
+        page = await self._ensure_active_page(reason="before extract_accessibility_tree")
+        if not page:
+            raise RuntimeError("No active page available for AX tree extraction.")
+
+        await self._wait_for_page_stable()
+        await self._dismiss_permission_surfaces(reason="before ax tree extraction")
+
+        # ── [A] ID 映射段：按 ARIA 规范从 DOM 属性推导 role/name ──
+        # 不调用 `accessibility.snapshot(root=handle)` 的原因：每元素一次 CDP 往返，
+        # 50 个元素 ≈ 50 次 round-trip。这里一次 page.evaluate 批量搞定。
+        _ID_MAP_JS = r"""
+(() => {
+    const marked = Array.from(document.querySelectorAll('[data-som-id]'));
+    marked.sort((a, b) => {
+        const ai = parseInt(a.getAttribute('data-som-id'), 10);
+        const bi = parseInt(b.getAttribute('data-som-id'), 10);
+        return (isNaN(ai) ? 0 : ai) - (isNaN(bi) ? 0 : bi);
+    });
+
+    function deriveRole(el) {
+        const explicit = el.getAttribute('role');
+        if (explicit) return explicit.trim();
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'a' && el.hasAttribute('href')) return 'link';
+        if (tag === 'button') return 'button';
+        if (tag === 'input') {
+            const t = (el.getAttribute('type') || 'text').toLowerCase();
+            if (['button', 'submit', 'reset'].includes(t)) return 'button';
+            if (t === 'checkbox') return 'checkbox';
+            if (t === 'radio') return 'radio';
+            if (t === 'search') return 'searchbox';
+            if (t === 'range') return 'slider';
+            return 'textbox';
+        }
+        if (tag === 'textarea') return 'textbox';
+        if (tag === 'select') return 'combobox';
+        if (el.isContentEditable) return 'textbox';
+        return tag;
+    }
+
+    function deriveName(el) {
+        const ariaLabelledBy = el.getAttribute('aria-labelledby');
+        if (ariaLabelledBy) {
+            const parts = ariaLabelledBy.split(/\s+/)
+                .map(id => document.getElementById(id))
+                .filter(Boolean)
+                .map(n => (n.textContent || '').trim());
+            const joined = parts.join(' ').trim();
+            if (joined) return joined;
+        }
+        const ariaLabel = el.getAttribute('aria-label');
+        if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+        const title = el.getAttribute('title');
+        if (title && title.trim()) return title.trim();
+        const placeholder = el.getAttribute('placeholder');
+        if (placeholder && placeholder.trim()) return placeholder.trim();
+        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (txt) return txt;
+        const alt = el.getAttribute('alt');
+        if (alt && alt.trim()) return alt.trim();
+        return '';
+    }
+
+    return marked.map(el => ({
+        id: el.getAttribute('data-som-id'),
+        role: deriveRole(el),
+        name: deriveName(el).slice(0, 80),
+        value: (el.value !== undefined && el.value !== null && String(el.value).trim())
+            ? String(el.value).slice(0, 40) : '',
+        disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+        checked: el.getAttribute('aria-checked') === 'true' || el.checked === true,
+        selected: el.selected === true || el.getAttribute('aria-selected') === 'true',
+        expanded: el.getAttribute('aria-expanded'),
+        required: el.required === true || el.getAttribute('aria-required') === 'true',
+        readonly: el.readOnly === true || el.getAttribute('aria-readonly') === 'true',
+    }));
+})()
+"""
+        id_rows: list[dict] = []
+        try:
+            raw = await page.evaluate(_ID_MAP_JS)
+            if isinstance(raw, list):
+                id_rows = [r for r in raw if isinstance(r, dict) and r.get("id")]
+        except Exception as e:
+            logger.debug(f"[AX Tree] ID 映射段提取失败: {e}")
+
+        id_lines: list[str] = []
+        for row in id_rows:
+            parts = [f"Role: {row.get('role') or '?'}"]
+            name = (row.get("name") or "").strip()
+            if name:
+                parts.append(f'Name: "{name}"')
+            value = (row.get("value") or "").strip()
+            if value:
+                parts.append(f'Value: "{value}"')
+            states: list[str] = []
+            if row.get("disabled"):
+                states.append("disabled")
+            if row.get("checked"):
+                states.append("checked")
+            if row.get("selected"):
+                states.append("selected")
+            expanded = row.get("expanded")
+            if expanded in ("true", "false"):
+                states.append(f"expanded={expanded}")
+            if row.get("required"):
+                states.append("required")
+            if row.get("readonly"):
+                states.append("readonly")
+            if states:
+                parts.append(f"State: {','.join(states)}")
+            id_lines.append(f"[ID: {row['id']}] " + ", ".join(parts))
+
+        # ── [B] 页面语义快照段：CDP AX Tree ──
+        ax_lines: list[str] = []
+        try:
+            ax_root = await self._get_ax_tree_via_cdp(page, interesting_only=True)
+            if ax_root:
+                self._flatten_ax_tree(ax_root, ax_lines, depth=0, max_depth=12)
+        except Exception as e:
+            logger.debug(f"[AX Tree] CDP snapshot 失败，跳过语义段: {e}")
+
+        # 语义段上限 120 行（避免长页面 AX Tree 撑爆 Token；ID 映射段不限）
+        MAX_SEMANTIC_LINES = 120
+        truncated_semantic = ax_lines[:MAX_SEMANTIC_LINES]
+
+        sections: list[str] = []
+        if id_lines:
+            sections.append("【交互元素 (SoM ID 映射)】\n" + "\n".join(id_lines))
+        if truncated_semantic:
+            hint = ""
+            if len(ax_lines) > MAX_SEMANTIC_LINES:
+                hint = f"\n...[AX Tree 过长，已截断 {len(ax_lines) - MAX_SEMANTIC_LINES} 行]..."
+            sections.append(
+                "【页面语义快照 (AX Tree)】\n" + "\n".join(truncated_semantic) + hint
+            )
+
+        if not sections:
+            logger.warning(
+                "[AX Tree] ID 映射段与语义段均为空；mark_and_screenshot 可能未注入 data-som-id"
+            )
+            return ""
+
+        logger.info(
+            f"[AX Tree] Emitted {len(id_lines)} ID-mapped rows + "
+            f"{len(truncated_semantic)}/{len(ax_lines)} semantic lines"
+        )
+        return "\n\n".join(sections)
+
     # 元素定位超时：改短以 fail fast，页面已刷新时不再苦等
     _LOCATOR_TIMEOUT = 3000
 
     async def execute_action(
         self,
-        action_dict: dict,
+        action: "VSpiderAction | dict",
         workflow_memory: dict | None = None,
     ) -> Page | None:
         """
-        根据 VLM 返回的决策字典执行对应的浏览器操作。
+        根据 VLM 返回的决策执行对应的浏览器操作。
+
+        dispatch 到 ActionRegistry 中注册的 Handler，具体动作实现见 actions.py。
+        保留原接口：Tab Guard / _last_action_error → ActionExecutionError 的自愈链路
+        仍由此方法兜底，行为与拆分前 100% 一致。
 
         Args:
-            action_dict: VLM 的决策字典，包含 action/target_id/type_value/memory_key
+            action: VLM 的决策。推荐传入 VSpiderAction 实例；也兼容原始 dict
+                    （会自动 coerce 为 VSpiderAction 并剥离 __rpa_* 元数据）。
             workflow_memory: 跨页面记忆库（可变 dict），由主循环传入；
                              save_to_memory 动作会直接写入此 dict；
                              type 动作会读取此 dict 做 {{key}} 插值。
@@ -1581,740 +2327,63 @@ Object.defineProperty(navigator, 'languages', {
             执行动作后处于激活状态的 Page 对象（供调用方更新 page 引用）。
             done / unknown action 时返回当前页（无切换）。
         """
-        # ── 每轮开始前清空上轮残留错误标记（防跨轮污染）──────────────────────
+        # 延迟导入避免与 actions.py 形成循环
+        try:
+            from .actions import ActionContext, ActionRegistry, UnknownActionError
+        except ImportError:
+            from actions import ActionContext, ActionRegistry, UnknownActionError
+
+        # ── 每轮开始前清空上轮残留错误标记 ──────────────────────────────────
         self._last_action_error = None
+
+        # ── 输入标准化：dict → VSpiderAction（同时剥离 RPA 元数据） ────────
+        rpa_required_keys: list[str] = []
+        rpa_template_value: str = ""
+        if isinstance(action, dict):
+            action_copy = dict(action)  # 不污染调用方
+            rpa_required_keys = sorted(
+                set(action_copy.pop("__rpa_required_keys", None) or [])
+            )
+            rpa_template_value = str(
+                action_copy.pop("__rpa_template_value", None) or ""
+            )
+            action_model = VSpiderAction(**action_copy)
+        else:
+            action_model = action
 
         page = await self._ensure_active_page(reason="before execute_action")
         if not page:
             logger.error("No active page available for action execution")
-            return
-        action = action_dict.get("action", "")
-        target_id = action_dict.get("target_id", 0)
-        type_value = action_dict.get("type_value", "")
-        memory_key = action_dict.get("memory_key") or ""
-        rpa_required_keys = sorted(set(action_dict.get("__rpa_required_keys") or []))
-        rpa_template_value = str(action_dict.get("__rpa_template_value") or "")
+            return None
 
-        def _with_rpa_meta(step: dict) -> dict:
-            if rpa_required_keys:
-                step["required_memory_keys"] = list(rpa_required_keys)
-            if action == "type" and rpa_template_value:
-                step["type_value_template"] = rpa_template_value
-            if action == "goto" and rpa_template_value:
-                step["url_template"] = rpa_template_value
-            return step
+        # ── Dispatch 到 Registry 中注册的 Handler ─────────────────────────
+        try:
+            handler = ActionRegistry.get(action_model.action)
+        except UnknownActionError:
+            logger.warning(f"Unknown action type: {action_model.action}")
+            return page  # 与原 else 分支一致：直接返回当前页，跳过 Tab Guard
 
-        if action == "click":
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"Executing click: element #{target_id} ({selector})")
-            try:
-                await self._clear_som_overlays()
-                target = await self._resolve_action_target(target_id, "click")
-                if target:
-                    await target.handle.scroll_into_view_if_needed(
-                        timeout=self._LOCATOR_TIMEOUT
-                    )
-                else:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found on active page or its iframes"
-                    )
-                # ── RPA 取证（先于点击）：点击可能触发页面跳转，上下文会随之销毁 ──
-                # 必须在 click() 之前提取 XPath，否则跳转后 evaluate 会抛
-                # "Execution context was destroyed" 错误
-                _pending_xpath = await self._get_xpath(target.handle)
+        ctx = ActionContext(
+            action=action_model,
+            browser=self,
+            workflow_memory=workflow_memory or {},
+            page=page,
+            rpa_required_keys=rpa_required_keys,
+            rpa_template_value=rpa_template_value,
+        )
+        handler_result = await handler.execute(ctx)
 
-                # 直接点击（全局 _handle_download 已兜底接管所有下载事件，无需包裹 expect_download）
-                try:
-                    await target.handle.click(
-                        force=True, timeout=self._LOCATOR_TIMEOUT
-                    )
-                except Exception:
-                    # Playwright 原生 click 失败时，使用 JS 兜底
-                    await target.handle.evaluate(
-                        """el => {
-                            el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-                            if (typeof el.click === 'function') {
-                                el.click();
-                            } else {
-                                el.dispatchEvent(new MouseEvent('click', {
-                                    bubbles: true,
-                                    cancelable: true,
-                                    composed: true,
-                                    view: window
-                                }));
-                            }
-                        }"""
-                    )
-                # ── RPA 录制：click 成功，将取证阶段缓存的 XPath 追加到轨迹 ──
-                if _pending_xpath:
-                    self.rpa_trail.append(
-                        _with_rpa_meta({"action": "click", "xpath": _pending_xpath, "type_value": ""})
-                    )
-                    logger.debug(f"[RPA] Recorded click: {_pending_xpath}")
-                logger.info(f"Click element #{target_id} succeeded")
-            except Exception as e:
-                # fail fast：元素可能已因页面刷新而消失
-                self._last_action_error = e
-                logger.error(f"Click element #{target_id} failed (page may have refreshed): {e}")
-
-            # 点击是最可能引发页面跳转的操作，必须充分等待
-            await self._wait_after_action(is_navigation=True)
-
-        elif action == "type":
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"Executing type: element #{target_id} <- {type_value!r}")
-            try:
-                await self._clear_som_overlays()
-                target = await self._resolve_action_target(target_id, "type")
-
-                if not target:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found on active page or its iframes"
-                    )
-
-                await target.handle.scroll_into_view_if_needed(timeout=self._LOCATOR_TIMEOUT)
-
-                # ── RPA 取证（先于输入）：在键盘操作前提取 XPath ────────────
-                # type 动作本身不会导致上下文销毁，但保持与 click 一致的"先取证"
-                # 原则，防止极端情况下 onInput 回调触发跳转时丢失上下文
-                _pending_xpath = await self._get_xpath(target.handle)
-
-                # ★ 记录输入前交互元素数量，用于异步下拉框检测
-                count_before = await self._count_interactive_elements()
-
-                # 1. 强制唤醒光标：点击视觉表层元素，依赖事件冒泡自动 focus 到真实输入框
-                try:
-                    await target.handle.click(force=True, timeout=self._LOCATOR_TIMEOUT)
-                except Exception:
-                    await target.handle.evaluate("""el => {
-                        if (typeof el.click === 'function') el.click();
-                        else el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                    }""")
-
-                # 2. 缓冲时间：等待 JS 动画完成（如滑出输入面板）
-                await asyncio.sleep(0.5)
-
-                # ★ 动态插值：将 {{key}} 替换为 workflow_memory 中的真实值
-                # 例如 type_value="{{order_id}}" → "ORD-2024-001"
-                if workflow_memory and "{{" in type_value:
-                    def _interpolate(m: re.Match) -> str:
-                        key = m.group(1).strip()
-                        val = workflow_memory.get(key)
-                        if val is None:
-                            logger.warning(
-                                f"[MEMORY] interpolation: key '{key}' not found in workflow_memory "
-                                f"(available: {list(workflow_memory.keys())})"
-                            )
-                            return m.group(0)  # 保留原始占位符
-                        return str(val)
-                    resolved = re.sub(r"\{\{([^}]+)\}\}", _interpolate, type_value)
-                    if resolved != type_value:
-                        logger.info(
-                            f"[MEMORY] type interpolation: {type_value!r} → {resolved!r}"
-                        )
-                    type_value = resolved
-
-                # 3. 键盘直输
-                modifier = "Meta" if sys.platform == "darwin" else "Control"
-                await page.keyboard.press(f"{modifier}+a")
-                await page.keyboard.press("Backspace")
-                await page.keyboard.type(type_value, delay=50)
-
-                # ── RPA 录制：type 成功，将取证阶段缓存的 XPath 追加到轨迹 ──
-                if _pending_xpath:
-                    self.rpa_trail.append(
-                        _with_rpa_meta({"action": "type", "xpath": _pending_xpath, "type_value": type_value})
-                    )
-                    logger.debug(f"[RPA] Recorded type: {_pending_xpath} <- {type_value!r}")
-                logger.info(f"Type into element #{target_id} succeeded")
-
-                # ══════════════════════════════════════════════════════
-                # ★ Boss 1 & 2：智能输入后处理
-                # 短暂等待，让防抖计时器触发 / 日历弹窗渲染
-                await asyncio.sleep(0.4)
-
-                # Boss 1：日期选择器 — 检测日历弹窗并强制按 Tab 收起
-                # 绝大多数日期组件（Ant Design/Element UI）在收到 Tab 或 Enter 后会收起日历
-                if await self._is_calendar_popup_visible():
-                    await page.keyboard.press("Tab")
-                    logger.info(
-                        f"[TYPE] Date picker calendar detected → dismissed with Tab. "
-                        f"Next screenshot will show clean input state."
-                    )
-                else:
-                    # Boss 2：异步搜索下拉框 — 等待动态下拉列表出现（最多 2.5 秒）
-                    appeared = await self._wait_for_submenu(count_before, max_wait=2.5)
-                    if appeared:
-                        logger.info(
-                            f"[TYPE] Async dropdown items appeared after input. "
-                            f"Next screenshot will capture the option list for VLM to click."
-                        )
-                # ══════════════════════════════════════════════════════
-
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"Type into element #{target_id} failed: {e}")
-
-            # type 不引发页面跳转，跳过 networkidle 避免自动补全 XHR 卡顿
-            await self._wait_after_action(light_action=True)
-
-        elif action == "hover":
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"Executing hover: element #{target_id} ({selector})")
-            try:
-                await self._clear_som_overlays()
-                target = await self._resolve_action_target(target_id, "click")
-                if not target:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found on active page or its iframes"
-                    )
-                await target.handle.scroll_into_view_if_needed(timeout=self._LOCATOR_TIMEOUT)
-
-                # ★ 级联菜单支持：记录悬停前的可交互元素数量
-                count_before = await self._count_interactive_elements()
-
-                await target.handle.hover(force=True, timeout=self._LOCATOR_TIMEOUT)
-                logger.info(f"Hover element #{target_id} succeeded")
-
-                # ★ 等待子菜单弹出（最多 2 秒），检测是否有新元素出现
-                appeared = await self._wait_for_submenu(count_before, max_wait=2.0)
-                if appeared:
-                    logger.info(f"[HOVER] Submenu/dropdown appeared after hovering #{target_id}")
-                else:
-                    logger.warning(
-                        f"[HOVER TIMEOUT] No new elements appeared after hovering #{target_id} "
-                        f"within 2s — parent item may be incorrect or menu requires a click to open."
-                    )
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"Hover element #{target_id} failed: {e}")
-
-            await self._wait_after_action(light_action=True)
-
-        elif action == "scroll":
-            # ── 智能滚动：支持 down/up/bottom/top + 无效滚动边界检测 ──────────
-            # type_value 指定方向（新协议）；兜底兼容旧协议 target_id 正负号
-            raw_dir = (type_value or "").strip().lower()
-            if raw_dir in ("down", "up", "bottom", "top"):
-                direction = raw_dir
-            elif target_id < 0:
-                direction = "up"
-            else:
-                direction = "down"
-
-            # 滚动前记录位置
-            prev_y = await page.evaluate("window.scrollY")
-
-            if direction == "bottom":
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            elif direction == "top":
-                await page.evaluate("window.scrollTo(0, 0)")
-            elif direction == "up":
-                await page.evaluate("window.scrollBy(0, -700)")
-            else:  # down
-                await page.evaluate("window.scrollBy(0, 700)")
-
-            # 给页面渲染和懒加载响应时间
-            await asyncio.sleep(1.0)
-
-            # 滚动后记录位置
-            new_y = await page.evaluate("window.scrollY")
-            logger.info(f"[SCROLL] direction={direction} scrollY: {prev_y} → {new_y}")
-            print(f"🔄 [SCROLL] 执行方向: {direction}, 位置变化: {prev_y} → {new_y}")
-
-            # 边界检测：位置未变 → 已到边缘，抛异常接入自愈系统
-            if prev_y == new_y:
+        # ── Handler 显式返回 Page（switch_tab / done）→ 跳过 Tab Guard ──
+        if handler_result is not None:
+            self._page = handler_result
+            if self._last_action_error is not None:
+                _err = self._last_action_error
+                self._last_action_error = None
                 raise ActionExecutionError(
-                    f"执行 scroll ({direction}) 无效：页面未发生滚动，"
-                    f"可能已到达页面边缘或该方向无滚动条。"
-                    f"请观察当前截图，不要再继续向该方向滚动。"
-                )
-
-        elif action == "upload":
-            logger.info(f"Executing upload: element #{target_id} <- {type_value!r}")
-            # ★ 文件路径解析优先级：
-            #   1. type_value 是真实存在的路径（VLM 从 goal 中提取）
-            #   2. --upload-file 预配置路径
-            file_path: Path | None = None
-            if type_value and type_value.strip():
-                candidate = Path(type_value.strip())
-                if candidate.exists():
-                    file_path = candidate
-                    logger.info(f"[UPLOAD] Using path from type_value: {file_path}")
-            if file_path is None and self._upload_file and self._upload_file.exists():
-                file_path = self._upload_file
-                logger.info(f"[UPLOAD] Using pre-configured --upload-file: {file_path}")
-            if file_path is None:
-                logger.error(
-                    f"[UPLOAD] No valid file found. "
-                    f"Provide a real path via --upload-file or in type_value. Got: {type_value!r}"
-                )
-                return
-            try:
-                await self._clear_som_overlays()
-                # ★ 不点击"上传"按钮（会弹出系统文件选择器），
-                #   直接定位 <input type="file"> 并通过 set_input_files 静默注入
-                file_target = await self._find_file_input(target_id)
-                if not file_target:
-                    raise RuntimeError(
-                        f"No <input type='file'> found near element #{target_id}"
-                    )
-                await file_target.handle.set_input_files(str(file_path.resolve()))
-                logger.info(f"[UPLOAD] File injected successfully: {file_path.resolve()}")
-                print(f"\n\033[1;32m✅ 文件上传成功:\033[0m \033[36m{file_path.resolve()}\033[0m\n")
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"[UPLOAD] Failed for element #{target_id}: {e}")
-
-            await self._wait_after_action(light_action=True)
-
-        elif action == "extract_link":
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"Executing extract_link: element #{target_id} ({selector})")
-            try:
-                # 获取在 som_inject.js 中注入的 URL 属性
-                target = await self._resolve_action_target(target_id, "click")
-                if not target:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found on active page or its iframes"
-                    )
-                extracted_url = await target.handle.evaluate(
-                    """el => el.getAttribute('data-som-url') || el.getAttribute('href') || el.getAttribute('src') || ''"""
-                )
-                if extracted_url:
-                    logger.info(f"[EXTRACT_LINK] Successfully extracted URL: {extracted_url}")
-                    # 打印高亮日志
-                    print(f"\n\033[1;32m[LINK EXTRACTED]\033[0m \033[36m{extracted_url}\033[0m\n")
-                    # 保存到独立文件
-                    from data_manager import save_to_excel
-                    save_to_excel({"target_id": target_id, "url": extracted_url}, "output_links.xlsx")
-                else:
-                    logger.warning(f"[EXTRACT_LINK] No URL found in data-som-url for element #{target_id}")
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"Extract link for element #{target_id} failed: {e}")
-
-        elif action == "download_image":
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"Executing download_image: element #{target_id} ({selector})")
-            try:
-                # 获取在 som_inject.js 中注入的 URL 属性
-                target = await self._resolve_action_target(target_id, "click")
-                if not target:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found on active page or its iframes"
-                    )
-                extracted_url = await target.handle.evaluate(
-                    """el => el.getAttribute('data-som-url') || el.getAttribute('src') || el.getAttribute('href') || ''"""
-                )
-                # 如果没有，尝试直接取 src 或 href
-                
-                if extracted_url:
-                    # 将相对路径自动处理为绝对路径
-                    import urllib.parse
-                    import time
-                    abs_url = urllib.parse.urljoin(page.url, extracted_url)
-                    
-                    logger.info(f"[DOWNLOAD_IMAGE] Target URL: {abs_url}")
-                    
-                    # 使用当前上下文环境发起 GET 请求，自动继承 Cookie 与登入态
-                    response = await self._context.request.get(abs_url)
-                    img_bytes = await response.body()
-                    
-                    # 创建 images 目录
-                    img_dir = self._download_dir / "images"
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # 确定文件后缀
-                    content_type = response.headers.get("content-type", "")
-                    ext = ".png"
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = ".jpg"
-                    elif "gif" in content_type:
-                        ext = ".gif"
-                    
-                    # 写盘
-                    filename = f"img_{int(time.time())}{ext}"
-                    filepath = img_dir / filename
-                    filepath.write_bytes(img_bytes)
-                    
-                    print(f"\n\033[1;32m✅ 成功下载图片:\033[0m \033[36m{filepath.resolve()}\033[0m\n")
-                    logger.info(f"[DOWNLOAD_IMAGE] Saved local: {filepath.resolve()}")
-                else:
-                    logger.warning(f"[DOWNLOAD_IMAGE] No URL found for element #{target_id}")
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"Download image for element #{target_id} failed: {e}")
-
-        elif action == "select":
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"Executing select: element #{target_id} ({selector}) <- {type_value!r}")
-            try:
-                await self._clear_som_overlays()
-                target = await self._resolve_action_target(target_id, "click")
-                if not target:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found on active page or its iframes"
-                    )
-                # 尝试通过 label 文本选择
-                try:
-                    await target.handle.select_option(label=type_value, timeout=self._LOCATOR_TIMEOUT)
-                except Exception:
-                    # label 匹配失败，尝试通过 value 匹配
-                    try:
-                        await target.handle.select_option(value=type_value, timeout=self._LOCATOR_TIMEOUT)
-                    except Exception:
-                        # 最后尝试通过索引匹配
-                        await target.handle.select_option(index=0, timeout=self._LOCATOR_TIMEOUT)
-                logger.info(f"Select element #{target_id} succeeded")
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"Select element #{target_id} failed: {e}")
-            await self._wait_after_action(is_navigation=False)
-
-        elif action == "smooth_scroll":
-            # ── 平滑滚动：behavior:'smooth' 模拟人类滚轮，更易触发懒加载 ────────
-            # type_value 指定方向：down（默认）/ up
-            direction = (type_value or "down").strip().lower()
-            if direction == "up":
-                js_scroll = "window.scrollBy({top: -window.innerHeight * 0.8, behavior: 'smooth'});"
-            else:
-                js_scroll = "window.scrollBy({top: window.innerHeight * 0.8, behavior: 'smooth'});"
-            try:
-                prev_y = await page.evaluate("window.scrollY")
-                await page.evaluate(js_scroll)
-                # smooth 动画约 400-600ms，再等懒加载回填内容
-                await asyncio.sleep(1.0)
-                new_y = await page.evaluate("window.scrollY")
-                logger.info(f"[SMOOTH_SCROLL] direction={direction} scrollY: {prev_y} → {new_y}")
-                print(f"🌊 [SMOOTH_SCROLL] direction={direction}, 位置变化: {prev_y} → {new_y}")
-                # RPA 录制
-                self.rpa_trail.append(
-                    _with_rpa_meta({"action": "smooth_scroll", "type_value": direction})
-                )
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"[SMOOTH_SCROLL] Failed: {e}")
-
-        elif action == "remove_element":
-            # ── 物理铲除 DOM 节点：用于清除广告遮罩、浮层等阻挡元素 ─────────────
-            selector = f'[data-som-id="{target_id}"]'
-            logger.info(f"[REMOVE_ELEMENT] Removing element #{target_id} ({selector})")
-            try:
-                await self._clear_som_overlays()
-                target = await self._resolve_action_target(target_id, "remove_element")
-                if not target:
-                    raise RuntimeError(
-                        f"Element #{target_id} not found — cannot remove"
-                    )
-                # 先取证 XPath（删除后节点消失，无法再 evaluate）
-                _pending_xpath = await self._get_xpath(target.handle)
-                # 从 DOM 树中物理删除该节点
-                await target.handle.evaluate("el => el.remove()")
-                logger.info(f"[REMOVE_ELEMENT] Element #{target_id} removed from DOM")
-                print(f"🗑️  [REMOVE_ELEMENT] 已铲除元素 #{target_id} (xpath={_pending_xpath})")
-                # RPA 录制（xpath 用于回放时定位，若已删则跳过）
-                if _pending_xpath:
-                    self.rpa_trail.append(
-                        _with_rpa_meta(
-                            {"action": "remove_element", "xpath": _pending_xpath, "type_value": ""}
-                        )
-                    )
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"[REMOVE_ELEMENT] Failed for element #{target_id}: {e}")
-
-        elif action == "wait":
-            # ── 显式等待：让 VLM 主动控制等待时间（如长动画、慢加载） ────────────
-            # type_value 填秒数字符串；默认 2 秒，上限 10 秒（防止 VLM 胡填大数卡死）
-            try:
-                wait_secs = max(1, min(10, int(float(type_value or "2"))))
-            except (ValueError, TypeError):
-                wait_secs = 2
-            logger.info(f"[WAIT] Explicit wait: {wait_secs}s (requested: {type_value!r})")
-            print(f"⏳ [WAIT] 显式等待 {wait_secs} 秒...")
-            await asyncio.sleep(wait_secs)
-            # RPA 录制：保留等待节奏，确保回放时动画/加载时序一致
-            self.rpa_trail.append(
-                _with_rpa_meta({"action": "wait", "type_value": str(wait_secs)})
-            )
-
-        elif action == "press_key":
-            key_name = (type_value or "").strip()
-            if not key_name:
-                raise ActionExecutionError(
-                    "press_key 动作必须在 type_value 中提供按键名称（如 'Enter'、'Escape'、'Tab'）。"
-                )
-            logger.info(f"Executing press_key: {key_name!r}")
-            try:
-                await page.keyboard.press(key_name)
-                self.rpa_trail.append(
-                    _with_rpa_meta({"action": "press_key", "type_value": key_name})
-                )
-                logger.debug(f"[RPA] Recorded press_key: {key_name!r}")
-                logger.info(f"Press key {key_name!r} succeeded")
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"Press key {key_name!r} failed: {e}")
-            # Enter 通常触发表单提交/页面跳转，保留 networkidle 等待；其余按键轻量等待
-            await self._wait_after_action(is_navigation=(key_name == "Enter"))
-
-        elif action == "goto":
-            url = type_value
-            if not url:
-                raise ActionExecutionError("goto 动作缺少目标 URL，请在 type_value 中填写完整的 URL。")
-
-            # 🛡️ 多标签页 goto 智能拦截器
-            # 比对目标 URL 与所有已打开标签页，防止"原位覆盖"破坏空间结构
-            url_clean = url.split("?")[0].rstrip("/")
-            open_pages = [p for p in self._context.pages if not p.is_closed()]
-
-            # 找目标 URL 已在哪个标签页
-            target_idx = -1
-            for idx, p in enumerate(open_pages):
-                if p.url.split("?")[0].rstrip("/") == url_clean:
-                    target_idx = idx
-                    break
-
-            # 找当前页在列表中的位置
-            try:
-                current_idx = open_pages.index(page)
-            except ValueError:
-                current_idx = -1
-
-            _goto_recorded = False
-
-            if target_idx != -1 and target_idx != current_idx:
-                # 情况 1：目标页已在后台 → 拦截，强制转为 switch_tab
-                self._page = open_pages[target_idx]
-                await self._page.bring_to_front()
-                await asyncio.sleep(0.5)
-                _goto_recorded = True
-                logger.info(
-                    f"[GOTO INTERCEPTOR] 目标已存在于 Tab [{target_idx}]，"
-                    f"已强制转换为 switch_tab，避免原位覆盖: {url[:80]}"
-                )
-            elif target_idx != -1 and target_idx == current_idx:
-                # 情况 2：目标就是当前页 → 静默忽略，无需重复跳转
-                logger.info(
-                    f"[GOTO INTERCEPTOR] 当前已在目标页面，忽略 goto 请求: {url[:80]}"
-                )
-            else:
-                # 情况 3：目标不存在于任何标签页 → 正常原位跳转
-                logger.info(f"Executing goto: {url}")
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await self._wait_for_page_stable()
-                    _goto_recorded = True
-                    logger.info(f"Navigation to {url} succeeded")
-                except Exception as e:
-                    self._last_action_error = e
-                    logger.error(f"Navigation to {url} failed: {e}")
-
-            if _goto_recorded:
-                self.rpa_trail.append(_with_rpa_meta({"action": "goto", "url": url}))
-                logger.debug(f"[RPA] Recorded goto: {url}")
-
-        elif action == "close_tab":
-            # 关闭当前标签页，并主动将焦点切回剩余最后一个页面
-            logger.info("[CLOSE TAB] Closing current page and falling back to previous tab")
-            try:
-                await page.close()
-                self.rpa_trail.append(_with_rpa_meta({"action": "close_tab", "type_value": ""}))
-                logger.debug("[RPA] Recorded close_tab")
-                logger.info("[CLOSE TAB] Page closed successfully")
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"[CLOSE TAB] Failed to close page: {e}")
-            # 主动更新 self._page，无需等待 Tab Guard L2 被动触发
-            open_pages = [p for p in self._context.pages if not p.is_closed()]
-            if open_pages:
-                self._page = open_pages[-1]
-                await self._page.bring_to_front()
-                await asyncio.sleep(0.8)
-                logger.info(
-                    f"[CLOSE TAB] Focused back to: {(self._page.url or 'about:blank')[:80]}"
-                )
-
-        elif action == "click_point":
-            # ── 无选择器坐标点击：千分制归一化坐标 → 真实像素 ──────────────
-            # VLM 输出 0-1000 的归一化坐标（与视口无关），
-            # 此处动态读取当前视口尺寸并换算为真实像素坐标后驱动鼠标点击。
-            point = action_dict.get("point")
-            if (
-                not point
-                or not isinstance(point, (list, tuple))
-                or len(point) != 2
-            ):
-                raise ActionExecutionError(
-                    "click_point 动作必须提供有效的 [x, y] 千分制归一化坐标，"
-                    f"收到的 point 值为：{point!r}。"
-                    "请在截图中目视估算目标元素位置，以 0-1000 范围输出坐标后重新提交。"
-                )
-
-            # 动态获取当前视口尺寸，支持非标准分辨率和响应式布局
-            viewport = page.viewport_size
-            if not viewport:
-                raise ActionExecutionError(
-                    "无法获取当前页面的视口尺寸，请检查页面状态。"
-                )
-            vw, vh = viewport["width"], viewport["height"]
-
-            # 千分制坐标 (0-1000) → 真实像素坐标
-            x_norm, y_norm = float(point[0]), float(point[1])
-            real_x = int((x_norm / 1000.0) * vw)
-            real_y = int((y_norm / 1000.0) * vh)
-
-            logger.info(
-                f"[CLICK_POINT] 归一化坐标 {point} -> 真实像素 ({real_x}, {real_y})"
-                f" (视口 {vw}x{vh})"
-            )
-            print(
-                f"\033[1;35m🎯 [物理干预]\033[0m "
-                f"VLM 归一化坐标 {point} → 真实屏幕坐标 ({real_x}, {real_y})"
-                f"  [视口 {vw}×{vh}]"
-            )
-            await page.mouse.move(real_x, real_y)
-            await page.mouse.click(real_x, real_y)
-            # ── RPA 录制：坐标点击直接记录归一化坐标（回放时按视口比例还原）──
-            self.rpa_trail.append(
-                _with_rpa_meta({"action": "click_point", "x_norm": point[0], "y_norm": point[1]})
-            )
-            logger.debug(f"[RPA] Recorded click_point: norm=({point[0]}, {point[1]}) real=({real_x}, {real_y})")
-            await self._wait_after_action()
-
-        elif action == "switch_tab":
-            # 按索引切换到指定标签页（索引由 VLM 从 tabs_state 摘要中读取）
-            tab_index = action_dict.get("target_id", 0)
-            open_pages = [p for p in self._context.pages if not p.is_closed()]
-            if 0 <= tab_index < len(open_pages):
-                self._page = open_pages[tab_index]
-                await self._page.bring_to_front()
-                await asyncio.sleep(0.5)
-                self.rpa_trail.append(
-                    _with_rpa_meta({"action": "switch_tab", "target_id": tab_index})
-                )
-                logger.debug(f"[RPA] Recorded switch_tab: {tab_index}")
-                logger.info(
-                    f"[SWITCH TAB] Switched to tab [{tab_index}]: "
-                    f"{(self._page.url or 'about:blank')[:80]}"
-                )
-            else:
-                raise ActionExecutionError(
-                    f"switch_tab 失败：标签页索引 {tab_index} 超出范围"
-                    f"（当前共 {len(open_pages)} 个标签页，有效索引 0~{len(open_pages)-1}）。"
-                )
-
-        elif action == "save_to_memory":
-            # ── 跨页面记忆库：双源提取 + 动态 key 兜底 + latest_memory 双写 ──
-            #
-            # VLM 的两种常见失误：
-            #   A. 忘了填 memory_key → 动态生成 temp_var_<timestamp>，不静默丢弃
-            #   B. 把值直接写在 type_value 而非让底层从 DOM 读 → 也能接收
-
-            # ── 1. memory_key 动态兜底：不再使用固定硬编码名称 ──────────────
-            effective_key = memory_key  # 已在函数顶部从 action_dict 提取
-            if not effective_key:
-                effective_key = f"temp_var_{int(time.time())}"
-                logger.warning(
-                    f"[MEMORY] save_to_memory: memory_key missing, "
-                    f"auto-generated key='{effective_key}'"
-                )
-                print(
-                    f"\033[1;33m⚠️  [MEMORY]\033[0m "
-                    f"VLM 未提供 memory_key，已动态生成临时命名为 '{effective_key}'"
-                )
-
-            logger.info(
-                f"Executing save_to_memory: element #{target_id} → key={effective_key!r}"
-            )
-
-            # ── 2. 双源提取策略 ───────────────────────────────────────────────
-            #   优先级 1：type_value 非空 → VLM 直接把值写在这里了
-            #   优先级 2：target_id 有效 → 从 DOM 元素提取 innerText / value
-            #   两者都无 → 抛出 RuntimeError，触发自愈反馈
-            try:
-                extracted_text: str = ""
-
-                if type_value and type_value.strip():
-                    # VLM 把值直接填在 type_value（常见于纯文本展示、无红框 ID 场景）
-                    extracted_text = type_value.strip()
-                    logger.info(
-                        f"[MEMORY] Value sourced from type_value: {extracted_text!r}"
-                    )
-                    print(
-                        f"\033[36m🧠 [MEMORY]\033[0m "
-                        f"VLM 直接传递了文本值: {extracted_text!r}"
-                    )
-
-                elif target_id and target_id != 0:
-                    # 从 DOM 元素提取可见文字或输入框当前值
-                    await self._clear_som_overlays()
-                    target = await self._resolve_action_target(target_id, "click")
-                    if not target:
-                        raise RuntimeError(
-                            f"Element #{target_id} not found on active page or its iframes"
-                        )
-                    extracted_text = str(
-                        await target.handle.evaluate(
-                            """el => {
-                                const text = (el.innerText || el.textContent || '').trim();
-                                const val  = (el.value || '').trim();
-                                return text || val || '';
-                            }"""
-                        )
-                    ).strip()
-                    logger.info(
-                        f"[MEMORY] Value sourced from DOM element #{target_id}: "
-                        f"{extracted_text!r}"
-                    )
-                    print(
-                        f"\033[36m🔍 [MEMORY]\033[0m "
-                        f"从页面元素提取了文本: {extracted_text!r}"
-                    )
-
-                else:
-                    raise RuntimeError(
-                        "save_to_memory 失败：VLM 既未提供 type_value，"
-                        "也未提供有效的 target_id，无法获取要保存的值"
-                    )
-
-                # ── 3. 双写记忆库：指定 key + latest_memory 快捷键 ──────────
-                if not extracted_text:
-                    logger.warning(
-                        f"[MEMORY] save_to_memory: extracted value is empty "
-                        f"(element #{target_id})"
-                    )
-                else:
-                    if workflow_memory is not None:
-                        workflow_memory[effective_key] = extracted_text
-                        # 同步更新 latest_memory，供 VLM 忘记变量名时兜底引用
-                        workflow_memory["latest_memory"] = extracted_text
-                    logger.info(
-                        f"[MEMORY] Saved: {effective_key!r} = {extracted_text!r} "
-                        f"(latest_memory also updated)"
-                    )
-                    print(
-                        f"\n\033[1;36m[MEMORY SAVED]\033[0m "
-                        f"\033[33m{effective_key}\033[0m = "
-                        f"\033[32m{extracted_text!r}\033[0m  "
-                        f"\033[90m(latest_memory 已同步)\033[0m\n"
-                    )
-
-            except Exception as e:
-                self._last_action_error = e
-                logger.error(f"[MEMORY] save_to_memory failed: {e}")
-
-            # save_to_memory 不触发导航，跳过 networkidle
-            await self._wait_after_action(light_action=True)
-
-        elif action == "done":
-            logger.info("Task marked as done, no action executed")
-            return page  # done 不触发页面切换，直接返回当前页
-
-        else:
-            logger.warning(f"Unknown action type: {action}")
-            return page  # 未知动作同上
+                    f"action={action_model.action} "
+                    f"target_id={action_model.target_id}: {_err}"
+                ) from _err
+            return handler_result
 
         # ══════════════════════════════════════════════════════
         # 焦点守护（Tab Guard）
@@ -2332,16 +2401,47 @@ Object.defineProperty(navigator, 'languages', {
                 reason=f"tab guard: switched from {(page.url or 'closed')[:60]}",
                 activate=True,
             )
+            # ── 标签页切换感知：因果归因通知，让 VLM 识别"这是刚才点击的成功副产物" ──
+            # 旧版把所有切换都默认为"误触"，推着 VLM 盲目 close_tab → 反向循环。
+            # 中立版又太被动，VLM 看不出切换由自己动作触发 → 错把切换当"页面异常"。
+            # 新版：报事实 + 明确因果（"是你上一步 click 触发的"）+ 判断框架。
+            old_url = page.url if not page.is_closed() else "(已关闭)"
+            new_url = active_page.url or "about:blank"
+            _prev_action = action_model.action
+            _prev_tid = action_model.target_id
+            if _prev_action in ("click", "click_new_tab"):
+                self._tab_switch_notice = (
+                    f"✅ 你上一步 {_prev_action}(元素 #{_prev_tid}) 已成功触发页面切换/新标签：\n"
+                    f"  旧页面: {old_url[:120]}\n"
+                    f"  当前页面: {new_url[:120]}\n"
+                    f"⚠️ 点击已经生效，**禁止再次点击同一个 #{_prev_tid}**（会被 LOOP GUARD 拦截）。\n"
+                    f"请对照【用户目标】判断：\n"
+                    f"  • 目标是'点击XX在新标签打开（+可能再切回）' → "
+                    f"点击阶段已完成。若目标要求切回搜索页，用 switch_tab 回原页；"
+                    f"若整个任务已达成，直接 action=done 结束。\n"
+                    f"  • 目标要求在新页面继续填表/提取 → 留在当前页继续操作。\n"
+                    f"  • 当前页明显是广告/验证墙/无关页（URL 含 sem/ad/promo、Cloudflare 验证） "
+                    f"→ close_tab 并在原页选**另一个** target_id 重试。"
+                )
+            else:
+                self._tab_switch_notice = (
+                    f"ℹ️ 标签页切换（上一步动作: {_prev_action}）：\n"
+                    f"  旧页面: {old_url[:120]}\n"
+                    f"  当前页面: {new_url[:120]}\n"
+                    f"请对照用户目标判断这是预期切换还是异常，再决定下一步。"
+                )
+        else:
+            self._tab_switch_notice = None
         # 更新实例持有的活跃页引用，确保下一轮截图使用正确页面
         self._page = active_page
 
         # ── 自愈抛出：若本轮操作有异常，向上层暴露以触发 Self-Healing ────────
-        # 先将错误暂存到局部变量并清空实例状态，避免下轮误判
         if self._last_action_error is not None:
             _err = self._last_action_error
             self._last_action_error = None
             raise ActionExecutionError(
-                f"action={action} target_id={action_dict.get('target_id', 0)}: {_err}"
+                f"action={action_model.action} "
+                f"target_id={action_model.target_id}: {_err}"
             ) from _err
 
         return active_page

@@ -11,10 +11,24 @@ import asyncio
 import json
 import re
 import logging
-from typing import Any, Literal, List, Optional
+from typing import Any, Dict, Literal, List, Optional, Union
 
 from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+# ── 静默 httpx AsyncClient GC 噪音 ──────────────────────────────
+# httpx.AsyncClient.__del__ 在事件循环关闭后尝试调度 aclose()，
+# 导致 "Event loop is closed" 错误日志。Patch 使其静默跳过。
+import httpx as _httpx
+
+_orig_del = getattr(_httpx.AsyncClient, "__del__", None)
+if _orig_del:
+    def _silent_del(self: _httpx.AsyncClient) -> None:  # type: ignore[misc]
+        try:
+            _orig_del(self)
+        except Exception:
+            pass
+    _httpx.AsyncClient.__del__ = _silent_del  # type: ignore[method-assign]
 
 try:
     from .config import (
@@ -59,8 +73,29 @@ def _broadcast_log_safe(message: str, level: str = "info") -> None:
 class VSpiderAction(BaseModel):
     """VLM 返回的结构化操作决策。所有字段均有默认值以兼容不完整的 VLM 响应。"""
 
+    # ★★★ progress_review 必须排在所有字段绝对第一位（Structured Outputs 会按此顺序生成）
+    # 用"强制自我反思 (Forced Reflection)" 压制 VLM 的视觉脑惯性：
+    # 不允许它一上来就看截图选 target_id，必须先对照历史复盘进度。
+    progress_review: str = Field(
+        default="",
+        description=(
+            "【绝对强制字段 · 第一顺位】在看当前截图之前，先对照【🛑 全局历史与进度复盘】"
+            "和【当前任务】，明确列出：①✅ 已达成的子目标（标注在哪一步完成、结果 URL / 标签变化）；"
+            "②⏳ 剩余未完成的子目标。如果所有子目标均已达成（例如「点击结果新标签 + 切回原页」均已在"
+            "历史中显示 ✅），**必须在此字段写出『✅ 任务已完成，进入 done』**，且下方 action 只能填 done。"
+            "禁止复制粘贴任务原文，必须按已观察到的历史事实做结论。"
+        ),
+    )
+    # ★ thought 第二位：progress_review 给出进度结论后，再基于当前截图推理下一步
+    thought: str = Field(
+        default="",
+        description=(
+            "在 progress_review 结论之后，结合当前截图和 AX Tree 描述你的推理过程。"
+            "如果 progress_review 已判定任务完成，此处只需重复『任务完成，输出 done』，"
+            "不要再分析视觉元素。"
+        ),
+    )
     current_state: str = Field(default="", description="当前页面状态描述")
-    thought: str = Field(default="", description="VLM 的思考过程")
     action: Literal[
         "click", "type", "hover", "scroll", "select",
         "press_key", "goto", "upload",
@@ -68,9 +103,11 @@ class VSpiderAction(BaseModel):
         "close_tab", "switch_tab", "save_to_memory", "done", "ask_human", "error",
         "captcha_detected",
         "click_point",    # 无选择器坐标点击：直接用像素坐标操控鼠标，跳过 SoM ID 定位
+        "click_new_tab",  # 中键点击：强制在新标签页打开链接，避免 click+switch_tab 循环
         "smooth_scroll",  # 平滑滚动：behavior:'smooth' 模拟人类滚轮，更易触发懒加载
         "remove_element", # 物理铲除：从 DOM 树直接删除广告遮罩/悬浮弹窗等阻挡节点
         "wait",           # 显式等待：主动暂停 N 秒，应对长动画/慢加载中间态
+        "drag_and_drop",  # 拖拽：将 target_id 元素拖到 type_value 指定 ID 的元素上
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(default=0, description="目标元素的 SoM ID")
     type_value: str = Field(default="", description="输入框内容（支持 {{key}} 插值）或按键名称")
@@ -82,7 +119,15 @@ class VSpiderAction(BaseModel):
             "如果是 save_to_memory，必须填写一个英文变量名（如 'icp_number'、'local_ip'）。"
         ),
     )
-    extracted_data: Any = Field(default=None, description="提取的结构化数据")
+    extracted_data: Optional[Union[Dict[str, Any], List[Any], str]] = Field(
+        default=None,
+        description=(
+            "⚠️ 极度重要：当 action 为 'extract' 时，此字段【绝对不能为 null】！"
+            "你必须仔细观察截图和 AX Tree，将目标数据整理为结构化 JSON 填入此字段。"
+            "示例：{\"title\": \"黑神话悟空\", \"views\": \"3500万\"} 或列表 [{...}, {...}]。"
+            "如果你输出 null，系统会直接拒绝并浪费一步！请参考 Few-Shot 范例 E。"
+        ),
+    )
     # 无选择器坐标定位专用字段：[x, y] 千分制归一化坐标（0-1000），仅 click_point 动作使用
     # 后端会自动将归一化坐标换算为当前视口的真实像素坐标再点击
     point: Optional[List[int]] = Field(default=None, description="千分制归一化坐标 [x, y]（0-1000），仅 click_point 动作使用")
@@ -108,6 +153,44 @@ class VSpiderAction(BaseModel):
         return str(v).strip() if v is not None else ""
 
     @model_validator(mode="after")
+    def _enforce_progress_action_consistency(self) -> "VSpiderAction":
+        """
+        强制一致性：thought / progress_review 宣告任务完成时，action 必须 = done。
+
+        修复 VLM "思想-动作分离" 幻觉：
+          progress_review / thought 写"✅ 任务已完成"，但 action 仍输出 click/extract。
+        触发规则：
+          - 弱触发：progress_review + thought 双字段宽匹配（任意意向词命中）
+          - 强触发：thought 单字段强匹配（行动后置完成词，补 progress_review 缺失盲点）
+        """
+        if self.action == "done":
+            return self
+        _done_markers_wide = (
+            "✅ 任务已完成", "任务已完成", "进入 done",
+            "任务完成，输出 done", "直接输出 done", "应输出 done",
+        )
+        # 强词表锁定"数据提取类任务的终态"，避免误杀子任务完成场景
+        _done_markers_strong = (
+            "已按要求提取", "已完成提取", "已提取所有", "已全部提取",
+            "已提取 3 条", "已提取 5 条", "已提取 10 条",
+        )
+        _pr_done = any(m in (self.progress_review or "") for m in _done_markers_wide)
+        _thought_done_wide = any(m in (self.thought or "") for m in _done_markers_wide)
+        _thought_done_strong = any(m in (self.thought or "") for m in _done_markers_strong)
+        _trigger = (_pr_done and _thought_done_wide) or _thought_done_strong
+        if _trigger:
+            import logging as _logging
+            _why = "thought 强完成词" if _thought_done_strong else "progress_review+thought 双宣告"
+            _logging.getLogger(__name__).warning(
+                f"[ACTION FIX] {_why}任务完成但 action={self.action}，"
+                f"强制纠偏为 done。thought={self.thought[:80]!r}"
+            )
+            self.action = "done"  # type: ignore[assignment]
+            self.target_id = 0
+            self.type_value = ""
+        return self
+
+    @model_validator(mode="after")
     def _require_memory_key_for_save(self) -> "VSpiderAction":
         """
         强制校验：执行 save_to_memory 时 memory_key 必须非空。
@@ -126,25 +209,66 @@ class VSpiderAction(BaseModel):
     def _validate_action_consistency(self) -> "VSpiderAction":
         """
         校验动作与参数的一致性，拦截 VLM 的"手脑不一致"幻觉：
-          - click + 非空 type_value → VLM 实际上想 type，但选错了 action
+          - click + 非空 type_value（URL 形式）→ 自动纠偏为 goto
+          - click + 非空 type_value（非 URL）→ VLM 实际上想 type，但选错了 action
           - type + 空 type_value   → VLM 忘记填写要输入的文字
         """
         if self.action == "click" and self.type_value and self.type_value.strip():
-            raise ValueError(
-                f"动作冲突！你选择了 'click'，但却在 type_value 中填入了 '{self.type_value}'。"
-                f"如果你想在输入框中打字，请务必将 action 改为 'type'！"
-                f"如果你真的只是想点击，请将 type_value 留空 \"\"。"
-            )
+            _tv = self.type_value.strip()
+            # ── 自动纠偏：click + URL → goto ────────────────────────────
+            # VLM 常见幻觉：想导航到某个 URL，但错用了 click 动作并将 URL 填入 type_value
+            if _tv.startswith(("http://", "https://", "www.")):
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[ACTION FIX] click + URL 自动纠偏为 goto: {_tv[:80]}"
+                )
+                self.action = "goto"       # type: ignore[assignment]
+                self.target_id = 0
+            # ── 自动纠偏：click + 按键名 → press_key ────────────────────
+            # VLM 常见幻觉：想按回车提交搜索，但错用了 click 动作
+            elif _tv in (
+                "Enter", "Escape", "Tab", "Backspace", "Delete", "Space",
+                "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+                "PageUp", "PageDown", "Home", "End",
+            ):
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[ACTION FIX] click + type_value='{_tv}' 自动纠偏为 press_key"
+                )
+                self.action = "press_key"  # type: ignore[assignment]
+                self.target_id = 0
+            # ── 自动纠偏：click + 普通文本 → type ───────────────────────
+            # VLM 常见幻觉：想在输入框打字，但错用了 click 动作
+            else:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[ACTION FIX] click + type_value='{_tv[:40]}' 自动纠偏为 type"
+                )
+                self.action = "type"       # type: ignore[assignment]
         if self.action == "type" and not (self.type_value and self.type_value.strip()):
             raise ValueError(
                 "动作缺陷！你选择了 'type' 动作，但 type_value 是空的。"
                 "请在 type_value 中填入你想输入的文字。"
             )
-        if self.action in ("click", "type") and self.target_id == 0:
-            raise ValueError(
-                f"🚨 严重错误！执行 '{self.action}' 动作必须指定页面上真实的红框序号作为 target_id，"
-                f"绝对不能为 0！请仔细观察截图，找到你要操作的元素对应的数字序号。"
+        if self.action in ("click", "click_new_tab", "type") and self.target_id == 0:
+            # ── 自动纠偏：click/type + target_id=0 → wait(2s) ────────────
+            # 避免硬 raise 引发连续 N 步 action=error 死循环（同 validator 内
+            # 其他分支一致采用 auto-correct，这里也统一到降级模式）。
+            import logging as _logging
+            _prev_action = self.action
+            _logging.getLogger(__name__).warning(
+                f"[ACTION FIX] {_prev_action} + target_id=0 自动纠偏为 wait(2s)，"
+                f"等 VLM 下一轮重新选有效红框"
             )
+            self.action = "wait"  # type: ignore[assignment]
+            self.target_id = 0
+            self.type_value = "2"
+            self.thought = (
+                f"[ZERO_TARGET_DOWNGRADE] 上一步你想执行 {_prev_action} 但 target_id=0，"
+                f"这会使校验失败并卡死循环。系统已代为 wait 2 秒。下一步请仔细看截图里可见的"
+                f"红框数字，挑一个**非 0 的编号**；若屏幕没有合适元素，改用 smooth_scroll 或 press_key。"
+            ) + (self.thought or "")
+            return self
         if self.action == "press_key" and not (self.type_value and self.type_value.strip()):
             raise ValueError(
                 "动作缺陷！你选择了 'press_key' 动作，但未提供按键名称。"
@@ -167,12 +291,17 @@ class VSpiderAction(BaseModel):
                 "请仔细观察截图中目标元素的相对位置，换算为 0-1000 范围后重新提交。"
             )
         if self.action == "extract" and self.extracted_data is None:
-            raise ValueError(
-                "动作缺陷！你选择了 'extract' 动作，但 extracted_data 是 null。\n"
-                "extract 动作的核心职责就是从页面截图中读取数据并输出到 extracted_data 字段。\n"
-                "请仔细观察截图，将你看到的目标数据整理为结构化 JSON 填入 extracted_data。\n"
-                "例如：extracted_data: {\"rank\": 1, \"title\": \"AI技术突破\", \"hot\": \"523万\"}"
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[ACTION FIX] extract + extracted_data=null → 自动降级为 wait(2s) + "
+                "自愈提示，下一步 VLM 将重新观察截图提取数据"
             )
+            # 降级为 wait 2 秒：让主循环重新截图后 VLM 再次尝试提取
+            self.action = "wait"           # type: ignore[assignment]
+            self.type_value = "2"
+            self.target_id = 0
+            # 在 thought 中加入显式标记，供 _validate_batch / main.py 精确识别
+            self.thought = "[EXTRACT_NULL_DOWNGRADE] " + (self.thought or "")
         return self
 
     def to_dict(self) -> dict:
@@ -232,10 +361,18 @@ class VLMClient:
     _RETRY_DELAY = 2.0
 
     def __init__(self):
+        import httpx
+
+        # 使用自定义 httpx 客户端，禁止 GC 时自动 aclose()
+        # 避免 event loop 关闭后 "Event loop is closed" 噪音日志
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(VLM_TIMEOUT),
+        )
         self.client = AsyncOpenAI(
             api_key=VLM_API_KEY,
             base_url=VLM_API_BASE,
             timeout=VLM_TIMEOUT,
+            http_client=_http_client,
         )
         self.model = VLM_MODEL_NAME
         # 操作历史：存储每轮批次中各动作的 (step, thought, action, target_id, type_value) 摘要
@@ -247,26 +384,31 @@ class VLMClient:
         logger.info(f"VLM 客户端初始化完成 | 模型: {self.model} | 端点: {VLM_API_BASE}")
 
     def _build_history_summary(self) -> str:
-        """构建最近 N 轮操作的历史摘要文本。"""
+        """构建最近 N 轮操作的历史摘要文本（含执行结果）。"""
         if not self._history:
             return ""
 
-        lines = ["## 最近操作历史（避免重复）"]
+        lines = ["## 最近操作历史（含执行结果，避免重复）"]
         for h in self._history[-self._HISTORY_WINDOW:]:
+            _result = h.get("result")
+            _result_tag = f" → {_result}" if _result else " → (执行中)"
             lines.append(
                 f"- 第{h['step']}步: action={h['action']}, "
-                f"target_id={h['target_id']}, "
-                f"type_value={h.get('type_value', '')!r} "
+                f"target_id={h['target_id']}(已失效), "
+                f"type_value={h.get('type_value', '')!r}{_result_tag} "
                 f"| {h.get('thought', '')[:80]}"
             )
         lines.append(
-            "\n**重要**: 如果上面的历史显示你连续多轮执行了相同的操作但页面没有变化，"
-            "请务必换一个不同的策略！不要重复同样的操作。\n"
+            "\n**⚠️ 严重警告**: "
+            "1. 历史中的 target_id 已全部失效！红框序号每一步都会重新分配，"
+            "绝对不能复用历史中的旧 ID。你必须根据**本步截图**中的红框数字重新选择目标。"
+            "\n2. **务必先读每一行末尾的 `→ 结果` 字段**：若上一次点击已成功触发新标签/跳转/完成输入，"
+            "切勿重复同一操作；结合用户目标判断任务是否已完成，若已达成直接输出 action=done。\n"
         )
         return "\n".join(lines)
 
     def _record_history(self, step: int, decisions: list[dict]) -> None:
-        """记录本轮批次所有决策到历史。"""
+        """记录本轮批次所有决策到历史（result 字段由 annotate_last_result 回填）。"""
         for decision in decisions:
             self._history.append({
                 "step": step,
@@ -274,10 +416,25 @@ class VLMClient:
                 "action": decision.get("action", ""),
                 "target_id": decision.get("target_id", 0),
                 "type_value": decision.get("type_value", ""),
+                "result": None,
             })
         # 只保留窗口大小的历史
         if len(self._history) > self._HISTORY_WINDOW * 2:
             self._history = self._history[-self._HISTORY_WINDOW:]
+
+    def annotate_last_result(self, note: str) -> None:
+        """
+        为最早一条尚未回填结果的历史记录写入执行结果摘要。
+
+        Args:
+            note: 简短结果描述，例如 "✅ url=https://... | 标签 1→2 | 触发TabGuard" 或 "❌ 失败: click #21 超时"
+        """
+        if not note:
+            return
+        for h in self._history:
+            if h.get("result") is None:
+                h["result"] = note[:160]
+                return
 
     def inject_error_feedback(self, error_msg: str) -> None:
         """
@@ -306,7 +463,7 @@ class VLMClient:
         向 VLM/LLM 发送当前状态，请求下一批次动作（连招模式）。
 
         图文双模态融合 (Hybrid Modality)：
-          - 默认每次都携带 SoM 截图 + 精简 DOM 树，VLM 用图文两路信息综合决策。
+          - 默认每次都携带 SoM 截图 + 无障碍语义树 (AX Tree)，VLM 用图文两路信息综合决策。
           - 仅当 screenshot_b64 为空 / None（截图模块失败等极端情况）时，才优雅降级
             为纯文本 payload，保证任务不中断。
 
@@ -314,7 +471,7 @@ class VLMClient:
             screenshot_b64: 网页截图的 Base64 编码字符串；空值触发纯文本降级
             goal: 用户的任务目标描述
             step: 当前步骤编号（从 1 开始）
-            input_descriptions: 融合后的辅助文本（输入框描述 + 精简 DOM 树 + 标签页/页面摘要）
+            input_descriptions: 融合后的辅助文本（输入框描述 + AX Tree + 标签页/页面摘要）
             workflow_memory: 当前跨页面记忆库，非空时注入提示
 
         Returns:
@@ -336,15 +493,15 @@ class VLMClient:
                 "执行 extract 时，必须读取**红框内部或红框旁边的真实文字/数字**，"
                 "绝对不能把红框上的序号当作数据（如热度、排名、价格等）写入 extracted_data。\n",
                 "## 当前模式：纯文本应急降级（截图失败，仅此一轮）\n"
-                "本轮截图采集失败，只能依赖上方【精简 DOM 树】中的 [ID: N] 序号来识别并操作页面元素。\n"
-                "输出的 target_id 必须来自 DOM 列表的 [ID: N]；这些 ID 仅本轮有效，禁止复用。\n"
-                "如果看到 [TEXT] 开头的行，仅能用于 extract/save_to_memory(target_id=0)，不能点击。\n",
+                "本轮截图采集失败，只能依赖上方【AX Tree 交互元素 (SoM ID 映射)】中的 [ID: N] 序号来识别并操作页面元素。\n"
+                "输出的 target_id 必须来自 ID 映射段的 [ID: N]；这些 ID 仅本轮有效，禁止复用。\n"
+                "页面语义快照段不含 ID，只能用作理解上下文，不可用作点击目标。\n",
             )
             user_text = user_text.replace(
                 "请仔细观察上方的网页截图（已标注红框和数字序号），"
                 "分析当前页面状态，决定下一步操作。\n"
                 "只输出 JSON，不要输出其他内容。",
-                "本轮仅有精简 DOM 树（截图缺失），请综合 placeholder、文本、类型判断页面状态并决定下一步动作。"
+                "本轮仅有 AX Tree（截图缺失），请综合元素的 Role / Name / Value / State 判断页面状态并决定下一步动作。"
                 "如果你发现页面已达到用户目标状态，请直接输出 done。只输出 JSON，不要输出其他内容。",
             )
             logger.warning(f"[步骤 {step}] 截图缺失，本轮降级为纯文本 payload")
@@ -367,7 +524,7 @@ class VLMClient:
             _broadcast_log_safe(f"[SELF-HEAL] Injected error context into step {step} prompt", level="warn")
             self._pending_error = None  # 消费后清空，避免下轮重复注入
 
-        # ── 尾部 JSON 强约束：DOM 树很长时注意力容易被带偏，在最末尾再钉一遍 ───
+        # ── 尾部 JSON 强约束：AX Tree 较长时注意力容易被带偏，在最末尾再钉一遍 ───
         user_text = (
             user_text
             + "\n\n🚨【系统强制指令】：请务必结合上述图文信息进行决策，"
@@ -379,7 +536,7 @@ class VLMClient:
         # 兼容 OpenAI / 通义千问 Qwen-VL 的 multimodal messages 协议：
         #   content = [{"type": "image_url", ...}, {"type": "text", ...}]
         if screenshot_b64:
-            # SoM 截图与精简 DOM 树已经在 input_descriptions 中融合到 user_text 里，
+            # SoM 截图与 AX Tree 已经在 input_descriptions 中融合到 user_text 里，
             # 下方 image_url 提供视觉通道，VLM 会结合两路信息做综合决策。
             #
             # 安全校验：识别 "data:image" 前缀（覆盖 jpeg/png/webp 等所有 image/* 子类型），
@@ -428,7 +585,7 @@ class VLMClient:
                         "type": "json_schema",
                         "json_schema": {
                             "name": "VSpiderActionBatch",
-                            "strict": True,
+                            "strict": False,
                             "schema": _VSPIDER_BATCH_SCHEMA,
                         },
                     }
@@ -436,6 +593,12 @@ class VLMClient:
                 try:
                     response = await self.client.chat.completions.create(**api_kwargs)
                 except BadRequestError as bre:
+                    bre_str = str(bre)
+                    # ── 区分"模型不支持 json_schema"与"内容审核拦截" ──────────
+                    # data_inspection_failed 是 DashScope 安全审核拒绝截图，
+                    # 不应该误触发 json_schema 降级，必须抛到外层走纯文本降级链路。
+                    if "data_inspection_failed" in bre_str:
+                        raise  # 抛到外层 except Exception 走纯文本降级
                     if self._use_structured:
                         # 模型不支持 json_schema → 永久降级并立即重试
                         self._use_structured = False
@@ -458,6 +621,10 @@ class VLMClient:
                 decisions = self._validate_batch(raw_dict, step)
 
                 # 打印思考过程（取批次第一个动作的 thought）
+                first_pr = decisions[0].get("progress_review", "") if decisions else ""
+                if first_pr:
+                    logger.info(f"[步骤 {step}] VLM 进度复盘: {first_pr}")
+                    _broadcast_log_safe(f"[步骤 {step}] VLM 进度复盘: {first_pr}")
                 first_thought = decisions[0].get("thought", "") if decisions else ""
                 if first_thought:
                     logger.info(f"[步骤 {step}] VLM 思考: {first_thought}")
@@ -486,6 +653,69 @@ class VLMClient:
 
             except Exception as e:
                 last_error = e
+                err_str = str(e)
+
+                # ── 内容审核拒绝：截图被 DashScope 安全过滤器拦截 ────────────
+                # 典型场景：新闻页面含敏感图片/标题，重试发同一张图毫无意义。
+                # 策略：去掉图片，降级为纯文本模式再发一次请求。
+                if "data_inspection_failed" in err_str:
+                    logger.warning(
+                        f"[步骤 {step}] 截图被 DashScope 内容审核拦截，"
+                        f"降级为纯文本模式重试..."
+                    )
+                    _broadcast_log_safe(
+                        f"[步骤 {step}] 截图被内容审核拦截，降级为纯文本模式...",
+                        level="warn",
+                    )
+                    # 将 messages 中的图片剥离，只保留文本
+                    _text_only_content = user_text
+                    _text_only_messages = [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": _text_only_content},
+                    ]
+                    _text_api_kwargs: dict = {
+                        "model": self.model,
+                        "messages": _text_only_messages,
+                        "max_tokens": VLM_MAX_TOKENS,
+                        "temperature": VLM_TEMPERATURE,
+                    }
+                    try:
+                        response = await self.client.chat.completions.create(
+                            **_text_api_kwargs
+                        )
+                        raw_content = response.choices[0].message.content
+                        logger.debug(
+                            f"[步骤 {step}] VLM 纯文本降级返回:\n{raw_content}"
+                        )
+                        raw_dict = self._parse_json(raw_content)
+                        decisions = self._validate_batch(raw_dict, step)
+                        first_thought = (
+                            decisions[0].get("thought", "") if decisions else ""
+                        )
+                        if first_thought:
+                            logger.info(
+                                f"[步骤 {step}] VLM 思考(纯文本): {first_thought}"
+                            )
+                            _broadcast_log_safe(
+                                f"[步骤 {step}] VLM 思考(纯文本): {first_thought}"
+                            )
+                        for i, d in enumerate(decisions):
+                            logger.info(
+                                f"[步骤 {step}] VLM 决策(纯文本)[{i + 1}/{len(decisions)}]: "
+                                f"action={d.get('action')} "
+                                f"target_id={d.get('target_id')} "
+                                f"type_value={d.get('type_value', '')!r}"
+                            )
+                        self._record_history(step, decisions)
+                        return decisions
+                    except Exception as _fallback_err:
+                        logger.error(
+                            f"[步骤 {step}] 纯文本降级也失败: {_fallback_err}"
+                        )
+                        last_error = _fallback_err
+                    # 不再继续重试，直接跳出循环
+                    break
+
                 logger.warning(
                     f"[步骤 {step}] VLM 请求异常 (尝试 {attempt}/"
                     f"{self._MAX_RETRIES + 1}): {type(e).__name__}: {e}"
@@ -499,6 +729,141 @@ class VLMClient:
         logger.error(f"[步骤 {step}] VLM 请求最终失败: {last_error}")
         _broadcast_log_safe(f"[步骤 {step}] VLM 请求最终失败: {last_error}", level="error")
         return list(_ERROR_DECISION_LIST)
+
+    # ════════════════════════════════════════════════════════════════
+    #  全页结构化数据提取（DOM 全文 + 纯文本 VLM 结构化调用）
+    # ════════════════════════════════════════════════════════════════
+
+    async def extract_structured_data(
+        self,
+        page_text: str,
+        goal: str,
+        example_data: Any = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        从页面 DOM 全文中提取结构化数据（纯文本 LLM 调用，无需截图）。
+
+        借鉴 browser-use 的 extract_clean_markdown 架构：
+        VLM 只负责发出 extract 意图，数据由系统从 DOM 获取全页文本后，
+        用一次纯文本 LLM 调用完成结构化，突破视口截图只能看到 ~10 条的限制。
+
+        Args:
+            page_text: document.body.innerText 获取的完整页面文本
+            goal: 用户的任务目标描述
+            example_data: VLM 之前提取的数据样本（用于推断字段名和格式）
+
+        Returns:
+            结构化数据列表（list[dict]），失败时返回 None
+        """
+        page_text = (page_text or "").strip()
+        if not page_text:
+            logger.warning("[EXTRACT FULL] 页面文本为空，跳过结构化提取")
+            return None
+
+        # 截断防止 token 溢出（纯文本 token 效率高，给 16K 字符）
+        page_text = page_text[:16000]
+
+        # ── 解析用户目标里的数量需求（如"前 3 条"），指导后端 LLM 一次返回够数 ──
+        _count_match = re.search(
+            r"(?:前|取|抓|提取|爬)\s*(\d+)\s*(?:条|个|项|篇|则)", goal or ""
+        )
+        _hint_count = int(_count_match.group(1)) if _count_match else None
+        count_hint = (
+            f"\n\n⚠️ 用户明确要求提取【{_hint_count} 条】数据。"
+            f"请在页面中按原始出现顺序找出前 {_hint_count} 条符合条件的条目，"
+            f"**一次性全部**放入返回的 JSON 数组，不要只返回 1 条或少于 {_hint_count} 条。"
+            if _hint_count else ""
+        )
+
+        # ── 根据 VLM 已提取的样本推断字段格式 ──
+        format_hint = ""
+        if example_data:
+            try:
+                if isinstance(example_data, list) and len(example_data) > 0:
+                    sample = example_data[0] if isinstance(example_data[0], dict) else {"value": example_data[0]}
+                    format_hint = f"\n期望的数据字段和格式示例（请严格遵循）：\n{json.dumps(sample, ensure_ascii=False, indent=2)}"
+                elif isinstance(example_data, dict):
+                    format_hint = f"\n期望的数据字段和格式示例（请严格遵循）：\n{json.dumps(example_data, ensure_ascii=False, indent=2)}"
+            except Exception:
+                pass
+
+        system_prompt = (
+            "你是一个专业的网页数据提取助手。\n"
+            "规则：\n"
+            "1. 只输出 JSON 数组 [...]，不要输出任何解释文字、markdown 代码块或其他格式\n"
+            "2. 提取页面中**所有**符合用户需求的数据项，一条都不要遗漏\n"
+            "3. 每个数据项是一个字典，字段名称应清晰且与用户需求匹配\n"
+            "4. 如果有格式示例，严格遵循示例的字段名和结构\n"
+            "5. 如果页面中没有匹配的数据，输出空数组 []\n"
+            "6. 数值字段保持原始格式（如 '3500万' 而非 35000000）\n"
+            + count_hint
+        )
+
+        user_prompt = (
+            f"用户任务：{goal}\n"
+            f"{format_hint}{count_hint}\n\n"
+            f"以下是网页的完整文本内容（通过 DOM 提取，包含页面上所有数据，"
+            f"不受视口限制），请从中提取**全部**符合用户任务要求的数据项：\n\n"
+            f"---页面文本开始---\n{page_text}\n---页面文本结束---\n\n"
+            f"请输出 JSON 数组，包含页面中所有匹配项。只输出 JSON，不要输出其他内容。"
+        )
+
+        try:
+            logger.info(
+                f"[EXTRACT FULL] 开始全页结构化提取，"
+                f"页面文本长度={len(page_text)}，目标={goal[:60]}"
+            )
+            _broadcast_log_safe(
+                "[EXTRACT FULL] 启动全页 AX Tree 结构化提取（纯文本 LLM 调用）..."
+            )
+
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=VLM_MAX_TOKENS,
+                temperature=0.1,  # 低温度确保数据提取准确
+            )
+
+            raw = (response.choices[0].message.content or "").strip()
+
+            # 清理 markdown code fence
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                raw = re.sub(r"\n?\s*```$", "", raw)
+
+            data = json.loads(raw)
+
+            if isinstance(data, list):
+                logger.info(
+                    f"[EXTRACT FULL] 全页结构化提取成功，共 {len(data)} 条数据"
+                )
+                _broadcast_log_safe(
+                    f"[EXTRACT FULL] 全页提取完成：{len(data)} 条数据"
+                )
+                print(
+                    f"\033[1;36m🔍 [EXTRACT FULL]\033[0m "
+                    f"AX Tree 全页提取 \033[36m{len(data)}\033[0m 条数据"
+                    f"（VLM 视口内仅 ~10 条）"
+                )
+                return data
+            elif isinstance(data, dict):
+                logger.info("[EXTRACT FULL] 返回单个字典，包装为列表")
+                return [data]
+            else:
+                logger.warning(f"[EXTRACT FULL] 意外的返回类型: {type(data)}")
+                return None
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"[EXTRACT FULL] JSON 解析失败: {e}")
+            return None
+        except Exception as e:
+            logger.warning(
+                f"[EXTRACT FULL] 结构化提取失败，将降级使用 VLM 原始数据: {e}"
+            )
+            return None
 
     def _validate_batch(self, raw: dict, step: int) -> list[dict]:
         """
@@ -519,7 +884,28 @@ class VLMClient:
             # 新格式：批次校验
             try:
                 batch = VSpiderActionBatch.model_validate(raw)
-                return [a.to_dict() for a in batch.actions]
+                decisions = [a.to_dict() for a in batch.actions]
+                # ── 检查 extract→wait / zero-target→wait 降级，注入自愈提示 ──
+                _EXTRACT_MARKER = "[EXTRACT_NULL_DOWNGRADE]"
+                _ZERO_MARKER = "[ZERO_TARGET_DOWNGRADE]"
+                for idx, a in enumerate(batch.actions):
+                    thought = a.thought or ""
+                    if thought.startswith(_EXTRACT_MARKER):
+                        decisions[idx]["__extract_downgraded"] = True
+                        self.inject_error_feedback(
+                            "⚠️ 你上一步想执行 extract 动作，但 extracted_data 是 null，"
+                            "已被系统自动降级为 wait。\n"
+                            "【本步要求】请重新执行 extract 动作，这次必须仔细观察截图，"
+                            "将目标数据整理为结构化 JSON 写入 extracted_data 字段。\n"
+                            "例如：extracted_data: {\"rank\": 1, \"title\": \"...\", \"views\": \"...\"}\n"
+                            "extracted_data 绝对不能是 null！"
+                        )
+                        break
+                    if _ZERO_MARKER in thought:
+                        decisions[idx]["__zero_target_downgraded"] = True
+                        self.inject_error_feedback(thought)
+                        break
+                return decisions
             except ValidationError as ve:
                 logger.warning(
                     f"[步骤 {step}] Pydantic 批次校验失败，降级为 error 决策: {ve}"

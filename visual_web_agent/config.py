@@ -22,11 +22,11 @@ VLM_API_BASE = os.getenv("VLM_API_BASE", "http://localhost:8000/v1")
 VLM_API_KEY = os.getenv("VLM_API_KEY", "EMPTY")
 VLM_MODEL_NAME = os.getenv("VLM_MODEL_NAME", "qwen-vl-max")
 VLM_TIMEOUT = int(os.getenv("VLM_TIMEOUT", "120"))
-VLM_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "1024"))
+VLM_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "4096"))
 VLM_TEMPERATURE = float(os.getenv("VLM_TEMPERATURE", "0.1"))
 
 # ========== Agent 运行配置 ==========
-MAX_STEPS = int(os.getenv("MAX_STEPS", "15"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
 SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "./screenshots")
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 VIEWPORT_WIDTH = int(os.getenv("VIEWPORT_WIDTH", "1280"))
@@ -47,4 +47,4 @@ PAGE_STABLE_TIMEOUT = int(os.getenv("PAGE_STABLE_TIMEOUT", "15000"))
 PAGE_FALLBACK_WAIT = float(os.getenv("PAGE_FALLBACK_WAIT", "3.0"))
 
 # ========== SoM 脚本路径 ==========
-SOM_SCRIPT_PATH = Path(__file__).parent / "som_inject_v5.js"
+SOM_SCRIPT_PATH = Path(__file__).parent / "som_inject_v6.js"
