@@ -235,6 +235,23 @@ class VSpiderAction(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _require_done_thought(self) -> "VSpiderAction":
+        """
+        action=done 必须带非空 thought，说明裁定依据（任务完成 / blocked / abort）。
+
+        修复 Task C 式的静默 done：VLM 在登录墙前 1 步 done、thought 为空，
+        用户看日志完全不知道为什么结束。强制 VLM 把理由写出来。
+        """
+        if self.action == "done" and not (self.thought or "").strip():
+            raise ValueError(
+                "action=done 必须在 thought 中说明裁定依据："
+                "是所有子目标已完成？还是遇到登录墙/风控/验证码无法继续？"
+                "或是 Reflector 判定不可完成？"
+                "空 thought 的 done 被拒绝，用户看不到任务为何结束。"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _enforce_progress_action_consistency(self) -> "VSpiderAction":
         """
         强制一致性：thought / progress_review 宣告任务完成时，action 必须 = done。

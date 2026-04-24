@@ -1739,6 +1739,33 @@ async def run_agent(
         _last_actions: list[tuple[str, int, str]] = []
         _LOOP_GUARD_WINDOW = 6
         _loop_guard_blocked_ids: set[int] = set()  # 触发过 LOOP GUARD 的 target_id，后续直接拦截
+        _loop_guard_blocked_points: set[tuple] = set()  # click_point 黑名单（bucket 后的坐标）
+
+        def _norm_url_for_guard(url: str) -> str:
+            """LOOP GUARD key 稳定化：只保留 scheme+host+path，抛弃 query/fragment。
+            修复 Bug B：JD 异常页等站每次刷新注入 timestamp nonce，
+            否则同元素同页 3 次点击会被拆成 3 个不同 key，计数器永远不累积。"""
+            if not url:
+                return ""
+            try:
+                p = urlparse(url)
+                return f"{p.scheme}://{p.netloc}{p.path}"
+            except Exception:
+                return url[:120]
+
+        def _bucket_point(point) -> tuple:
+            """click_point 坐标聚类：千分制 100 宽度桶，容忍 VLM 坐标漂移。
+            VLM 常把"刷新"估算为 [500, 750]，下次估 [505, 745] / [512, 757]
+            都应视为同一坐标区域 → 全部 map 到 (5, 7)。"""
+            if not point or not isinstance(point, (list, tuple)) or len(point) < 2:
+                return ()
+            try:
+                return (int(point[0]) // 100, int(point[1]) // 100)
+            except (TypeError, ValueError):
+                return ()
+
+        # LOOP GUARD 覆盖的动作集（Bug #1 修复）
+        _LOOP_GUARD_ACTIONS = ("click", "click_new_tab", "click_point")
         _extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
         _total_extracted_rows = 0  # 跨页累加的总行数
         _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
@@ -2381,7 +2408,30 @@ async def run_agent(
                     action = decision.get("action", "")
 
                     if status == "error" or action == "error":
-                        logger.warning("[WARN] VLM returned error status, retrying...")
+                        # Bug #2 修复：VLM API 失败也计入连续错误计数（避免 _ERROR_DECISION
+                        # 不走 ActionExecutionError 分支，老路径永远不触发熔断）。
+                        _consecutive_errors += 1
+                        _api_err_msg = (
+                            decision.get("thought")
+                            or "VLM 请求失败或返回格式异常"
+                        )
+                        logger.warning(
+                            f"[WARN] VLM returned error status "
+                            f"({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}): {_api_err_msg}"
+                        )
+                        vlm.annotate_last_result(f"❌ VLM API 失败: {_api_err_msg[:60]}")
+                        if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                            _print_manual_warning(
+                                "VLM API KEEPS FAILING",
+                                f"VLM 后端连续 {_MAX_CONSECUTIVE_ERRORS} 次返回 error "
+                                f"(network / rate-limit / malformed JSON)。"
+                                f"检查 VLM_API_BASE / VLM_MODEL_NAME / 网络 / 配额，"
+                                f"修复后按回车继续。最后一条：{_api_err_msg[:120]}",
+                            )
+                            await asyncio.get_event_loop().run_in_executor(None, input)
+                            logger.info("[MANUAL] User confirmed after API failures, resuming...")
+                            _consecutive_errors = 0
+                            vlm.inject_error_feedback("")  # 清空积压反馈
                         break  # 中止本批次，进入下一步（重新截图）
 
                     if status == "captcha_detected" or action == "ask_human":
@@ -2822,22 +2872,36 @@ async def run_agent(
 
                     # ── LOOP GUARD 前置拦截：已进入黑名单的 target_id 直接阻断 ───
                     _click_target_id = decision.get("target_id", 0)
-                    if action in ("click", "click_new_tab") and _click_target_id in _loop_guard_blocked_ids:
+                    _click_point_bucket = _bucket_point(decision.get("point"))
+                    _id_blocked = (
+                        action in ("click", "click_new_tab")
+                        and _click_target_id != 0
+                        and _click_target_id in _loop_guard_blocked_ids
+                    )
+                    _point_blocked = (
+                        action == "click_point"
+                        and _click_point_bucket
+                        and _click_point_bucket in _loop_guard_blocked_points
+                    )
+                    if _id_blocked or _point_blocked:
+                        _trap_desc = (
+                            f"元素 #{_click_target_id}" if _id_blocked
+                            else f"坐标区域 ~{_click_point_bucket}"
+                        )
                         logger.warning(
-                            f"[LOOP GUARD] 前置拦截：target_id={_click_target_id} 已在黑名单，跳过执行"
+                            f"[LOOP GUARD] 前置拦截：{_trap_desc} 已在黑名单，跳过执行"
                         )
                         _block_msg = (
-                            f"🚫 系统强制拦截：元素 #{_click_target_id} 已被 LOOP GUARD 封禁！\n"
-                            f"该元素此前已被检测为死循环陷阱，本次点击已被直接取消（未执行）。\n"
-                            f"【强制指令】立刻停止对 #{_click_target_id} 的一切操作！\n"
-                            f"请仔细观察最新截图，选择一个**完全不同的元素**继续任务 ——\n"
-                            f"例如跳过广告，点击下方的第二个/第三个搜索结果；\n"
+                            f"🚫 系统强制拦截：{_trap_desc} 已被 LOOP GUARD 封禁！\n"
+                            f"该目标此前已被检测为死循环陷阱，本次{action}已被直接取消（未执行）。\n"
+                            f"【强制指令】立刻停止对 {_trap_desc} 的一切操作！\n"
+                            f"请仔细观察最新截图，选择一个**完全不同**的目标继续任务 ——\n"
+                            f"例如跳过广告，点击第二/第三个搜索结果；或换个坐标区域；\n"
                             f"或者如果任务实际已完成（结果页已打开、标签已切换），请直接 action=done。"
                         )
                         vlm.inject_error_feedback(_block_msg)
-                        # 方案②：前置拦截也标注历史，让 VLM 下一轮看到"本次未执行"
                         vlm.annotate_last_result(
-                            f"🚫 被LOOP GUARD前置拦截(#{_click_target_id}在黑名单), 未执行"
+                            f"🚫 被LOOP GUARD前置拦截({_trap_desc}在黑名单), 未执行"
                         )
                         break  # 不执行，直接进入下一步重新截图+决策
 
@@ -2866,11 +2930,25 @@ async def run_agent(
                         # 只有「同一 ID 被点击 ≥ 3 次 **且** 着陆 URL 完全相同」才判定死循环，
                         # 翻页（URL 递增）或 A/B 循环切换（URL 交替变化）不再误伤。
                         _landing_url = browser.current_url
-                        _cur_action_key = (action, decision.get("target_id", 0), _landing_url)
+                        _landing_key_url = _norm_url_for_guard(_landing_url)
+                        _point_bucket = _bucket_point(decision.get("point"))
+                        # Bug #1+#3 修复 v2：click_point 的 key 去掉 URL。
+                        # 原因：JD/淘宝等风控页每次打空 click_point 会跳到不同 error path，
+                        # 带 URL 的 key 永不相等；而 click_point 作为"无 SoM id 的应急坐标点击"
+                        # 跨页合法用例不存在（翻页都用 click+target_id），coord 重复即幻觉。
+                        _key_url = (
+                            "" if action == "click_point" else _landing_key_url
+                        )
+                        _cur_action_key = (
+                            action, decision.get("target_id", 0),
+                            _point_bucket, _key_url,
+                        )
+                        _guard_eligible = action in _LOOP_GUARD_ACTIONS and (
+                            _cur_action_key[1] != 0 or bool(_point_bucket)
+                        )
                         _click_repeat_count = (
-                            _last_actions.count(_cur_action_key) + 1  # 本次也计入
-                            if action in ("click", "click_new_tab") and _cur_action_key[1] != 0
-                            else 0
+                            _last_actions.count(_cur_action_key) + 1
+                            if _guard_eligible else 0
                         )
                         _last_actions.append(_cur_action_key)
                         if len(_last_actions) > _LOOP_GUARD_WINDOW:
@@ -2894,37 +2972,48 @@ async def run_agent(
                         vlm.annotate_last_result("✅ " + " | ".join(_outcome_parts))
 
                         if _click_repeat_count >= 3:
+                            # 识别是 ID 循环还是坐标循环，构造差异化描述
+                            _is_point_loop = action == "click_point" and _point_bucket
+                            _trap_tag = (
+                                f"坐标区域 ~{_point_bucket}" if _is_point_loop
+                                else f"元素 #{_cur_action_key[1]}"
+                            )
                             logger.warning(
                                 f"[LOOP GUARD] 检测到动作死循环（URL-aware）！"
-                                f"target_id={_cur_action_key[1]} 在最近 {_LOOP_GUARD_WINDOW} 步内"
-                                f"被点击 {_click_repeat_count} 次且着陆 URL 相同 "
+                                f"{_trap_tag} 在最近 {_LOOP_GUARD_WINDOW} 步内"
+                                f"被 {action} {_click_repeat_count} 次且着陆 URL 相同 "
                                 f"({_landing_url[:80]}), 交由 VLM 自主反思。"
                             )
                             _page_summary = await browser.get_active_page_summary()
                             _loop_guard_msg = (
                                 f"🚨 严重警告：你陷入了操作死循环！\n"
                                 f"系统检测到你在最近 {_LOOP_GUARD_WINDOW} 步里已经"
-                                f"{_click_repeat_count} 次点击了同一个元素 #{_cur_action_key[1]}，"
-                                f"且每次点击后着陆的 URL 完全相同（{_landing_url[:120]}），"
+                                f"{_click_repeat_count} 次对 {_trap_tag} 执行了 {action}，"
+                                f"且每次之后着陆的 URL 完全相同（{_landing_url[:120]}），"
                                 f"说明页面没有任何有效进展。"
-                                f"这个元素大概率是无效的、被前端禁用的、或者是诱导点击的陷阱"
-                                f"（例如 SEM/广告链接，点开后又被 close_tab 撤销）。\n"
-                                f"【系统强制指令】：绝对禁止在下一步中再次尝试点击或操作该元素！"
-                                f"请立刻观察最新截图，寻找其他完全不同的路径 —— "
-                                f"例如改点击**第二个/第三个**搜索结果（跳过广告位），"
-                                f"或换一个关键词重新搜索。"
+                                f"这个目标大概率是无效的、被前端禁用的、或者是诱导点击的陷阱。\n"
+                                f"【系统强制指令】：绝对禁止在下一步中再次操作该目标！"
+                                f"请立刻观察最新截图，寻找完全不同的路径 —— "
+                                f"例如换点另一个红框 ID、或坐标位置偏移 >100 千分位。"
                                 f"如果当前页面已经明显达到用户目标状态"
-                                f"（如表单已提交、已跳转到结果页、已进入目标标签页、已完成下载/导出），"
-                                f"请直接输出 action=done 结束任务。"
+                                f"（如结果页已打开、标签已切换），请直接输出 action=done 结束任务。"
                             )
                             if _page_summary:
                                 _loop_guard_msg += f"\n【当前页面摘要】{_page_summary}"
                             vlm.inject_error_feedback(_loop_guard_msg)
-                            _loop_guard_blocked_ids.add(_cur_action_key[1])
-                            logger.info(
-                                f"[LOOP GUARD] target_id={_cur_action_key[1]} 已加入黑名单，"
-                                f"后续点击将被前置拦截。当前黑名单: {_loop_guard_blocked_ids}"
-                            )
+                            if _is_point_loop:
+                                _loop_guard_blocked_points.add(_point_bucket)
+                                logger.info(
+                                    f"[LOOP GUARD] 坐标区域 {_point_bucket} 已加入黑名单，"
+                                    f"后续 click_point 前置拦截。当前坐标黑名单: "
+                                    f"{_loop_guard_blocked_points}"
+                                )
+                            elif _cur_action_key[1] != 0:
+                                _loop_guard_blocked_ids.add(_cur_action_key[1])
+                                logger.info(
+                                    f"[LOOP GUARD] target_id={_cur_action_key[1]} 已加入黑名单，"
+                                    f"后续点击将被前置拦截。当前黑名单: {_loop_guard_blocked_ids}"
+                                )
                             break  # 中止本批次，进入下一步（重新截图，让 VLM 看着报错重新决策）
 
                         _login_intercepted = await _run_preflight_login(
@@ -2967,6 +3056,49 @@ async def run_agent(
                             f"[SELF-HEAL] Action failed ({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}): "
                             f"{err_msg}"
                         )
+                        # ── Bug A fix：失败也必须进 LOOP GUARD 历史 ───────────────
+                        # 否则 VLM 反复点同一不存在的元素，计数器永远为 0，永远不会触发封禁。
+                        # 失败路径没导航，用 _pre_url 构建 key（与成功分支同 schema）。
+                        _failed_key_url = _norm_url_for_guard(_pre_url)
+                        _failed_point_bucket = _bucket_point(decision.get("point"))
+                        # 同成功分支：click_point 的 key 去掉 URL
+                        _failed_key_url_final = (
+                            "" if action == "click_point" else _failed_key_url
+                        )
+                        _failed_action_key = (
+                            action, decision.get("target_id", 0),
+                            _failed_point_bucket, _failed_key_url_final,
+                        )
+                        _last_actions.append(_failed_action_key)
+                        if len(_last_actions) > _LOOP_GUARD_WINDOW:
+                            _last_actions.pop(0)
+                        # 失败也检查是否达到 LOOP GUARD 阈值（click/click_new_tab/click_point）
+                        _failed_eligible = action in _LOOP_GUARD_ACTIONS and (
+                            _failed_action_key[1] != 0 or bool(_failed_point_bucket)
+                        )
+                        if (
+                            _failed_eligible
+                            and _last_actions.count(_failed_action_key) >= 3
+                        ):
+                            _failed_is_point = (
+                                action == "click_point" and _failed_point_bucket
+                            )
+                            _failed_trap = (
+                                f"坐标区域 ~{_failed_point_bucket}" if _failed_is_point
+                                else f"元素 #{_failed_action_key[1]}"
+                            )
+                            if _failed_is_point:
+                                _loop_guard_blocked_points.add(_failed_point_bucket)
+                            else:
+                                _loop_guard_blocked_ids.add(_failed_action_key[1])
+                            logger.warning(
+                                f"[LOOP GUARD] {_failed_trap} 连续 3 次{action}失败，加入黑名单"
+                            )
+                            vlm.inject_error_feedback(
+                                f"🚫 {_failed_trap} 已连续 3 次 {action} 失败（{err_msg[:60]}），"
+                                f"加入 LOOP GUARD 黑名单。请立即换策略 —— "
+                                f"改点其它元素/坐标、或若任务实际已完成直接 action=done。"
+                            )
                         # 方案②：失败也回填历史，避免 VLM 误以为动作已经成功
                         vlm.annotate_last_result(f"❌ 失败: {err_msg[:80]}")
 
