@@ -169,10 +169,23 @@ def _parse_goal_target_count(goal: str) -> int | None:
     Returns:
         解析出的目标数量，未指定则返回 None。
     """
-    m = re.search(r'(?:前|共|取|抓)\s*(\d+)\s*(?:条|个|项|篇|则)', goal)
+    # 量词主集 + 扩展（覆盖 "部电影 / 的回答 / 家店铺" 这类语义量词）
+    _QUANT = r'条|个|项|篇|则|部|家|名|位|款|本|场|首'
+    m = re.search(rf'(?:前|共|取|抓)\s*(\d+)\s*(?:{_QUANT})', goal)
     if m:
         return int(m.group(1))
-    m = re.search(r'(\d+)\s*(?:条|个|项|篇|则)\s*(?:数据|内容|信息|记录|新闻|商品|评论)', goal)
+    m = re.search(
+        rf'(\d+)\s*(?:{_QUANT})\s*(?:数据|内容|信息|记录|新闻|商品|评论|电影|答案|回答|文章|视频|结果|店铺)',
+        goal,
+    )
+    if m:
+        return int(m.group(1))
+    # "排名前 N 的 / 前 N 的"：Top-N 语义，无显式量词但意图明确
+    m = re.search(r'(?:排名)?前\s*(\d+)\s*(?:的|名)', goal)
+    if m:
+        return int(m.group(1))
+    # "Top N" 英文语义
+    m = re.search(r'[Tt]op\s*(\d+)\b', goal)
     if m:
         return int(m.group(1))
     return None
@@ -2118,8 +2131,22 @@ async def run_agent(
                         1 for sg in _task_plan.sub_goals
                         if sg.status in ("done", "failed")
                     )
+                    # Fix B 放行：提取任务已达用户目标量 → 直接允许 done，跳过门闸
+                    # 修复"豆瓣 Top250 / 京东搜索 N 条"这类任务在步骤 1 extract 成功后
+                    # 被门闸强留反复重提取的 6-7 步冗余循环。
+                    _goal_target = _parse_goal_target_count(goal)
+                    _extraction_complete = (
+                        _goal_target is not None
+                        and _total_extracted_rows >= _goal_target
+                    )
                     # 允许 done 的条件：已完成子目标数 >= 总数 - 1（仅剩当前 = 最后一个）
-                    if _done_or_failed < _total - 1:
+                    # 或提取已达量（Fix B）
+                    if _extraction_complete:
+                        logger.info(
+                            f"[PLAN GATE] 放行 done：提取已达量 "
+                            f"{_total_extracted_rows}/{_goal_target} 条，跳过门闸"
+                        )
+                    if _done_or_failed < _total - 1 and not _extraction_complete:
                         logger.warning(
                             f"[PLAN GATE] VLM 过早 action=done（进度 "
                             f"{_done_or_failed}/{_total} 子目标完成），降级为 error"
