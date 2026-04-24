@@ -221,6 +221,14 @@ class BrowserEnv:
         self._last_action_error: Exception | None = None  # 自愈：记录本轮操作异常
         self._tab_switch_notice: str | None = None  # 标签页切换感知通知
         self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
+        # ── @eN 别名映射（Wave 3 语义快照）──
+        # key="@eN" → {som_id: int, role, name, selector}
+        # 每轮 extract_accessibility_tree() 时刷新；供 _coerce_target_id 反解。
+        self.element_mapping: dict[str, dict] = {}
+        # ── 语义 Locator 自愈频次计数（Wave 3 fallback 观测）──
+        # `[data-som-id=N]` 查不到元素时，尝试 get_by_role(role, name=, exact=True)
+        # 命中 1 个即用，否则放弃。计数非 0 说明 SPA 重渲真的在吃 data-som-id。
+        self._semantic_fallback_count: int = 0
         # ── RPA 肌肉记忆：记录本次任务每步成功动作的真实 XPath / 坐标 ──────
         self.rpa_trail: list[dict] = []
 
@@ -929,6 +937,33 @@ class BrowserEnv:
         if not page:
             return None
 
+        # ── Fix 3：拦截幻觉 target_id（如 9001、99999）──
+        # SoM 只会给当前可见交互元素分配编号，VLM 凭空编出来的数字直接报错，
+        # 避免浪费一轮 Playwright query + 模糊 "Element not found" 错误。
+        # target_id=0 是合法"无目标"值（press_key/wait/scroll 走这条路），豁免。
+        if target_id != 0 and self._last_som_elements:
+            _valid_ids = {
+                int(el["id"]) for el in self._last_som_elements
+                if el.get("id") is not None and str(el["id"]).isdigit()
+            }
+            if _valid_ids and target_id not in _valid_ids:
+                _sample = sorted(_valid_ids)
+                _hint = (
+                    f"{_sample[:10]}...(共 {len(_sample)} 个)"
+                    if len(_sample) > 10 else str(_sample)
+                )
+                self._last_action_error = ValueError(
+                    f"target_id={target_id} 不在本轮 SoM 标记中，疑似幻觉 ID。"
+                    f"有效 ID：{_hint}。"
+                    "请从截图红框或 @eN 快照中选一个真实存在的编号，"
+                    "若页面无合适目标改用 smooth_scroll / press_key / wait。"
+                )
+                logger.warning(
+                    f"[TARGET HALLUCINATION] target_id={target_id} 不在 "
+                    f"SoM 有效集合（{len(_valid_ids)} 个）"
+                )
+                return None
+
         selector = f'[data-som-id="{target_id}"]'
         resolver = """({ targetId, actionKind }) => {
             const base = document.querySelector(`[data-som-id="${targetId}"]`);
@@ -1048,7 +1083,81 @@ class BrowserEnv:
             except Exception:
                 continue
 
+        # ── 语义 Locator 自愈回退（Wave 3）──
+        # 到这里说明所有 frame 都找不到 [data-som-id=N]。最常见成因：
+        # SPA 前端在 SoM 注入后重渲 → 新节点没有 data-som-id 属性。
+        # 从 element_mapping 取出上轮快照记录的 role/name，用 Playwright 原生
+        # 语义 locator 在主 frame 里重新定位。**命中 1 个才用**，>1 放弃（语义
+        # 歧义优先保真），0 个也放弃，让上层自愈链照常抛 ActionExecutionError。
+        fallback_target = await self._semantic_fallback_resolve(
+            page=page, target_id=target_id, action_kind=action_kind
+        )
+        if fallback_target is not None:
+            return fallback_target
+
         return None
+
+    async def _semantic_fallback_resolve(
+        self, page: Page, target_id: int, action_kind: str
+    ) -> "ActionTarget | None":
+        """
+        基于 element_mapping 里缓存的 role/name，用 get_by_role 重新定位元素。
+
+        严格契约：仅当精确匹配命中 **恰好 1 个** 时才返回；0 或 >1 均返回 None。
+        原因：SoM 原始定位依赖视觉歧义消除（红框），降级到 `.first` 会盲点错
+        另一个同名按钮（如"提交"在对话框/登录框里重复出现）。保守优于乐观。
+
+        Playwright `get_by_role(name=..., exact=True)` 做完整字符串匹配。
+        """
+        ref = f"@e{target_id}"
+        meta = self.element_mapping.get(ref)
+        if not meta:
+            return None
+        role = (meta.get("role") or "").strip().lower()
+        name = (meta.get("name") or "").strip()
+        # 角色或名字为空 → 无足够语义信号，放弃
+        if not role or not name:
+            return None
+        # get_by_role 接受的角色白名单（与 extract_accessibility_tree 一致的交互角色）
+        _ALLOWED_ROLES = {
+            "button", "link", "textbox", "searchbox", "combobox",
+            "checkbox", "radio", "switch", "slider",
+            "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+            "option", "treeitem",
+        }
+        if role not in _ALLOWED_ROLES:
+            return None
+        try:
+            locator = page.get_by_role(role, name=name, exact=True)
+            count = await locator.count()
+        except Exception as e:
+            logger.debug(f"[SEMANTIC FALLBACK] locator query failed: {e}")
+            return None
+        if count != 1:
+            logger.info(
+                f"[SEMANTIC FALLBACK] {ref} role={role!r} name={name!r} "
+                f"命中 {count} 个（需恰好 1），放弃回退"
+            )
+            return None
+        try:
+            handle = await locator.element_handle(timeout=2000)
+        except Exception as e:
+            logger.debug(f"[SEMANTIC FALLBACK] element_handle failed: {e}")
+            return None
+        if handle is None:
+            return None
+        self._semantic_fallback_count += 1
+        synthetic_selector = f'role={role}[name="{name}"]'
+        logger.warning(
+            f"[SEMANTIC FALLBACK] {ref} 原选择器 [data-som-id={target_id}] 失效，"
+            f"已通过 {synthetic_selector} 自愈定位（action={action_kind}，"
+            f"累计 fallback {self._semantic_fallback_count} 次）"
+        )
+        return ActionTarget(
+            frame=page.main_frame,
+            handle=handle,
+            selector=synthetic_selector,
+        )
 
     async def start(self, url: str) -> None:
         """
@@ -2238,15 +2347,29 @@ Object.defineProperty(navigator, 'languages', {
         except Exception as e:
             logger.debug(f"[AX Tree] ID 映射段提取失败: {e}")
 
-        id_lines: list[str] = []
+        # 可交互角色白名单：只把这些角色写进 @eN 紧凑快照（VLM 决策用）。
+        # 其它如 heading/text/img/generic 等落入第二段 AX Tree 作上下文。
+        _INTERACTIVE_ROLES = {
+            "button", "link", "textbox", "searchbox", "combobox",
+            "checkbox", "radio", "switch", "slider",
+            "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
+            "option", "treeitem",
+        }
+
+        # 每轮刷新 @eN 映射；ID 采用 SoM 序号，与截图红框数字同源。
+        self.element_mapping.clear()
+        compact_lines: list[str] = []
         for row in id_rows:
-            parts = [f"Role: {row.get('role') or '?'}"]
+            role = (row.get("role") or "").strip().lower()
+            if role not in _INTERACTIVE_ROLES:
+                continue
+            try:
+                som_id_int = int(row["id"])
+            except (TypeError, ValueError):
+                continue
+            ref = f"@e{som_id_int}"
             name = (row.get("name") or "").strip()
-            if name:
-                parts.append(f'Name: "{name}"')
             value = (row.get("value") or "").strip()
-            if value:
-                parts.append(f'Value: "{value}"')
             states: list[str] = []
             if row.get("disabled"):
                 states.append("disabled")
@@ -2261,9 +2384,21 @@ Object.defineProperty(navigator, 'languages', {
                 states.append("required")
             if row.get("readonly"):
                 states.append("readonly")
+
+            parts = [ref, f"[{role or '?'}]"]
+            if name:
+                parts.append(f'"{name}"')
+            if value:
+                parts.append(f'value="{value}"')
             if states:
-                parts.append(f"State: {','.join(states)}")
-            id_lines.append(f"[ID: {row['id']}] " + ", ".join(parts))
+                parts.append("{" + ",".join(states) + "}")
+            compact_lines.append(" ".join(parts))
+            self.element_mapping[ref] = {
+                "som_id": som_id_int,
+                "role": role,
+                "name": name,
+                "selector": f'[data-som-id="{som_id_int}"]',
+            }
 
         # ── [B] 页面语义快照段：CDP AX Tree ──
         ax_lines: list[str] = []
@@ -2279,8 +2414,13 @@ Object.defineProperty(navigator, 'languages', {
         truncated_semantic = ax_lines[:MAX_SEMANTIC_LINES]
 
         sections: list[str] = []
-        if id_lines:
-            sections.append("【交互元素 (SoM ID 映射)】\n" + "\n".join(id_lines))
+        if compact_lines:
+            sections.append(
+                "【可交互元素 (@eN 语义快照)】\n"
+                "格式：@eN [role] \"name\" value=\"...\" {states}；@eN 中的数字 = 截图红框序号。\n"
+                "操作时 target_id 直接填这个数字（如 @e5 → target_id=5）。\n"
+                + "\n".join(compact_lines)
+            )
         if truncated_semantic:
             hint = ""
             if len(ax_lines) > MAX_SEMANTIC_LINES:
@@ -2291,12 +2431,12 @@ Object.defineProperty(navigator, 'languages', {
 
         if not sections:
             logger.warning(
-                "[AX Tree] ID 映射段与语义段均为空；mark_and_screenshot 可能未注入 data-som-id"
+                "[AX Tree] @eN 映射段与语义段均为空；mark_and_screenshot 可能未注入 data-som-id"
             )
             return ""
 
         logger.info(
-            f"[AX Tree] Emitted {len(id_lines)} ID-mapped rows + "
+            f"[AX Tree] Emitted {len(compact_lines)} @eN refs + "
             f"{len(truncated_semantic)}/{len(ax_lines)} semantic lines"
         )
         return "\n\n".join(sections)

@@ -38,13 +38,13 @@ for _dotenv_path in (_PROJECT_ROOT / ".env", _APP_ROOT / ".env"):
 try:
     from .config import MAX_STEPS, SCREENSHOT_DIR
     from .browser_env import BrowserEnv, ActionExecutionError
-    from .vlm_client import VLMClient
+    from .vlm_client import VLMClient, TaskPlan
     from .data_manager import save_to_excel
     from .trajectory_logger import HtmlLogger
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR
     from browser_env import BrowserEnv, ActionExecutionError
-    from vlm_client import VLMClient
+    from vlm_client import VLMClient, TaskPlan
     from data_manager import save_to_excel
     from trajectory_logger import HtmlLogger
 
@@ -1749,6 +1749,15 @@ async def run_agent(
         _MAX_CONSECUTIVE_ERRORS = 3
         _consecutive_errors = 0
 
+        # ── Wave 2：Planner / Reflector 状态 ──────────────────────────
+        _task_plan: "TaskPlan | None" = None
+        _steps_since_reflect = 0
+        _reflect_count = 0
+        _MAX_REFLECTS = 5          # 一次任务最多 Reflector 调用次数（防 cascade）
+        _REFLECT_INTERVAL = 5      # 兜底间隔：连续 N 步未反思时主动触发一次
+        _dedup_tripped_last_step = False  # 上一步 extract dedup 命中标志
+        _abort_requested = False    # Reflector 判 abort 后允许下一步合法 done
+
         # ── 跨页面记忆库 ──────────────────────────────────────────────
         # VLM 通过 save_to_memory 动作写入，通过 {{key}} 插值在 type 动作读取
         workflow_memory: dict = {}
@@ -1827,6 +1836,26 @@ async def run_agent(
                         _run_succeeded = True
                         return True
         # ──────────────────────────────────────────────────────────────
+
+        # ══════════════════════════════════════════════════════════════
+        # Wave 2 Planner：任务起手生成子目标清单
+        # 失败时静默降级为单子目标 TaskPlan，主循环行为与 Wave 1 等价。
+        # ══════════════════════════════════════════════════════════════
+        try:
+            _task_plan = await vlm.make_plan(
+                goal=goal,
+                initial_url=browser.current_url or start_url,
+                workflow_memory=workflow_memory,
+            )
+            print(
+                f"\n\033[1;35m📋 [PLANNER]\033[0m 生成 "
+                f"\033[35m{len(_task_plan.sub_goals)}\033[0m 个子目标："
+            )
+            for _sg in _task_plan.sub_goals:
+                print(f"   {_sg.id}. {_sg.description}")
+        except Exception as _plan_err:
+            logger.warning(f"[PLANNER] 调用失败静默降级：{_plan_err}")
+            _task_plan = None
 
         for step in range(1, MAX_STEPS + 1):
             _check_stop(f"before_step_{step}")
@@ -1955,9 +1984,10 @@ async def run_agent(
                         "\n\n=====================================\n"
                         "【辅助信息：页面无障碍语义树 (AX Tree)】\n"
                         "以下是当前页面的纯语义结构，过滤了所有样式噪音。\n"
-                        "  · 第一段 [交互元素 (SoM ID 映射)] 的 [ID: N] 与截图红框数字一一对应，\n"
-                        "    重点参考每个元素的 Role 和 Name。\n"
-                        "  · 第二段 [页面语义快照] 提供整体 AX 结构，辅助理解上下文。\n"
+                        "  · 第一段 [可交互元素 @eN 语义快照] 是按阅读顺序编号的紧凑清单：\n"
+                        "    `@eN [role] \"name\" {states}`，N 与截图红框数字一一对应。\n"
+                        "    需要操作某元素时，target_id 直接填数字（如 @e5 → target_id=5）。\n"
+                        "  · 第二段 [页面语义快照] 提供整体 AX 结构（含标题、文本等），辅助理解上下文。\n"
                         "  ⚠ 执行 extract 时，**必须从 AX Tree 中读取文本数据**（标题、数值、描述），\n"
                         "    而非仅靠截图 OCR。被浮层遮挡的元素在 AX Tree 中仍然存在。\n"
                         f"{ax_tree_text}\n"
@@ -1968,15 +1998,154 @@ async def run_agent(
                     (input_descriptions or "") + ax_block + _page_hint + _tabs_hint
                 )
 
+                # ── Wave 2 Reflector：仅失败信号或兜底触发 ────────────────
+                _prev_loop_guard_size = len(_loop_guard_blocked_ids)
+                _reflect_signals: list[str] = []
+                if _consecutive_errors >= 2:
+                    _reflect_signals.append(f"连续 {_consecutive_errors} 步 action=error")
+                if _dedup_tripped_last_step:
+                    _reflect_signals.append("上一步 extract 被 dedup 拦截")
+                if _steps_since_reflect >= _REFLECT_INTERVAL and _task_plan is not None:
+                    _reflect_signals.append(f"{_REFLECT_INTERVAL} 步兜底检查")
+                # Fix 4：登录墙 URL 探测（passport/login/signin/sso/captcha）
+                _cur_url_lower = (browser.current_url or "").lower()
+                if re.search(r"/(login|signin|sign-in|passport|sso|captcha|verify)\b", _cur_url_lower):
+                    # 仅当 goal 里没显式给凭证时才当登录墙（goal 含 {{phone}} = 用户主动登录）
+                    _goal_has_cred = bool(re.search(r"\{\{\s*(phone|password|username|account|mobile|email)\s*\}\}", goal, re.IGNORECASE))
+                    if not _goal_has_cred:
+                        _reflect_signals.append(f"当前 URL 疑似登录/验证页：{browser.current_url}")
+
+                if (
+                    _reflect_signals
+                    and _task_plan is not None
+                    and _reflect_count < _MAX_REFLECTS
+                ):
+                    try:
+                        _rd = await vlm.reflect(
+                            plan=_task_plan,
+                            history_summary=vlm._build_history_summary(),
+                            signals=_reflect_signals,
+                            current_url=browser.current_url or "",
+                        )
+                        _reflect_count += 1
+                        _steps_since_reflect = 0
+                        _dedup_tripped_last_step = False
+                        if _rd.decision == "advance" and _rd.advance_to_idx is not None:
+                            _target_idx = max(0, min(_rd.advance_to_idx, len(_task_plan.sub_goals) - 1))
+                            _task_plan.sub_goals[_task_plan.current_idx].status = "done"
+                            _task_plan.current_idx = _target_idx
+                            _task_plan.sub_goals[_target_idx].status = "active"
+                            vlm.inject_error_feedback(
+                                f"🎯 [REFLECTOR] {_rd.reason}；"
+                                f"系统已推进至子目标 {_target_idx + 1}/"
+                                f"{len(_task_plan.sub_goals)}："
+                                f"{_task_plan.sub_goals[_target_idx].description}"
+                            )
+                        elif _rd.decision == "revise" and _rd.new_sub_goals:
+                            _task_plan.sub_goals = _rd.new_sub_goals
+                            _task_plan.current_idx = 0
+                            if _task_plan.sub_goals:
+                                _task_plan.sub_goals[0].status = "active"
+                            vlm.inject_error_feedback(
+                                f"🔧 [REFLECTOR] 计划已修订（{_rd.reason}）。"
+                                f"新的当前子目标："
+                                f"{_task_plan.sub_goals[0].description if _task_plan.sub_goals else '(空)'}"
+                            )
+                        elif _rd.decision == "abort":
+                            _abort_requested = True
+                            vlm.inject_error_feedback(
+                                f"🛑 [REFLECTOR] 判定不可完成（{_rd.reason}）。"
+                                f"请立即输出 action=done 结束任务。"
+                            )
+                        # continue: 不做额外干预，让 VLM 正常推进
+                    except Exception as _reflect_err:
+                        logger.warning(f"[REFLECTOR] 调用失败忽略：{_reflect_err}")
+                else:
+                    _steps_since_reflect += 1
+                _dedup_tripped_last_step = False
+
                 decisions = await vlm.ask(
                     screenshot_b64,
                     goal,
                     step,
                     input_descriptions,
                     workflow_memory,
+                    task_plan=_task_plan,
                 )
 
                 _log_decision = decisions
+
+                # ── Fix 2：拦截"子目标未完就 done"（CRITICAL：Task B bug）
+                # VLM 把「子目标完成 → 推进」错认为「全局完成 → done」；
+                # 只要 _task_plan 存在、当前不是末子目标、且 Reflector 未判 abort，
+                # action=done 一律降级为 error，并注入语义区分反馈。
+                if (
+                    _task_plan is not None
+                    and decisions
+                    and decisions[0].get("action") == "done"
+                    and not _abort_requested
+                ):
+                    _cur_idx = _task_plan.current_idx
+                    _total = len(_task_plan.sub_goals)
+                    _done_or_failed = sum(
+                        1 for sg in _task_plan.sub_goals
+                        if sg.status in ("done", "failed")
+                    )
+                    # 允许 done 的条件：已完成子目标数 >= 总数 - 1（仅剩当前 = 最后一个）
+                    if _done_or_failed < _total - 1:
+                        logger.warning(
+                            f"[PLAN GATE] VLM 过早 action=done（进度 "
+                            f"{_done_or_failed}/{_total} 子目标完成），降级为 error"
+                        )
+                        _broadcast_log_safe(
+                            f"[PLAN GATE] 拦截过早 done（{_done_or_failed}/{_total}）",
+                            level="warn",
+                        )
+                        decisions[0]["action"] = "error"
+                        decisions[0]["target_id"] = 0
+                        decisions[0]["type_value"] = ""
+                        vlm.inject_error_feedback(
+                            f"🛑 你输出了 action=done，但当前只完成 {_done_or_failed}/{_total} 个子目标，"
+                            f"任务远未结束。\n"
+                            f"【语义区分】：\n"
+                            f"  · 完成**当前子目标**（如「首页已加载」）→ subgoal_status=\"completed\" "
+                            f"+ 给出真正的下一步动作（click/type/scroll/...）\n"
+                            f"  · 完成**全部子目标**或**确认任务不可完成** → action=\"done\"\n"
+                            f"当前子目标 {_cur_idx + 1}/{_total}："
+                            f"「{_task_plan.sub_goals[_cur_idx].description}」，"
+                            f"退出标准：「{_task_plan.sub_goals[_cur_idx].exit_criteria}」。"
+                            f"请给出达成该退出标准的具体动作，不要直接 done。"
+                        )
+
+                # ── Wave 2 子目标自宣告推进 ─────────────────────────────
+                # VLM 每步返回 subgoal_status：若 completed 则系统推进 _task_plan.current_idx。
+                # 末子目标完成但 action!=done → 强制纠偏为 done，贴合 Wave 2 语义。
+                if _task_plan is not None and decisions:
+                    _head = decisions[0]
+                    if _head.get("subgoal_status") == "completed":
+                        _idx = _task_plan.current_idx
+                        _is_last = _idx >= len(_task_plan.sub_goals) - 1
+                        _task_plan.sub_goals[_idx].status = "done"
+                        if not _is_last:
+                            _task_plan.current_idx += 1
+                            _task_plan.sub_goals[_task_plan.current_idx].status = "active"
+                            logger.info(
+                                f"[PLAN] VLM 自宣告推进至子目标 "
+                                f"{_task_plan.current_idx + 1}/{len(_task_plan.sub_goals)}："
+                                f"{_task_plan.sub_goals[_task_plan.current_idx].description}"
+                            )
+                            _broadcast_log_safe(
+                                f"[PLAN] 推进至子目标 {_task_plan.current_idx + 1}: "
+                                f"{_task_plan.sub_goals[_task_plan.current_idx].description}"
+                            )
+                        elif _head.get("action") != "done":
+                            logger.warning(
+                                f"[PLAN] 末子目标 completed 但 action={_head.get('action')}，"
+                                f"强制纠偏为 done"
+                            )
+                            _head["action"] = "done"
+                            _head["target_id"] = 0
+                            _head["type_value"] = ""
 
                 # ── extract+null 即时自动提取 ────────────────────────────
                 # 借鉴 browser-use 架构：VLM 只需给出 extract 意图，
@@ -1989,6 +2158,7 @@ async def run_agent(
                     # ── 同页去重：如果当前 URL 已成功提取过，不再重复提取 ──
                     _current_auto_url = browser.current_url
                     if _current_auto_url in _extracted_page_urls:
+                        _dedup_tripped_last_step = True  # Wave 2 Reflector 信号
                         logger.warning(
                             f"[EXTRACT AUTO DEDUP] 当前页面已提取过，跳过重复提取: "
                             f"{_current_auto_url}"
@@ -2316,6 +2486,7 @@ async def run_agent(
 
                         # ── 同页去重：如果当前 URL 已经提取过，跳过 ──
                         if _current_url in _extracted_page_urls:
+                            _dedup_tripped_last_step = True  # Wave 2 Reflector 信号
                             # Step 0：先判断是否已达用户指定的数量目标，优先引导 done
                             _target_count_pre = _parse_goal_target_count(goal)
                             _pre_reached = (

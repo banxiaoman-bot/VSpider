@@ -412,6 +412,29 @@ SYSTEM_PROMPT += """
 - 触发 `ask_human` 后，系统会**自动暂停**并提示操作员在浏览器中手动完成，操作员按回车后流程自动恢复。
 - If the user specifies an exact viewport such as `1920x1080`, assume the browser will honor it and reason about visibility using that viewport.
 
+## 🔒 凭证安全红线（违反立即 ValidationError）
+
+**这是绝对红线，优先级高于一切任务目标。**
+
+你**绝对禁止**凭空捏造任何类型的凭证信息并输入到任何表单，包括但不限于：
+- 手机号（如 13800138000、18888888888、测试段 170/171 号段）
+- 邮箱（如 test@example.com、admin@foo.com）
+- 密码（如 password、password123、123456、abcdef、Qwerty1）
+- 用户名（如 admin、root、test、demo、user123）
+- 身份证号、银行卡号、验证码等任何 PII
+
+**正确行为**：
+1. 若 `workflow_memory` 里有用户**明确预置**的凭证变量（如 `{{phone}}`、`{{password}}`、`{{username}}`），用 `{{变量名}}` 插值语法引用；
+2. 若没有预置凭证且页面需要登录 → 立即 `action=ask_human` 说明需要凭证，**或** `action=done` 裁定任务 blocked；
+3. **禁止**将"模式化占位串"（13800138000 / password123 / test@ 等）写进 `type_value`，系统会 ValidationError 拒绝。
+
+**违反后果**：一旦 `type_value` 匹配到凭证模式黑名单，Pydantic 校验失败，本步沦为 error 且下一步 prompt 会告知你违反了红线。连续违反将被强制终止。
+
+**判断触发场景**：
+- 任务 goal 里明确含凭证（`{{phone}}`、用户主动给了账号密码）→ 正常 type 引用
+- 任务 goal 不含凭证但页面要求登录 → 立即 ask_human / done，**不要**硬闯
+- 搜索框里输入关键词（即使关键词是"如何注册账号"）→ 继续正常 type，不要自我审查
+
 ## 登录失败处理规则（必须严格遵守）
 
 **判断登录失败的信号**：你已经点击了登录按钮（或按了 Enter 提交表单），但在下一轮截图中，登录弹窗/登录页面**仍然存在**（没有跳转到目标主界面），或者出现了**验证码**弹窗。
@@ -561,6 +584,7 @@ def build_user_message(
     history: str = "",
     input_descriptions: str = "",
     workflow_memory: dict | None = None,
+    task_plan: "object | None" = None,
 ) -> str:
     """
     构建发送给 VLM 的用户消息文本部分。
@@ -572,6 +596,7 @@ def build_user_message(
         history: 最近操作历史摘要文本
         input_descriptions: 当前页面中输入框的详细信息描述
         workflow_memory: 跨页面记忆库，非空时注入提示让 VLM 知道可用的变量
+        task_plan: Wave 2 任务计划对象（TaskPlan），非空时插入计划摘要与当前子目标
 
     Returns:
         格式化后的用户消息文本
@@ -591,6 +616,31 @@ def build_user_message(
             f"{history}\n"
             "=========================================================\n"
         )
+    # ── Wave 2：任务计划骑脸注入（紧贴历史之下）──────────────────────────
+    # 让 VLM 每步都看到"整体计划 + 当前子目标 + 退出标准"，治跨步战略盲视。
+    if task_plan is not None and getattr(task_plan, "sub_goals", None):
+        _cur = task_plan.current
+        _total = len(task_plan.sub_goals)
+        _cur_idx = task_plan.current_idx
+        _lines = [f"📋 【全局任务计划】(进度 {_cur_idx + 1}/{_total})"]
+        for sg in task_plan.sub_goals:
+            if sg.status == "done":
+                _lines.append(f"   ✅ {sg.id}. {sg.description}")
+            elif sg.status == "active":
+                _lines.append(f"   ▶ {sg.id}. {sg.description}   ← 当前子目标")
+                _lines.append(f"       退出标准: {sg.exit_criteria}")
+            elif sg.status == "failed":
+                _lines.append(f"   ❌ {sg.id}. {sg.description}")
+            else:
+                _lines.append(f"   ⏳ {sg.id}. {sg.description}")
+        if _cur is not None:
+            _lines.append(
+                f"\n【本步要求】只聚焦当前子目标 「{_cur.description}」。"
+                f"完成该子目标（满足退出标准）时把 subgoal_status 设为 \"completed\"，"
+                f"系统会自动推进计划；否则保持 \"in_progress\"。"
+                f"若当前是最后一个子目标且已完成，同时把 action 设为 done。"
+            )
+        parts.append("\n".join(_lines) + "\n")
     # ── 记忆库注入：让 VLM 知道当前手里有哪些跨页面保存的数据 ──────────────
     if workflow_memory:
         mem_lines = [f"## 当前跨页面记忆库（可在 type 动作中用 {{{{key}}}} 引用）"]
@@ -616,3 +666,100 @@ def build_user_message(
         f"只输出 JSON，不要输出其他内容。"
     )
     return "\n".join(parts)
+
+
+# ════════════════════════════════════════════════════════════════
+#  Wave 2 — Planner / Reflector prompt builders
+# ════════════════════════════════════════════════════════════════
+
+def build_plan_prompts(
+    goal: str,
+    initial_url: str,
+    workflow_memory: dict | None = None,
+) -> tuple[str, str]:
+    """生成 Planner LLM 的 (system, user) prompts。"""
+    system = (
+        "你是一个资深的网页自动化任务规划师。你的唯一工作：把用户的自然语言 goal 拆成 "
+        "3-6 个**可独立验证**的有序子目标，供下游 Web Agent 顺序执行。\n\n"
+        "拆分规则：\n"
+        "1. 每个子目标必须同时包含 description（要做什么）与 exit_criteria（怎么算完成，"
+        "   用可观察的页面状态描述，如「搜索结果页已加载，可见 >=3 条结果」或「数据已写入 Excel」）\n"
+        "2. 粒度控制在 3-6 个：太少（1-2 个）= 无法切换战术；太多（>6）= 过度拆分拖慢执行\n"
+        "3. 按执行顺序编号 id=1,2,3...；列表中第一个子目标由系统自动置为 active\n"
+        "4. 若 goal 含「先 X 后 Y 忽略 X 的错误」这种容错描述，X 仍要单独列一个子目标，"
+        "   exit_criteria 写「尝试 X 即可，无论成败后续都继续执行」\n"
+        "5. 最后一个子目标的 exit_criteria 通常是「完成 goal 全部要求，准备输出 done」\n"
+        "6. 🔒 登录墙识别：若完成 goal 显然需要登录态（访问私有内容、发贴、下单等），"
+        "   且 goal 文本中**未**明确给出凭证（如 {{phone}} / {{password}} 占位符、"
+        "   或直接写出账号密码），则第一个子目标必须设为登录墙探测，其 exit_criteria 写："
+        "   「若起始 URL 或首屏出现登录/验证页（URL 含 login/signin/passport/sso，"
+        "   或有手机号/密码/验证码输入框），立即 abort；否则视为已登录，推进下一子目标」。"
+        "   禁止把「完成登录」作为独立子目标 —— 无凭证就别尝试，直接 abort。\n\n"
+        "输出要求：\n"
+        "- 只输出 JSON，不要任何 markdown、不要解释文字\n"
+        "- JSON 结构：{\"goal\": str, \"sub_goals\": [{id, description, exit_criteria, status}], "
+        "\"current_idx\": 0}\n"
+        "- 所有子目标的 status 填 \"pending\"，current_idx 填 0（系统会把第一个改为 active）\n\n"
+        "示例 —— goal=\"搜索 Claude AI，点击第一个结果在新标签打开，再切回搜索页\"：\n"
+        "{\n"
+        '  "goal": "搜索 Claude AI，点击第一个结果在新标签打开，再切回搜索页",\n'
+        '  "sub_goals": [\n'
+        '    {"id":1,"description":"在搜索框输入 Claude AI 并提交","exit_criteria":"搜索结果页已加载，URL 含 q=Claude","status":"pending"},\n'
+        '    {"id":2,"description":"中键点击第一条搜索结果链接","exit_criteria":"新标签页已打开并加载目标站点","status":"pending"},\n'
+        '    {"id":3,"description":"切回原搜索结果页","exit_criteria":"当前活动标签回到搜索结果页","status":"pending"}\n'
+        '  ],\n'
+        '  "current_idx": 0\n'
+        "}"
+    )
+    mem_block = ""
+    if workflow_memory:
+        mem_block = f"\n\n当前已有跨页面记忆变量：{list(workflow_memory.keys())}"
+    user = (
+        f"用户 goal：{goal}\n"
+        f"起始 URL：{initial_url}"
+        f"{mem_block}\n\n"
+        f"请按上述规则输出 TaskPlan JSON。"
+    )
+    return system, user
+
+
+def build_reflect_prompts(
+    task_plan: "object",
+    history_summary: str,
+    signals: list[str],
+    current_url: str,
+) -> tuple[str, str]:
+    """生成 Reflector LLM 的 (system, user) prompts。"""
+    system = (
+        "你是一个 Web Agent 的监督员（Reflector）。主 Agent 在执行任务时遇到了异常信号，"
+        "请你结合 **任务计划 + 最近历史 + 当前现状**，给出一个决策：\n\n"
+        "- continue：计划无误，Agent 只是暂时遇阻，无需干预，让它自己再试一步\n"
+        "- advance：当前子目标的退出标准实际已达成，但 Agent 忘了推进，强制跳到 advance_to_idx\n"
+        "- revise：计划本身有误（如起始页不对、漏了关键步骤），给出完整的 new_sub_goals 覆盖\n"
+        "- abort：任务不可完成（如要求的页面不存在、要登录但没凭据），给出 abort_verdict=fail 终结\n\n"
+        "决策原则：\n"
+        "1. 优先 continue（最保守）；只有明确证据时才 advance / revise / abort\n"
+        "2. advance 必须同时给 advance_to_idx（0-based 索引）\n"
+        "3. revise 必须给完整的 new_sub_goals（列表，不是补丁），沿用 SubGoal schema\n"
+        "4. 仅输出 JSON，不要 markdown、不要解释"
+    )
+
+    # 计划摘要
+    plan_lines = [f"当前任务计划（goal={task_plan.goal}）："]
+    for sg in task_plan.sub_goals:
+        _mark = {"done": "[✅完成]", "active": "[▶ 当前]", "pending": "[⏳待做]", "failed": "[❌失败]"}.get(sg.status, "[?]")
+        plan_lines.append(
+            f"  {_mark} {sg.id}. {sg.description}（退出标准：{sg.exit_criteria}）"
+        )
+    plan_text = "\n".join(plan_lines)
+
+    signals_text = "\n".join(f"  - {s}" for s in signals) if signals else "  (无)"
+
+    user = (
+        f"{plan_text}\n\n"
+        f"触发 Reflector 的异常信号：\n{signals_text}\n\n"
+        f"最近操作历史：\n{history_summary or '  (尚无历史)'}\n\n"
+        f"当前 URL：{current_url}\n\n"
+        f"请输出 ReflectorDecision JSON。"
+    )
+    return system, user

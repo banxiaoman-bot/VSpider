@@ -11,7 +11,7 @@ import asyncio
 import json
 import re
 import logging
-from typing import Any, Dict, Literal, List, Optional, Union
+from typing import Any, ClassVar, Dict, Literal, List, Optional, Union
 
 from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -109,7 +109,14 @@ class VSpiderAction(BaseModel):
         "wait",           # 显式等待：主动暂停 N 秒，应对长动画/慢加载中间态
         "drag_and_drop",  # 拖拽：将 target_id 元素拖到 type_value 指定 ID 的元素上
     ] = Field(..., description="要执行的动作类型")
-    target_id: int = Field(default=0, description="目标元素的 SoM ID")
+    target_id: int = Field(
+        default=0,
+        description=(
+            "目标元素的 SoM ID（= AX Tree 中 @eN 的数字部分）。"
+            "若你看到 @e5 [button] \"Submit\"，操作它就填 5。"
+            "允许直接写 @e5 字符串（系统会自动解析）。"
+        ),
+    )
     type_value: str = Field(default="", description="输入框内容（支持 {{key}} 插值）或按键名称")
     memory_key: str = Field(
         ...,  # 绝对必填，不设默认值，强制生成引擎输出此字段
@@ -132,10 +139,43 @@ class VSpiderAction(BaseModel):
     # 后端会自动将归一化坐标换算为当前视口的真实像素坐标再点击
     point: Optional[List[int]] = Field(default=None, description="千分制归一化坐标 [x, y]（0-1000），仅 click_point 动作使用")
     status: str = Field(default="", description="状态信息（如 captcha_detected）")
+    # Wave 2：子目标自宣告完成标志。VLM 每步在 action 选定后自评：
+    #   本步动作是否让【当前子目标】达到 exit_criteria？是 → "completed"；否 → "in_progress"
+    # 主循环在 VSpiderAction 返回后检查此字段，若 completed 且非末子目标则推进 _task_plan.current_idx。
+    subgoal_status: Literal["in_progress", "completed"] = Field(
+        default="in_progress",
+        description=(
+            "当前子目标状态。若本步动作达成 task_plan.current 的 exit_criteria，"
+            "设为 'completed'（系统会自动推进到下一子目标）；否则保持 'in_progress'。"
+            "末尾子目标完成时应同时把 action 设为 done。"
+        ),
+    )
 
     @field_validator("target_id", mode="before")
     @classmethod
     def _coerce_target_id(cls, v: Any) -> int:
+        # 支持 @eN 别名（Wave 3 语义快照）：VLM 可能回显 "@e5" / "e5" / "@E5"
+        # 或带空格 "@e 5"；structured-output 强制 int 时 VLM 通常直接回数字。
+        # 畸形字符串（"@efoo"/"@e"/""/"foo"）**必须抛 ValueError** → Pydantic
+        # ValidationError → _validate_decision 自愈反馈路径，让 VLM 下一步修正，
+        # 而不是静默吞成 0 再被 click+0→wait 机制二次降级（掩盖真实输入）。
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                raise ValueError(
+                    "target_id 为空字符串。请给出具体数字 ID（如 3）或 @eN 别名（如 @e5）。"
+                )
+            s = raw.lstrip("@").lstrip()
+            if s.lower().startswith("e"):
+                s = s[1:].strip()
+            try:
+                return int(s)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"target_id={raw!r} 无法解析。允许格式：整数（3）、@eN（@e5）、eN（e5）。"
+                    "若当前页面没有合适目标，请改用 smooth_scroll / press_key / wait，不要编造 ID。"
+                )
+        # 非字符串分支保留旧行为：None / 布尔 / 其它 → 0（default 语义）
         try:
             return int(v)
         except (TypeError, ValueError):
@@ -151,6 +191,48 @@ class VSpiderAction(BaseModel):
     def _coerce_memory_key(cls, v: Any) -> str:
         """将 null/None 统一转为空字符串，避免 model_validator 收到 None。"""
         return str(v).strip() if v is not None else ""
+
+    # ── 凭证捏造黑名单（Fix 1：CRITICAL 安全红线）──
+    # 仅对 action="type" 生效；action="press_key"/"goto"/"extract" 的 type_value
+    # 语义完全不同（按键名 / URL / 数据），不做此校验。
+    # 命中任一模式 → raise ValueError → Pydantic ValidationError → 自愈反馈。
+    _FABRICATED_CREDENTIAL_PATTERNS: ClassVar[list[re.Pattern[str]]] = [
+        # 中国大陆手机号（严格 11 位 1x 开头）
+        re.compile(r"^1[3-9]\d{9}$"),
+        # 弱密码 / 占位密码
+        re.compile(r"^(password|passwd|pwd|pass)\d*$", re.IGNORECASE),
+        re.compile(r"^(123456|1234567|12345678|123456789|111111|000000|888888|666666)$"),
+        re.compile(r"^(qwerty|qwerty123|abcdef|abc123|admin|admin123|root|root123)$", re.IGNORECASE),
+        # 测试邮箱
+        re.compile(r"^(test|admin|demo|foo|bar|example|user|root|qa)\d*@", re.IGNORECASE),
+        re.compile(r"@(example\.com|test\.com|foo\.bar|test\.test)$", re.IGNORECASE),
+        # 常见假身份
+        re.compile(r"^(张三|李四|王五|testuser|demouser)$", re.IGNORECASE),
+    ]
+
+    @model_validator(mode="after")
+    def _reject_fabricated_credentials(self) -> "VSpiderAction":
+        """
+        拦截 VLM 凭空捏造的凭证串。两道过滤：
+          1. 仅 action="type" 触发（press_key/goto/extract 的 type_value 语义不同）
+          2. 允许 {{memory_key}} 插值串透传（未解析前就是字面量 "{{phone}}"，不匹配黑名单）
+        """
+        if self.action != "type":
+            return self
+        v = (self.type_value or "").strip()
+        if not v or v.startswith("{{"):
+            return self
+        for _pat in self._FABRICATED_CREDENTIAL_PATTERNS:
+            if _pat.match(v):
+                raise ValueError(
+                    f"🔒 凭证安全红线：type_value={v!r} 匹配凭证捏造黑名单"
+                    f"（模式：{_pat.pattern}）。"
+                    "你不允许凭空捏造手机号/密码/邮箱/用户名并提交到真实表单。"
+                    "正确做法："
+                    "(a) 若 workflow_memory 有用户预置的凭证，用 {{变量名}} 引用；"
+                    "(b) 否则立即 action=ask_human 或 action=done 裁定任务 blocked。"
+                )
+        return self
 
     @model_validator(mode="after")
     def _enforce_progress_action_consistency(self) -> "VSpiderAction":
@@ -327,6 +409,86 @@ class VSpiderActionBatch(BaseModel):
 # 批次 JSON Schema（连招模式下用于 response_format）
 _VSPIDER_BATCH_SCHEMA: dict = VSpiderActionBatch.model_json_schema()
 
+
+# ════════════════════════════════════════════════════════════════
+#  Wave 2 — Planner / Reflector 数据模型
+# ════════════════════════════════════════════════════════════════
+
+class SubGoal(BaseModel):
+    """单个可独立验证的子目标。"""
+    id: int = Field(..., description="子目标序号，从 1 开始")
+    description: str = Field(..., description="子目标简述（如 '搜索 python playwright'）")
+    exit_criteria: str = Field(
+        ...,
+        description="退出标准，一句话描述如何判断本子目标完成（如 '搜索结果页加载，可见 >=3 条结果'）"
+    )
+    status: Literal["pending", "active", "done", "failed"] = Field(
+        default="pending",
+        description="子目标状态。任务起手时首个为 active，其余 pending"
+    )
+
+
+class TaskPlan(BaseModel):
+    """任务计划 = goal + 有序子目标列表。"""
+    goal: str = Field(..., description="用户原始目标")
+    sub_goals: List[SubGoal] = Field(..., description="3-6 个按序执行的子目标")
+    current_idx: int = Field(default=0, description="当前活动子目标索引")
+
+    @property
+    def current(self) -> Optional[SubGoal]:
+        if 0 <= self.current_idx < len(self.sub_goals):
+            return self.sub_goals[self.current_idx]
+        return None
+
+    def advance(self) -> bool:
+        """推进到下一子目标，返回 True；已是最后一个返回 False（仅标 done 不推进）。"""
+        if self.current_idx < len(self.sub_goals) - 1:
+            self.sub_goals[self.current_idx].status = "done"
+            self.current_idx += 1
+            self.sub_goals[self.current_idx].status = "active"
+            return True
+        self.sub_goals[self.current_idx].status = "done"
+        return False
+
+    def summary(self) -> str:
+        """一行进度概览，用于 prompt 注入。"""
+        icons = {"done": "✅", "active": "▶", "pending": "⏳", "failed": "❌"}
+        return "  ".join(
+            f"{icons.get(s.status, '·')} {s.id}. {s.description[:24]}"
+            for s in self.sub_goals
+        )
+
+
+class ReflectorDecision(BaseModel):
+    """Reflector 审计后的决策。"""
+    decision: Literal["continue", "advance", "revise", "abort"] = Field(
+        ...,
+        description=(
+            "审计结论："
+            "continue=计划无误仅暂时遇阻；"
+            "advance=当前子目标实际已完成强推进；"
+            "revise=计划有误，给出新子目标列表；"
+            "abort=不可完成，终结任务"
+        ),
+    )
+    reason: str = Field(..., description="决策理由，简述现状与结论")
+    advance_to_idx: Optional[int] = Field(
+        default=None,
+        description="advance 专用，推进到的目标索引（0-based）"
+    )
+    new_sub_goals: Optional[List[SubGoal]] = Field(
+        default=None,
+        description="revise 专用，完全覆盖的新子目标列表"
+    )
+    abort_verdict: Optional[Literal["success", "fail"]] = Field(
+        default=None,
+        description="abort 专用，最终裁决"
+    )
+
+
+_TASK_PLAN_SCHEMA: dict = TaskPlan.model_json_schema()
+_REFLECTOR_DECISION_SCHEMA: dict = ReflectorDecision.model_json_schema()
+
 # 默认的错误回退决策
 _ERROR_DECISION = {
     "thought": "VLM 请求失败或返回格式异常",
@@ -458,6 +620,7 @@ class VLMClient:
         step: int,
         input_descriptions: str = "",
         workflow_memory: dict | None = None,
+        task_plan: Optional["TaskPlan"] = None,
     ) -> list[dict]:
         """
         向 VLM/LLM 发送当前状态，请求下一批次动作（连招模式）。
@@ -480,7 +643,8 @@ class VLMClient:
         """
         history_text = self._build_history_summary()
         user_text = build_user_message(
-            goal, step, MAX_STEPS, history_text, input_descriptions, workflow_memory
+            goal, step, MAX_STEPS, history_text, input_descriptions, workflow_memory,
+            task_plan=task_plan,
         )
 
         # ── 图文双模态：若截图失败（极端情况）才切换纯文本降级 ───────────────
@@ -493,9 +657,9 @@ class VLMClient:
                 "执行 extract 时，必须读取**红框内部或红框旁边的真实文字/数字**，"
                 "绝对不能把红框上的序号当作数据（如热度、排名、价格等）写入 extracted_data。\n",
                 "## 当前模式：纯文本应急降级（截图失败，仅此一轮）\n"
-                "本轮截图采集失败，只能依赖上方【AX Tree 交互元素 (SoM ID 映射)】中的 [ID: N] 序号来识别并操作页面元素。\n"
-                "输出的 target_id 必须来自 ID 映射段的 [ID: N]；这些 ID 仅本轮有效，禁止复用。\n"
-                "页面语义快照段不含 ID，只能用作理解上下文，不可用作点击目标。\n",
+                "本轮截图采集失败，只能依赖上方【可交互元素 @eN 语义快照】中的 @eN 编号来识别并操作页面元素。\n"
+                "输出的 target_id 必须来自 @eN 快照段（@e5 → target_id=5）；这些编号仅本轮有效，禁止复用。\n"
+                "页面语义快照段不含 @eN，只能用作理解上下文，不可用作点击目标。\n",
             )
             user_text = user_text.replace(
                 "请仔细观察上方的网页截图（已标注红框和数字序号），"
@@ -864,6 +1028,171 @@ class VLMClient:
                 f"[EXTRACT FULL] 结构化提取失败，将降级使用 VLM 原始数据: {e}"
             )
             return None
+
+    # ════════════════════════════════════════════════════════════════
+    #  Wave 2 — Planner / Reflector（纯文本 LLM，无截图）
+    # ════════════════════════════════════════════════════════════════
+
+    async def make_plan(
+        self,
+        goal: str,
+        initial_url: str,
+        workflow_memory: Optional[dict] = None,
+    ) -> TaskPlan:
+        """
+        任务起手调一次，把 goal 拆成 3-6 个可独立验证的子目标。
+
+        失败（网络 / JSON / schema）时返回只含单一子目标的 TaskPlan，
+        等价于关闭 Planner —— 保证零回归。
+        """
+        fallback_plan = TaskPlan(
+            goal=goal,
+            sub_goals=[SubGoal(
+                id=1,
+                description=goal[:80],
+                exit_criteria="完成用户全部需求",
+                status="active",
+            )],
+            current_idx=0,
+        )
+
+        try:
+            from .prompts import build_plan_prompts  # type: ignore
+        except ImportError:
+            from prompts import build_plan_prompts   # type: ignore
+
+        system_prompt, user_prompt = build_plan_prompts(goal, initial_url, workflow_memory)
+
+        try:
+            logger.info(f"[PLANNER] 生成任务计划 goal={goal[:60]}")
+            _broadcast_log_safe("[PLANNER] 调用 Planner LLM 生成任务计划...")
+
+            api_kwargs: dict = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": VLM_MAX_TOKENS,
+                "temperature": 0.2,
+            }
+            if self._use_structured:
+                api_kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "TaskPlan",
+                        "strict": False,
+                        "schema": _TASK_PLAN_SCHEMA,
+                    },
+                }
+
+            try:
+                response = await self.client.chat.completions.create(**api_kwargs)
+            except BadRequestError:
+                api_kwargs.pop("response_format", None)
+                response = await self.client.chat.completions.create(**api_kwargs)
+
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                raw = re.sub(r"\n?\s*```$", "", raw)
+
+            data = json.loads(raw)
+            plan = TaskPlan.model_validate(data)
+
+            if not plan.sub_goals:
+                logger.warning("[PLANNER] LLM 返回空子目标列表，降级为单子目标计划")
+                return fallback_plan
+
+            # 首个子目标默认置为 active
+            if plan.sub_goals[0].status != "active":
+                plan.sub_goals[0].status = "active"
+            plan.current_idx = 0
+
+            logger.info(
+                f"[PLANNER] 计划生成成功：{len(plan.sub_goals)} 个子目标 | "
+                + plan.summary()
+            )
+            _broadcast_log_safe(
+                f"[PLANNER] 计划生成：{len(plan.sub_goals)} 个子目标"
+            )
+            return plan
+
+        except Exception as e:
+            logger.warning(f"[PLANNER] 生成失败降级为单子目标：{type(e).__name__}: {e}")
+            return fallback_plan
+
+    async def reflect(
+        self,
+        plan: TaskPlan,
+        history_summary: str,
+        signals: List[str],
+        current_url: str,
+    ) -> ReflectorDecision:
+        """
+        失败信号或兜底兜到时调，审计"计划 vs 现状"。
+
+        失败时返回 decision="continue"，等价于不介入，保持零回归。
+        """
+        fallback = ReflectorDecision(decision="continue", reason="reflector call failed")
+
+        try:
+            from .prompts import build_reflect_prompts  # type: ignore
+        except ImportError:
+            from prompts import build_reflect_prompts   # type: ignore
+
+        system_prompt, user_prompt = build_reflect_prompts(
+            plan, history_summary, signals, current_url
+        )
+
+        try:
+            logger.info(
+                f"[REFLECTOR] 触发审计，信号={signals}；当前子目标 "
+                f"{plan.current_idx + 1}/{len(plan.sub_goals)}"
+            )
+            _broadcast_log_safe(
+                f"[REFLECTOR] 调用 Reflector LLM 审计，信号：{'; '.join(signals)}"
+            )
+
+            api_kwargs: dict = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": VLM_MAX_TOKENS,
+                "temperature": 0.2,
+            }
+            if self._use_structured:
+                api_kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "ReflectorDecision",
+                        "strict": False,
+                        "schema": _REFLECTOR_DECISION_SCHEMA,
+                    },
+                }
+
+            try:
+                response = await self.client.chat.completions.create(**api_kwargs)
+            except BadRequestError:
+                api_kwargs.pop("response_format", None)
+                response = await self.client.chat.completions.create(**api_kwargs)
+
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                raw = re.sub(r"\n?\s*```$", "", raw)
+
+            data = json.loads(raw)
+            rd = ReflectorDecision.model_validate(data)
+            logger.info(f"[REFLECTOR] 决策={rd.decision} 理由={rd.reason[:80]}")
+            _broadcast_log_safe(f"[REFLECTOR] 决策={rd.decision} | {rd.reason[:60]}")
+            return rd
+
+        except Exception as e:
+            logger.warning(f"[REFLECTOR] 调用失败降级为 continue：{type(e).__name__}: {e}")
+            return fallback
 
     def _validate_batch(self, raw: dict, step: int) -> list[dict]:
         """
