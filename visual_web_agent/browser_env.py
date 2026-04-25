@@ -11,6 +11,7 @@ SoM 标记注入、截图捕获和操作执行。
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import re
@@ -31,10 +32,14 @@ from playwright_stealth import Stealth
 
 try:
     from . import config
+    from .auth_manager import apply_storage_state_to_context, load_auth_profiles
+    from .artifact_manager import artifact_root, register_artifact
     from .data_manager import save_intercepted_data
     from .vlm_client import VSpiderAction
 except ImportError:
     import config
+    from auth_manager import apply_storage_state_to_context, load_auth_profiles
+    from artifact_manager import artifact_root, register_artifact
     from data_manager import save_intercepted_data
     from vlm_client import VSpiderAction
 
@@ -203,7 +208,7 @@ class BrowserEnv:
         self._page: Page | None = None
         self._som_js: str = ""
         self._screenshot_dir: Path = Path(config.SCREENSHOT_DIR)
-        self._download_dir: Path = Path("./downloads")
+        self._download_dir: Path = artifact_root() / "downloads"
         # XHR 拦截相关
         self._intercept_enabled: bool = False  # 默认关闭，由 configure_interceptor() 或 --xhr 参数开启
         self._intercept_count: int = 0
@@ -217,10 +222,18 @@ class BrowserEnv:
         # main.py 轮询检测，一旦有值立即触发"主引擎生效"分支，跳过 VLM。
         self._intercept_url_pattern: str | None = None  # URL 匹配关键词（子串匹配）
         self._intercepted_data: list | None = None       # 首次命中的数据快照
+        self._intercept_seen_row_keys: set[str] = set()
+        self._intercept_schema_fingerprints: set[str] = set()
+        self._intercept_endpoint_scores: dict[str, int] = {}
         self._upload_file: Path | None = None   # --upload-file 预配置路径
         self._last_action_error: Exception | None = None  # 自愈：记录本轮操作异常
         self._tab_switch_notice: str | None = None  # 标签页切换感知通知
         self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
+        self._auth_matrix_note: str = ""
+        self.auth_matrix_loaded: bool = False
+        self.auth_stale_detected: bool = False
+        self.auth_stale_reason: str = ""
+        self.auth_status_note: str = ""  # Auth Matrix / Sentinel status injected into prompts
         # ── @eN 别名映射（Wave 3 语义快照）──
         # key="@eN" → {som_id: int, role, name, selector}
         # 每轮 extract_accessibility_tree() 时刷新；供 _coerce_target_id 反解。
@@ -246,7 +259,9 @@ class BrowserEnv:
         """
         import re as _re
         _PAG_RE = _re.compile(
-            r'^(more|next|下一页|下页|next\s*page|load\s*more|›|»|▶|→|older)$',
+            r'^(more|next|next\s*page|load\s*more|older|'
+            r'下一页|下页|下一頁|下頁|更多|加载更多|'
+            r'>|›|»|▶|→|\d+)$',
             _re.IGNORECASE,
         )
         hits: list[dict] = []
@@ -259,6 +274,95 @@ class BrowserEnv:
                     "role": el.get("role") or el.get("tag") or "?",
                 })
         return hits
+
+    async def probe_pagination(self) -> dict:
+        """主动探测分页器：滚到底 + 扫 AX Tree element_mapping。
+
+        修复 HN AI Agent 任务那种"首屏看不到分页器 → VLM 误判无限滚动 → 6 步
+        smooth_scroll 弯路"的场景。在 extract 之前调一次：
+          - 滚到 document.body.scrollHeight
+          - 等 1s 让懒加载分页器进入 AX Tree
+          - 扫 element_mapping 找翻页类按钮（数字/Next/下一页/›/»）
+          - 滚回原位置（避免破坏 VLM 视觉锚点）
+
+        Returns:
+            {
+                "has_paginator": bool,
+                "candidates": [{ref, role, name, som_id}, ...],  # 命中的分页元素
+                "kind": "numeric" | "next_only" | "infinite",
+            }
+        """
+        import re as _re
+        page = await self._ensure_active_page(reason="probe_pagination")
+        if not page:
+            return {"has_paginator": False, "candidates": [], "kind": "infinite"}
+
+        _scroll_top_before = 0
+        try:
+            _scroll_top_before = await page.evaluate("() => window.scrollY") or 0
+        except Exception:
+            pass
+
+        # 滚到底触发懒加载分页器
+        try:
+            await page.evaluate(
+                "() => window.scrollTo({top: document.body.scrollHeight, behavior: 'instant'})"
+            )
+            await asyncio.sleep(1.0)  # 等懒加载
+        except Exception:
+            pass
+
+        # 重新提取 AX Tree（更新 element_mapping）
+        try:
+            await self.extract_accessibility_tree()
+        except Exception as e:
+            logger.debug(f"[PROBE PAGE] re-extract AX 失败：{e}")
+
+        _NUM_RE = _re.compile(r"^\d{1,3}$")
+        _NEXT_RE = _re.compile(
+            r"^(next|next\s*page|more|older|下一页|下页|下一頁|下頁|"
+            r"更多|加载更多|>|›|»|▶|→)$",
+            _re.IGNORECASE,
+        )
+        candidates: list[dict] = []
+        has_numeric = False
+        has_next = False
+        mapping = getattr(self, "element_mapping", {}) or {}
+        for ref, meta in mapping.items():
+            role = (meta.get("role") or "").lower()
+            name = (meta.get("name") or "").strip()
+            if role not in ("button", "link"):
+                continue
+            if _NUM_RE.match(name):
+                has_numeric = True
+                candidates.append({
+                    "ref": ref, "role": role, "name": name,
+                    "som_id": meta.get("som_id"),
+                })
+            elif _NEXT_RE.match(name):
+                has_next = True
+                candidates.append({
+                    "ref": ref, "role": role, "name": name,
+                    "som_id": meta.get("som_id"),
+                })
+
+        # 滚回原位置，不破坏 VLM 视觉锚点
+        try:
+            await page.evaluate(f"() => window.scrollTo({{top: {_scroll_top_before}, behavior: 'instant'}})")
+            await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        kind = (
+            "numeric" if has_numeric
+            else "next_only" if has_next
+            else "infinite"
+        )
+        return {
+            "has_paginator": bool(candidates),
+            "candidates": candidates,
+            "kind": kind,
+        }
 
     async def _get_xpath(self, handle) -> str:
         """
@@ -1419,43 +1523,78 @@ Object.defineProperty(navigator, 'languages', {
         except Exception as _stealth_err:
             logger.debug(f"playwright_stealth skipped: {_stealth_err}")
 
-        # ── 状态劫持：注入本地 auth_state.json（Cookie + LocalStorage） ──────
+        # ── Auth Matrix：按 profile 注入 Cookie + origin-scoped LocalStorage ──
         # launch_persistent_context 不支持 storage_state 参数，
-        # 通过 add_cookies + add_init_script 两步等效实现。
-        # 文件查找顺序：项目根目录 → visual_web_agent 子目录
-        _auth_candidates = [
-            Path(__file__).parent.parent / "auth_state.json",
-            Path(__file__).parent / "auth_state.json",
-        ]
-        _auth_path = next((p for p in _auth_candidates if p.exists()), None)
-        if _auth_path:
+        # 通过 add_cookies + origin-scoped add_init_script 两步等效实现。
+        auth_profiles = getattr(config, "AUTH_PROFILES", "")
+        if auth_profiles:
             try:
-                _auth_state = json.loads(_auth_path.read_text(encoding="utf-8"))
-                # 1. Cookie 注入（立即生效，覆盖已有同名 Cookie）
-                _cookies = _auth_state.get("cookies") or []
-                if _cookies:
-                    await self._context.add_cookies(_cookies)
-                    logger.info(
-                        f"[AUTH] 检测到 auth_state.json，已挂载 {len(_cookies)} 条 Cookie "
-                        f"实现越权登录 ← {_auth_path.name}"
+                auth_result = load_auth_profiles(
+                    auth_profiles,
+                    start_url=url,
+                    auth_dir=getattr(config, "AUTH_DIR", ""),
+                )
+                if auth_result.enabled:
+                    cookie_count, origin_count = await apply_storage_state_to_context(
+                        self._context,
+                        auth_result.state,
                     )
-                # 2. LocalStorage 注入（通过 init_script 在每次导航前写入）
-                _origins = _auth_state.get("origins") or []
-                _ls_lines: list[str] = []
-                for _origin_data in _origins:
-                    for _item in (_origin_data.get("localStorage") or []):
-                        _k = str(_item.get("name", "")).replace('"', '\\"').replace("\\", "\\\\")
-                        _v = str(_item.get("value", "")).replace('"', '\\"').replace("\\", "\\\\")
-                        _ls_lines.append(f'try{{localStorage.setItem("{_k}","{_v}");}}catch(_){{}}')
-                if _ls_lines:
-                    await self._context.add_init_script("\n".join(_ls_lines))
+                    self._auth_matrix_note = auth_result.prompt_note()
+                    self.auth_status_note = self._auth_matrix_note
+                    self.auth_matrix_loaded = True
                     logger.info(
-                        f"[AUTH] 已注入 {len(_ls_lines)} 条 localStorage 条目"
+                        "[AUTH MATRIX] Loaded profiles=%s cookies=%s origins=%s files=%s",
+                        ",".join(auth_result.profiles),
+                        cookie_count,
+                        origin_count,
+                        ",".join(path.name for path in auth_result.files),
                     )
+                    for warning in auth_result.warnings:
+                        logger.warning("[AUTH MATRIX] %s", warning)
+                else:
+                    self._auth_matrix_note = (
+                        f"已启用 auth profile 选择（{auth_profiles}），但没有匹配到可加载的状态。"
+                    )
+                    self.auth_status_note = self._auth_matrix_note
+                    self.auth_matrix_loaded = False
+                    logger.info("[AUTH MATRIX] No auth profiles matched for %s", url)
             except Exception as _auth_err:
-                logger.warning(f"[AUTH] auth_state.json 加载失败（非致命，跳过）: {_auth_err}")
+                self._auth_matrix_note = f"Auth Matrix 加载失败：{type(_auth_err).__name__}: {_auth_err}"
+                self.auth_status_note = self._auth_matrix_note
+                self.auth_matrix_loaded = False
+                logger.warning("[AUTH MATRIX] Failed to load auth profiles: %s", _auth_err)
         else:
-            logger.debug("[AUTH] 未检测到 auth_state.json，跳过状态注入")
+            self._auth_matrix_note = "未启用 Auth Matrix（未设置 --auth-profiles / VSPIDER_AUTH_PROFILES）。"
+            self.auth_status_note = self._auth_matrix_note
+            self.auth_matrix_loaded = False
+            logger.debug("[AUTH MATRIX] Disabled; no profile injection requested")
+
+            # 兼容旧路径：仅当未启用 Auth Matrix 时才尝试单文件 auth_state.json。
+            _auth_candidates = [
+                Path(__file__).parent.parent / "auth_state.json",
+                Path(__file__).parent / "auth_state.json",
+            ]
+            _auth_path = next((p for p in _auth_candidates if p.exists()), None)
+            if _auth_path:
+                try:
+                    _auth_state = json.loads(_auth_path.read_text(encoding="utf-8"))
+                    cookie_count, origin_count = await apply_storage_state_to_context(
+                        self._context,
+                        _auth_state,
+                    )
+                    self._auth_matrix_note = (
+                        f"已加载旧版 auth_state.json（cookies={cookie_count}, origins={origin_count}）。"
+                    )
+                    self.auth_status_note = self._auth_matrix_note
+                    self.auth_matrix_loaded = False
+                    logger.warning(
+                        "[AUTH LEGACY] Loaded deprecated auth_state.json (%s cookies, %s origins). "
+                        "Prefer .auth profiles with --auth-profiles.",
+                        cookie_count,
+                        origin_count,
+                    )
+                except Exception as _auth_err:
+                    logger.warning(f"[AUTH LEGACY] auth_state.json 加载失败（非致命，跳过）: {_auth_err}")
 
         # launch_persistent_context 默认自带一个 page
         if self._context.pages:
@@ -1485,12 +1624,110 @@ Object.defineProperty(navigator, 'languages', {
         # 首次导航后等待 SPA 完全渲染
         await self._wait_for_page_stable()
         await self._dismiss_permission_surfaces(reason="after initial navigation")
+        await self.refresh_auth_sentinel()
         logger.info("Page loaded and stable")
 
         # 挂载 XHR/Fetch 响应拦截器
         logger.info("Page-level interceptors will auto-register for new tabs and popups")
 
         # 挂载全局底层下载拦截器（绕过弹窗）
+
+    async def refresh_auth_sentinel(self) -> str:
+        """
+        Run generic auth-surface detection and build a prompt note.
+
+        This is intentionally not a site-specific "logged in" detector. It only
+        exposes cheap environment signals; the VLM still decides from screenshot
+        and AX Tree whether the task can proceed.
+        """
+        page = await self._ensure_active_page(reason="auth sentinel")
+        if not page:
+            self.auth_status_note = f"{self._auth_matrix_note}\n通用检测：无可用页面。"
+            return self.auth_status_note
+
+        try:
+            signals = await page.evaluate(
+                """
+() => {
+  const visible = (el) => {
+    try {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style && style.visibility !== 'hidden' && style.display !== 'none' &&
+             rect.width > 2 && rect.height > 2;
+    } catch (_) { return false; }
+  };
+  const textOf = (el) => ((el.innerText || el.value || el.getAttribute('aria-label') ||
+                          el.getAttribute('placeholder') || '') + '').trim();
+  const passwordInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(visible);
+  const allControls = Array.from(document.querySelectorAll('a,button,[role="button"],input,textarea'));
+  const loginRe = /(登录|登陆|登录\\/注册|sign\\s*in|log\\s*in|login)/i;
+  const loginEntries = allControls.filter((el) => visible(el) && loginRe.test(textOf(el)));
+  const bodyText = (document.body && document.body.innerText || '').slice(0, 5000);
+  const captchaRe = /(验证码|滑块|拼图|扫码|二维码|短信|动态口令|安全验证|风控|captcha|verify|verification)/i;
+  return {
+    url: location.href,
+    title: document.title || '',
+    passwordCount: passwordInputs.length,
+    loginEntryCount: loginEntries.length,
+    captchaLike: captchaRe.test(bodyText),
+  };
+}
+"""
+            )
+        except Exception as exc:
+            self.auth_status_note = (
+                f"{self._auth_matrix_note}\n通用检测：Auth Sentinel 执行失败："
+                f"{type(exc).__name__}: {exc}"
+            )
+            logger.debug("[AUTH SENTINEL] failed: %s", exc)
+            return self.auth_status_note
+
+        current_url = str(signals.get("url") or page.url or "")
+        login_like_url = bool(
+            re.search(
+                r"login|signin|sign-in|auth|passport|sso|cas|oauth|authserver|iam",
+                current_url,
+                flags=re.IGNORECASE,
+            )
+        )
+        password_count = int(signals.get("passwordCount") or 0)
+        login_entry_count = int(signals.get("loginEntryCount") or 0)
+        captcha_like = bool(signals.get("captchaLike"))
+        strong_login_wall = bool(
+            password_count > 0
+            or captcha_like
+            or (login_like_url and login_entry_count > 0)
+        )
+        self.auth_stale_detected = bool(self.auth_matrix_loaded and strong_login_wall)
+        self.auth_stale_reason = (
+            "Auth profile 已加载，但首屏仍出现强登录墙/验证信号；"
+            "可能是 Cookie 或 LocalStorage 过期。请重新运行 tools/manual_auth.py 刷新该 profile。"
+            if self.auth_stale_detected else ""
+        )
+
+        self.auth_status_note = (
+            f"{self._auth_matrix_note}\n"
+            "通用检测："
+            f"login_like_url={login_like_url}; "
+            f"visible_password_inputs={password_count}; "
+            f"visible_login_entries={login_entry_count}; "
+            f"captcha_or_2fa_like_text={captcha_like}; "
+            f"stale_auth_profile={self.auth_stale_detected}。\n"
+            "请结合截图和 AX Tree 自主判断是否已登录；若已登录，直接执行业务目标；"
+            "若出现验证码/扫码/短信/风控，请 ask_human，不要反复尝试登录。"
+        )
+        if self.auth_stale_detected:
+            self.auth_status_note += f"\n{self.auth_stale_reason}"
+        logger.info(
+            "[AUTH SENTINEL] login_like_url=%s password_inputs=%s login_entries=%s captcha_like=%s stale=%s",
+            login_like_url,
+            password_count,
+            login_entry_count,
+            captcha_like,
+            self.auth_stale_detected,
+        )
+        return self.auth_status_note
 
     async def detect_login_button(self) -> bool:
         """
@@ -1947,7 +2184,7 @@ Object.defineProperty(navigator, 'languages', {
 
     async def extract_text_dom(self) -> str:
         """
-        DOM 只读序列化（图文双模态的文本侧）。
+        旧版 DOM 只读序列化（保留给遗留/调试路径，非当前 AX Tree 主路径）。
 
         前置条件：调用前 `mark_and_screenshot` 必须已执行 —— 它通过 som_inject_v5.js
         为页面上所有可见可交互元素写入 `data-som-id`（红框数字 ↔ 属性值 ↔ DOM 行 ID
@@ -1958,18 +2195,18 @@ Object.defineProperty(navigator, 'languages', {
             末尾追加少量 `[TEXT] ...` 行（非交互语义文本，如 h1/h2/p），帮助 VLM 理解页面语境。
             若当前页面尚未注入 SoM ID，返回空串。
         """
-        page = await self._ensure_active_page(reason="before extract_text_dom")
+        page = await self._ensure_active_page(reason="before legacy extract_text_dom")
         if not page:
-            raise RuntimeError("No active page available for DOM extraction.")
+            raise RuntimeError("No active page available for legacy DOM extraction.")
 
         await self._wait_for_page_stable()
-        await self._dismiss_permission_surfaces(reason="before text dom extraction")
+        await self._dismiss_permission_surfaces(reason="before legacy text DOM extraction")
 
         # ── 只读序列化：复用 som_inject_v5.js 已写入的 data-som-id 作为单一事实源 ──
         # 关键设计：此处不再另起 SELECTOR 重新扫描页面，也绝不擦除 data-som-id。
         # 原因：screenshot 上的红框编号由 SoM v5 决定；若这里再扫一遍并重编号，
         # 会导致截图红框 "12" 与 DOM 输出 "[ID: 12]" 指向不同元素 → VLM 误点。
-        # 现在流程：mark_and_screenshot 已完成编号 → extract_text_dom 只读取 + 序列化。
+        # 现在流程：mark_and_screenshot 已完成编号 → 旧版 extract_text_dom 只读取 + 序列化。
         _DOM_EXTRACT_JS = """
 (() => {
     const results = [];
@@ -2082,7 +2319,7 @@ Object.defineProperty(navigator, 'languages', {
             try:
                 result = await frame.evaluate(_DOM_EXTRACT_JS)
             except Exception as e:
-                logger.debug(f"[TEXT DOM] Frame evaluation skipped: {e}")
+                logger.debug(f"[LEGACY TEXT DOM] Frame evaluation skipped: {e}")
                 continue
 
             if not result or not isinstance(result, dict):
@@ -2096,14 +2333,14 @@ Object.defineProperty(navigator, 'languages', {
 
         if not elements:
             logger.warning(
-                "[TEXT DOM] No SoM-tagged interactive elements found; "
+                "[LEGACY TEXT DOM] No SoM-tagged interactive elements found; "
                 "mark_and_screenshot 可能未成功注入 data-som-id"
             )
             return ""
 
         dom_text = "\n".join(elements)
         logger.info(
-            f"[TEXT DOM] Serialized {len(elements)} lines (SoM marked={marked_total}) "
+            f"[LEGACY TEXT DOM] Serialized {len(elements)} lines (SoM marked={marked_total}) "
             f"across {frame_hits} frames — read-only, shares IDs with screenshot"
         )
         return dom_text
@@ -2252,7 +2489,7 @@ Object.defineProperty(navigator, 'languages', {
         """
         提取页面的无障碍语义树，用作 VLM 图文融合决策的文本侧输入。
 
-        前置条件：与 extract_text_dom 相同，调用前 mark_and_screenshot 需已完成，
+        前置条件：与旧版 extract_text_dom 相同，调用前 mark_and_screenshot 需已完成，
         确保 [data-som-id] 已注入 —— 只有这样 ID 映射段才能拿到红框一一对应的编号。
 
         Returns:
@@ -2819,6 +3056,7 @@ Object.defineProperty(navigator, 'languages', {
             
             print(f"\n✅ [底层拦截] 成功拦截文件下载并静默保存至: \033[36m{final_path.resolve()}\033[0m\n")
             logger.info(f"[DOWNLOAD INTERCEPT] Saved native file: {final_path.resolve()}")
+            register_artifact(final_path)
         except Exception as e:
             logger.error(f"[DOWNLOAD INTERCEPT] Failed to save file: {e}")
 
@@ -2852,6 +3090,9 @@ Object.defineProperty(navigator, 'languages', {
         self._intercept_url_pattern = url_pattern.strip() if url_pattern else None
         # 每次重新配置时清空上次缓存，防止旧数据触发误判
         self._intercepted_data = None
+        self._intercept_seen_row_keys.clear()
+        self._intercept_schema_fingerprints.clear()
+        self._intercept_endpoint_scores.clear()
         logger.info(
             f"Interceptor configured | enabled={enabled} | "
             f"file={filename} | unique_key={unique_key} | "
@@ -2910,15 +3151,20 @@ Object.defineProperty(navigator, 'languages', {
             if self._intercept_url_pattern.lower() in url.lower():
                 core_list = self._extract_data_list(json_body)
                 if core_list:
-                    self._intercepted_data = core_list
+                    new_rows = self._dedupe_intercept_rows(core_list)
+                    if not new_rows:
+                        logger.info(f"[XHR CORE] Duplicate API payload skipped: {url[:120]}")
+                        return
+                    self._remember_intercept_schema(new_rows)
+                    self._intercepted_data = new_rows
                     # 同步写盘（防止 main.py 未及时消费时数据丢失）
                     try:
                         save_intercepted_data(
-                            json_list=core_list,
+                            json_list=new_rows,
                             filename=self._intercept_filename,
                             unique_key=self._intercept_unique_key,
                         )
-                        self._intercept_count += len(core_list)
+                        self._intercept_count += len(new_rows)
                     except Exception as save_err:
                         logger.error(f"[XHR CORE] Failed to save: {save_err}")
 
@@ -2928,11 +3174,11 @@ Object.defineProperty(navigator, 'languages', {
                     RESET = "\033[0m"
                     print(
                         f"\n{GREEN_BOLD}[XHR INTERCEPT] 成功拦截核心 API 数据！{RESET} "
-                        f"{CYAN}{len(core_list)} 条记录{RESET} "
+                        f"{CYAN}{len(new_rows)} new records{RESET} "
                         f"← {url[:100]}\n"
                     )
                     logger.info(
-                        f"[XHR CORE] Captured {len(core_list)} records "
+                        f"[XHR CORE] Captured {len(new_rows)} new records "
                         f"(pattern={self._intercept_url_pattern!r}): {url[:120]}"
                     )
                     return  # 核心数据已处理，无需再走通用轨道重复保存
@@ -2945,21 +3191,133 @@ Object.defineProperty(navigator, 'languages', {
         if not data_list:
             return
 
+        score, fingerprint = self._score_intercept_candidate(url, data_list)
+        if score < 5:
+            logger.debug(
+                f"[XHR SENTINEL] Candidate ignored score={score} "
+                f"rows={len(data_list)} fp={fingerprint[:80]} url={url[:120]}"
+            )
+            return
+
+        new_rows = self._dedupe_intercept_rows(data_list)
+        if not new_rows:
+            logger.info(
+                f"[XHR SENTINEL] Duplicate payload skipped "
+                f"score={score} fp={fingerprint[:80]} url={url[:120]}"
+            )
+            return
+
+        self._remember_intercept_schema(new_rows)
+
         logger.info(
-            f"[XHR INTERCEPT] Detected {len(data_list)} records "
-            f"from: {url[:120]}..."
+            f"[XHR SENTINEL] Accepted {len(new_rows)}/{len(data_list)} new records "
+            f"score={score} fp={fingerprint[:80]} from: {url[:120]}..."
         )
 
         # 保存到 Excel
         try:
             save_intercepted_data(
-                json_list=data_list,
+                json_list=new_rows,
                 filename=self._intercept_filename,
                 unique_key=self._intercept_unique_key,
             )
-            self._intercept_count += len(data_list)
+            self._intercept_count += len(new_rows)
         except Exception as e:
             logger.error(f"[XHR INTERCEPT] Failed to save data: {e}")
+
+    def _stable_json_hash(self, value) -> str:
+        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _row_dedup_key(self, row: dict) -> str:
+        if self._intercept_unique_key:
+            keys = (
+                [self._intercept_unique_key]
+                if isinstance(self._intercept_unique_key, str)
+                else list(self._intercept_unique_key)
+            )
+            values = [row.get(k) for k in keys if k in row and row.get(k) not in (None, "")]
+            if values:
+                return "key:" + self._stable_json_hash(values)
+        return "hash:" + self._stable_json_hash(row)
+
+    def _dedupe_intercept_rows(self, rows: list[dict]) -> list[dict]:
+        new_rows: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = self._row_dedup_key(row)
+            if key in self._intercept_seen_row_keys:
+                continue
+            self._intercept_seen_row_keys.add(key)
+            new_rows.append(row)
+        return new_rows
+
+    def _schema_fingerprint(self, rows: list[dict]) -> str:
+        key_set: set[str] = set()
+        for row in rows[:5]:
+            if isinstance(row, dict):
+                key_set.update(str(k) for k in row.keys())
+        return "|".join(sorted(key_set))
+
+    def _remember_intercept_schema(self, rows: list[dict]) -> None:
+        fp = self._schema_fingerprint(rows)
+        if fp:
+            self._intercept_schema_fingerprints.add(fp)
+
+    def _score_intercept_candidate(self, url: str, rows: list[dict]) -> tuple[int, str]:
+        fingerprint = self._schema_fingerprint(rows)
+        if not fingerprint:
+            return 0, ""
+
+        score = 0
+        row_count = len(rows)
+        keys = set(fingerprint.split("|"))
+        lower_url = (url or "").lower()
+
+        if row_count >= self._intercept_min_list_size:
+            score += 2
+        if row_count >= 20:
+            score += 2
+        if row_count >= 50:
+            score += 1
+
+        url_markers = (
+            "api", "ajax", "xhr", "search", "query", "list", "page", "record",
+            "item", "order", "table", "data", "result", "export",
+        )
+        if any(marker in lower_url for marker in url_markers):
+            score += 2
+
+        business_keys = {
+            "id", "uuid", "uid", "url", "link", "title", "name", "price", "amount",
+            "date", "time", "status", "type", "code", "no", "number", "order_id",
+            "created_at", "updated_at",
+        }
+        if keys & business_keys:
+            score += 2
+        if len(keys) >= 3:
+            score += 1
+
+        if fingerprint in self._intercept_schema_fingerprints:
+            score += 5
+
+        noise_keys = {
+            "children", "routes", "menus", "permissions", "locale", "i18n",
+            "config", "settings", "schema",
+        }
+        if keys & noise_keys and row_count < 20:
+            score -= 3
+
+        endpoint_key = re.sub(
+            r"([?&](page|current|offset|limit|size|pageSize)=)[^&]+",
+            r"\1*",
+            lower_url,
+        )
+        self._intercept_endpoint_scores[endpoint_key] = max(
+            score, self._intercept_endpoint_scores.get(endpoint_key, 0)
+        )
+        return score, fingerprint
 
     def _extract_data_list(self, json_body) -> list[dict] | None:
         """

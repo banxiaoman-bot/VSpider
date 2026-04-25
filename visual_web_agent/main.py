@@ -40,13 +40,19 @@ try:
     from .browser_env import BrowserEnv, ActionExecutionError
     from .vlm_client import VLMClient, TaskPlan
     from .data_manager import save_to_excel
+    from .data_sanitizer import sanitize_extracted_rows
+    from .artifact_manager import resolve_artifact_path
     from .trajectory_logger import HtmlLogger
+    from .auth_vault import SecretResolutionError, resolve_env_placeholders
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR
     from browser_env import BrowserEnv, ActionExecutionError
     from vlm_client import VLMClient, TaskPlan
     from data_manager import save_to_excel
+    from data_sanitizer import sanitize_extracted_rows
+    from artifact_manager import resolve_artifact_path
     from trajectory_logger import HtmlLogger
+    from auth_vault import SecretResolutionError, resolve_env_placeholders
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -99,6 +105,24 @@ def _broadcast_done_safe(success: bool, message: str = "") -> None:
         broadcast_done(success, message)
     except Exception:
         pass
+
+
+async def _wait_for_human_resume(reason: str = "") -> None:
+    try:
+        from api_server import broadcast_human_intervention, wait_for_human_resume
+
+        if broadcast_human_intervention(reason):
+            await wait_for_human_resume()
+            return
+    except Exception:
+        pass
+
+    await asyncio.get_event_loop().run_in_executor(
+        None,
+        input,
+        "\n👉 请在弹出的浏览器窗口中手动完成操作（滑块验证 / 扫码登录 / 手动填写等）。\n"
+        "✅ 操作完成后，在此终端按下 [回车键] 以恢复自动化流程...\n",
+    )
 
 
 _RPA_CACHE_DIR = Path(__file__).parent / "rpa_cache"
@@ -188,7 +212,53 @@ def _parse_goal_target_count(goal: str) -> int | None:
     m = re.search(r'[Tt]op\s*(\d+)\b', goal)
     if m:
         return int(m.group(1))
+    # English bulk extraction wording: "extract 2000 records/items/rows"
+    m = re.search(r'(\d+)\s*(?:records?|items?|rows?|entries|results?)\b', goal, re.I)
+    if m:
+        return int(m.group(1))
     return None
+
+
+def _parse_goal_target_pages(goal: str) -> int | None:
+    """Parse goals such as "前5页" / "提取 3 pages"."""
+    m = re.search(r'(?:前|共|取|抓|提取|获取)?\s*(\d+)\s*页', goal)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(?:first|top|extract|get|scrape)\s*(\d+)\s*pages?\b', goal, re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _derive_effective_max_steps(goal: str) -> int:
+    """Raise step budget for bulk extraction / multi-page traversal goals.
+
+    Triggers (any of):
+      - explicit count >= 50 (e.g. "抓取 200 条"): budget = max(MAX_STEPS, count//5 + 30)
+      - explicit page traversal "前 N 页 / 共 N 页 / N 页数据": budget = max(50, N*5 + 10)
+      - generic "翻页 / 分页 / 下一页 / 多页 / 逐页 / pagination" + count<50:
+        budget = max(50, MAX_STEPS)
+    """
+    target_count = _parse_goal_target_count(goal)
+    if target_count is not None and target_count >= 50:
+        return min(500, max(MAX_STEPS, target_count // 5 + 30))
+
+    # 显式翻页计数：「前 N 页」「共 N 页」「N 页 数据/列表」
+    page_match = re.search(
+        r'(?:前|共|抓取|采集|提取|遍历|爬|browse|first)\s*(\d+)\s*(?:页|pages?)',
+        goal, re.IGNORECASE,
+    )
+    if page_match:
+        n_pages = int(page_match.group(1))
+        # 每页约 3-5 步（提取+滚动+点击下一页+缓冲），加 10 步前后开销
+        return min(500, max(50, n_pages * 5 + 10))
+
+    # 通用翻页关键词（不带数量但意图明确）
+    page_keywords = ('翻页', '分页', '下一页', '多页', '逐页', 'pagination', 'paginate', 'next page')
+    if any(kw in goal.lower() for kw in (k.lower() for k in page_keywords)):
+        return max(50, MAX_STEPS)
+
+    return MAX_STEPS
 
 
 def _goal_should_skip_rpa(goal: str) -> tuple[bool, str]:
@@ -591,6 +661,20 @@ def _resolve_login_settings(url: str) -> dict:
     return settings
 
 
+def _resolve_login_vault_value(value: str, label: str) -> str:
+    try:
+        resolved, used, names = resolve_env_placeholders(value)
+    except SecretResolutionError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if used:
+        logger.info(
+            "[AUTH VAULT] Resolved pre-login %s from env placeholder(s): %s",
+            label,
+            ", ".join(names),
+        )
+    return resolved
+
+
 async def _run_preflight_login(
     browser: BrowserEnv,
     goal: str,
@@ -709,6 +793,9 @@ async def _run_preflight_login(
         else:
             print("[AUTH] Login popup detected during execution, taking over with native login...")
 
+        user_account = _resolve_login_vault_value(user_account, "username")
+        user_pwd = _resolve_login_vault_value(user_pwd, "password")
+
         user_locator = await _first_visible_locator(page, user_selector)
         if user_locator:
             await user_locator.fill(user_account)
@@ -812,20 +899,20 @@ def _goal_should_force_vision(goal: str) -> bool:
     return _env_flag("VSPIDER_FORCE_VISION_FOR_LIST_TASKS", default=True) and _goal_prefers_visual_navigation(goal)
 
 
-def _should_fallback_to_vision(goal: str, text_dom: str) -> tuple[bool, str]:
-    lines = [line.strip() for line in (text_dom or "").splitlines() if line.strip()]
+def _should_fallback_to_vision(goal: str, text_snapshot: str) -> tuple[bool, str]:
+    lines = [line.strip() for line in (text_snapshot or "").splitlines() if line.strip()]
     if not lines:
-        return True, "text-only DOM empty"
+        return True, "text snapshot empty"
 
     id_lines = [line for line in lines if line.startswith("[ID:")]
     text_lines = [line for line in lines if line.startswith("[TEXT]")]
 
     if _goal_prefers_visual_navigation(goal):
         if len(lines) < 18:
-            return True, f"goal needs list-item navigation but text-only DOM is sparse ({len(lines)} lines)"
+            return True, f"goal needs list-item navigation but text snapshot is sparse ({len(lines)} lines)"
         if len(id_lines) < 12 and len(text_lines) < 4:
             return True, (
-                "goal needs visual list discovery but current text-only DOM mostly contains "
+                "goal needs visual list discovery but current text snapshot mostly contains "
                 "navigation chrome"
             )
 
@@ -954,7 +1041,7 @@ def _search_goal_done_looks_premature(
     start_url: str,
     current_url: str,
     page_summary: str,
-    text_dom: str,
+    semantic_text: str,
 ) -> bool:
     """
     对常规搜索任务做一层完成态校验：
@@ -966,7 +1053,7 @@ def _search_goal_done_looks_premature(
 
     current_url = (current_url or "").strip()
     start_url = (start_url or "").strip()
-    summary_text = "\n".join(part for part in (page_summary, text_dom) if part)
+    summary_text = "\n".join(part for part in (page_summary, semantic_text) if part)
 
     result_markers = [
         r"结果页", r"搜索结果", r"results?", r"search results?",
@@ -1019,6 +1106,152 @@ def _decision_implies_completion(decision: dict) -> bool:
         r"all required steps have been completed",
     ]
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in completion_patterns)
+
+
+def _decision_claims_current_subgoal_completed(decision: dict) -> bool:
+    """
+    对 action=done 的决策做补充判定：若模型在 progress_review/thought/current_state
+    中明确声明“当前子目标退出标准已满足”，即使漏填 subgoal_status，也视作当前
+    子目标已完成。
+    """
+    if (decision.get("subgoal_status") or "").strip().lower() == "completed":
+        return True
+
+    text = "\n".join(
+        str(decision.get(key, "") or "")
+        for key in ("progress_review", "current_state", "thought")
+    ).strip()
+    if not text:
+        return False
+
+    exit_met_patterns = [
+        r"满足(?:了)?[^\n]{0,30}退出标准",
+        r"符合[^\n]{0,30}退出标准",
+        r"子目标[^\n]{0,20}(?:已完成|完成)",
+        r"当前子目标[^\n]{0,20}(?:已完成|完成)",
+        r"已验证[^\n]{0,40}(?:成功|完成|可见|已加载)",
+        r"exit criteria (?:is )?met",
+        r"current subgoal (?:is )?complete(?:d)?",
+    ]
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in exit_met_patterns):
+        return True
+
+    completion_patterns = [
+        r"任务已完成",
+        r"用户目标已(?:经)?(?:全部)?达成",
+        r"目标已(?:经)?(?:全部)?达成",
+        r"已全部达成",
+        r"无需再操作",
+        r"不需要再操作",
+        r"可直接结束任务",
+        r"可以直接结束任务",
+        r"task (?:is )?complete(?:d)?",
+        r"goal (?:has been )?achieved",
+        r"already completed",
+        r"no further action needed",
+        r"all required steps have been completed",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in completion_patterns)
+
+
+def _is_terminal_only_subgoal(subgoal: "TaskPlan | Any") -> bool:
+    """识别仅用于收尾输出 done 的行政型尾子目标。"""
+    description = str(getattr(subgoal, "description", "") or "").strip()
+    exit_criteria = str(getattr(subgoal, "exit_criteria", "") or "").strip()
+    if not (description or exit_criteria):
+        return False
+
+    def _strip_negated_noop_phrases(text: str) -> str:
+        cleaned = text
+        noop_patterns = [
+            r"不执行任何交互",
+            r"无需任何交互",
+            r"不需要任何交互",
+            r"无须任何交互",
+            r"无需再操作",
+            r"不需要再操作",
+            r"无须再操作",
+            r"无需任何操作",
+            r"不需要任何操作",
+            r"无须任何操作",
+        ]
+        for pattern in noop_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        return cleaned
+
+    _action_text = _strip_negated_noop_phrases(
+        "\n".join(part for part in (description, exit_criteria) if part)
+    )
+    physical_action_patterns = [
+        r"点击",
+        r"单击",
+        r"\bclick(?:_new_tab|_point)?\b",
+        r"输入",
+        r"填写",
+        r"\btype\b",
+        r"提取",
+        r"\bextract(?:_link)?\b",
+        r"按(?:键|下)",
+        r"\bpress_key\b",
+        r"滚动",
+        r"翻页",
+        r"\bscroll\b",
+        r"\bsmooth_scroll\b",
+        r"悬停",
+        r"\bhover\b",
+        r"选择",
+        r"\bselect\b",
+        r"上传",
+        r"\bupload\b",
+        r"下载",
+        r"导出",
+        r"\bdownload(?:_image)?\b",
+        r"拖拽",
+        r"拖动",
+        r"\bdrag(?:_and_drop)?\b",
+        r"移除",
+        r"\bremove_element\b",
+        r"导航",
+        r"跳转",
+        r"\bgoto\b",
+        r"登录",
+        r"搜索",
+        r"提交",
+        r"关闭(?:弹窗|对话框|标签页)?",
+        r"\bclose_tab\b",
+        r"切换(?:标签页)?",
+        r"\bswitch_tab\b",
+        r"\bask_human\b",
+        r"人工处理",
+    ]
+    if any(re.search(pattern, _action_text, flags=re.IGNORECASE) for pattern in physical_action_patterns):
+        return False
+
+    terminal_prefix_patterns = [
+        r"^\s*任务完成(?:[:：,，。；!！\s].*)?$",
+        r"^\s*结束任务(?:[:：,，。；!！\s].*)?$",
+        r"^\s*任务终止(?:[:：,，。；!！\s].*)?$",
+        r"^\s*终止任务(?:[:：,，。；!！\s].*)?$",
+        r"^\s*确认目标达成(?:后)?(?:[:：,，。；!！\s].*)?$",
+        r"^\s*完成\s*goal\s*全部要求(?:[:：,，。；!！\s].*)?$",
+        r"^\s*完成用户全部需求(?:[:：,，。；!！\s].*)?$",
+        r"^\s*(?:准备)?输出\s*done(?:[:：,，。；!！\s].*)?$",
+        r"^\s*action\s*=\s*done(?:[:：,，。；!！\s].*)?$",
+        r"^\s*直接\s*done(?:[:：,，。；!！\s].*)?$",
+        r"^\s*ready to output done(?:[:：,，。；!！\s].*)?$",
+        r"^\s*finish(?: the)? task(?:[:：,，。；!！\s].*)?$",
+        r"^\s*terminate(?: the)? task(?:[:：,，。；!！\s].*)?$",
+        r"^\s*不执行任何交互(?:[:：,，。；!！\s].*)?$",
+        r"^\s*无需任何交互(?:[:：,，。；!！\s].*)?$",
+    ]
+
+    for candidate in (description, exit_criteria):
+        if candidate and any(
+            re.search(pattern, candidate, flags=re.IGNORECASE)
+            for pattern in terminal_prefix_patterns
+        ):
+            return True
+    return False
 
 
 def _goal_explicitly_requests_backtracking(goal: str) -> bool:
@@ -1239,7 +1472,13 @@ def _normalize_rpa_cache_payload(payload) -> dict:
 def _extract_placeholder_keys(text: str) -> list[str]:
     if not text or "{{" not in text:
         return []
-    return sorted({m.strip() for m in re.findall(r"\{\{([^}]+)\}\}", text) if m.strip()})
+    keys: set[str] = set()
+    for raw in re.findall(r"\{\{([^}]+)\}\}", text):
+        key = raw.strip()
+        if not key or key.lower().startswith("env:"):
+            continue
+        keys.add(key)
+    return sorted(keys)
 
 
 def _stable_memory_keys(workflow_memory: dict | None) -> list[str]:
@@ -1624,11 +1863,21 @@ def _print_manual_warning(title: str, message: str):
         print(line)
 
 
+def _runtime_config_module():
+    try:
+        from . import config as runtime_config
+    except ImportError:
+        import config as runtime_config
+    return runtime_config
+
+
 def _apply_runtime_overrides(args) -> None:
     """Apply runtime config overrides from CLI arguments and natural-language constraints."""
-    import config
+    config = _runtime_config_module()
 
     config.BROWSER_USER_DATA_DIR = args.user_data_dir
+    if hasattr(args, "auth_profiles") and args.auth_profiles is not None:
+        config.AUTH_PROFILES = args.auth_profiles
 
     override_text = "\n".join(
         part for part in (args.constraints, args.context, args.goal, args.output) if part
@@ -1651,6 +1900,8 @@ async def run_agent(
     xhr_pattern: str = "",
     require_login: bool = False,
     stop_event: threading.Event | None = None,
+    auth_profiles: str | None = None,
+    vlm_options: dict | None = None,
 ) -> bool:
     """
     Agent 核心运转循环。
@@ -1665,6 +1916,24 @@ async def run_agent(
                      一旦拦截到匹配 URL 的 API 响应，立即保存数据并终止 VLM 循环。
     """
     from datetime import datetime
+
+    if auth_profiles is not None:
+        _runtime_config_module().AUTH_PROFILES = auth_profiles
+    if vlm_options:
+        _cfg = _runtime_config_module()
+        if vlm_options.get("model"):
+            _cfg.VLM_MODEL_NAME = str(vlm_options["model"])
+        if vlm_options.get("semantic_model"):
+            _cfg.VLM_SEMANTIC_MODEL_NAME = str(vlm_options["semantic_model"])
+        if vlm_options.get("base_url"):
+            _cfg.VLM_API_BASE = str(vlm_options["base_url"])
+        if vlm_options.get("api_key"):
+            _cfg.VLM_API_KEY = str(vlm_options["api_key"])
+        if vlm_options.get("temperature") is not None:
+            _cfg.VLM_TEMPERATURE = float(vlm_options["temperature"])
+        if vlm_options.get("max_tokens") is not None:
+            _cfg.VLM_MAX_TOKENS = int(vlm_options["max_tokens"])
+        _cfg.VLM_TEXT_ONLY = str(vlm_options.get("model_type", "")).lower() == "text"
 
     # 每次运行生成独立的带时间戳文件名，避免多次运行数据混在一起
     _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1681,11 +1950,24 @@ async def run_agent(
         if stop_event and stop_event.is_set():
             raise RuntimeError(f"STOP_REQUESTED::{context}")
 
+    def _abort_if_stale_auth() -> bool:
+        if not getattr(browser, "auth_stale_detected", False):
+            return False
+        stale_msg = getattr(browser, "auth_stale_reason", "") or (
+            "Auth profile appears stale; please refresh it with tools/manual_auth.py."
+        )
+        logger.error("[AUTH STALE] %s", stale_msg)
+        _broadcast_log_safe(f"[AUTH STALE] {stale_msg}", level="error")
+        _broadcast_done_safe(False, stale_msg)
+        return True
+
     try:
         _broadcast_log_safe("VSpider Agent started", level="info")
         _check_stop("before_browser_start")
         # 启动浏览器并导航
         await browser.start(start_url)
+        if _abort_if_stale_auth():
+            return False
 
         # 预配置上传文件路径（--upload-file 参数）
         if upload_file:
@@ -1720,22 +2002,18 @@ async def run_agent(
         # ── 预检登录拦截器：在 VLM 接管前，优先用原生 Playwright 完成一次安全登录 ──
         await _run_preflight_login(browser, goal, require_login=require_login)
 
-        # ── 登录状态 DOM 检测（Python 侧，在主循环前执行一次）──────────────
-        # 直接用 JS 检查页面有无可见的"登录"按钮，把确认结论注入 goal。
-        # 这是事实陈述，VLM 无法用任务目标文本推翻它。
-        if _goal_requires_login_flow(goal):
-            has_login_btn = await browser.detect_login_button()
-            if not has_login_btn:
-                login_note = (
-                    "\n\n【系统自动检测结果】当前页面 DOM 中未发现可见的'登录'按钮，"
-                    "系统已确认当前处于登录态。请跳过所有登录操作，直接执行任务目标。"
-                )
-                goal = goal + login_note
-                logger.info("[LOGIN DETECT] No login button found → already logged in, injected note into goal.")
-            else:
-                logger.info("[LOGIN DETECT] Login button found → not logged in, proceed with login flow.")
-        else:
-            logger.info("[LOGIN DETECT] Goal does not involve login flow → skip login-state prompt injection.")
+        # ── Auth Sentinel（通用认证哨兵）──────────────────────────────
+        # 不写站点专属"已登录选择器"，只把低成本环境信号交给 VLM 做视觉裁定。
+        auth_note = await browser.refresh_auth_sentinel()
+        if auth_note:
+            goal = (
+                goal
+                + "\n\n【认证环境（系统通用检测，非业务结论）】\n"
+                + auth_note
+            )
+            logger.info("[AUTH SENTINEL] Injected generic auth environment note into goal.")
+        if _abort_if_stale_auth():
+            return False
         # ──────────────────────────────────────────────────────────────────
 
         logger.info(f"{'=' * 60}")
@@ -1743,7 +2021,19 @@ async def run_agent(
         _broadcast_log_safe(f"[TARGET] {goal}")
         logger.info(f"[URL] {start_url}")
         _broadcast_log_safe(f"[URL] {start_url}")
-        logger.info(f"[MAX STEPS] {MAX_STEPS}")
+        _effective_max_steps = _derive_effective_max_steps(goal)
+        if _effective_max_steps > MAX_STEPS:
+            logger.info(
+                f"[MAX STEPS] bulk extraction budget raised: "
+                f"{MAX_STEPS} -> {_effective_max_steps}"
+            )
+            _broadcast_log_safe(
+                f"[MAX STEPS] 批量提取任务自动提高步数预算: "
+                f"{MAX_STEPS} -> {_effective_max_steps}",
+                level="info",
+            )
+        else:
+            logger.info(f"[MAX STEPS] {MAX_STEPS}")
         logger.info(f"{'=' * 60}")
 
         # 滑窗：记录最近 6 步的 (action, target_id, landing_url)，用于检测点击死循环
@@ -1753,6 +2043,12 @@ async def run_agent(
         _LOOP_GUARD_WINDOW = 6
         _loop_guard_blocked_ids: set[int] = set()  # 触发过 LOOP GUARD 的 target_id，后续直接拦截
         _loop_guard_blocked_points: set[tuple] = set()  # click_point 黑名单（bucket 后的坐标）
+        # ── Fix 4：RAW（降级前）VLM 输出 LOOP GUARD ──────────────────────
+        # 监测 ZERO_TARGET_DOWNGRADE 之前的原始决策，捕捉 VLM 反复输出
+        # `click target_id=0 type_value="2"` 这种 schema 错位幻觉（被 validator
+        # 降级为 wait 后老 LOOP GUARD 看不见）。连续 3 次就强制硬指令 + 切走。
+        _consecutive_zero_target = 0
+        _last_zero_target_tv = ""
 
         def _norm_url_for_guard(url: str) -> str:
             """LOOP GUARD key 稳定化：只保留 scheme+host+path，抛弃 query/fragment。
@@ -1780,9 +2076,267 @@ async def run_agent(
         # LOOP GUARD 覆盖的动作集（Bug #1 修复）
         _LOOP_GUARD_ACTIONS = ("click", "click_new_tab", "click_point")
         _extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
+        _pagination_probed = False  # 首次 extract 后探测分页器一次（Improvement 1）
+        _pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
+        _pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
         _total_extracted_rows = 0  # 跨页累加的总行数
         _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
         _extracted_page_urls: set = set()  # 已成功提取数据的不同页面 URL 集合
+        _extracted_page_keys: set[str] = set()  # URL + table signature; SPA/table pagination stays on one URL
+        _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
+
+        def _filter_new_extracted_rows(data, source_text: str = ""):
+            target_count = _parse_goal_target_count(goal)
+            target_remaining = (
+                None if target_count is None
+                else max(0, target_count - _total_extracted_rows)
+            )
+            result = sanitize_extracted_rows(
+                raw_data=data,
+                source_text=source_text,
+                seen_fingerprints=_seen_extract_row_keys,
+                target_remaining=target_remaining,
+            )
+            logger.info(result.summary_log(target_remaining=target_remaining))
+            return (
+                result.rows,
+                result.accepted,
+                result.duplicates,
+                result.rejected_total,
+            )
+
+        async def _extract_visible_table_rows_via_dom(reason: str) -> list[dict]:
+            try:
+                _table_page = await browser._ensure_active_page(reason=reason)
+                rows = await _table_page.evaluate(
+                    """() => {
+                        const clean = (value) => String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        const isVisible = (el) => {
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const tables = Array.from(document.querySelectorAll('table'));
+                        let best = { score: 0, rows: [] };
+
+                        for (const table of tables) {
+                            if (!isVisible(table)) continue;
+                            let headers = Array.from(table.querySelectorAll('thead th'))
+                                .map(th => clean(th.innerText))
+                                .filter(Boolean);
+                            const bodyRows = Array.from(table.querySelectorAll('tbody tr'))
+                                .filter(tr => isVisible(tr));
+                            const parsedRows = [];
+
+                            for (const tr of bodyRows) {
+                                const cells = Array.from(tr.querySelectorAll('td'))
+                                    .filter(td => isVisible(td))
+                                    .map(td => clean(td.innerText));
+                                if (cells.length < 2) continue;
+                                if (cells.some(cell => /no matching records|no data/i.test(cell))) {
+                                    continue;
+                                }
+                                if (!headers.length || headers.length !== cells.length) {
+                                    headers = cells.map((_, index) => `column_${index + 1}`);
+                                }
+                                const row = {};
+                                cells.forEach((cell, index) => {
+                                    row[headers[index] || `column_${index + 1}`] = cell;
+                                });
+                                parsedRows.push(row);
+                            }
+
+                            const score = parsedRows.length * Math.max(headers.length, 1);
+                            if (parsedRows.length >= 2 && score > best.score) {
+                                best = { score, rows: parsedRows };
+                            }
+                        }
+                        return best.rows;
+                    }"""
+                )
+                if isinstance(rows, list) and rows:
+                    logger.info("[EXTRACT DOM] visible table rows=%s", len(rows))
+                    return rows
+            except Exception as table_err:
+                logger.debug("[EXTRACT DOM] table extraction skipped: %s", table_err)
+            return []
+
+        async def _visible_table_signature(reason: str) -> str:
+            try:
+                _sig_page = await browser._ensure_active_page(reason=reason)
+                return await _sig_page.evaluate(
+                    """() => {
+                        const clean = (value) => String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        const isVisible = (el) => {
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const table = Array.from(document.querySelectorAll('table'))
+                            .find(t => isVisible(t));
+                        if (!table) return '';
+                        return Array.from(table.querySelectorAll('tbody tr'))
+                            .filter(tr => isVisible(tr))
+                            .slice(0, 5)
+                            .map(tr => clean(tr.innerText))
+                            .join('|');
+                    }"""
+                ) or ""
+            except Exception:
+                return ""
+
+        async def _auto_advance_table_page_via_dom(reason: str) -> bool:
+            try:
+                _page_for_next = await browser._ensure_active_page(reason=reason)
+                before_sig = await _visible_table_signature("table autopager before")
+                if not before_sig:
+                    return False
+                result = await _page_for_next.evaluate(
+                    """() => {
+                        const clean = (value) => String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        const isVisible = (el) => {
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const isDisabled = (el) => {
+                            const cls = String(el.className || '').toLowerCase();
+                            return el.disabled
+                                || el.getAttribute('aria-disabled') === 'true'
+                                || cls.includes('disabled');
+                        };
+
+                        const tables = Array.from(document.querySelectorAll('table'))
+                            .filter(isVisible);
+                        if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
+                            for (const table of tables) {
+                                if (!window.jQuery.fn.dataTable.isDataTable(table)) {
+                                    continue;
+                                }
+                                const dt = window.jQuery(table).DataTable();
+                                const info = dt.page.info();
+                                if (info && info.page < info.pages - 1) {
+                                    dt.page('next').draw('page');
+                                    return {
+                                        ok: true,
+                                        method: 'datatables_api',
+                                        page: info.page + 2,
+                                        pages: info.pages
+                                    };
+                                }
+                            }
+                        }
+
+                        const nextText = /^(next|next page|>|›|»|→|下一页|下页)$/i;
+                        const candidates = Array.from(
+                            document.querySelectorAll('button,a,[role="button"],[role="link"]')
+                        ).filter(isVisible);
+                        for (const el of candidates) {
+                            const label = clean(
+                                el.innerText
+                                || el.getAttribute('aria-label')
+                                || el.getAttribute('title')
+                                || el.textContent
+                            );
+                            if (!label || !nextText.test(label)) continue;
+                            if (isDisabled(el)) continue;
+                            el.scrollIntoView({block: 'center', inline: 'center'});
+                            el.click();
+                            return {ok: true, method: 'dom_next_button', label};
+                        }
+
+                        const current = candidates.find(el => {
+                            const cls = String(el.className || '').toLowerCase();
+                            const label = clean(el.innerText || el.textContent);
+                            return /^\\d+$/.test(label)
+                                && (cls.includes('current')
+                                    || cls.includes('active')
+                                    || el.getAttribute('aria-current') === 'page');
+                        });
+                        if (current) {
+                            const currentNo = Number(clean(current.innerText || current.textContent));
+                            const next = candidates.find(el => clean(el.innerText || el.textContent) === String(currentNo + 1));
+                            if (next && !isDisabled(next)) {
+                                next.scrollIntoView({block: 'center', inline: 'center'});
+                                next.click();
+                                return {ok: true, method: 'dom_numeric_page', page: currentNo + 1};
+                            }
+                        }
+
+                        return {ok: false, method: 'not_found'};
+                    }"""
+                )
+                if not isinstance(result, dict) or not result.get("ok"):
+                    return False
+                try:
+                    await _page_for_next.wait_for_function(
+                        """(before) => {
+                            const clean = (value) => String(value || '')
+                                .replace(/\\s+/g, ' ')
+                                .trim();
+                            const isVisible = (el) => {
+                                const style = window.getComputedStyle(el);
+                                const rect = el.getBoundingClientRect();
+                                return style.display !== 'none'
+                                    && style.visibility !== 'hidden'
+                                    && rect.width > 0
+                                    && rect.height > 0;
+                            };
+                            const table = Array.from(document.querySelectorAll('table'))
+                                .find(t => isVisible(t));
+                            if (!table) return false;
+                            const after = Array.from(table.querySelectorAll('tbody tr'))
+                                .filter(tr => isVisible(tr))
+                                .slice(0, 5)
+                                .map(tr => clean(tr.innerText))
+                                .join('|');
+                            return after && after !== before;
+                        }""",
+                        arg=before_sig,
+                        timeout=3000,
+                    )
+                except Exception:
+                    after_sig = await _visible_table_signature("table autopager after")
+                    if not after_sig or after_sig == before_sig:
+                        logger.info(
+                            "[TABLE AUTOPAGER] clicked but visible table signature did not change: %s",
+                            result,
+                        )
+                        return False
+                logger.info("[TABLE AUTOPAGER] advanced page via %s", result)
+                return True
+            except Exception as pager_err:
+                logger.debug("[TABLE AUTOPAGER] skipped: %s", pager_err)
+                return False
+
+        async def _nudge_scroll_after_duplicate_extract(reason: str) -> None:
+            try:
+                _scroll_page = await browser._ensure_active_page(reason=reason)
+                await _scroll_page.evaluate(
+                    """() => {
+                        const before = window.scrollY;
+                        window.scrollBy({top: Math.max(600, window.innerHeight * 0.75), behavior: 'smooth'});
+                        return before !== window.scrollY;
+                    }"""
+                )
+                logger.info("[EXTRACT DEDUP] nudged page downward after duplicate rows")
+            except Exception as scroll_err:
+                logger.debug("[EXTRACT DEDUP] duplicate-row scroll nudge failed: %s", scroll_err)
 
         # ── 自愈计数器 ────────────────────────────────────────────────
         # 连续执行失败超过 _MAX_CONSECUTIVE_ERRORS 次时强制转 ask_human
@@ -1897,16 +2451,18 @@ async def run_agent(
             logger.warning(f"[PLANNER] 调用失败静默降级：{_plan_err}")
             _task_plan = None
 
-        for step in range(1, MAX_STEPS + 1):
+        for step in range(1, _effective_max_steps + 1):
             _check_stop(f"before_step_{step}")
             logger.info(f"\n{'-' * 50}")
-            logger.info(f">> Step {step}/{MAX_STEPS}")
+            logger.info(f">> Step {step}/{_effective_max_steps}")
             logger.info(f"{'-' * 50}")
 
             # ── 本轮日志收集状态 ──────────────────────────────────────────
             _log_screenshot_path: str | None = None
-            _log_decision: list[dict] | None = None
+            _log_decision: list[dict] | dict | None = None
             _log_error: str | None = None
+            _log_reasoning_text_source: str | None = None
+            _log_extract_text_source: str | None = None
 
             try:
                 _login_intercepted = await _run_preflight_login(
@@ -1961,16 +2517,16 @@ async def run_agent(
                 # 主引擎生效条件：
                 #   - 使用了 --xhr-pattern 参数
                 #   - 网络拦截器已捕获到匹配 URL 的 API 数据快照
-                # 一旦命中，立即保存数据并退出主循环，无需再截图或请求 VLM。
+                # 一旦命中，数据已由 Network Sentinel 去重并落盘；无需再截图或请求 VLM。
                 core_data = browser.intercepted_data
                 if core_data is not None:
                     _record_cnt = len(core_data) if isinstance(core_data, list) else 1
                     logger.info(
                         f"[HYBRID PRIMARY] XHR engine captured {_record_cnt} records — "
-                        f"skipping screenshot + VLM, saving directly."
+                        f"skipping screenshot + VLM."
                     )
-                    saved_path = save_to_excel(core_data, _xhr_output)
-                    logger.info(f"[HYBRID PRIMARY] Saved to: {saved_path}")
+                    saved_path = str(resolve_artifact_path(_xhr_output).resolve())
+                    logger.info(f"[HYBRID PRIMARY] Already saved by Network Sentinel: {saved_path}")
                     print(
                         f"\n\033[1;32m[主引擎生效]\033[0m 网络层已自动截获核心 API 数据，"
                         f"共 \033[36m{_record_cnt}\033[0m 条，"
@@ -1982,9 +2538,9 @@ async def run_agent(
                     break
                 # ════════════════════════════════════════════════════════════
                 # 图文双模态融合 (Hybrid Modality)
-                # 每一轮都同时采集 SoM 截图 + 精简 DOM 树，融合发送给 VLM。
+                # 每一轮都同时采集 SoM 截图 + AX Tree 语义树（含 DOM ID 映射段），融合发送给 VLM。
                 # 彻底废除"智能路由/纯文本降级"的单模态切换 —— 视觉与文本互为冗余，
-                # VLM 得以用红框数字定位 + DOM 属性校验的方式做综合决策。
+                # VLM 得以用红框数字定位 + AX 语义 / DOM ID 映射校验的方式做综合决策。
                 # ════════════════════════════════════════════════════════════
                 _tabs_state = await browser.get_tabs_state()
                 _tabs_hint = f"\n\n【当前标签页列表】{_tabs_state}" if _tabs_state else ""
@@ -1999,7 +2555,7 @@ async def run_agent(
 
                 screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
                 _log_screenshot_path = (
-                    str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.jpg") if screenshot_b64 else None
+                    str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
                 )
 
                 try:
@@ -2009,6 +2565,8 @@ async def run_agent(
                         f"[HYBRID] AX Tree 提取失败，本轮仅凭截图决策: {_ax_err}"
                     )
                     ax_tree_text = ""
+
+                _log_reasoning_text_source = "AX_TREE" if ax_tree_text else "SCREENSHOT_ONLY"
 
                 # 兜底：防止超大 AX Tree 撑爆 Token
                 if ax_tree_text and len(ax_tree_text) > 15000:
@@ -2104,6 +2662,30 @@ async def run_agent(
                     _steps_since_reflect += 1
                 _dedup_tripped_last_step = False
 
+                # ── Improvement 1：消费分页器探测结果（一次性，注入完即清） ──
+                if _pagination_hint_msg:
+                    input_descriptions = (
+                        _pagination_hint_msg + "\n" + (input_descriptions or "")
+                    )
+                    _pagination_hint_msg = ""
+
+                # ── Path D + Improvement 3：进度透传，标为系统权威记账 ──
+                # VLM 没有长程数学记忆，必须在 prompt 里持续回灌权威进度。
+                # **强调"系统记账（唯一权威）"** 让 VLM 不再自己心算条数（避免 37/50 vs 30/50 偏差）。
+                _prog_target = _parse_goal_target_count(goal)
+                if _prog_target is not None and _total_extracted_rows > 0:
+                    _prog_pages = len(_extracted_page_urls)
+                    _prog_remaining = max(0, _prog_target - _total_extracted_rows)
+                    _prog_pct = int(min(100, _total_extracted_rows * 100 / _prog_target))
+                    input_descriptions = (
+                        f"\n📊【全局抓取进度（系统记账，唯一权威）】"
+                        f"{_total_extracted_rows}/{_prog_target} 条 "
+                        f"({_prog_pct}%，跨 {_prog_pages} 个页面)，"
+                        f"还需 {_prog_remaining} 条；达量后引擎会自动终止任务。\n"
+                        f"**禁止**在 thought 里自己心算/估算条数 —— 一切以此数字为准。\n"
+                        + (input_descriptions or "")
+                    )
+
                 decisions = await vlm.ask(
                     screenshot_b64,
                     goal,
@@ -2111,9 +2693,51 @@ async def run_agent(
                     input_descriptions,
                     workflow_memory,
                     task_plan=_task_plan,
+                    max_steps=_effective_max_steps,
                 )
 
                 _log_decision = decisions
+
+                # ── Fix 4：连续 ZERO_TARGET_DOWNGRADE RAW LOOP GUARD ───────
+                # 检测 VLM 反复输出 click+target_id=0+type_value="X" 的 schema
+                # 错位幻觉。已被 validator 降级为 wait，但底层意图仍是同一错误。
+                # 连续 3 次相同 type_value → 强行注入硬指令 + 重置积压反馈。
+                _head_dec = decisions[0] if decisions else {}
+                if _head_dec.get("__zero_target_downgraded"):
+                    _cur_tv = (_head_dec.get("type_value") or "").strip()
+                    if _cur_tv == _last_zero_target_tv:
+                        _consecutive_zero_target += 1
+                    else:
+                        _consecutive_zero_target = 1
+                        _last_zero_target_tv = _cur_tv
+                    if _consecutive_zero_target >= 3:
+                        logger.warning(
+                            f"[RAW GUARD] 连续 {_consecutive_zero_target} 次 "
+                            f"ZERO_TARGET_DOWNGRADE (type_value={_cur_tv!r})，"
+                            f"VLM 卡死在 schema 错位幻觉 — 强制升级反馈"
+                        )
+                        _broadcast_log_safe(
+                            f"[RAW GUARD] 连续 {_consecutive_zero_target} 次同 type_value 错位",
+                            level="warn",
+                        )
+                        vlm.inject_error_feedback(
+                            f"🆘【最后通牒 — 你已经连续 {_consecutive_zero_target} 步犯同一个错】\n"
+                            f"反复输出 click/type target_id=0 type_value={_cur_tv!r}，被系统降级为 wait。\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"接下来你**必须**做以下其中一件事，否则任务终止：\n"
+                            f"  A. 在 @eN 快照里找到 Name=={_cur_tv!r} 的元素，"
+                            f"输出 click + target_id=<那个真实非零数字> + type_value=\"\"；\n"
+                            f"  B. 如果 @eN 快照里**真的没有** Name=={_cur_tv!r} 的元素，"
+                            f"输出 smooth_scroll target_id=0 type_value=\"down\" 让它进入视口；\n"
+                            f"  C. 如果当前任务已无法完成，输出 action=done 并在 thought 说明放弃理由。\n"
+                            f"⛔ 严禁再次输出 type_value={_cur_tv!r} —— 这个值已被系统标记为陷阱。"
+                        )
+                        # 重置计数器避免连续触发同一警告
+                        _consecutive_zero_target = 0
+                        _last_zero_target_tv = ""
+                else:
+                    _consecutive_zero_target = 0
+                    _last_zero_target_tv = ""
 
                 # ── Fix 2：拦截"子目标未完就 done"（CRITICAL：Task B bug）
                 # VLM 把「子目标完成 → 推进」错认为「全局完成 → done」；
@@ -2131,6 +2755,19 @@ async def run_agent(
                         1 for sg in _task_plan.sub_goals
                         if sg.status in ("done", "failed")
                     )
+                    _pending_tail = [
+                        sg for sg in _task_plan.sub_goals[_cur_idx + 1:]
+                        if sg.status not in ("done", "failed")
+                    ]
+                    _terminal_only_tail = bool(_pending_tail) and all(
+                        _is_terminal_only_subgoal(sg) for sg in _pending_tail
+                    )
+                    _current_subgoal_complete = _decision_claims_current_subgoal_completed(
+                        decisions[0]
+                    )
+                    _allow_done_via_terminal_tail = (
+                        _terminal_only_tail and _current_subgoal_complete
+                    )
                     # Fix B 放行：提取任务已达用户目标量 → 直接允许 done，跳过门闸
                     # 修复"豆瓣 Top250 / 京东搜索 N 条"这类任务在步骤 1 extract 成功后
                     # 被门闸强留反复重提取的 6-7 步冗余循环。
@@ -2146,7 +2783,19 @@ async def run_agent(
                             f"[PLAN GATE] 放行 done：提取已达量 "
                             f"{_total_extracted_rows}/{_goal_target} 条，跳过门闸"
                         )
-                    if _done_or_failed < _total - 1 and not _extraction_complete:
+                    elif _allow_done_via_terminal_tail:
+                        logger.info(
+                            "[PLAN GATE] 放行 done：当前子目标已满足退出标准，"
+                            "其余仅剩收尾型 done 子目标。"
+                        )
+                        _task_plan.sub_goals[_cur_idx].status = "done"
+                        for _tail_sg in _pending_tail:
+                            _tail_sg.status = "done"
+                    if (
+                        _done_or_failed < _total - 1
+                        and not _extraction_complete
+                        and not _allow_done_via_terminal_tail
+                    ):
                         logger.warning(
                             f"[PLAN GATE] VLM 过早 action=done（进度 "
                             f"{_done_or_failed}/{_total} 子目标完成），降级为 error"
@@ -2209,47 +2858,26 @@ async def run_agent(
                 )
                 if _has_extract_downgrade:
                     _extract_null_streak += 1
-                    # ── 同页去重：如果当前 URL 已成功提取过，不再重复提取 ──
+                    # 同 URL 不再直接跳过：无限滚动/局部刷新常常保持 URL 不变。
+                    # 这里仅记录信号，真正是否重复由行级 fingerprint 决定。
                     _current_auto_url = browser.current_url
                     if _current_auto_url in _extracted_page_urls:
-                        _dedup_tripped_last_step = True  # Wave 2 Reflector 信号
-                        logger.warning(
-                            f"[EXTRACT AUTO DEDUP] 当前页面已提取过，跳过重复提取: "
-                            f"{_current_auto_url}"
+                        logger.info(
+                            "[EXTRACT AUTO] URL already seen; continuing with row-level dedup: %s",
+                            _current_auto_url,
                         )
-                        _dedup_pag_links = browser.find_pagination_links()
-                        if _dedup_pag_links:
-                            _pag_hint = "\n".join(
-                                f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
-                                for p in _dedup_pag_links
-                            )
-                            vlm.inject_error_feedback(
-                                f"⚠️ 当前页面（{_current_auto_url}）的数据已经提取过了，"
-                                f"不会重复提取。\n"
-                                f"系统在当前页面发现了以下翻页链接：\n{_pag_hint}\n"
-                                f"【立即操作】请点击上述翻页链接翻页，例如："
-                                f"click(target_id={_dedup_pag_links[0]['id']})\n"
-                                f"⚠️ 必须使用上述精确的 ID，不要猜测其他 ID！"
-                            )
-                        else:
-                            vlm.inject_error_feedback(
-                                f"⚠️ 当前页面（{_current_auto_url}）的数据已经提取过了，"
-                                f"不会重复提取。\n"
-                                "当前页面未发现翻页链接。\n"
-                                "如果任务需要更多数据，请尝试向下滚动查找翻页按钮。\n"
-                                "如果已完成所有页的提取，请直接输出 done 结束任务。"
-                            )
-                        continue  # 跳到下一步重新截图
                     logger.warning(
                         f"[EXTRACT AUTO] VLM 输出 extract+null "
                         f"(第 {_extract_null_streak} 次)，启动 AX Tree 自动提取"
                     )
                     try:
+                        _auto_extract_text_source = "AX_TREE"
                         # ── 通过 AX Tree 获取全页语义文本（优于 innerText）──
                         # AX Tree 天然过滤 script/style/广告噪音，只保留语义内容
                         _ax_text = await browser.extract_page_text_via_ax_tree()
                         if not _ax_text:
                             # AX Tree 失败时降级为 innerText
+                            _auto_extract_text_source = "INNER_TEXT_FALLBACK"
                             _page_for_extract = await browser._ensure_active_page(
                                 reason="extract auto fallback to innerText"
                             )
@@ -2273,15 +2901,66 @@ async def run_agent(
                         else:
                             # 结构化失败，降级为原始文本 blob
                             _auto_extracted = {
-                                "source": "auto_extract_from_ax_tree",
+                                "source": (
+                                    "auto_extract_from_ax_tree"
+                                    if _auto_extract_text_source == "AX_TREE"
+                                    else "auto_extract_from_inner_text_fallback"
+                                ),
                                 "page_url": browser.current_url,
                                 "page_text": _ax_text[:8000],
                             }
                             _new_rows = 1
                             logger.info(
                                 f"[EXTRACT AUTO] 结构化提取未返回数据，"
-                                f"降级保存原始 AX Tree 文本 (长度={len(_ax_text)})"
+                                f"降级保存原始页面文本 (source={_auto_extract_text_source}, "
+                                f"长度={len(_ax_text)})"
                             )
+
+                        _dom_auto_rows = await _extract_visible_table_rows_via_dom(
+                            "auto extract visible table rows"
+                        )
+                        if _dom_auto_rows:
+                            _auto_extracted = _dom_auto_rows
+                            _auto_extract_text_source = "DOM_TABLE"
+                            _new_rows = len(_auto_extracted)
+                            logger.info(
+                                "[EXTRACT AUTO DOM] using %s visible table rows instead of AX/VLM output",
+                                _new_rows,
+                            )
+
+                        _auto_extracted, _new_rows, _dup_rows, _rejected_rows = _filter_new_extracted_rows(
+                            _auto_extracted,
+                            source_text=_ax_text,
+                        )
+                        if _new_rows == 0:
+                            _dedup_tripped_last_step = True
+                            logger.warning(
+                                "[EXTRACT AUTO DEDUP] no new rows after row-level filtering "
+                                "(duplicates=%s, rejected=%s, url=%s)",
+                                _dup_rows,
+                                _rejected_rows,
+                                _current_auto_url,
+                            )
+                            vlm.inject_error_feedback(
+                                "⚠️ 系统尝试提取当前视野/页面，但行级去重发现没有新增数据。\n"
+                                "请不要再次 extract 同一批内容。下一步应优先执行 "
+                                "smooth_scroll(type_value='down') 加载更多列表项，或使用 "
+                                "next_page / click_text 点击明确的下一页控件。"
+                            )
+                            await _nudge_scroll_after_duplicate_extract(
+                                "auto extract duplicate rows"
+                            )
+                            continue
+
+                        if _dup_rows or _rejected_rows:
+                            logger.info(
+                                "[EXTRACT AUTO DEDUP] filtered %s duplicate rows, "
+                                "rejected %s unsupported rows, saving %s new rows",
+                                _dup_rows,
+                                _rejected_rows,
+                                _new_rows,
+                            )
+
                         saved_path = save_to_excel(
                             _auto_extracted, _vlm_output,
                         )
@@ -2291,16 +2970,62 @@ async def run_agent(
                         # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放
                         _rpa_cache_allowed = False
                         _rpa_skip_reason = "contains auto-extract steps"
+                        # ── Improvement 1：首次 extract 后探测分页器（auto-extract 路径） ──
+                        if not _pagination_probed and _extract_count == 1:
+                            _pagination_probed = True
+                            try:
+                                _probe = await browser.probe_pagination()
+                                _pagination_kind = _probe.get("kind", "")
+                                _cands = _probe.get("candidates", [])
+                                if _probe.get("has_paginator"):
+                                    _names = ", ".join(
+                                        f"{c['ref']}={c['name']!r}" for c in _cands[:6]
+                                    )
+                                    _pagination_hint_msg = (
+                                        f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                        f"已确认页面底部存在翻页控件：{_names}。\n"
+                                        f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
+                                        f"**禁止** smooth_scroll 当无限滚动处理。"
+                                    )
+                                else:
+                                    _pagination_hint_msg = (
+                                        "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
+                                        "已滚到底未发现翻页控件，本页是无限滚动列表。\n"
+                                        "**仍然输出 next_page** —— 引擎层会自动走 L4 瀑布流兜底（smooth_scroll）"
+                                        "加载新数据。next_page 是万能翻页动作，不需要你判断模式。"
+                                    )
+                                logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
+                            except Exception as _probe_err:
+                                logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
+                        # ── Path C：Hard Kill — 引擎层强杀，达量直接终止主循环 ──
+                        # 不再注入提示让 VLM 决策，避免它走神或重提取浪费步数。
+                        _hk_target = _parse_goal_target_count(goal)
+                        if _hk_target is not None and _total_extracted_rows >= _hk_target:
+                            logger.info(
+                                f"[HARD KILL] 引擎达量终止：累计 "
+                                f"{_total_extracted_rows} >= 目标 {_hk_target} 条"
+                            )
+                            print(
+                                f"\033[1;32m🎯 [HARD KILL]\033[0m 已达量 "
+                                f"{_total_extracted_rows}/{_hk_target}，引擎层终止任务"
+                            )
+                            _broadcast_log_safe(
+                                f"[HARD KILL] 累计 {_total_extracted_rows}/{_hk_target} 条达量，引擎终止"
+                            )
+                            _task_completed = True
+                            _run_succeeded = True
+                            break  # 退出动作循环，主循环检测 _task_completed 退出
                         logger.info(
                             f"[EXTRACT AUTO] Saved to: {saved_path} "
                             f"(累计 {_total_extracted_rows} 条)"
                         )
                         print(
                             f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
-                            f"VLM 未填充数据，系统已从 AX Tree 全页提取 "
+                            f"VLM 未填充数据，系统已从 {_auto_extract_text_source} 全页提取 "
                             f"\033[36m{_new_rows}\033[0m 条数据。"
                             f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
                         )
+                        _log_extract_text_source = _auto_extract_text_source
                         _log_decision = [{
                             "action": "extract",
                             "extracted_data": _auto_extracted,
@@ -2487,12 +3212,8 @@ async def run_agent(
                         _rpa_cache_allowed = False
                         _rpa_skip_reason = "contains ask_human / manual intervention step"
 
-                        # 阻塞等待用户在浏览器中手动完成后按 Enter
-                        await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            input,
-                            "\n👉 请在弹出的浏览器窗口中手动完成操作（滑块验证 / 扫码登录 / 手动填写等）。\n✅ 操作完成后，在此终端按下 [回车键] 以恢复自动化流程...\n",
-                        )
+                        # 阻塞等待用户在浏览器中手动完成后恢复（API UI 或 CLI 回车）
+                        await _wait_for_human_resume(_hitl_reason or "manual intervention required")
                         logger.info("[HITL] 用户已确认手动操作完成，恢复 VSpider 自动化流程...")
                         break  # 中止本批次，进入下一步（重新截图）
 
@@ -2560,68 +3281,28 @@ async def run_agent(
                         _rpa_skip_reason = "contains extract steps"
                         extracted = decision.get("extracted_data")
                         _current_url = browser.current_url
+                        _current_extract_page_key = _current_url
 
-                        # ── 同页去重：如果当前 URL 已经提取过，跳过 ──
+                        # 同 URL 可能是无限滚动/局部刷新列表，不再直接跳过。
+                        # 真实重复由后面的行级 fingerprint 过滤。
                         if _current_url in _extracted_page_urls:
-                            _dedup_tripped_last_step = True  # Wave 2 Reflector 信号
-                            # Step 0：先判断是否已达用户指定的数量目标，优先引导 done
-                            _target_count_pre = _parse_goal_target_count(goal)
-                            _pre_reached = (
-                                _target_count_pre is not None
-                                and _total_extracted_rows >= _target_count_pre
+                            logger.info(
+                                "[EXTRACT] URL already seen; row-level dedup will decide: %s",
+                                _current_url,
                             )
-                            logger.warning(
-                                "[EXTRACT DEDUP] 当前页面已提取过，跳过重复提取"
-                            )
-                            _n_pages = len(_extracted_page_urls)
-                            if _pre_reached:
-                                # ✅ 已达目标：不再建议翻页/滚动，立即要求 done
-                                vlm.inject_error_feedback(
-                                    f"✅ 你已累计提取 {_total_extracted_rows} 条数据，"
-                                    f"已达成用户要求的 {_target_count_pre} 条。\n"
-                                    f"请立即输出 action=done 结束任务，不要再 extract、"
-                                    f"不要翻页、不要滚动。"
-                                )
-                            elif _n_pages >= 2:
-                                # 已提取 2+ 页面，强烈建议 done
-                                vlm.inject_error_feedback(
-                                    f"⚠️ 当前页面数据已经提取过了！\n"
-                                    f"你已经成功提取了 {_n_pages} 个不同页面的数据"
-                                    f"（累计 {_total_extracted_rows} 条）。\n"
-                                    "请回顾用户的原始任务要求：如果用户要求的页数已经提取完毕，"
-                                    "请立即输出 done 结束任务！\n"
-                                    "只有当用户明确要求更多页面时才继续翻页。"
-                                )
-                            else:
-                                vlm.inject_error_feedback(
-                                    "⚠️ 当前页面数据已经提取过了！你正在重复提取同一页面！\n"
-                                    "系统已帮你跳过。请立即执行以下操作之一：\n"
-                                    "1. smooth_scroll(target_id=0, type_value='down') 向下滚动找到【下一页】按钮\n"
-                                    "2. 找到并 click 【下一页】按钮翻页\n"
-                                    "3. 如果所有页提取完毕，输出 done 结束任务"
-                                )
-                            # 仅在未达目标时才自动滚动寻找分页按钮
-                            if not _pre_reached:
-                                try:
-                                    _scroll_page = await browser._ensure_active_page(
-                                        reason="auto scroll for pagination"
-                                    )
-                                    await _scroll_page.evaluate(
-                                        "window.scrollBy({top: 600, behavior: 'smooth'})"
-                                    )
-                                    logger.info("[EXTRACT DEDUP] 已自动向下滚动 600px")
-                                except Exception:
-                                    pass
-                            break
 
                         if extracted:
+                            _log_extract_text_source = "VLM_EXTRACT_OUTPUT"
+                            _source_text_for_validation = ""
                             # ── AX Tree 全页结构化提取：突破视口限制 ──
                             # VLM 只能看到视口中的 ~10 条，但一页通常有 20+ 条数据。
                             # 通过 AX Tree 获取全页语义文本，用纯文本 VLM 调用结构化提取全部数据。
                             try:
+                                _full_extract_text_source = "AX_TREE"
                                 _full_page_text = await browser.extract_page_text_via_ax_tree()
                                 if not _full_page_text:
                                     # AX Tree 失败时降级为 innerText
+                                    _full_extract_text_source = "INNER_TEXT_FALLBACK"
                                     _page_for_full = await browser._ensure_active_page(
                                         reason="extract fallback to innerText"
                                     )
@@ -2629,6 +3310,7 @@ async def run_agent(
                                         "() => document.body.innerText"
                                     )
                                     logger.info("[EXTRACT FULL] AX Tree 为空，降级使用 innerText")
+                                _source_text_for_validation = _full_page_text or ""
                                 _full_extracted = await vlm.extract_structured_data(
                                     page_text=_full_page_text,
                                     goal=goal,
@@ -2638,14 +3320,15 @@ async def run_agent(
                                     extracted if isinstance(extracted, list) else [extracted]
                                 ):
                                     logger.info(
-                                        f"[EXTRACT FULL] AX Tree 全页提取 {len(_full_extracted)} 条 "
+                                        f"[EXTRACT FULL] {_full_extract_text_source} 全页提取 {len(_full_extracted)} 条 "
                                         f"vs VLM 视口 {len(extracted) if isinstance(extracted, list) else 1} 条，"
                                         f"采用全页数据"
                                     )
                                     extracted = _full_extracted
+                                    _log_extract_text_source = _full_extract_text_source
                                 elif _full_extracted:
                                     logger.info(
-                                        f"[EXTRACT FULL] AX Tree 全页 {len(_full_extracted)} 条 "
+                                        f"[EXTRACT FULL] {_full_extract_text_source} 全页 {len(_full_extracted)} 条 "
                                         f"≤ VLM {len(extracted) if isinstance(extracted, list) else 1} 条，"
                                         f"保留 VLM 原始数据"
                                     )
@@ -2653,9 +3336,93 @@ async def run_agent(
                                 logger.warning(
                                     f"[EXTRACT FULL] 全页提取失败，使用 VLM 原始数据: {_full_err}"
                                 )
+                                try:
+                                    _page_for_validate = await browser._ensure_active_page(
+                                        reason="extract source validation fallback"
+                                    )
+                                    _source_text_for_validation = await _page_for_validate.evaluate(
+                                        "() => document.body.innerText"
+                                    )
+                                except Exception:
+                                    _source_text_for_validation = ""
+
+                            _dom_table_rows = await _extract_visible_table_rows_via_dom(
+                                "extract visible table rows"
+                            )
+                            if _dom_table_rows:
+                                extracted = _dom_table_rows
+                                _log_extract_text_source = "DOM_TABLE"
+                                _dom_sig = await _visible_table_signature(
+                                    "extract DOM page signature"
+                                )
+                                if _dom_sig:
+                                    _current_extract_page_key = (
+                                        f"{_current_url}#table:"
+                                        f"{hashlib.md5(_dom_sig.encode('utf-8', errors='ignore')).hexdigest()}"
+                                    )
+                                if not _source_text_for_validation:
+                                    try:
+                                        _page_for_validate = await browser._ensure_active_page(
+                                            reason="extract DOM source validation"
+                                        )
+                                        _source_text_for_validation = await _page_for_validate.evaluate(
+                                            "() => document.body.innerText"
+                                        )
+                                    except Exception:
+                                        _source_text_for_validation = ""
+                                logger.info(
+                                    "[EXTRACT DOM] using %s visible table rows instead of VLM/AX output",
+                                    len(_dom_table_rows),
+                                )
+
+                            decision["extracted_data"] = extracted
+
+                            extracted, _new_rows, _dup_rows, _rejected_rows = _filter_new_extracted_rows(
+                                extracted,
+                                source_text=_source_text_for_validation,
+                            )
+                            decision["extracted_data"] = extracted
+                            if _new_rows == 0:
+                                _dedup_tripped_last_step = True
+                                logger.warning(
+                                    "[EXTRACT DEDUP] no new rows after row-level filtering "
+                                    "(duplicates=%s, rejected=%s, url=%s)",
+                                    _dup_rows,
+                                    _rejected_rows,
+                                    _current_url,
+                                )
+                                _target_count_pre = _parse_goal_target_count(goal)
+                                _pre_reached = (
+                                    _target_count_pre is not None
+                                    and _total_extracted_rows >= _target_count_pre
+                                )
+                                if _pre_reached:
+                                    vlm.inject_error_feedback(
+                                        f"✅ 你已累计提取 {_total_extracted_rows} 条数据，"
+                                        f"已达成用户要求的 {_target_count_pre} 条。"
+                                        "请立即输出 action=done 结束任务，不要再 extract。"
+                                    )
+                                else:
+                                    vlm.inject_error_feedback(
+                                        "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
+                                        "请不要重复提取当前列表。下一步优先 smooth_scroll 向下加载更多，"
+                                        "或使用 next_page / click_text 点击明确的下一页、页码、Next 控件。"
+                                    )
+                                    await _nudge_scroll_after_duplicate_extract(
+                                        "explicit extract duplicate rows"
+                                )
+                                break
+
+                            if _dup_rows or _rejected_rows:
+                                logger.info(
+                                    "[EXTRACT DEDUP] filtered %s duplicate rows, "
+                                    "rejected %s unsupported rows, saving %s new rows",
+                                    _dup_rows,
+                                    _rejected_rows,
+                                    _new_rows,
+                                )
 
                             # 统计本次新增行数
-                            _new_rows = len(extracted) if isinstance(extracted, list) else 1
                             _total_extracted_rows += _new_rows
                             logger.info(
                                 f"[EXTRACT] 本次提取 {_new_rows} 条，"
@@ -2671,11 +3438,91 @@ async def run_agent(
                             )
                             _extract_count += 1
                             _extracted_page_urls.add(_current_url)
+                            _extracted_page_keys.add(_current_extract_page_key)
+                            # ── Improvement 1：首次 extract 后探测分页器（显式 extract 路径） ──
+                            if not _pagination_probed and _extract_count == 1:
+                                _pagination_probed = True
+                                try:
+                                    _probe = await browser.probe_pagination()
+                                    _pagination_kind = _probe.get("kind", "")
+                                    _cands = _probe.get("candidates", [])
+                                    if _probe.get("has_paginator"):
+                                        _names = ", ".join(
+                                            f"{c['ref']}={c['name']!r}" for c in _cands[:6]
+                                        )
+                                        _pagination_hint_msg = (
+                                            f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                            f"已确认页面底部存在翻页控件：{_names}。\n"
+                                            f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
+                                            f"**禁止** smooth_scroll 当无限滚动处理。"
+                                        )
+                                    else:
+                                        _pagination_hint_msg = (
+                                            "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
+                                            "已滚到底未发现翻页控件，可视为无限滚动列表。"
+                                            "继续 smooth_scroll down 加载新数据，直到页面无新增或达量。"
+                                        )
+                                    logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
+                                except Exception as _probe_err:
+                                    logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
+                            # ── Path C：Hard Kill 引擎层强杀（同上） ──
+                            _hk_target = _parse_goal_target_count(goal)
+                            if _hk_target is not None and _total_extracted_rows >= _hk_target:
+                                logger.info(
+                                    f"[HARD KILL] 引擎达量终止：累计 "
+                                    f"{_total_extracted_rows} >= 目标 {_hk_target} 条"
+                                )
+                                print(
+                                    f"\033[1;32m🎯 [HARD KILL]\033[0m 已达量 "
+                                    f"{_total_extracted_rows}/{_hk_target}，引擎层终止任务"
+                                )
+                                _broadcast_log_safe(
+                                    f"[HARD KILL] 累计 {_total_extracted_rows}/{_hk_target} 条达量，引擎终止"
+                                )
+                                _task_completed = True
+                                _run_succeeded = True
+                                break
+                            _hk_pages = _parse_goal_target_pages(goal)
+                            if _hk_pages is not None and len(_extracted_page_keys) >= _hk_pages:
+                                logger.info(
+                                    "[HARD KILL] 表格页数达标：%s/%s pages, rows=%s",
+                                    len(_extracted_page_keys),
+                                    _hk_pages,
+                                    _total_extracted_rows,
+                                )
+                                _broadcast_log_safe(
+                                    f"[HARD KILL] 已提取 {len(_extracted_page_keys)}/{_hk_pages} 页，"
+                                    f"累计 {_total_extracted_rows} 条，任务完成"
+                                )
+                                _task_completed = True
+                                _run_succeeded = True
+                                break
+
+                            _need_more_table_pages = (
+                                _log_extract_text_source == "DOM_TABLE"
+                                and (
+                                    (_hk_target is not None and _total_extracted_rows < _hk_target)
+                                    or (_hk_pages is not None and len(_extracted_page_keys) < _hk_pages)
+                                )
+                            )
+                            if _need_more_table_pages:
+                                _advanced = await _auto_advance_table_page_via_dom(
+                                    "advance after successful table extract"
+                                )
+                                if _advanced:
+                                    _extract_count = 0
+                                    vlm.inject_error_feedback(
+                                        f"✅ 系统已保存当前表格页 {_new_rows} 条，"
+                                        f"累计 {_total_extracted_rows} 条。"
+                                        "底层已自动点击下一页，下一步请直接执行 extract，"
+                                        "不要回到上一页，也不要重复提取刚才的数据。"
+                                    )
+                                    break
                         else:
                             logger.warning("[EXTRACT] No extracted_data in VLM response")
 
                         # ── 智能翻页/结束引导（根据已提取页数 + 目标数量决定建议） ──
-                        _n_pages = len(_extracted_page_urls)
+                        _n_pages = max(len(_extracted_page_urls), len(_extracted_page_keys))
                         _target_count_b = _parse_goal_target_count(goal)
                         _reached_target_b = (
                             _target_count_b is not None
@@ -2746,6 +3593,22 @@ async def run_agent(
 
                         # 连续 extract 守卫（防止 VLM 不翻页也不 done 陷入死循环）
                         if _extract_count >= 3:
+                            _guard_target = _parse_goal_target_count(goal)
+                            if _guard_target is not None and _total_extracted_rows < _guard_target:
+                                logger.warning(
+                                    "[EXTRACT GUARD] consecutive extract threshold reached, "
+                                    "but target is not met (%s/%s); force navigation instead of ending.",
+                                    _total_extracted_rows,
+                                    _guard_target,
+                                )
+                                vlm.inject_error_feedback(
+                                    f"⚠️ 系统检测到连续 extract 次数过多，但当前只提取 "
+                                    f"{_total_extracted_rows}/{_guard_target} 条，尚未达标。\n"
+                                    "下一步禁止继续 extract；必须先执行 next_page、click_text 页码/Next，"
+                                    "或 smooth_scroll down 加载更多真实数据。"
+                                )
+                                _extract_count = 0
+                                break
                             logger.warning(
                                 "[EXTRACT GUARD] 连续 extract 无翻页动作，"
                                 f"已累积 {_total_extracted_rows} 条数据，强制结束任务。"
@@ -2757,8 +3620,12 @@ async def run_agent(
                         # 提取后中止本批次，下一步重新截图（VLM 可能还需要翻页提取更多）
                         break
                     else:
-                        # 翻页动作（click/scroll/smooth_scroll）重置连续 extract 计数
-                        if action in ("click", "scroll", "smooth_scroll"):
+                        # Any real navigation/viewport-changing action resets consecutive extract count.
+                        if action in (
+                            "click", "click_text", "click_point", "click_new_tab",
+                            "next_page", "scroll", "smooth_scroll", "goto",
+                            "press_key", "switch_tab", "close_tab",
+                        ):
                             _extract_count = 0
 
                     # 5. 记忆库日志（save_to_memory 动作由 execute_action 内部写入 workflow_memory）
@@ -2770,12 +3637,12 @@ async def run_agent(
                     if action == "done":
                         page_summary = await browser.get_active_page_summary()
                         current_url = browser.current_url
-                        text_dom_for_done = ""
+                        ax_tree_text_for_done = ""
                         if _goal_is_plain_search_task(goal):
                             try:
-                                # 用 AX Tree 代替旧的 DOM 文本快照 —— name 字段里仍然包含搜索结果链接标题，
+                                # 用 AX Tree 代替旧的文本快照 —— name 字段里仍然包含搜索结果链接标题，
                                 # 对 _search_goal_done_looks_premature 的子串检测来说是等价的信息源。
-                                text_dom_for_done = await browser.extract_accessibility_tree()
+                                ax_tree_text_for_done = await browser.extract_accessibility_tree()
                             except Exception as _done_ax_err:
                                 logger.debug(f"[DONE GUARD] AX tree snapshot skipped: {_done_ax_err}")
                         if _search_goal_done_looks_premature(
@@ -2783,7 +3650,7 @@ async def run_agent(
                             start_url,
                             current_url,
                             page_summary,
-                            text_dom_for_done,
+                            ax_tree_text_for_done,
                         ):
                             logger.warning(
                                 "[DONE GUARD] Blocked a premature done on a search task "
@@ -2897,6 +3764,58 @@ async def run_agent(
                                     f"{_placeholder} → \033[32m{_mem_v!r}\033[0m"
                                 )
 
+                    # ── Schema 自愈：把“在链接/按钮上 type 可见文字”转成 click_text ──
+                    # 典型误填：VLM 想点击未编号/难定位的 “Zero configuration”，却输出
+                    # action=type target_id=<Examples链接> type_value="Zero configuration"。
+                    # 对非输入控件执行 type 只会污染搜索框或触发站内搜索，应直接文本点击。
+                    if action == "type" and decision.get("target_id", 0):
+                        _type_tv = str(decision.get("type_value") or "").strip()
+                        _type_tid = decision.get("target_id", 0)
+                        _target_meta = None
+                        try:
+                            _target_id_int = int(_type_tid)
+                            _target_meta = next(
+                                (
+                                    el for el in getattr(browser, "_last_som_elements", [])
+                                    if int(el.get("id", -1)) == _target_id_int
+                                ),
+                                None,
+                            )
+                        except Exception:
+                            _target_meta = None
+                        _target_role = str(
+                            (_target_meta or {}).get("role")
+                            or (_target_meta or {}).get("tag")
+                            or ""
+                        ).strip().lower()
+                        _input_roles = {
+                            "textbox", "searchbox", "combobox", "spinbutton",
+                            "textarea", "input",
+                        }
+                        _clickable_roles = {
+                            "link", "button", "menuitem", "tab", "option",
+                        }
+                        if (
+                            _type_tv
+                            and _target_role
+                            and _target_role not in _input_roles
+                            and (
+                                _target_role in _clickable_roles
+                                or len(_type_tv) <= 80
+                            )
+                        ):
+                            logger.warning(
+                                "[ACTION FIX] type on non-input target #%s "
+                                "(role=%s, value=%r) -> click_text",
+                                _type_tid,
+                                _target_role,
+                                _type_tv,
+                            )
+                            decision["action"] = "click_text"
+                            decision["target_id"] = 0
+                            decision["type_value"] = _type_tv
+                            action = "click_text"
+
                     # ── LOOP GUARD 前置拦截：已进入黑名单的 target_id 直接阻断 ───
                     _click_target_id = decision.get("target_id", 0)
                     _click_point_bucket = _bucket_point(decision.get("point"))
@@ -2944,6 +3863,26 @@ async def run_agent(
                         if active_page is not None:
                             # execute_action 内部已更新 browser._page，此处仅做日志追踪
                             logger.debug(f"[TAB GUARD] Active page after action: {(active_page.url or 'about:blank')[:80]}")
+
+                        if action == "next_page" and browser.rpa_trail:
+                            _last_rpa = browser.rpa_trail[-1]
+                            if isinstance(_last_rpa, dict) and _last_rpa.get("action") == "next_page":
+                                _np_method = _last_rpa.get("method") or _last_rpa.get("strategy") or ""
+                                _np_strategy = _last_rpa.get("strategy") or ""
+                                _np_landed = _last_rpa.get("landed_url") or browser.current_url
+                                if _np_method:
+                                    decision["execution_method"] = str(_np_method)
+                                if _np_strategy:
+                                    decision["strategy"] = str(_np_strategy)
+                                if _np_landed:
+                                    decision["landed_url"] = str(_np_landed)
+                                decision["status"] = "success"
+                                logger.info(
+                                    "[NEXT_PAGE RESULT] method=%s strategy=%s landed=%s",
+                                    _np_method,
+                                    _np_strategy,
+                                    str(_np_landed)[:160],
+                                )
 
                         # ── 标签页切换感知：将 Tab Guard 切换事件注入 VLM 反馈 ──────
                         _tab_switched_this_step = bool(browser._tab_switch_notice)
@@ -3151,6 +4090,19 @@ async def run_agent(
 
             finally:
                 # 无论本步以何种方式退出（continue/break/正常/异常），均实时写入轨迹日志
+                if isinstance(_log_decision, list):
+                    _log_primary = _log_decision[0] if _log_decision else None
+                elif isinstance(_log_decision, dict):
+                    _log_primary = _log_decision
+                else:
+                    _log_primary = None
+
+                if isinstance(_log_primary, dict):
+                    if _log_reasoning_text_source:
+                        _log_primary["reasoning_text_source"] = _log_reasoning_text_source
+                    if _log_extract_text_source:
+                        _log_primary["extract_text_source"] = _log_extract_text_source
+
                 html_logger.log_step(
                     step_num=step,
                     screenshot_path=_log_screenshot_path,
@@ -3161,9 +4113,14 @@ async def run_agent(
 
         else:
             # for-else: 循环正常结束（没有 break），说明达到最大步数
-            logger.warning(f"[WARN] Max steps reached ({MAX_STEPS}), task not completed.")
-            _broadcast_log_safe(f"[WARN] Max steps reached ({MAX_STEPS}), task not completed.", level="warn")
-            _broadcast_done_safe(False, f"Max steps reached ({MAX_STEPS})")
+            logger.warning(
+                f"[WARN] Max steps reached ({_effective_max_steps}), task not completed."
+            )
+            _broadcast_log_safe(
+                f"[WARN] Max steps reached ({_effective_max_steps}), task not completed.",
+                level="warn",
+            )
+            _broadcast_done_safe(False, f"Max steps reached ({_effective_max_steps})")
             # 保存最终状态截图
             await browser.mark_and_screenshot(step=99)
 
@@ -3185,6 +4142,25 @@ async def run_agent(
             logger.error(f"[ERROR] Agent exception: {type(e).__name__}: {e}", exc_info=True)
             _broadcast_log_safe(f"[ERROR] Agent exception: {type(e).__name__}: {e}", level="error")
             _broadcast_done_safe(False, f"Agent exception: {type(e).__name__}: {e}")
+            try:
+                html_logger.log_step(
+                    step_num=0,
+                    screenshot_path=None,
+                    action_dict={
+                        "action": "error",
+                        "target_id": 0,
+                        "status": "startup_failed",
+                        "thought": (
+                            "Agent failed before the first browser observation. "
+                            "Check the target URL, browser startup, and runtime config."
+                        ),
+                        "type_value": f"{type(e).__name__}: {e}",
+                    },
+                    error_msg=f"{type(e).__name__}: {e}",
+                    memory_state={},
+                )
+            except Exception as log_err:
+                logger.debug("[ERROR] Failed to write startup error to HTML log: %s", log_err)
     finally:
         html_logger.finalize()
         await browser.close()
@@ -3219,6 +4195,15 @@ def main():
         "--user-data-dir",
         default=default_user_data_dir,
         help=f"Browser user data directory for session/cookie persistence (default: {default_user_data_dir})",
+    )
+    parser.add_argument(
+        "--auth-profiles",
+        default=os.getenv("VSPIDER_AUTH_PROFILES", ""),
+        help=(
+            "Auth Matrix profiles to load from .auth/ (comma/space separated), or 'auto' "
+            "to load profiles whose storage_state domains match --url. "
+            "Example: --auth-profiles bilibili_default,jd_test01"
+        ),
     )
     parser.add_argument(
         "--context",
