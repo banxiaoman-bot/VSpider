@@ -24,22 +24,142 @@ import time
 import urllib.parse
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 try:
     from .vlm_client import VSpiderAction
     from .browser_env import ActionExecutionError
+    from .auth_vault import SecretResolutionError, resolve_env_placeholders
+    from .artifact_manager import register_artifact
 except ImportError:
     from vlm_client import VSpiderAction
     from browser_env import ActionExecutionError
+    from auth_vault import SecretResolutionError, resolve_env_placeholders
+    from artifact_manager import register_artifact
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
     from .browser_env import BrowserEnv
 
 logger = logging.getLogger("vspider.actions")
+
+
+def _is_navigation_context_destroyed(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "execution context was destroyed" in text
+        or "most likely because of a navigation" in text
+        or "cannot find context with specified id" in text
+    )
+
+
+async def _click_locator_with_js_fallback(
+    loc: Any, label: str, timeout: int = 3000
+) -> str:
+    """Click with Playwright first, then DOM-level JS click if actionability blocks it."""
+    try:
+        await loc.scroll_into_view_if_needed(timeout=2000)
+        await loc.click(timeout=timeout)
+        return "native"
+    except Exception as native_err:
+        logger.warning(
+            f"[JS CLICK FALLBACK] native click blocked for {label}: {native_err}"
+        )
+        await loc.evaluate(
+            """el => {
+                el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+                if (typeof el.click === 'function') {
+                    el.click();
+                } else {
+                    el.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        composed: true,
+                        view: window
+                    }));
+                }
+            }"""
+        )
+        return "js"
+
+
+async def _scroll_largest_container(
+    page: Any, direction: str, smooth: bool = False
+) -> dict:
+    """Scroll the largest visible overflow container when window scrolling is ineffective."""
+    return await page.evaluate(
+        """([direction, smooth]) => {
+            const dir = String(direction || 'down').toLowerCase();
+            const behavior = smooth ? 'smooth' : 'auto';
+            const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+            const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+
+            function visibleRect(el) {
+                const r = el.getBoundingClientRect();
+                if (!r || r.width < 20 || r.height < 20) return null;
+                if (r.bottom <= 0 || r.right <= 0 || r.top >= viewportH || r.left >= viewportW) return null;
+                const cs = window.getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || 1) <= 0.01) return null;
+                return r;
+            }
+
+            const candidates = [];
+            for (const el of Array.from(document.querySelectorAll('*'))) {
+                if (el === document.documentElement || el === document.body) continue;
+                const r = visibleRect(el);
+                if (!r) continue;
+                const cs = window.getComputedStyle(el);
+                const overflowY = `${cs.overflowY || ''} ${cs.overflow || ''}`.toLowerCase();
+                const scrollableStyle = overflowY.includes('auto') || overflowY.includes('scroll') || overflowY.includes('overlay');
+                const canScroll = el.scrollHeight > el.clientHeight + 8;
+                if (!canScroll || !scrollableStyle) continue;
+                const maxTop = el.scrollHeight - el.clientHeight;
+                const canMoveDown = el.scrollTop < maxTop - 2;
+                const canMoveUp = el.scrollTop > 2;
+                if ((dir === 'up' || dir === 'top') ? !canMoveUp : !canMoveDown) continue;
+                const area = Math.max(0, Math.min(r.right, viewportW) - Math.max(r.left, 0)) *
+                             Math.max(0, Math.min(r.bottom, viewportH) - Math.max(r.top, 0));
+                candidates.push({ el, area, top: el.scrollTop, maxTop });
+            }
+            candidates.sort((a, b) => b.area - a.area);
+            const picked = candidates[0];
+            if (!picked) return { moved: false, reason: 'no-scrollable-container' };
+
+            const el = picked.el;
+            const before = el.scrollTop;
+            const delta = Math.max(240, Math.round((el.clientHeight || viewportH || 800) * 0.85));
+            if (dir === 'top') el.scrollTo({ top: 0, behavior });
+            else if (dir === 'bottom') el.scrollTo({ top: el.scrollHeight, behavior });
+            else el.scrollBy({ top: (dir === 'up' ? -delta : delta), behavior });
+
+            const ident = [
+                el.tagName ? el.tagName.toLowerCase() : 'element',
+                el.id ? `#${el.id}` : '',
+                el.className && typeof el.className === 'string'
+                    ? '.' + el.className.trim().split(/\\s+/).slice(0, 3).join('.')
+                    : ''
+            ].join('');
+            return {
+                moved: true,
+                before,
+                after: el.scrollTop,
+                maxTop: picked.maxTop,
+                target: ident,
+                candidates: candidates.length
+            };
+        }""",
+        [direction, smooth],
+    )
+
+
+def _resolve_env_placeholders(text: str) -> tuple[str, bool, list[str]]:
+    """Resolve {{env:VAR}} placeholders immediately before browser input."""
+    try:
+        return resolve_env_placeholders(text)
+    except SecretResolutionError as exc:
+        raise ActionExecutionError(str(exc)) from exc
 
 
 # ════════════════════════════════════════════════════════════════
@@ -272,6 +392,18 @@ class ScrollHandler(ActionHandler):
         print(f"🔄 [SCROLL] 执行方向: {direction}, 位置变化: {prev_y} → {new_y}")
 
         if prev_y == new_y:
+            local = await _scroll_largest_container(page, direction, smooth=False)
+            await asyncio.sleep(0.8)
+            if local.get("moved"):
+                logger.info(
+                    f"[SCROLL LOCAL] direction={direction} target={local.get('target')} "
+                    f"scrollTop: {local.get('before')} → {local.get('after')}"
+                )
+                print(
+                    f"🔄 [SCROLL LOCAL] {direction}: {local.get('target')} "
+                    f"{local.get('before')} → {local.get('after')}"
+                )
+                return None
             raise ActionExecutionError(
                 f"执行 scroll ({direction}) 无效：页面未发生滚动，"
                 f"可能已到达页面边缘或该方向无滚动条。"
@@ -302,14 +434,27 @@ class SmoothScrollHandler(ActionHandler):
                 f"🌊 [SMOOTH_SCROLL] direction={direction}, 位置变化: {prev_y} → {new_y}"
             )
             if abs(new_y - prev_y) < 1:
-                boundary = "底" if direction != "up" else "顶"
-                hint = (
-                    f"页面已滚到{boundary}部，无法继续向"
-                    f"{'下' if direction != 'up' else '上'}滚动。"
-                    f"如果需要翻页，请直接点击页面上可见的'下一页'/'More'等翻页链接或按钮。"
-                )
-                logger.warning(f"[SMOOTH_SCROLL] {hint}")
-                browser._last_action_error = RuntimeError(hint)
+                local = await _scroll_largest_container(page, direction, smooth=True)
+                await asyncio.sleep(0.8)
+                if local.get("moved"):
+                    logger.info(
+                        f"[SMOOTH_SCROLL LOCAL] direction={direction} "
+                        f"target={local.get('target')} "
+                        f"scrollTop: {local.get('before')} → {local.get('after')}"
+                    )
+                    print(
+                        f"🌊 [SMOOTH_SCROLL LOCAL] {direction}: {local.get('target')} "
+                        f"{local.get('before')} → {local.get('after')}"
+                    )
+                else:
+                    boundary = "底" if direction != "up" else "顶"
+                    hint = (
+                        f"页面已滚到{boundary}部，无法继续向"
+                        f"{'下' if direction != 'up' else '上'}滚动。"
+                        f"如果需要翻页，请直接点击页面上可见的'下一页'/'More'等翻页链接或按钮。"
+                    )
+                    logger.warning(f"[SMOOTH_SCROLL] {hint}")
+                    browser._last_action_error = RuntimeError(hint)
             browser.rpa_trail.append(
                 ctx.with_rpa_meta({"action": "smooth_scroll", "type_value": direction})
             )
@@ -352,7 +497,11 @@ class ClickHandler(ActionHandler):
                 await target.handle.click(
                     force=True, timeout=browser._LOCATOR_TIMEOUT
                 )
-            except Exception:
+            except Exception as native_err:
+                logger.warning(
+                    f"[JS CLICK FALLBACK] native click blocked for element #{target_id}: "
+                    f"{native_err}"
+                )
                 await target.handle.evaluate(
                     """el => {
                         el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
@@ -381,10 +530,16 @@ class ClickHandler(ActionHandler):
                 logger.debug(f"[RPA] Recorded click: {_pending_xpath}")
             logger.info(f"Click element #{target_id} succeeded")
         except Exception as e:
-            browser._last_action_error = e
-            logger.error(
-                f"Click element #{target_id} failed (page may have refreshed): {e}"
-            )
+            if _is_navigation_context_destroyed(e):
+                logger.info(
+                    f"[CLICK] element #{target_id} triggered navigation; "
+                    f"ignoring stale execution-context error: {e}"
+                )
+            else:
+                browser._last_action_error = e
+                logger.error(
+                    f"Click element #{target_id} failed (page may have refreshed): {e}"
+                )
 
         await browser._wait_after_action(is_navigation=True)
         return None
@@ -483,8 +638,9 @@ class TypeHandler(ActionHandler):
         target_id = ctx.action.target_id
         type_value = ctx.action.type_value
         workflow_memory = ctx.workflow_memory
+        display_value = type_value
         selector = f'[data-som-id="{target_id}"]'
-        logger.info(f"Executing type: element #{target_id} <- {type_value!r}")
+        logger.info(f"Executing type: element #{target_id} <- {display_value!r}")
         try:
             await browser._clear_som_overlays()
             target = await browser._resolve_action_target(target_id, "type")
@@ -535,6 +691,16 @@ class TypeHandler(ActionHandler):
                         f"[MEMORY] type interpolation: {type_value!r} → {resolved!r}"
                     )
                 type_value = resolved
+                display_value = resolved
+
+            env_template = display_value if "{{env:" in display_value else ""
+            type_value, used_auth_vault, env_names = _resolve_env_placeholders(type_value)
+            if used_auth_vault:
+                display_value = env_template
+                logger.info(
+                    "[AUTH VAULT] type_value resolved from env placeholder(s): %s",
+                    ", ".join(env_names),
+                )
 
             modifier = "Meta" if sys.platform == "darwin" else "Control"
             await page.keyboard.press(f"{modifier}+a")
@@ -548,10 +714,14 @@ class TypeHandler(ActionHandler):
                         "xpath": _pending_xpath,
                         "ax_role": _pending_ax_role or "",
                         "ax_name": _pending_ax_name or "",
-                        "type_value": type_value,
+                        "type_value": display_value if used_auth_vault else type_value,
                     })
                 )
-                logger.debug(f"[RPA] Recorded type: {_pending_xpath} <- {type_value!r}")
+                logger.debug(
+                    "[RPA] Recorded type: %s <- %r",
+                    _pending_xpath,
+                    display_value if used_auth_vault else type_value,
+                )
             logger.info(f"Type into element #{target_id} succeeded")
 
             await asyncio.sleep(0.4)
@@ -888,6 +1058,566 @@ class ClickPointHandler(ActionHandler):
         return None
 
 
+@ActionRegistry.register("next_page")
+class NextPageHandler(ActionHandler):
+    """启发式翻页：用业界通用 locator 链找下一页按钮，绕开 VLM target_id 填位。
+
+    借鉴 Skyvern / Browser-use 的做法：翻页是结构化模式（Next/下一页/›/→ 等），
+    引擎用 XPath/CSS heuristic 直接命中比让 VLM 凭视觉找坐标可靠 100 倍。
+    """
+    # 按命中优先级排序的 locator 模板列表。第一个命中即点击，其余为 fallback。
+    _LOCATOR_TEMPLATES: ClassVar[list[str]] = [
+        # ARIA / accessibility 优先：明确语义
+        'a[aria-label*="next" i]',
+        'button[aria-label*="next" i]',
+        'a[aria-label*="下一页"]',
+        'button[aria-label*="下一页"]',
+        # rel=next：HTML 标准翻页提示
+        'a[rel="next"]',
+        # data 属性常见命名
+        '[data-testid*="next" i]',
+        '[data-test*="next" i]',
+    ]
+    # 可见文字 locator（Playwright get_by_text + role 组合）
+    _TEXT_PATTERNS: ClassVar[list[str]] = [
+        "下一页", "下一頁", "Next", "next page", "Next ›", "Next →",
+        "More", "更多", "Older", "›", "»", "→", "▶",
+    ]
+
+    # URL 变异常见的分页参数键。`p` 语义过载，只有 DOM 预检证明它用于分页时才允许变异。
+    _SAFE_URL_PAGE_KEYS: ClassVar[tuple[str, ...]] = (
+        "page", "pn", "pageno", "pagenum", "pageindex", "pagenumber",
+    )
+    _RISKY_URL_PAGE_KEYS: ClassVar[tuple[str, ...]] = ("p",)
+    _URL_PAGE_KEYS: ClassVar[tuple[str, ...]] = _SAFE_URL_PAGE_KEYS + _RISKY_URL_PAGE_KEYS
+    # offset / start 类参数：每页步长不固定（10/20/50），需要看上一页的差值，保守跳过；
+    # 但用户明确给了 size/limit 时引擎可以推算 —— 第一版不做这个，避免乱跳。
+
+    async def _dom_confirms_pagination_param(
+        self, page, key: str, expected_next: int
+    ) -> bool:
+        """Verify overloaded query keys like `p` are actually pagination links."""
+        return bool(await page.evaluate(
+            """([key, expectedNext]) => {
+                const expected = String(expectedNext);
+                const nextWords = ['next', 'older', 'more', '下一页', '下一頁', '下页', '下頁', '后页', '後頁', '›', '»', '→', '▶'];
+                const anchors = Array.from(document.querySelectorAll('a[href]'));
+                for (const a of anchors) {
+                    let url;
+                    try {
+                        url = new URL(a.getAttribute('href'), location.href);
+                    } catch (_) {
+                        continue;
+                    }
+                    const value = url.searchParams.get(key);
+                    if (value !== expected) continue;
+                    const label = [
+                        a.textContent || '',
+                        a.getAttribute('aria-label') || '',
+                        a.getAttribute('title') || '',
+                        a.getAttribute('rel') || ''
+                    ].join(' ').trim().toLowerCase();
+                    if (label === expected) return true;
+                    if (nextWords.some(word => label.includes(word.toLowerCase()))) return true;
+                    const cls = `${a.className || ''} ${a.id || ''}`.toLowerCase();
+                    if (cls.includes('page') || cls.includes('pager') || cls.includes('pagination')) {
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            [key, expected_next],
+        ))
+
+    async def _page_signature(self, page) -> tuple[str, str, int, int]:
+        """Small page fingerprint used to verify heuristic pagination actually moved."""
+        url = page.url or ""
+        try:
+            data = await page.evaluate(
+                """() => {
+                    const body = document.body;
+                    const normalized = (body && body.innerText || '').replace(/\\s+/g, ' ').trim();
+                    return {
+                        sample: normalized.slice(0, 5000),
+                        length: normalized.length,
+                        scrollHeight: body ? body.scrollHeight : 0
+                    };
+                }"""
+            ) or {}
+            text = data.get("sample") or ""
+            text_len = int(data.get("length") or 0)
+            scroll_height = int(data.get("scrollHeight") or 0)
+        except Exception:
+            text = ""
+            text_len = 0
+            scroll_height = 0
+        return url, text, text_len, scroll_height
+
+    async def _wait_for_pagination_change(
+        self, page, before: tuple[str, str, int, int], label: str
+    ) -> bool:
+        """Return True only if a click changed URL or visible page text."""
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+        after = await self._page_signature(page)
+        if after != before:
+            if self._looks_like_detail_navigation(before[0], after[0]):
+                logger.warning(
+                    "[NEXT_PAGE] candidate %s changed page, but landed on a "
+                    "likely detail/result page (%s -> %s); restoring list page",
+                    label,
+                    before[0][:120],
+                    after[0][:120],
+                )
+                await self._restore_after_bad_candidate(page, before[0], label)
+                return False
+            return True
+        logger.info(f"[NEXT_PAGE] candidate {label} clicked but page did not change")
+        return False
+
+    def _query_has_page_signal(self, url: str) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            return any(k.lower() in self._URL_PAGE_KEYS for k, _ in params)
+        except Exception:
+            return False
+
+    def _path_has_page_signal(self, path: str) -> bool:
+        return bool(re.search(r"/(?:page|p|pg)/\d+(?:/|$)", path or "", re.I))
+
+    def _looks_like_detail_navigation(self, before_url: str, after_url: str) -> bool:
+        """Reject heuristic next_page clicks that opened a result/detail page.
+
+        This guard is intentionally only used for DOM heuristic pagination, not
+        URL mutation. A real "next page" should normally keep the same host and
+        move via a page-like query/path signal; jumping to another domain or an
+        article/item URL is almost always a misclick on a list result.
+        """
+        if not before_url or not after_url or before_url == after_url:
+            return False
+        try:
+            before = urllib.parse.urlparse(before_url)
+            after = urllib.parse.urlparse(after_url)
+        except Exception:
+            return False
+
+        if before.scheme in ("about", "data") or after.scheme in ("about", "data"):
+            return False
+        if before.netloc and after.netloc and before.netloc != after.netloc:
+            return True
+
+        if self._query_has_page_signal(after_url) or self._path_has_page_signal(after.path):
+            return False
+
+        after_segments = [s.lower() for s in (after.path or "").split("/") if s]
+        detail_words = {
+            "item", "items", "story", "stories", "post", "posts", "article",
+            "articles", "detail", "details", "thread", "threads",
+            "discussion", "discussions", "comments",
+        }
+        if any(seg in detail_words for seg in after_segments):
+            return True
+
+        query_keys = {k.lower() for k, _ in urllib.parse.parse_qsl(after.query, keep_blank_values=True)}
+        if query_keys & {"id", "item", "story", "post", "article", "thread"}:
+            return True
+
+        if before.path != after.path:
+            # From a search/list root to a deeper non-pagination path is usually
+            # a result click, especially when produced by a fuzzy next_page locator.
+            before_depth = len([s for s in (before.path or "").split("/") if s])
+            after_depth = len(after_segments)
+            if after_depth > before_depth:
+                return True
+        return False
+
+    async def _restore_after_bad_candidate(self, page, before_url: str, label: str) -> None:
+        if not before_url or not before_url.startswith(("http://", "https://")):
+            return
+        try:
+            await page.goto(before_url, wait_until="domcontentloaded", timeout=10000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+            logger.info("[NEXT_PAGE] restored original page after rejected candidate %s", label)
+        except Exception as restore_err:
+            logger.warning(
+                "[NEXT_PAGE] failed to restore original page after rejected candidate %s: %s",
+                label,
+                restore_err,
+            )
+
+    async def _locator_is_disabled(self, loc) -> bool:
+        try:
+            if await loc.is_disabled(timeout=500):
+                return True
+        except Exception:
+            pass
+        try:
+            disabled = await loc.evaluate(
+                """el => Boolean(
+                    el.disabled ||
+                    el.getAttribute('aria-disabled') === 'true' ||
+                    el.getAttribute('disabled') !== null ||
+                    /\b(disabled|current|active|selected)\b/i.test(String(el.className || ''))
+                )"""
+            )
+            return bool(disabled)
+        except Exception:
+            return False
+
+    async def _click_if_effective(self, page, loc, label: str) -> bool:
+        if await self._locator_is_disabled(loc):
+            logger.debug(f"[NEXT_PAGE] skip disabled/current candidate {label}")
+            return False
+        before = await self._page_signature(page)
+        click_mode = await _click_locator_with_js_fallback(loc, label, timeout=3000)
+        return await self._wait_for_pagination_change(
+            page, before, f"{label}/{click_mode}"
+        )
+
+    async def _try_url_mutation(self, page) -> str:
+        """Level 0：URL 变异翻页。返回变异后的新 URL（已 goto 完毕）；失败返回 ""。
+
+        安全机制：
+        1. 跳过 SPA：若 URL 含 hash 路由（#/...）且 query 没分页参数，放弃变异，
+           因为 hash 路由的「翻页」其实是前端 JS 重渲，goto 不会触发。
+        2. 数值合法性：page=abc 或 page>9999 这种，跳过。
+        3. 翻页生效校验：goto 后再读 page.url，若新 URL path/query 与目标不一致
+           （网站可能强制重定向回首页），返回 "" 让上层走 DOM 降级。
+        4. DOM 校验：goto 后 _wait_for_page_stable，若页面 body 内容与变异前一致
+           （URL 改了但内容没变），也返回 "" 走降级。
+        """
+        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+        cur_url = page.url or ""
+        if not cur_url or not cur_url.startswith(("http://", "https://")):
+            return ""
+        parsed = urlparse(cur_url)
+        params = list(parse_qsl(parsed.query, keep_blank_values=True))
+        has_page_query = any(k.lower() in self._URL_PAGE_KEYS for k, _ in params)
+
+        async def _restore_original(reason: str) -> str:
+            """Return to the original page before DOM fallback continues."""
+            current = page.url or ""
+            if current == cur_url:
+                return ""
+            try:
+                logger.info(f"[NEXT_PAGE L0] {reason}; restoring original URL before fallback")
+                await page.goto(cur_url, wait_until="domcontentloaded", timeout=10000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass
+            except Exception as restore_err:
+                logger.warning(f"[NEXT_PAGE L0] failed to restore original URL: {restore_err}")
+            return ""
+
+        # SPA hash 路由放弃 —— 除非 query 自身已经带分页参数。
+        if parsed.fragment and "/" in parsed.fragment and not has_page_query:
+            logger.debug("[NEXT_PAGE L0] hash 路由且无分页 query，跳过 URL 变异")
+            return ""
+
+        # 变异前快照：用于判断翻页是否真生效
+        _before_signature = await self._page_signature(page)
+
+        new_url = ""
+        # ── 1. query 参数 page=N 变异 ──
+        for i, (k, v) in enumerate(params):
+            key = k.lower()
+            if key not in self._URL_PAGE_KEYS:
+                continue
+            try:
+                cur_n = int(v)
+            except (ValueError, TypeError):
+                continue
+            if cur_n < 0 or cur_n > 9999:  # 异常值跳过
+                continue
+            if key in self._RISKY_URL_PAGE_KEYS:
+                try:
+                    allowed = await self._dom_confirms_pagination_param(
+                        page, key, cur_n + 1
+                    )
+                except Exception as preflight_err:
+                    logger.debug(
+                        f"[NEXT_PAGE L0] risky param {key!r} preflight failed: {preflight_err}"
+                    )
+                    allowed = False
+                if not allowed:
+                    logger.info(
+                        f"[NEXT_PAGE L0] skip risky query param {key!r}: "
+                        "no pagination href evidence"
+                    )
+                    continue
+            params[i] = (k, str(cur_n + 1))
+            new_query = urlencode(params, doseq=True)
+            new_url = urlunparse(parsed._replace(query=new_query))
+            logger.info(f"[NEXT_PAGE L0] query 变异 {k}={cur_n}→{cur_n+1}: {new_url[:120]}")
+            break
+
+        # ── 2. 路径段 /page/N、/p/N 变异 ──
+        if not new_url:
+            import re as _re
+            m = _re.search(r"(/(?:page|p|pg)/)(\d+)", parsed.path, _re.IGNORECASE)
+            if m:
+                try:
+                    cur_n = int(m.group(2))
+                    if 0 <= cur_n <= 9999:
+                        new_path = (
+                            parsed.path[:m.start(2)]
+                            + str(cur_n + 1)
+                            + parsed.path[m.end(2):]
+                        )
+                        new_url = urlunparse(parsed._replace(path=new_path))
+                        logger.info(
+                            f"[NEXT_PAGE L0] 路径变异 {m.group(0)}→"
+                            f"{m.group(1)}{cur_n+1}: {new_url[:120]}"
+                        )
+                except (ValueError, TypeError):
+                    pass
+
+        if not new_url:
+            return ""
+
+        # ── 3. 执行 goto + 校验 ──
+        try:
+            await page.goto(new_url, wait_until="domcontentloaded", timeout=15000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"[NEXT_PAGE L0] goto 失败，降级到 DOM: {e}")
+            return await _restore_original("goto failed")
+
+        # 校验 URL：站点可能 302 回首页/登录页
+        landed = page.url or ""
+        if not landed.startswith(("http://", "https://")):
+            return await _restore_original("landed URL is invalid")
+        # path 必须接近（允许 query 多/少参数），否则视作被劫持
+        landed_p = urlparse(landed)
+        new_p = urlparse(new_url)
+        if landed_p.netloc != new_p.netloc or landed_p.path != new_p.path:
+            logger.warning(
+                f"[NEXT_PAGE L0] 着陆 URL 不匹配（{landed[:80]} vs {new_url[:80]}），降级"
+            )
+            return await _restore_original("landed URL mismatch")
+
+        # 校验内容：URL 已变但正文签名完全一致 → 翻页未生效
+        _after_signature = await self._page_signature(page)
+        if _before_signature[1:] == _after_signature[1:]:
+            logger.warning("[NEXT_PAGE L0] 着陆页内容与上一页一致，翻页未生效，降级")
+            return await _restore_original("landed content unchanged")
+
+        return landed
+
+    async def execute(self, ctx: "ActionContext") -> "Optional[Page]":
+        browser = ctx.browser
+        page = ctx.page
+        if not page:
+            raise ActionExecutionError("next_page: 无活动页面。")
+
+        # ── Strategy 0: URL Mutation（最高效，零依赖 DOM）──
+        try:
+            mutated = await self._try_url_mutation(page)
+        except Exception as e:
+            logger.debug(f"[NEXT_PAGE L0] 变异异常忽略: {e}")
+            mutated = ""
+        if mutated:
+            logger.info(f"[NEXT_PAGE] L0 URL 变异成功 → {mutated[:120]}")
+            print(f"\033[1;35m🚀 [NEXT_PAGE]\033[0m L0 URL 变异 → {mutated[:80]}")
+            browser.rpa_trail.append(
+                ctx.with_rpa_meta({
+                    "action": "next_page",
+                    "method": "url_mutation",
+                    "strategy": "url_mutation",
+                    "landed_url": mutated,
+                })
+            )
+            await browser._wait_after_action()
+            return None
+
+        clicked = False
+        used_strategy = ""
+        # ── Strategy 1: CSS / ARIA selector ──
+        for sel in self._LOCATOR_TEMPLATES:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    used_strategy = f"css={sel}"
+                    if await self._click_if_effective(page, loc, used_strategy):
+                        clicked = True
+                        break
+            except Exception:
+                continue
+
+        # ── Strategy 2: visible text ──
+        if not clicked:
+            for txt in self._TEXT_PATTERNS:
+                try:
+                    # 优先精确匹配，缩小误命中
+                    loc = page.get_by_text(txt, exact=True).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        used_strategy = f'text="{txt}"'
+                        if await self._click_if_effective(page, loc, used_strategy):
+                            clicked = True
+                            break
+                except Exception:
+                    continue
+
+        # ── Strategy 3: role=link/button + accessible name ──
+        if not clicked:
+            for txt in self._TEXT_PATTERNS:
+                for role in ("link", "button"):
+                    try:
+                        loc = page.get_by_role(role, name=txt, exact=True).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            used_strategy = f"role={role} name=={txt!r}"
+                            if await self._click_if_effective(page, loc, used_strategy):
+                                clicked = True
+                                break
+                    except Exception:
+                        continue
+                if clicked:
+                    break
+
+        # ── Strategy 4 (L4): 无限瀑布流兜底 —— 滚动加载更多 ──
+        # Twitter / 小红书 / 商品流等纯瀑布流站没有 Next 控件，前面四级全不命中。
+        # 不抛错让 VLM 困惑，直接降级为 smooth_scroll down，引擎层完成"翻页"语义。
+        # next_page 因此变成"万能翻页动作"：分页页用 URL/DOM，瀑布流自动转滚动。
+        if not clicked:
+            try:
+                _scroll_before = await page.evaluate("() => window.scrollY") or 0
+                await page.evaluate(
+                    "() => window.scrollBy({top: window.innerHeight * 0.85, "
+                    "left: 0, behavior: 'smooth'})"
+                )
+                await asyncio.sleep(0.8)  # 等懒加载触发
+                _scroll_after = await page.evaluate("() => window.scrollY") or 0
+                _scroll_delta = max(0, _scroll_after - _scroll_before)
+                if _scroll_delta < 50:
+                    # 滚轮没动 = 真到页面底部，next_page 该报错让 VLM 决定 done
+                    raise ActionExecutionError(
+                        "next_page: 启发式翻页链路全部失败（L0 URL 变异 / L1-3 DOM locator）"
+                        "且页面已滚到底无新内容可加载，可能已是最后一页。"
+                        "请评估累计提取量，若已达目标输出 done，否则换 click + 真实 target_id 重试。"
+                    )
+                used_strategy = f"infinite_scroll Δ={_scroll_delta}px"
+                clicked = True  # 视作成功
+            except ActionExecutionError:
+                raise
+            except Exception as e:
+                raise ActionExecutionError(
+                    f"next_page: 启发式 locator 链全部未命中且滚动兜底失败（{e}）。"
+                    "请改用 click + 真实 target_id 或 click_text + 具体文字。"
+                )
+
+        logger.info(f"[NEXT_PAGE] 命中策略 {used_strategy}")
+        print(f"\033[1;35m🤖 [NEXT_PAGE]\033[0m 启发式翻页 → {used_strategy}")
+        browser.rpa_trail.append(
+            ctx.with_rpa_meta({
+                "action": "next_page",
+                "method": (
+                    "infinite_scroll" if used_strategy.startswith("infinite_scroll")
+                    else "dom_heuristic"
+                ),
+                "strategy": used_strategy,
+                "landed_url": page.url or "",
+            })
+        )
+        await browser._wait_after_action()
+        return None
+
+
+@ActionRegistry.register("click_text")
+class ClickTextHandler(ActionHandler):
+    """文本定位点击：page.get_by_text(type_value) 绕开 SoM ID 填位。
+
+    适用场景：密集分页器、文字链、固定 label 按钮 —— 当 VLM 知道按钮的可见文字
+    但 target_id 字段总填错时，这条路彻底跳过 VLM 的 schema 填位问题。
+    """
+
+    async def execute(self, ctx: "ActionContext") -> "Optional[Page]":
+        browser = ctx.browser
+        page = ctx.page
+        text = (ctx.action.type_value or "").strip()
+        if not text:
+            raise ActionExecutionError(
+                "click_text 必须在 type_value 中提供可见文字（如 '2' / '下一页' / 'Submit'）。"
+            )
+        if not page:
+            raise ActionExecutionError("click_text: 无活动页面。")
+
+        clicked = False
+        used = ""
+        # ── 1. 精确匹配（优先）──
+        try:
+            loc = page.get_by_text(text, exact=True).first
+            if await loc.count() > 0 and await loc.is_visible():
+                mode = await _click_locator_with_js_fallback(
+                    loc, f"click_text exact {text!r}", timeout=3000
+                )
+                clicked = True
+                used = f'exact="{text}" ({mode})'
+        except Exception:
+            pass
+
+        # ── 2. role=link/button + name 精确 ──
+        if not clicked:
+            for role in ("link", "button"):
+                try:
+                    loc = page.get_by_role(role, name=text, exact=True).first
+                    if await loc.count() > 0 and await loc.is_visible():
+                        mode = await _click_locator_with_js_fallback(
+                            loc, f"click_text role={role} {text!r}", timeout=3000
+                        )
+                        clicked = True
+                        used = f"role={role} name=={text!r} ({mode})"
+                        break
+                except Exception:
+                    continue
+
+        # ── 3. 子串匹配（最后兜底）──
+        # 短文本/数字页码只允许精确命中，避免 "2" 误点到任意含 2 的标题/计数。
+        allow_substring = len(text) > 2 and not text.isdigit()
+        if not clicked and allow_substring:
+            try:
+                loc = page.get_by_text(text, exact=False).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    mode = await _click_locator_with_js_fallback(
+                        loc, f"click_text substring {text!r}", timeout=3000
+                    )
+                    clicked = True
+                    used = f'substring="{text}" ({mode})'
+            except Exception:
+                pass
+
+        if not clicked:
+            raise ActionExecutionError(
+                f"click_text: 在页面上找不到可见且可点击的元素含文字 {text!r}。"
+                "请检查 type_value 是否完全匹配按钮显示文字，或换用 next_page / "
+                "smooth_scroll 让目标进入视口。"
+            )
+
+        logger.info(f"[CLICK_TEXT] {text!r} 命中：{used}")
+        print(f"\033[1;35m🎯 [CLICK_TEXT]\033[0m {text!r} → {used}")
+        browser.rpa_trail.append(
+            ctx.with_rpa_meta({
+                "action": "click_text", "type_value": text, "strategy": used,
+            })
+        )
+        await browser._wait_after_action()
+        return None
+
+
 @ActionRegistry.register("switch_tab")
 class SwitchTabHandler(ActionHandler):
     async def execute(self, ctx: ActionContext) -> Optional["Page"]:
@@ -1030,6 +1760,7 @@ class DownloadImageHandler(ActionHandler):
                     f"\033[36m{filepath.resolve()}\033[0m\n"
                 )
                 logger.info(f"[DOWNLOAD_IMAGE] Saved local: {filepath.resolve()}")
+                register_artifact(filepath)
             else:
                 logger.warning(
                     f"[DOWNLOAD_IMAGE] No URL found for element #{target_id}"

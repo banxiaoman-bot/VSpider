@@ -38,9 +38,10 @@ try:
         VLM_TIMEOUT,
         VLM_MAX_TOKENS,
         VLM_TEMPERATURE,
+        VLM_HISTORY_WINDOW,
         MAX_STEPS,
     )
-    from .prompts import SYSTEM_PROMPT, build_user_message
+    from .prompts import build_system_prompt, build_user_message
 except ImportError:
     from config import (
         VLM_API_BASE,
@@ -49,9 +50,10 @@ except ImportError:
         VLM_TIMEOUT,
         VLM_MAX_TOKENS,
         VLM_TEMPERATURE,
+        VLM_HISTORY_WINDOW,
         MAX_STEPS,
     )
-    from prompts import SYSTEM_PROMPT, build_user_message
+    from prompts import build_system_prompt, build_user_message
 
 logger = logging.getLogger("vspider.vlm")
 
@@ -108,6 +110,8 @@ class VSpiderAction(BaseModel):
         "remove_element", # 物理铲除：从 DOM 树直接删除广告遮罩/悬浮弹窗等阻挡节点
         "wait",           # 显式等待：主动暂停 N 秒，应对长动画/慢加载中间态
         "drag_and_drop",  # 拖拽：将 target_id 元素拖到 type_value 指定 ID 的元素上
+        "next_page",      # 启发式翻页：底层尝试 [Next/下一页/›/→] 等通用 locator
+        "click_text",     # 文本定位点击：底层 page.get_by_text(type_value) 绕开 SoM ID 填位
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(
         default=0,
@@ -336,8 +340,34 @@ class VSpiderAction(BaseModel):
                 )
                 self.action = "press_key"  # type: ignore[assignment]
                 self.target_id = 0
-            # ── 自动纠偏：click + 普通文本 → type ───────────────────────
-            # VLM 常见幻觉：想在输入框打字，但错用了 click 动作
+            # ── Fix 5：click + 短文本/标签字 → 静默擦掉 type_value，保留 click ─
+            # VLM 常见 schema 错位：想点击「页码 2」「下一页」「>」按钮，
+            # 错把按钮可见文字塞进 type_value（type_value 实际只用于 type 动作输入）。
+            # 判定：长度 ≤ 3 且非纯字母词 → 几乎可断定是按钮 label，不是输入文本。
+            # 精准条件命中时静默擦除（不抛警告），剩下的真·长文本才认为是 click→type 错选动作。
+            elif (
+                len(_tv) <= 3
+                or _tv in ("下一页", "上一页", "Next", "Prev", "Previous", "More", "更多")
+                or (len(_tv) <= 6 and (_tv.isdigit() or all(c in "<>«»‹›←→▲▼▶◀" for c in _tv)))
+            ):
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[ACTION FIX] click + 短标签 type_value={_tv!r} 静默擦除"
+                    f"（保留 click，target_id 应为该按钮的 @eN 数字）"
+                )
+                if self.target_id == 0:
+                    _logging.getLogger(__name__).warning(
+                        f"[ACTION FIX] click + target_id=0 + label type_value={_tv!r} "
+                        "-> click_text"
+                    )
+                    self.action = "click_text"  # type: ignore[assignment]
+                    self.target_id = 0
+                    self.type_value = _tv
+                else:
+                    self.type_value = ""
+                # action 保持 click 不变；如果 target_id 仍为 0 会进入下一道 ZERO_TARGET_DOWNGRADE 守卫
+            # ── 自动纠偏：click + 长文本 → type ───────────────────────
+            # 真·schema 错选：长文本几乎一定是 VLM 想 type 但选成 click
             else:
                 import logging as _logging
                 _logging.getLogger(__name__).info(
@@ -355,17 +385,83 @@ class VSpiderAction(BaseModel):
             # 其他分支一致采用 auto-correct，这里也统一到降级模式）。
             import logging as _logging
             _prev_action = self.action
-            _logging.getLogger(__name__).warning(
-                f"[ACTION FIX] {_prev_action} + target_id=0 自动纠偏为 wait(2s)，"
-                f"等 VLM 下一轮重新选有效红框"
+            _prev_tv = (self.type_value or "").strip()
+            # 诊断：click + target_id=0 + type_value 非空且短（像元素可见文字）→
+            # 极可能是 VLM 把"点击标签为 X 的按钮"误填成"click + type_value=X"，
+            # 应当把对应 @eN 数字部分填到 target_id，而非 type_value
+            # 也覆盖 click→type 旁路改写：上游 _validate_action_consistency 把
+            # `click + type_value="2"` 当 VLM 选错 action 改成 `type`，到我们这里
+            # _prev_action 就成了 type。无论 click 还是 type，target_id=0 + 短文本 type_value
+            # 都强烈暗示"把元素可见文字塞错位"。
+            _likely_label_misfill = (
+                _prev_action in ("click", "click_new_tab", "type")
+                and len(_prev_tv) <= 20
+                and _prev_tv != ""
             )
+            _logging.getLogger(__name__).warning(
+                f"[ACTION FIX] {_prev_action} + target_id=0 (type_value={_prev_tv!r}) "
+                f"自动纠偏为 wait(2s)，等 VLM 下一轮重新选有效红框"
+            )
+            _tv_lower = _prev_tv.lower()
+            _looks_like_click_text = (
+                _prev_tv
+                and (
+                    _prev_tv.isdigit()
+                    or _tv_lower in {"next", "prev", "previous", "more"}
+                    or (
+                        len(_prev_tv) <= 3
+                        and all(c in "<>/-+|[](){}.,:;!?" for c in _prev_tv)
+                    )
+                )
+            )
+            if _looks_like_click_text:
+                _logging.getLogger(__name__).warning(
+                    f"[ACTION FIX] {_prev_action} + target_id=0 + label "
+                    f"type_value={_prev_tv!r} -> click_text"
+                )
+                self.action = "click_text"  # type: ignore[assignment]
+                self.target_id = 0
+                self.type_value = _prev_tv
+                self.thought = (
+                    f"[ZERO_TARGET_AUTOFIX] target_id=0 with label {_prev_tv!r} "
+                    "was converted to click_text. "
+                ) + (self.thought or "")
+                return self
+
             self.action = "wait"  # type: ignore[assignment]
             self.target_id = 0
             self.type_value = "2"
+            _diag_extra = ""
+            if _likely_label_misfill:
+                _diag_extra = (
+                    f"\n\n🚨【绝对硬指令】你刚才输出 {_prev_action} target_id=0 type_value={_prev_tv!r}，"
+                    f"系统判定为「字段错位幻觉」。\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"【最快路径 — 推荐】使用 `click_text` 文本定位绕开 target_id 填位：\n"
+                    f"  {{\"action\":\"click_text\",\"target_id\":0,\"type_value\":{_prev_tv!r}}}\n"
+                    f"  底层引擎会用 page.get_by_text({_prev_tv!r}) 直接定位并点击，\n"
+                    f"  不依赖你填对 SoM 红框 ID。**对密集分页器极强**。\n\n"
+                    f"【或者 — 如果是翻页场景】用 `next_page` 启发式翻页：\n"
+                    f"  {{\"action\":\"next_page\",\"target_id\":0,\"type_value\":\"\"}}\n"
+                    f"  引擎会自动找 [Next/下一页/›/→] 等通用控件并点击。\n\n"
+                    f"【常规路径 — 如果你确定 ID】：\n"
+                    f"  1. 在【可交互元素 @eN 语义快照】里找到 Name 等于 {_prev_tv!r} 的元素（如 `@e43 [button] {_prev_tv!r}`）\n"
+                    f"  2. 输出 action=\"click\"\n"
+                    f"  3. target_id 必须填 @eN 的**真实非零数字**（如 43）\n"
+                    f"  4. type_value 必须为空字符串 \"\"\n\n"
+                    f"【绝对禁止】：\n"
+                    f"  · 禁止再次把 {_prev_tv!r} 写进 type_value\n"
+                    f"  · 禁止 target_id=0\n"
+                    f"  · 禁止用 click_point 估算坐标（已经有红框 ID 就不要降维）\n\n"
+                    f"语义口诀：type_value 只用于 type 动作的「键盘输入文本」（搜索关键词、表单内容），"
+                    f"**绝对不是**按钮上的可见文字。按钮可见文字是用来在 @eN 清单里**查 ID** 的，"
+                    f"查到的 ID 才填进 target_id。"
+                )
             self.thought = (
                 f"[ZERO_TARGET_DOWNGRADE] 上一步你想执行 {_prev_action} 但 target_id=0，"
                 f"这会使校验失败并卡死循环。系统已代为 wait 2 秒。下一步请仔细看截图里可见的"
                 f"红框数字，挑一个**非 0 的编号**；若屏幕没有合适元素，改用 smooth_scroll 或 press_key。"
+                + _diag_extra
             ) + (self.thought or "")
             return self
         if self.action == "press_key" and not (self.type_value and self.type_value.strip()):
@@ -541,26 +637,45 @@ class VLMClient:
 
     def __init__(self):
         import httpx
+        try:
+            from . import config as runtime_config
+        except ImportError:
+            import config as runtime_config
+
+        self.api_base = getattr(runtime_config, "VLM_API_BASE", VLM_API_BASE)
+        self.api_key = getattr(runtime_config, "VLM_API_KEY", VLM_API_KEY)
+        self.model = getattr(runtime_config, "VLM_MODEL_NAME", VLM_MODEL_NAME)
+        self.semantic_model = (
+            getattr(runtime_config, "VLM_SEMANTIC_MODEL_NAME", "") or self.model
+        )
+        self.timeout = getattr(runtime_config, "VLM_TIMEOUT", VLM_TIMEOUT)
+        self.max_tokens = getattr(runtime_config, "VLM_MAX_TOKENS", VLM_MAX_TOKENS)
+        self.temperature = getattr(runtime_config, "VLM_TEMPERATURE", VLM_TEMPERATURE)
+        self.text_only = bool(getattr(runtime_config, "VLM_TEXT_ONLY", False))
 
         # 使用自定义 httpx 客户端，禁止 GC 时自动 aclose()
         # 避免 event loop 关闭后 "Event loop is closed" 噪音日志
         _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(VLM_TIMEOUT),
+            timeout=httpx.Timeout(self.timeout),
         )
         self.client = AsyncOpenAI(
-            api_key=VLM_API_KEY,
-            base_url=VLM_API_BASE,
-            timeout=VLM_TIMEOUT,
+            api_key=self.api_key,
+            base_url=self.api_base,
+            timeout=self.timeout,
             http_client=_http_client,
         )
-        self.model = VLM_MODEL_NAME
         # 操作历史：存储每轮批次中各动作的 (step, thought, action, target_id, type_value) 摘要
         self._history: list[dict] = []
+        self._history_window: int = max(2, int(VLM_HISTORY_WINDOW or self._HISTORY_WINDOW))
         # 结构化输出：首次尝试 json_schema 模式，若模型不支持则自动降级
         self._use_structured: bool = True
         # 自愈反馈：下一轮 ask() 会将上一轮的执行错误注入提示
         self._pending_error: str | None = None
-        logger.info(f"VLM 客户端初始化完成 | 模型: {self.model} | 端点: {VLM_API_BASE}")
+        logger.info(
+            f"VLM client initialized | model={self.model} | base={self.api_base} | "
+            f"semantic_model={self.semantic_model} | text_only={self.text_only} | "
+            f"max_tokens={self.max_tokens} | temperature={self.temperature}"
+        )
 
     def _build_history_summary(self) -> str:
         """构建最近 N 轮操作的历史摘要文本（含执行结果）。"""
@@ -568,7 +683,10 @@ class VLMClient:
             return ""
 
         lines = ["## 最近操作历史（含执行结果，避免重复）"]
-        for h in self._history[-self._HISTORY_WINDOW:]:
+        older_count = max(0, len(self._history) - self._history_window)
+        if older_count:
+            lines.append(f"- Earlier {older_count} history item(s) omitted; rely on current goal and recent results.")
+        for h in self._history[-self._history_window:]:
             _result = h.get("result")
             _result_tag = f" → {_result}" if _result else " → (执行中)"
             lines.append(
@@ -598,8 +716,8 @@ class VLMClient:
                 "result": None,
             })
         # 只保留窗口大小的历史
-        if len(self._history) > self._HISTORY_WINDOW * 2:
-            self._history = self._history[-self._HISTORY_WINDOW:]
+        if len(self._history) > self._history_window * 2:
+            self._history = self._history[-self._history_window:]
 
     def annotate_last_result(self, note: str) -> None:
         """
@@ -638,6 +756,7 @@ class VLMClient:
         input_descriptions: str = "",
         workflow_memory: dict | None = None,
         task_plan: Optional["TaskPlan"] = None,
+        max_steps: int | None = None,
     ) -> list[dict]:
         """
         向 VLM/LLM 发送当前状态，请求下一批次动作（连招模式）。
@@ -659,10 +778,32 @@ class VLMClient:
             thought/action/target_id/type_value/memory_key/status 等字段
         """
         history_text = self._build_history_summary()
+        system_prompt = build_system_prompt(
+            goal=goal,
+            browser_state=input_descriptions,
+            workflow_memory=workflow_memory,
+        )
+        logger.debug(
+            "[PROMPT] dynamic system prompt chars=%s (goal=%r)",
+            len(system_prompt),
+            goal[:80],
+        )
         user_text = build_user_message(
-            goal, step, MAX_STEPS, history_text, input_descriptions, workflow_memory,
+            goal, step, max_steps or MAX_STEPS, history_text, input_descriptions, workflow_memory,
             task_plan=task_plan,
         )
+        if self.text_only and screenshot_b64:
+            screenshot_b64 = None
+            user_text += (
+                "\n\n[TEXT_ONLY_MODEL]\n"
+                "Current selected model is text-only. Strip image payload and rely only on "
+                "AX Tree, element roles/names/states, URL and page text. Choose target_id "
+                "strictly from the current @eN element snapshot."
+            )
+            _broadcast_log_safe(
+                f"[MODEL] Text-only model active: image payload stripped for step {step}",
+                level="warn",
+            )
 
         # ── 图文双模态：若截图失败（极端情况）才切换纯文本降级 ───────────────
         # 常规路径保留原始"截图说明"，因为此时图文并行，VLM 依旧需要解释红框语义。
@@ -735,7 +876,7 @@ class VLMClient:
             user_content = user_text
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": user_content,
@@ -758,8 +899,8 @@ class VLMClient:
                 api_kwargs: dict = {
                     "model": self.model,
                     "messages": messages,
-                    "max_tokens": VLM_MAX_TOKENS,
-                    "temperature": VLM_TEMPERATURE,
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
                 }
                 if self._use_structured:
                     api_kwargs["response_format"] = {
@@ -851,14 +992,14 @@ class VLMClient:
                     # 将 messages 中的图片剥离，只保留文本
                     _text_only_content = user_text
                     _text_only_messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": _text_only_content},
                     ]
                     _text_api_kwargs: dict = {
                         "model": self.model,
                         "messages": _text_only_messages,
-                        "max_tokens": VLM_MAX_TOKENS,
-                        "temperature": VLM_TEMPERATURE,
+                        "max_tokens": self.max_tokens,
+                        "temperature": self.temperature,
                     }
                     try:
                         response = await self.client.chat.completions.create(
@@ -999,12 +1140,12 @@ class VLMClient:
             )
 
             response = await self.client.chat.completions.create(
-                model=self.model,
+                model=self.semantic_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=VLM_MAX_TOKENS,
+                max_tokens=self.max_tokens,
                 temperature=0.1,  # 低温度确保数据提取准确
             )
 
@@ -1085,12 +1226,12 @@ class VLMClient:
             _broadcast_log_safe("[PLANNER] 调用 Planner LLM 生成任务计划...")
 
             api_kwargs: dict = {
-                "model": self.model,
+                "model": self.semantic_model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "max_tokens": VLM_MAX_TOKENS,
+                "max_tokens": self.max_tokens,
                 "temperature": 0.2,
             }
             if self._use_structured:
@@ -1172,12 +1313,12 @@ class VLMClient:
             )
 
             api_kwargs: dict = {
-                "model": self.model,
+                "model": self.semantic_model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                "max_tokens": VLM_MAX_TOKENS,
+                "max_tokens": self.max_tokens,
                 "temperature": 0.2,
             }
             if self._use_structured:
