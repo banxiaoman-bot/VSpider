@@ -2079,6 +2079,8 @@ async def run_agent(
         _pagination_probed = False  # 首次 extract 后探测分页器一次（Improvement 1）
         _pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
         _pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
+        _first_flip_pending = False  # 首次 extract 后强制下一步走 next_page（引擎层硬约束）
+        _first_extract_ever_done = False  # 任务级永久锁：首次 extract 完成过（不会被翻页重置）
         _total_extracted_rows = 0  # 跨页累加的总行数
         _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
         _extracted_page_urls: set = set()  # 已成功提取数据的不同页面 URL 集合
@@ -2698,46 +2700,81 @@ async def run_agent(
 
                 _log_decision = decisions
 
+                # ── 首翻引擎硬约束：第一次 extract 之后强制 next_page ──
+                # VLM 即使读到「首翻铁律」prompt 也常受 probe="infinite" 提示误导走 smooth_scroll，
+                # 导致 4-8 步 dedup 弯路。这里在引擎层强行改写决策为 next_page，
+                # 让 next_page 五级漏斗（L0 URL Mutation 优先）来判定页面真实模式。
+                # 仅触发一次：执行后立即清 flag；若 next_page L4 真的报错滚不动，
+                # VLM 下一轮会收到错误反馈正常走 done/click 路径。
+                if (
+                    _first_flip_pending
+                    and decisions
+                    and decisions[0].get("action") in ("smooth_scroll", "scroll", "extract")
+                ):
+                    _orig_action = decisions[0].get("action")
+                    logger.info(
+                        f"[FIRST FLIP] 引擎硬约束：首次 extract 后下一步必须 next_page，"
+                        f"已将 VLM 决策 {_orig_action!r} 改写为 next_page"
+                    )
+                    _broadcast_log_safe(
+                        f"[FIRST FLIP] 改写 {_orig_action} → next_page", level="warn"
+                    )
+                    decisions[0]["action"] = "next_page"
+                    decisions[0]["target_id"] = 0
+                    decisions[0]["type_value"] = ""
+                    # 保留 thought / extracted_data 等原字段，仅改动作类型
+                    decisions[0]["thought"] = (
+                        f"[FIRST FLIP 引擎改写] 原决策={_orig_action}，"
+                        "首次 extract 后系统强制走 next_page 探测分页器。"
+                        + (decisions[0].get("thought") or "")
+                    )
+                    _first_flip_pending = False  # 一次性消费，不再触发
+                # 即使 VLM 已经选了 next_page，flag 也清掉避免重复触发
+                elif _first_flip_pending and decisions and decisions[0].get("action") == "next_page":
+                    _first_flip_pending = False
+
                 # ── Fix 4：连续 ZERO_TARGET_DOWNGRADE RAW LOOP GUARD ───────
                 # 检测 VLM 反复输出 click+target_id=0+type_value="X" 的 schema
                 # 错位幻觉。已被 validator 降级为 wait，但底层意图仍是同一错误。
                 # 连续 3 次相同 type_value → 强行注入硬指令 + 重置积压反馈。
                 _head_dec = decisions[0] if decisions else {}
                 if _head_dec.get("__zero_target_downgraded"):
-                    _cur_tv = (_head_dec.get("type_value") or "").strip()
-                    if _cur_tv == _last_zero_target_tv:
-                        _consecutive_zero_target += 1
-                    else:
-                        _consecutive_zero_target = 1
-                        _last_zero_target_tv = _cur_tv
+                    # Fix C：去掉 type_value 比对（Fix 5 会擦短标签，导致 type_value 看似不一致），
+                    # 改为单纯连续计数，更鲁棒覆盖豆瓣那种"thought 反复写 target_id=21 但 JSON 出 0"的死循环。
+                    _consecutive_zero_target += 1
                     if _consecutive_zero_target >= 3:
+                        # 从 thought 里挖 VLM 真正想点的 @eN（如 "@e21"），让通牒更具体
+                        import re as _zt_re
+                        _thought = (_head_dec.get("thought") or "")
+                        _en_match = _zt_re.search(r"@e(\d+)", _thought)
+                        _hint_id = _en_match.group(1) if _en_match else "<你 thought 中提到的 @eN 数字>"
                         logger.warning(
                             f"[RAW GUARD] 连续 {_consecutive_zero_target} 次 "
-                            f"ZERO_TARGET_DOWNGRADE (type_value={_cur_tv!r})，"
-                            f"VLM 卡死在 schema 错位幻觉 — 强制升级反馈"
+                            f"ZERO_TARGET_DOWNGRADE，VLM schema 错位 — 强制升级反馈"
+                            f"（推断目标 @e{_hint_id}）"
                         )
                         _broadcast_log_safe(
-                            f"[RAW GUARD] 连续 {_consecutive_zero_target} 次同 type_value 错位",
+                            f"[RAW GUARD] 连续 {_consecutive_zero_target} 次 ZERO_TARGET 错位 → 升级反馈",
                             level="warn",
                         )
                         vlm.inject_error_feedback(
-                            f"🆘【最后通牒 — 你已经连续 {_consecutive_zero_target} 步犯同一个错】\n"
-                            f"反复输出 click/type target_id=0 type_value={_cur_tv!r}，被系统降级为 wait。\n"
+                            f"🆘【最后通牒 — 你已连续 {_consecutive_zero_target} 步 schema 错位】\n"
+                            f"你反复输出 click/type target_id=0，但 thought 明明写了真实 @eN（如 @e{_hint_id}）。\n"
+                            f"问题：你把 @eN 的数字部分填错位置了 —— 应填到 target_id 字段，不是 type_value。\n"
                             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"接下来你**必须**做以下其中一件事，否则任务终止：\n"
-                            f"  A. 在 @eN 快照里找到 Name=={_cur_tv!r} 的元素，"
-                            f"输出 click + target_id=<那个真实非零数字> + type_value=\"\"；\n"
-                            f"  B. 如果 @eN 快照里**真的没有** Name=={_cur_tv!r} 的元素，"
-                            f"输出 smooth_scroll target_id=0 type_value=\"down\" 让它进入视口；\n"
-                            f"  C. 如果当前任务已无法完成，输出 action=done 并在 thought 说明放弃理由。\n"
-                            f"⛔ 严禁再次输出 type_value={_cur_tv!r} —— 这个值已被系统标记为陷阱。"
+                            f"【请按下面三选一立即输出，否则任务终止】：\n"
+                            f"  A. 直接 click：{{\"action\":\"click\",\"target_id\":{_hint_id},"
+                            f"\"type_value\":\"\",\"memory_key\":\"\",...}}\n"
+                            f"  B. 用 click_text 文本定位（绕开 ID 填位）：\n"
+                            f"     {{\"action\":\"click_text\",\"target_id\":0,"
+                            f"\"type_value\":\"<按钮可见文字，如 后页 或 2>\",...}}\n"
+                            f"  C. 如果任务无法完成，输出 action=done 并在 thought 说明放弃理由。\n"
+                            f"⛔ 严禁再输出 target_id=0 + 非空 type_value 的组合。"
                         )
-                        # 重置计数器避免连续触发同一警告
+                        # 重置计数器避免连续触发同一警告（每 3 次触发一次）
                         _consecutive_zero_target = 0
-                        _last_zero_target_tv = ""
                 else:
                     _consecutive_zero_target = 0
-                    _last_zero_target_tv = ""
 
                 # ── Fix 2：拦截"子目标未完就 done"（CRITICAL：Task B bug）
                 # VLM 把「子目标完成 → 推进」错认为「全局完成 → done」；
@@ -2970,6 +3007,13 @@ async def run_agent(
                         # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放
                         _rpa_cache_allowed = False
                         _rpa_skip_reason = "contains auto-extract steps"
+                        # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
+                        # Bug 修复：用任务级永久锁 _first_extract_ever_done，避免 _extract_count
+                        # 在翻页/导航后被重置回 0 → 下一次 extract 又把 flag 设回 True →
+                        # FIRST FLIP 在每次翻页后反复触发的问题。
+                        if not _first_extract_ever_done:
+                            _first_extract_ever_done = True
+                            _first_flip_pending = True
                         # ── Improvement 1：首次 extract 后探测分页器（auto-extract 路径） ──
                         if not _pagination_probed and _extract_count == 1:
                             _pagination_probed = True
@@ -3439,6 +3483,11 @@ async def run_agent(
                             _extract_count += 1
                             _extracted_page_urls.add(_current_url)
                             _extracted_page_keys.add(_current_extract_page_key)
+                            # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
+                            # Bug 修复：用任务级永久锁，避免翻页后 _extract_count 重置反复触发
+                            if not _first_extract_ever_done:
+                                _first_extract_ever_done = True
+                                _first_flip_pending = True
                             # ── Improvement 1：首次 extract 后探测分页器（显式 extract 路径） ──
                             if not _pagination_probed and _extract_count == 1:
                                 _pagination_probed = True

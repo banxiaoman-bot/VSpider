@@ -17,6 +17,11 @@ from typing import Callable
 
 import pandas as pd
 
+try:
+    from .artifact_manager import register_artifact, resolve_artifact_path
+except ImportError:
+    from artifact_manager import register_artifact, resolve_artifact_path
+
 logger = logging.getLogger("vspider.data")
 
 # ANSI 颜色
@@ -134,6 +139,7 @@ def _save_dataframe_to_excel(
 
     # 去重
     if unique_key:
+        # 显式 unique_key：精确按指定列去重
         subset = [unique_key] if isinstance(unique_key, str) else unique_key
         valid_cols = [c for c in subset if c in df_combined.columns]
         if valid_cols:
@@ -144,6 +150,31 @@ def _save_dataframe_to_excel(
             removed = before_dedup - len(df_combined)
             if removed > 0:
                 logger.info(f"Dedup by {valid_cols}: removed {removed} duplicates")
+    else:
+        # 自动 hash 去重：保护快速翻页场景下的"AJAX 未完成 + 上一页 DOM 仍存"导致的重复落盘
+        # 适用 DataTables / 动态表格等 URL 不变的翻页场景（fast-pagination race）
+        # 哈希基于所有数据列（剥离 _extracted_at 等系统列），保证内容相同的行被识别为重复
+        _SYSTEM_COLS = {"_extracted_at", "_row_hash"}
+        _data_cols = [c for c in df_combined.columns if c not in _SYSTEM_COLS]
+        if _data_cols and len(df_combined) >= 2:
+            import hashlib
+            def _row_fingerprint(row):
+                # 按列名稳定排序后串接成字符串，再 sha1 截 16 字符
+                _vals = [f"{c}={row[c]!s}" for c in sorted(_data_cols)]
+                return hashlib.sha1("\x1f".join(_vals).encode("utf-8")).hexdigest()[:16]
+            try:
+                _hashes = df_combined.apply(_row_fingerprint, axis=1)
+                before_dedup = len(df_combined)
+                _keep_mask = ~_hashes.duplicated(keep="last")
+                df_combined = df_combined[_keep_mask].reset_index(drop=True)
+                removed = before_dedup - len(df_combined)
+                if removed > 0:
+                    logger.info(
+                        f"[AUTO HASH DEDUP] 自动去重移除 {removed} 行重复数据"
+                        f"（疑似快翻页 AJAX race），保留最新副本"
+                    )
+            except Exception as _hash_err:
+                logger.warning(f"[AUTO HASH DEDUP] 失败忽略：{_hash_err}")
 
     # 写入
     df_combined.to_excel(filepath, index=False, engine="openpyxl")
@@ -167,7 +198,7 @@ def save_to_excel(
         filters: 可选过滤规则
         unique_key: 去重字段
     """
-    filepath = Path(filename)
+    filepath = resolve_artifact_path(filename)
 
     # 统一转换为 list[dict]
     if isinstance(data, dict):
@@ -193,6 +224,7 @@ def save_to_excel(
     df_new = pd.DataFrame(data_list)
     abs_path, total = _save_dataframe_to_excel(df_new, filepath, unique_key)
     logger.info(f"[VLM Extract] Saved to: {abs_path} (total {total} rows)")
+    register_artifact(abs_path)
     return abs_path
 
 
@@ -220,7 +252,7 @@ def save_intercepted_data(
     Returns:
         保存的文件绝对路径
     """
-    filepath = Path(filename)
+    filepath = resolve_artifact_path(filename)
 
     if not json_list or len(json_list) == 0:
         logger.warning("[XHR Intercept] Empty data list, skipping save.")
@@ -241,4 +273,5 @@ def save_intercepted_data(
         f"[XHR Intercept] Saved {new_count} new records -> {abs_path} "
         f"(total {total} rows)"
     )
+    register_artifact(abs_path)
     return abs_path
