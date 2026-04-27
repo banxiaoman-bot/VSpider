@@ -34,6 +34,15 @@ CORE_PROMPT = """
 
 
 JSON_SCHEMA_PROMPT = """
+⚠️ 顶层结构铁律（违反将触发系统救援 + 警告）：
+- JSON 顶层**必须**是 {"actions": [...]}，不允许省略 actions 包裹层
+- **绝对禁止**直接返回单行数据如 {"title":"...","points":"...","url":"..."}
+  这种是 extracted_data 的内容，必须包在 actions[0].extracted_data 里
+- 即使本步只是 extract，也要写完整：
+    {"actions":[{"action":"extract","target_id":0,"type_value":"","memory_key":"",
+                 "extracted_data":[{...}, {...}],"thought":"...","progress_review":"...",
+                 "current_state":"...","status":"success","subgoal_status":"in_progress"}]}
+
 JSON 输出格式必须严格为：
 {
   "actions": [

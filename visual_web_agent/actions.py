@@ -1066,22 +1066,34 @@ class NextPageHandler(ActionHandler):
     引擎用 XPath/CSS heuristic 直接命中比让 VLM 凭视觉找坐标可靠 100 倍。
     """
     # 按命中优先级排序的 locator 模板列表。第一个命中即点击，其余为 fallback。
+    # 所有模板都加 :not([disabled]):not([aria-disabled="true"]):not(.disabled) 过滤，
+    # 防止 DataTables 等库在末页保留 Next 按钮但置 disabled 时仍被命中导致空点击循环。
+    _DISABLED_FILTER: ClassVar[str] = (
+        ':not([disabled]):not([aria-disabled="true"]):not(.disabled)'
+    )
     _LOCATOR_TEMPLATES: ClassVar[list[str]] = [
         # ARIA / accessibility 优先：明确语义
-        'a[aria-label*="next" i]',
-        'button[aria-label*="next" i]',
-        'a[aria-label*="下一页"]',
-        'button[aria-label*="下一页"]',
+        'a[aria-label*="next" i]' + _DISABLED_FILTER,
+        'button[aria-label*="next" i]' + _DISABLED_FILTER,
+        'a[aria-label*="下一页"]' + _DISABLED_FILTER,
+        'button[aria-label*="下一页"]' + _DISABLED_FILTER,
         # rel=next：HTML 标准翻页提示
-        'a[rel="next"]',
+        'a[rel="next"]' + _DISABLED_FILTER,
         # data 属性常见命名
-        '[data-testid*="next" i]',
-        '[data-test*="next" i]',
+        '[data-testid*="next" i]' + _DISABLED_FILTER,
+        '[data-test*="next" i]' + _DISABLED_FILTER,
     ]
     # 可见文字 locator（Playwright get_by_text + role 组合）
     _TEXT_PATTERNS: ClassVar[list[str]] = [
-        "下一页", "下一頁", "Next", "next page", "Next ›", "Next →",
-        "More", "更多", "Older", "›", "»", "→", "▶",
+        # 简体/繁体中文翻页文字
+        "下一页", "下一頁", "下页", "下頁", "后页", "後頁",
+        "下一页 >", "后页>", "后页 >",
+        # 英文常见
+        "Next", "next page", "Next ›", "Next →", "Next page",
+        # 通用关键词
+        "More", "更多", "Older", "加载更多", "加載更多", "查看更多",
+        # 符号
+        "›", "»", "→", "▶", ">",
     ]
 
     # URL 变异常见的分页参数键。`p` 语义过载，只有 DOM 预检证明它用于分页时才允许变异。
@@ -1090,8 +1102,17 @@ class NextPageHandler(ActionHandler):
     )
     _RISKY_URL_PAGE_KEYS: ClassVar[tuple[str, ...]] = ("p",)
     _URL_PAGE_KEYS: ClassVar[tuple[str, ...]] = _SAFE_URL_PAGE_KEYS + _RISKY_URL_PAGE_KEYS
-    # offset / start 类参数：每页步长不固定（10/20/50），需要看上一页的差值，保守跳过；
-    # 但用户明确给了 size/limit 时引擎可以推算 —— 第一版不做这个，避免乱跳。
+    # offset / start 类参数：豆瓣 Top250 用 ?start=0/25/50/...（步长 25），
+    # 多数搜索接口用 ?offset=N&limit=M。识别后按已知步长（或常见值 10/25/50）递增。
+    _OFFSET_URL_KEYS: ClassVar[tuple[str, ...]] = (
+        "start", "offset", "from", "skip",
+    )
+    # 与 offset 配套的"页大小"参数 —— 找到时用其值作步长
+    _PAGE_SIZE_KEYS: ClassVar[tuple[str, ...]] = (
+        "limit", "size", "count", "pagesize", "per_page", "perpage",
+    )
+    # offset 默认步长（豆瓣 25 / 多数搜索 10）—— 找不到 size 参数时回退
+    _DEFAULT_OFFSET_STEPS: ClassVar[tuple[int, ...]] = (25, 10, 20, 50)
 
     async def _dom_confirms_pagination_param(
         self, page, key: str, expected_next: int
@@ -1363,6 +1384,49 @@ class NextPageHandler(ActionHandler):
             logger.info(f"[NEXT_PAGE L0] query 变异 {k}={cur_n}→{cur_n+1}: {new_url[:120]}")
             break
 
+        # ── 1.5. offset/start 类参数变异（豆瓣 ?start=25 / 通用 ?offset=N&limit=M） ──
+        # 与 page 参数不同，offset 是"行偏移量"而非"页码"，递增步长 = limit/size/per_page。
+        # 推断步长优先级：
+        #   1. URL 已有 limit/size/per_page → 用其值（最可靠）
+        #   2. 当前 offset 值看似是 0 / step 倍数 → 取 _DEFAULT_OFFSET_STEPS[0]=25（豆瓣模式）
+        #   3. 否则跳过此分支
+        if not new_url:
+            _offset_idx = -1
+            _offset_key = ""
+            _offset_val = 0
+            for i, (k, v) in enumerate(params):
+                if k.lower() in self._OFFSET_URL_KEYS:
+                    try:
+                        _offset_val = int(v)
+                        if 0 <= _offset_val <= 99999:
+                            _offset_idx = i
+                            _offset_key = k
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            if _offset_idx >= 0:
+                # 找步长
+                _step = 0
+                for k, v in params:
+                    if k.lower() in self._PAGE_SIZE_KEYS:
+                        try:
+                            _s = int(v)
+                            if 1 <= _s <= 1000:
+                                _step = _s
+                                break
+                        except (ValueError, TypeError):
+                            continue
+                if _step == 0:
+                    # 没显式 size：用默认步长。豆瓣 Top250 是 25，最常见。
+                    _step = self._DEFAULT_OFFSET_STEPS[0]
+                _new_offset = _offset_val + _step
+                params[_offset_idx] = (_offset_key, str(_new_offset))
+                new_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+                logger.info(
+                    f"[NEXT_PAGE L0] offset 变异 {_offset_key}={_offset_val}→{_new_offset} "
+                    f"(step={_step}): {new_url[:120]}"
+                )
+
         # ── 2. 路径段 /page/N、/p/N 变异 ──
         if not new_url:
             import re as _re
@@ -1384,10 +1448,20 @@ class NextPageHandler(ActionHandler):
                 except (ValueError, TypeError):
                     pass
 
+        # ── 3. 首翻 seed：URL 完全没有 page 参数 → 主动追加 page=1（HN Algolia 等场景） ──
+        # 修复：?q=AI+Agent 这种首屏 URL 没有 page key，原递增逻辑无法启动；
+        # 主动 seed page=1，下一次 next_page 再来就能 1→2 走原 query 递增路径。
+        # 仅当 URL 看起来像列表/搜索结果页（query 有内容）时才 seed，避免对静态详情页乱加。
+        if not new_url and parsed.query:
+            params.append(("page", "1"))
+            new_query = urlencode(params, doseq=True)
+            new_url = urlunparse(parsed._replace(query=new_query))
+            logger.info(f"[NEXT_PAGE L0] 首翻 seed page=1: {new_url[:120]}")
+
         if not new_url:
             return ""
 
-        # ── 3. 执行 goto + 校验 ──
+        # ── 4. 执行 goto + 校验 ──
         try:
             await page.goto(new_url, wait_until="domcontentloaded", timeout=15000)
             try:
@@ -1489,28 +1563,55 @@ class NextPageHandler(ActionHandler):
                 if clicked:
                     break
 
-        # ── Strategy 4 (L4): 无限瀑布流兜底 —— 滚动加载更多 ──
+        # ── Strategy 4 (L4): 无限瀑布流兜底 —— 滚动 + 校验内容真增长 ──
         # Twitter / 小红书 / 商品流等纯瀑布流站没有 Next 控件，前面四级全不命中。
-        # 不抛错让 VLM 困惑，直接降级为 smooth_scroll down，引擎层完成"翻页"语义。
-        # next_page 因此变成"万能翻页动作"：分页页用 URL/DOM，瀑布流自动转滚动。
+        # 关键避坑：scrollY 增量 ≠ 内容增加。HN Algolia 这类**伪无限滚动**站
+        # （实为分页器但无标准 Next 控件）滚动只移动视口不加载新条目，
+        # 必须同时校验 body innerText 长度 / 列表项数量真实增长，才能判定"翻页成功"。
         if not clicked:
             try:
-                _scroll_before = await page.evaluate("() => window.scrollY") or 0
+                _state_js = (
+                    "() => ({"
+                    "  y: window.scrollY,"
+                    "  textLen: (document.body && document.body.innerText || '').length,"
+                    "  itemCount: document.querySelectorAll("
+                    "    'article, li, [role=\"article\"], [role=\"listitem\"], "
+                    "    .Story, .item, .row, tr'"
+                    "  ).length"
+                    "})"
+                )
+                _before = await page.evaluate(_state_js) or {}
                 await page.evaluate(
                     "() => window.scrollBy({top: window.innerHeight * 0.85, "
                     "left: 0, behavior: 'smooth'})"
                 )
-                await asyncio.sleep(0.8)  # 等懒加载触发
-                _scroll_after = await page.evaluate("() => window.scrollY") or 0
-                _scroll_delta = max(0, _scroll_after - _scroll_before)
-                if _scroll_delta < 50:
-                    # 滚轮没动 = 真到页面底部，next_page 该报错让 VLM 决定 done
+                await asyncio.sleep(1.0)  # 等懒加载触发
+                _after = await page.evaluate(_state_js) or {}
+
+                _delta_y = max(0, int(_after.get("y", 0)) - int(_before.get("y", 0)))
+                _delta_text = int(_after.get("textLen", 0)) - int(_before.get("textLen", 0))
+                _delta_items = int(_after.get("itemCount", 0)) - int(_before.get("itemCount", 0))
+
+                # 滚轮没动 = 真到页面底部
+                if _delta_y < 50:
                     raise ActionExecutionError(
-                        "next_page: 启发式翻页链路全部失败（L0 URL 变异 / L1-3 DOM locator）"
-                        "且页面已滚到底无新内容可加载，可能已是最后一页。"
-                        "请评估累计提取量，若已达目标输出 done，否则换 click + 真实 target_id 重试。"
+                        "next_page: 启发式翻页全失败 + 已滚到页面底部（scrollY 不再增长），"
+                        "可能已是最后一页。请评估累计提取量，若已达目标输出 done。"
                     )
-                used_strategy = f"infinite_scroll Δ={_scroll_delta}px"
+                # Fix 2 关键：滚轮动了但内容没增长 = 伪无限滚动（实际是分页器但无标准控件）
+                # 这种情况 L4 不算成功，应当报错让上层换路（ask_human / done / click 真实 target_id）
+                if _delta_text < 200 and _delta_items <= 0:
+                    raise ActionExecutionError(
+                        f"next_page: L4 滚动后内容未增长（textLen Δ={_delta_text}，"
+                        f"itemCount Δ={_delta_items}），本页**不是**真无限滚动 —— "
+                        "实际是分页器但 L0-L3 都没识别到下一页控件。请改用 "
+                        "click_text 加具体页码（如 type_value=\"2\"）翻页，"
+                        "或评估累计量考虑输出 done。"
+                    )
+                used_strategy = (
+                    f"infinite_scroll Δy={_delta_y}px Δtext={_delta_text} "
+                    f"Δitems={_delta_items}"
+                )
                 clicked = True  # 视作成功
             except ActionExecutionError:
                 raise
