@@ -2,16 +2,32 @@
 __pycache__/
 *.py[cod]
 browser_data/
+.auth/
 downloads/
 screenshots/
 
 # 日志文件
 *.log
 run.*.log
+logs/
+visual_web_agent/logs/
 
 # 输出文件
 *.xlsx
 output_*.xlsx
+
+# 运行时缓存
+visual_web_agent/rpa_cache/
+visual_web_agent/browser_data*/
+visual_web_agent/downloads/
+temp_uploads/
+
+# IDE / tooling
+.claude/
+.qoder/
+
+# 临时 / 散落产物
+auto_extract_fallback_*
 
 # 测试文件
 test_page.html
