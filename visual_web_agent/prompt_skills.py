@@ -50,7 +50,7 @@ JSON 输出格式必须严格为：
       "progress_review": "先复盘全局历史和当前子目标进度；若任务已完成，明确写任务已完成",
       "thought": "结合当前截图和 AX Tree 的推理过程",
       "current_state": "客观描述当前页面状态",
-      "action": "click | click_new_tab | type | hover | scroll | smooth_scroll | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | ask_human | click_point | remove_element | drag_and_drop | next_page",
+      "action": "click | click_text | click_new_tab | type | hover | hover_and_click | scroll | smooth_scroll | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | ask_human | click_point | remove_element | drag_and_drop | next_page",
       "target_id": 0,
       "type_value": "",
       "memory_key": "",
@@ -64,8 +64,9 @@ JSON 输出格式必须严格为：
 
 字段要求：
 - 所有字段都要输出，memory_key 无需保存时填空字符串。
-- click/type/hover/select/upload/extract_link/download_image/remove_element/click_new_tab/drag_and_drop
+- click/type/hover/hover_and_click/select/upload/extract_link/download_image/remove_element/click_new_tab/drag_and_drop
   必须使用真实 target_id。
+- hover_and_click 还必须在 type_value 填写要点击的菜单项可见文字。
 - scroll/smooth_scroll/wait/done/press_key/goto/close_tab/extract/next_page 可用 target_id=0。
 - click_point 仅在没有可用 SoM/AX ID 且目标位置非常明确时使用，point 为 0-1000 归一化坐标。
 - extract 的 extracted_data 绝对不能为 null，必须放入当前页面真实结构化数据。
@@ -98,12 +99,20 @@ ACTION_REFERENCE_PROMPT = """
   page.get_by_text(type_value, exact=True) 直接定位，**不依赖 SoM 红框 ID**。
   适合：密集页码 (type_value="2")、文字链 ("下一页")、按钮 label ("Submit") 等。
   当你看清按钮文字但找不准 @eN 数字时用这个。
+- hover_and_click：**复合悬浮+菜单点击原子操作**（target_id=hover触发器, type_value=菜单项文字）。
+  专治 Element Plus / Ant Design / Element UI 等 hover-trigger dropdown，
+  解决"hover 后菜单展开但 SoM 截图重置鼠标 → 菜单瞬间收起 → VLM 看不到子项"的死结。
+  示例：{"action":"hover_and_click","target_id":28,"type_value":"Action 3"}
+  → 引擎 hover #28 + 等菜单展开 + 同会话内点 "Action 3" 文本，全程不重置鼠标。
+  **遇到 hover-trigger 下拉菜单**（Element Plus 的 trigger="hover"）必用这个。
+  常规 click-trigger 下拉用普通 click + click_text 两步即可。
 - ask_human：需要人类处理验证码、扫码、短信码、权限审批或其它风控障碍。
 - done：任务完成。
 
 连招规则：
 - 只有确定中间步骤不需要新截图时才输出多 action，例如连续填多个字段再 Enter。
-- 点击后会跳转、展开、异步加载、hover 展开菜单、下载、上传、提交表单等场景必须分步观察。
+- 点击后会跳转、展开、异步加载、下载、上传、提交表单等场景必须分步观察。
+- 例外：hover-trigger 下拉菜单若还要点击子菜单，必须用 hover_and_click 一步原子完成，不要拆成 hover 后等下一轮截图再 click。
 """.strip()
 
 
@@ -114,6 +123,22 @@ COMPLETION_PROMPT = """
 - 连续两轮页面无变化时，不要重复同一动作；换元素、等待、滚动、关闭遮挡或 ask_human。
 - 任务要求保存、下载、导出时，底层会把 extract/download 产物登记到 artifacts；不要为了“落盘”
   反复提取同一批数据。
+
+🛡️【验收优先纪律（Verify-Before-Act）— 所有任务通用】
+在输出任何 action 之前，必须先完成"状态验收"三问：
+1. 读 AX Tree 的 `value="..."`、`checked`、`selected`、`expanded` 字段，以及 URL 是否已变为结果页。
+2. 当前 DOM 的可观测状态是否已经满足终极目标（Task）的全部硬性条件？
+   例：目标"选择下个月15号" → 目标 input 的 `value="2026-05-15"` 即满足。
+   例：目标"搜索 X 并打开结果" → URL 含 `?q=X` 或结果页标题匹配即满足。
+3. 如果第 2 条成立：**立即 action=done，status=success，subgoal_status=completed**；
+   严禁为了"补走形式步骤"（再开一次日历、再点一次按钮、再确认一次）而画蛇添足 ——
+   重复动作会覆盖掉已达成的状态，把成功变失败。
+
+特别警告：
+- 不要因"thought 里写了『点击 X』"就机械点击。thought 只是推理草稿，如果验收已通过，
+  最终 action 必须是 done，而不是 thought 里的动词。
+- 当你在 thought 中出现「目标已完成 / value 已正确 / 任务达成 / 无需再点」等短语时，
+  action 字段**必须**写 done，绝对不能写 click/type/wait。
 """.strip()
 
 
@@ -215,6 +240,20 @@ FORM_SKILL = """
 ## Skill: Forms / Search / Filters
 适用：表单、填写、输入、提交、筛选、过滤、查询、搜索、日期、下拉、树形选择、上传。
 
+🚨【表单视口锁定纪律 — 极度重要，违反必死】
+SoM 红框 ID（@eN）是**基于视口实时重新分配**的。当表单只有半截露在屏幕里就动手填，
+会导致下一帧截图时 ID 全部洗牌（@e26 这一帧是 Activity name，下一帧可能是 Activity form）→
+你的短期记忆和当前红框完全错位 → 同一字段被覆写成不同内容 → 任务彻底崩盘。
+
+**填写任何表单字段前必须先做的事**：
+1. **完整滚动**：通过 scroll/smooth_scroll 把**整个表单区域**置入屏幕视口。
+   判定标准：截图里能同时看到表单**第一个字段标签**到**Submit/Create 按钮**。
+2. **稳定 ID**：滚到位之后，**等下一帧截图**确认所有字段红框都在，才开始 type/click。
+3. **绝对禁止**：在表单只露一半时执行 type/click —— 即使 @eN 看起来正确也禁止。
+   正确做法是 scroll 直到完整可见，再操作。
+4. 表单太长一屏装不下时：先填上半部分（确认全部上半字段可见再填），再 scroll 到下半，
+   等下半字段稳定可见再继续。一次只动当前完全可见的字段。
+
 规则：
 1. 先读当前表单标签、placeholder、已选值和校验提示，再写入。
 2. 搜索框/筛选框输入后，若出现联想下拉，先 wait 或选择明确匹配项；若提交按钮被下拉遮挡，
@@ -223,6 +262,43 @@ FORM_SKILL = """
 4. 异步下拉框按“输入关键词 -> wait -> 点击匹配项”处理。
 5. 树形多选按层级渐进展开，只勾选目标节点。
 6. 上传文件时使用 upload，type_value 填用户提供的文件路径；没有路径则 ask_human。
+
+🎯【日期选择器验收纪律 — 必读，违反 = 立刻失败】
+日期任务的唯一成功信号是：**目标 input 的 `value="YYYY-MM-DD"` 与需求日期完全一致**。
+每一步动作前，先在 @eN 列表里找到目标日期输入框（role=textbox/combobox，name 或
+placeholder 含 "Pick a day"/"日期"/"请选择" 等），读它的 `value="..."`：
+
+- ✅ value 已等于目标日期 → **立即 action=done**，不要再开日历、再翻月、再点格子。
+  这是最容易犯的错：已经成功了，但因为 thought 里写着"应点击15号"就机械再点一次，
+  结果把值清掉或跳到错误日期。
+- ⏳ value 与目标日期只差月份 → 只需点 "Next Month / Prev Month" 翻到目标月份。
+- ❌ value 为空或为旧值 → 按"点输入框 → 翻到目标月 → 点目标日"三步走。
+
+多输入框歧义处理：
+- 页面常出现多个同 placeholder 的日期框（如"Default" + "Picker with quick options"）。
+- goal 里的"标题下方第一个"指**空间位置**，不是 @eN 序号小的那个。
+- 必须在截图里用眼睛确认目标输入框的位置（对齐哪个标题、在哪一列），
+  再回到 @eN 列表找 role/name 匹配且空间位置正确的那条，不要盲选 ID 最小的。
+
+日历格子/月份点击技巧：
+- 点日期格子优先用 `click + target_id`（格子通常有 @eN 红框）。
+- 若没有红框或红框点击失败，用 `click_text` + 数字文本（如 type_value="15"）。
+- 点月份/年份面板里的 "May"/"2026" 用 `click_text` + 可见文字，引擎会走
+  ".el-month-table td" / ".ant-picker-cell" 等网格 selector。
+""".strip()
+
+
+CASCADER_SKILL = """
+## Skill: Cascader / Multi-level Select
+适用：级联选择器、Cascader、多级菜单、多级下拉、树形级联、选择路径 A -> B -> C。
+
+规则：
+1. 这是 click-trigger 弹层，不是 hover tooltip。先 click 输入框/combobox 打开菜单。
+2. 菜单打开后，按用户给出的路径逐层点击：父节点展开后，下一步必须点击它右侧/下一列的子节点。
+3. 如果截图或 AX Tree 已显示子节点（例如 Navigation 已在 Guide 右侧可见），不要再点击父节点 Guide；直接 click_text "Navigation" 或点击子节点真实 target_id。
+4. click_text 会优先命中已展开弹层里的菜单项，适合处理同名顶部导航/侧边栏干扰。
+5. 禁止点击顶部全局导航、左侧组件目录、文档目录中的同名文字，除非当前页面根本不是目标组件页，需要先进入目标组件。
+6. 最后一层节点点击后，如果输入框 value/显示文本已经出现完整路径或最终值，立即 done。
 """.strip()
 
 
@@ -252,6 +328,37 @@ CREDENTIAL_SKILL = """
 3. 日志和 thought 中只能写占位符，不写真实密钥。
 4. 页面需要凭证但没有可用占位符时，输出 ask_human。
 5. 如果占位符缺失对应环境变量，底层会失败；不要自行改写变量名。
+""".strip()
+
+
+HOVER_MENU_SKILL = """
+## Skill: Hover Menu / Dropdown
+适用：hover、悬浮、悬停、下拉菜单、Dropdown、Menu、menuitem、Element Plus / Ant Design hover-trigger 菜单。
+规则：
+1. 如果用户要求“悬浮/hover 某按钮，然后点击弹出的菜单项”，不要拆成 hover -> 下一轮截图 -> click。
+   这类菜单会在 SoM 截图或鼠标离开触发器时瞬间收起，导致下一轮看不到菜单项。
+2. 必须优先输出原子动作：
+   {"action":"hover_and_click","target_id":触发器真实ID,"type_value":"菜单项可见文字"}
+3. target_id 是当前截图/AX Tree 中 hover 触发器的真实非 0 ID；type_value 是菜单项文本，例如 "Action 3"。
+4. 只有用户只要求“展开菜单/观察菜单”且不要求点击菜单项时，才单独使用 hover。
+5. hover_and_click 执行成功后，如果目标就是点击该菜单项且页面没有新的可见结果，直接 done；
+   不要反复 hover/click 同一项。
+6. 如果是 click-trigger 下拉（点击按钮才展开），可用 click 触发器后再 click_text 菜单项；不要误用 hover。
+""".strip()
+
+
+TOOLTIP_SKILL = """
+## Skill: Tooltip / Hover Text Extraction
+适用：悬浮/hover 元素后读取 tooltip、提示框、提示气泡、popover、黑色提示框中的短文本。
+规则：
+1. 这类任务不是批量翻页/列表抓取任务。绝对不要在提取 tooltip 后使用 next_page、分页、滚动加载更多。
+2. 每个目标按钮的流程是：hover 真实 target_id -> 下一轮若 AX Tree/截图出现 role=tooltip 或黑色提示框文本 -> extract。
+3. extract 只能输出 tooltip 本身的短文本，不要提取页面下方 Props/API 表格、代码块、导航目录或示例说明。
+4. 推荐结构：
+   {"direction":"Top","tooltip_text":"Top Center prompts info"}
+   多个目标依次追加，不要重复保存同一个方向。
+5. 如果 tooltip 文本已经在 AX Tree 中以 Role: tooltip / Name: ... 出现，视为可提取；不要因为想“再确认一次”反复 hover 同一按钮。
+6. 四个方向/多个按钮全部提取完成后立即 done。
 """.strip()
 
 
@@ -288,7 +395,7 @@ SEMANTIC_MAPPING_SKILL = """
 常见意图映射：
 - 搜索/查询/过滤：优先 searchbox/textbox/combobox，然后 Enter 或提交按钮。
 - 关闭遮挡：Escape、关闭按钮、remove_element。
-- 更多/展开/下拉：click 或 hover，之后等下一轮截图确认。
+- 更多/展开/下拉：click-trigger 用 click；hover-trigger 且要点子菜单时用 hover_and_click。
 - 下载/导出：优先页面原生导出按钮，其次 download_image/extract_link。
 - 购买/提交/删除等高风险动作：在能确认目标和状态前不要点击最终确认。
 """.strip()
@@ -323,8 +430,11 @@ SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,
+    "cascader": CASCADER_SKILL,
     "login": LOGIN_SKILL,
     "credential": CREDENTIAL_SKILL,
+    "hover_menu": HOVER_MENU_SKILL,
+    "tooltip": TOOLTIP_SKILL,
     "hitl": HITL_SKILL,
     "memory": MEMORY_SKILL,
     "multi_tab": MULTI_TAB_SKILL,

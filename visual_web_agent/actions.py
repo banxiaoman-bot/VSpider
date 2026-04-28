@@ -654,6 +654,39 @@ class TypeHandler(ActionHandler):
                 timeout=browser._LOCATOR_TIMEOUT
             )
 
+            # 视口锁定预检（暗礁 1 防线）：
+            # SoM ID 基于视口实时分配；如果输入框只露一半就 type，下一帧截图 ID 会洗牌，
+            # VLM 会把同一字段误认成另一个字段反复覆写。强制要求目标元素**完整在视口内**，
+            # 否则主动 scrollIntoView({block:"center"}) 居中 + 等待稳定后再操作。
+            try:
+                _viewport_check = await target.handle.evaluate(
+                    """el => {
+                        const r = el.getBoundingClientRect();
+                        const vh = window.innerHeight;
+                        const vw = window.innerWidth;
+                        return {
+                            top: r.top, bottom: r.bottom, left: r.left, right: r.right,
+                            height: r.height, width: r.width, vh, vw,
+                            fully_visible: r.top >= 0 && r.bottom <= vh && r.left >= 0 && r.right <= vw,
+                            partial_clip: Math.max(0, -r.top) + Math.max(0, r.bottom - vh)
+                        };
+                    }"""
+                )
+                if _viewport_check and not _viewport_check.get("fully_visible"):
+                    _clip = _viewport_check.get("partial_clip", 0) or 0
+                    _h = _viewport_check.get("height", 1) or 1
+                    if _h > 0 and (_clip / _h) > 0.2:  # 超过 20% 高度被截断
+                        logger.info(
+                            f"[TYPE] 目标输入框被视口截断 {_clip:.0f}/{_h:.0f}px "
+                            f"({_clip / _h * 100:.0f}%)，强制 scrollIntoView({{block:'center'}})"
+                        )
+                        await target.handle.evaluate(
+                            "el => el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'})"
+                        )
+                        await asyncio.sleep(0.4)  # 等滚动稳定
+            except Exception as _vp_err:
+                logger.debug(f"[TYPE] viewport precheck failed (non-fatal): {_vp_err}")
+
             _pending_xpath = await browser._get_xpath(target.handle)
             _pending_ax_role, _pending_ax_name = await browser._get_accessibility_signature(
                 page, target.handle
@@ -775,22 +808,62 @@ class HoverHandler(ActionHandler):
 
             await target.handle.hover(force=True, timeout=browser._LOCATOR_TIMEOUT)
             logger.info(f"Hover element #{target_id} succeeded")
+            _hover_meta = None
             if _pending_xpath:
-                browser.rpa_trail.append(
-                    ctx.with_rpa_meta({
-                        "action": "hover",
-                        "xpath": _pending_xpath,
-                        "ax_role": _pending_ax_role or "",
-                        "ax_name": _pending_ax_name or "",
-                        "type_value": "",
-                    })
-                )
+                _hover_meta = ctx.with_rpa_meta({
+                    "action": "hover",
+                    "xpath": _pending_xpath,
+                    "ax_role": _pending_ax_role or "",
+                    "ax_name": _pending_ax_name or "",
+                    "type_value": "",
+                })
+                browser.rpa_trail.append(_hover_meta)
 
             appeared = await browser._wait_for_submenu(count_before, max_wait=2.0)
             if appeared:
                 logger.info(
                     f"[HOVER] Submenu/dropdown appeared after hovering #{target_id}"
                 )
+                try:
+                    tooltip_text = await page.evaluate(
+                        """() => {
+                            const selectors = [
+                                '[role="tooltip"]',
+                                '.el-tooltip__popper',
+                                '.el-popper',
+                                '.ant-tooltip-inner',
+                                '.tooltip',
+                                '.v-popper__inner'
+                            ];
+                            const seen = new Set();
+                            const out = [];
+                            for (const sel of selectors) {
+                                for (const el of document.querySelectorAll(sel)) {
+                                    const rect = el.getBoundingClientRect();
+                                    const style = window.getComputedStyle(el);
+                                    if (
+                                        rect.width > 0 && rect.height > 0 &&
+                                        style.visibility !== 'hidden' &&
+                                        style.display !== 'none' &&
+                                        Number(style.opacity || 1) > 0
+                                    ) {
+                                        const text = (el.innerText || el.textContent || '').trim();
+                                        if (text && !seen.has(text)) {
+                                            seen.add(text);
+                                            out.push(text);
+                                        }
+                                    }
+                                }
+                            }
+                            return out.join(' | ');
+                        }"""
+                    )
+                    if tooltip_text:
+                        logger.info("[HOVER] visible tooltip text: %s", tooltip_text)
+                        if isinstance(_hover_meta, dict):
+                            _hover_meta["tooltip_text"] = tooltip_text
+                except Exception as _tooltip_err:
+                    logger.debug("[HOVER] tooltip text capture skipped: %s", _tooltip_err)
             else:
                 logger.warning(
                     f"[HOVER TIMEOUT] No new elements appeared after hovering "
@@ -1659,19 +1732,115 @@ class ClickTextHandler(ActionHandler):
 
         clicked = False
         used = ""
-        # ── 1. 精确匹配（优先）──
-        try:
-            loc = page.get_by_text(text, exact=True).first
-            if await loc.count() > 0 and await loc.is_visible():
-                mode = await _click_locator_with_js_fallback(
-                    loc, f"click_text exact {text!r}", timeout=3000
-                )
-                clicked = True
-                used = f'exact="{text}" ({mode})'
-        except Exception:
-            pass
 
-        # ── 2. role=link/button + name 精确 ──
+        async def _click_first_visible(locator: Any, label: str, limit: int = 20) -> str:
+            try:
+                count = await locator.count()
+            except Exception:
+                return ""
+            for idx in range(min(count, limit)):
+                candidate = locator.nth(idx)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    disabled = await candidate.evaluate(
+                        """el => !!el.closest(
+                            '[aria-disabled="true"], .is-disabled, .disabled, [disabled]'
+                        )"""
+                    )
+                    if disabled:
+                        continue
+                    mode = await _click_locator_with_js_fallback(
+                        candidate, label, timeout=3000
+                    )
+                    return f"{label}#{idx} ({mode})"
+                except Exception as click_err:
+                    logger.debug(
+                        "[CLICK_TEXT] candidate %s#%s failed: %s",
+                        label,
+                        idx,
+                        click_err,
+                    )
+                    continue
+            return ""
+
+        # ── 1. 已展开弹层/菜单优先 ──
+        # 避免同名文本误点到全局导航或侧边栏，例如顶部 Guide 链接 vs
+        # Element Plus Cascader 弹层里的 Guide 选项。
+        menu_selectors = (
+            ".el-popper .el-cascader-node",
+            ".el-cascader-panel .el-cascader-node",
+            ".el-cascader-menu [role='menuitem']",
+            ".el-popper [role='menuitem']",
+            "[role='menu'] [role='menuitem']",
+            "[role='listbox'] [role='option']",
+            ".el-select-dropdown__item",
+            ".el-dropdown-menu__item",
+            ".ant-cascader-menu-item",
+            ".ant-select-item-option",
+            ".ant-dropdown-menu-item",
+            ".dropdown-menu li",
+            ".dropdown-item",
+        )
+        for selector in menu_selectors:
+            try:
+                loc = page.locator(selector).filter(has_text=text)
+                used = await _click_first_visible(
+                    loc, f"click_text popup {selector} {text!r}"
+                )
+                if used:
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        # ── 2. 精确匹配 ──
+        if not clicked:
+            try:
+                loc = page.get_by_text(text, exact=True)
+                used = await _click_first_visible(loc, f"click_text exact {text!r}")
+                clicked = bool(used)
+            except Exception:
+                pass
+
+        # ── 2.5. 网格/日历/选项型元素（div/td 没有 role=button/link 的情况）──
+        # 现象：Element Plus 月份/年份面板里的 "May"/"2026" 是 <div>/<td>，
+        # 既不在 tier 1 的弹层 selector 里，也不匹配 tier 3 的 role=link/button，
+        # tier 4 的 get_by_text(exact=False).first 又可能误中 aria 文本或隐藏节点。
+        # 这里专门覆盖主流 UI 库的日期/级联/Tab 等"可点但没 role"控件。
+        if not clicked:
+            grid_selectors = (
+                # Element Plus
+                ".el-date-table td",
+                ".el-month-table td",
+                ".el-year-table td",
+                ".el-picker-panel td",
+                # Ant Design
+                ".ant-picker-cell",
+                ".ant-picker-month-btn",
+                ".ant-picker-year-btn",
+                # Arco / Naive / 通用
+                ".arco-picker-cell",
+                ".n-date-panel-date",
+                # 通用 ARIA 网格/选项
+                "[role='gridcell']",
+                "[role='option']",
+                "[role='tab']",
+                "[role='treeitem']",
+            )
+            for selector in grid_selectors:
+                try:
+                    loc = page.locator(selector).filter(has_text=text)
+                    used = await _click_first_visible(
+                        loc, f"click_text grid {selector} {text!r}"
+                    )
+                    if used:
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+        # ── 3. role=link/button + name 精确 ──
         if not clicked:
             for role in ("link", "button"):
                 try:
@@ -1686,7 +1855,7 @@ class ClickTextHandler(ActionHandler):
                 except Exception:
                     continue
 
-        # ── 3. 子串匹配（最后兜底）──
+        # ── 4. 子串匹配（最后兜底）──
         # 短文本/数字页码只允许精确命中，避免 "2" 误点到任意含 2 的标题/计数。
         allow_substring = len(text) > 2 and not text.isdigit()
         if not clicked and allow_substring:
@@ -1717,6 +1886,164 @@ class ClickTextHandler(ActionHandler):
         )
         await browser._wait_after_action()
         return None
+
+
+@ActionRegistry.register("hover_and_click")
+class HoverAndClickHandler(ActionHandler):
+    """复合 hover→wait→click 原子操作，专治 hover-trigger 下拉菜单。
+
+    痛点：Element Plus / Ant Design / Element UI 等的 hover-trigger dropdown
+    在 Playwright `hover` 后，下一轮 SoM mark_and_screenshot 会移动鼠标做坐标
+    采样 → 鼠标离开 trigger → 菜单瞬间收起（200ms hide delay 标准实现）→
+    截图捕到 collapsed 状态 → VLM 永远看不到 menuitem → 卡死循环。
+
+    解决：在**同一个 Playwright 会话内**完成 hover → 短延迟 → 点击 menu 文本，
+    全程不让 SoM 介入，鼠标自然移动到 menu 区域保持菜单展开。
+
+    用法：
+      target_id = hover 触发器红框 ID（如 "Dropdown List" 按钮）
+      type_value = 要点击的菜单项可见文字（如 "Action 3"）
+    """
+
+    async def execute(self, ctx: "ActionContext") -> "Optional[Page]":
+        browser = ctx.browser
+        page = ctx.page
+        target_id = ctx.action.target_id
+        menu_text = (ctx.action.type_value or "").strip()
+        if not page:
+            raise ActionExecutionError("hover_and_click: 无活动页面。")
+        if target_id == 0:
+            raise ActionExecutionError(
+                "hover_and_click 必须提供 hover 触发器的 target_id（非 0）。"
+            )
+        if not menu_text:
+            raise ActionExecutionError(
+                "hover_and_click 必须在 type_value 提供菜单项可见文字（如 'Action 3'）。"
+            )
+
+        try:
+            await browser._clear_som_overlays()
+            target = await browser._resolve_action_target(target_id, "click")
+            if not target:
+                raise ActionExecutionError(
+                    f"hover_and_click: hover 触发器 #{target_id} 未找到"
+                )
+            await target.handle.scroll_into_view_if_needed(timeout=browser._LOCATOR_TIMEOUT)
+
+            # Step 1: hover trigger（不释放）
+            logger.info(f"[HOVER_AND_CLICK] step 1: hover #{target_id} 触发器")
+            await target.handle.hover(timeout=3000)
+
+            # Step 2: 等菜单展开动画（多数 UI 库 100-300ms 延迟 + transition）
+            await asyncio.sleep(0.5)
+
+            # Step 3: 在 menu 内点击目标文本（不重置鼠标）。
+            # 菜单弹层常被 portal 到 body 下，且候选文本可能同时出现在源码示例中；
+            # 这里遍历可见候选，并在原生点击失败时用 JS click 兜底。
+            logger.info(f"[HOVER_AND_CLICK] step 3: 点击菜单项 {menu_text!r}")
+            _clicked = False
+            _used = ""
+
+            async def _click_visible_candidate(locator: Any, label: str) -> str:
+                count = 0
+                try:
+                    count = await locator.count()
+                except Exception:
+                    return ""
+                for idx in range(min(count, 20)):
+                    candidate = locator.nth(idx)
+                    try:
+                        if not await candidate.is_visible():
+                            continue
+                        mode = await _click_locator_with_js_fallback(
+                            candidate, label, timeout=1500
+                        )
+                        return f"{label}#{idx} ({mode})"
+                    except Exception as click_err:
+                        logger.debug(
+                            f"[HOVER_AND_CLICK] candidate {label}#{idx} failed: {click_err}"
+                        )
+                        continue
+                return ""
+
+            menu_selectors = (
+                '[role="menuitem"]',
+                '[role="menuitemcheckbox"]',
+                '[role="menuitemradio"]',
+                '[role="option"]',
+                ".el-dropdown-menu__item",
+                ".el-select-dropdown__item",
+                ".ant-dropdown-menu-item",
+                ".ant-select-item-option",
+                ".dropdown-item",
+                ".dropdown-menu li",
+            )
+            for selector in menu_selectors:
+                if _clicked:
+                    break
+                try:
+                    loc = page.locator(selector).filter(has_text=menu_text)
+                    _used = await _click_visible_candidate(loc, f"selector={selector}")
+                    _clicked = bool(_used)
+                except Exception:
+                    continue
+
+            if not _clicked:
+                try:
+                    loc = page.get_by_text(menu_text, exact=True)
+                    _used = await _click_visible_candidate(loc, f'exact="{menu_text}"')
+                    _clicked = bool(_used)
+                except Exception:
+                    pass
+            if not _clicked:
+                for role in ("menuitem", "menuitemcheckbox", "menuitemradio", "option", "button"):
+                    try:
+                        loc = page.get_by_role(role, name=menu_text, exact=True)
+                        _used = await _click_visible_candidate(
+                            loc, f"role={role} name=={menu_text!r}"
+                        )
+                        if _used:
+                            _clicked = True
+                            break
+                    except Exception:
+                        continue
+            if not _clicked:
+                # 子串模糊兜底
+                try:
+                    loc = page.get_by_text(menu_text, exact=False)
+                    _used = await _click_visible_candidate(
+                        loc, f'substring="{menu_text}"'
+                    )
+                    _clicked = bool(_used)
+                except Exception:
+                    pass
+
+            if not _clicked:
+                raise ActionExecutionError(
+                    f"hover_and_click: hover #{target_id} 后未在菜单中找到 {menu_text!r}。"
+                    "可能菜单未展开（trigger 不是 hover 触发型），或文字不完全匹配。"
+                    "可改为分步：先 click 触发器（trigger=click），再 click_text 菜单项。"
+                )
+
+            logger.info(f"[HOVER_AND_CLICK] ✅ 复合操作成功: hover #{target_id} → click {_used}")
+            print(
+                f"\033[1;35m🎯 [HOVER+CLICK]\033[0m hover #{target_id} → "
+                f"click {menu_text!r} ({_used})"
+            )
+            browser.rpa_trail.append(
+                ctx.with_rpa_meta({
+                    "action": "hover_and_click",
+                    "hover_target_id": target_id,
+                    "menu_text": menu_text,
+                    "click_strategy": _used,
+                })
+            )
+            await browser._wait_after_action()
+            return None
+        except ActionExecutionError:
+            raise
+        except Exception as e:
+            raise ActionExecutionError(f"hover_and_click 执行失败: {e}")
 
 
 @ActionRegistry.register("switch_tab")
