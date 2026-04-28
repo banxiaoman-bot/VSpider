@@ -802,6 +802,19 @@ _MULTI_TAB_TRIGGERS = (
     "标签页", "新标签", "新窗口", "后台打开", "switch_tab", "close_tab",
     "click_new_tab", "new tab", "tab",
 )
+_HOVER_MENU_TRIGGERS = (
+    "hover", "悬浮", "悬停", "鼠标悬停", "下拉菜单", "菜单项", "弹出菜单",
+    "dropdown", "drop-down", "menuitem", "hover-trigger", "element plus",
+    "element ui", "ant design", "action 1", "action 2", "action 3",
+)
+_CASCADER_TRIGGERS = (
+    "cascader", "级联", "级联选择器", "多级菜单", "多级下拉", "多级选择",
+    "树形级联", "选择路径", "->", "→",
+)
+_TOOLTIP_TRIGGERS = (
+    "tooltip", "tool tip", "popover", "提示框", "提示气泡", "黑色提示",
+    "浮层提示", "气泡", "悬浮提示", "鼠标悬停提示",
+)
 _HITL_TRIGGERS = (
     "captcha", "验证码", "风控", "滑块", "扫码", "短信", "二次认证", "设备校验",
     "ask_human", "human_intervention",
@@ -883,6 +896,12 @@ def build_system_prompt(
         skills.append("memory")
     if _text_has_any(haystack, _MULTI_TAB_TRIGGERS):
         skills.append("multi_tab")
+    if _text_has_any(haystack, _HOVER_MENU_TRIGGERS):
+        skills.append("hover_menu")
+    if _text_has_any(haystack, _CASCADER_TRIGGERS):
+        skills.append("cascader")
+    if _text_has_any(haystack, _TOOLTIP_TRIGGERS):
+        skills.append("tooltip")
     if _text_has_any(haystack, _SEMANTIC_TRIGGERS):
         skills.append("semantic")
     if _text_has_any(haystack, ("示例", "范例", "few-shot", "few shot")):
