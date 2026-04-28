@@ -40,7 +40,11 @@ try:
     from .browser_env import BrowserEnv, ActionExecutionError
     from .vlm_client import VLMClient, TaskPlan
     from .data_manager import save_to_excel
-    from .data_sanitizer import sanitize_extracted_rows
+    from .data_sanitizer import (
+        TOOLTIP_UNIQUE_KEY,
+        extract_tooltip_primary_key,
+        sanitize_extracted_rows,
+    )
     from .artifact_manager import resolve_artifact_path
     from .trajectory_logger import HtmlLogger
     from .auth_vault import SecretResolutionError, resolve_env_placeholders
@@ -49,7 +53,11 @@ except ImportError:
     from browser_env import BrowserEnv, ActionExecutionError
     from vlm_client import VLMClient, TaskPlan
     from data_manager import save_to_excel
-    from data_sanitizer import sanitize_extracted_rows
+    from data_sanitizer import (
+        TOOLTIP_UNIQUE_KEY,
+        extract_tooltip_primary_key,
+        sanitize_extracted_rows,
+    )
     from artifact_manager import resolve_artifact_path
     from trajectory_logger import HtmlLogger
     from auth_vault import SecretResolutionError, resolve_env_placeholders
@@ -228,6 +236,37 @@ def _parse_goal_target_pages(goal: str) -> int | None:
     if m:
         return int(m.group(1))
     return None
+
+
+def _goal_is_tooltip_extract(goal: str) -> bool:
+    """Small hover/tooltip extraction tasks are not bulk pagination jobs."""
+    text = str(goal or "").lower()
+    return any(
+        kw in text
+        for kw in (
+            "tooltip", "tool tip", "popover", "悬浮", "悬停", "鼠标悬停",
+            "提示框", "提示气泡", "黑色提示", "气泡", "浮层提示",
+        )
+    )
+
+
+def _goal_needs_pagination_probe(goal: str) -> bool:
+    """Whether first-extract should force a next_page probe."""
+    text = str(goal or "").lower()
+    if _goal_is_tooltip_extract(text):
+        return False
+    target_count = _parse_goal_target_count(text)
+    if target_count is not None and target_count >= 50:
+        return True
+    if _parse_goal_target_pages(text):
+        return True
+    return any(
+        kw in text
+        for kw in (
+            "批量", "全量", "所有", "全部", "多页", "翻页", "分页", "下一页",
+            "逐页", "pagination", "paginate", "next page", "all pages",
+        )
+    )
 
 
 def _derive_effective_max_steps(goal: str) -> int:
@@ -1092,13 +1131,23 @@ def _decision_implies_completion(decision: dict) -> bool:
 
     completion_patterns = [
         r"任务已完成",
+        r"任务已(?:经)?(?:全部)?完成",
+        r"任务已(?:经)?(?:全部)?达成",
+        r"任务[^\n]{0,30}达成退出标准",
         r"用户目标已(?:经)?(?:全部)?达成",
         r"目标已(?:经)?(?:全部)?达成",
         r"已全部达成",
         r"无需再操作",
         r"不需要再操作",
+        r"无需再点击",
+        r"不需要再点击",
+        r"选择已(?:经)?完成",
+        r"已成功选择",
         r"可直接结束任务",
         r"可以直接结束任务",
+        r"直接结束任务",
+        r"直接输出\s*done",
+        r"准备输出\s*done",
         r"task (?:is )?complete(?:d)?",
         r"goal (?:has been )?achieved",
         r"already completed",
@@ -1138,13 +1187,23 @@ def _decision_claims_current_subgoal_completed(decision: dict) -> bool:
 
     completion_patterns = [
         r"任务已完成",
+        r"任务已(?:经)?(?:全部)?完成",
+        r"任务已(?:经)?(?:全部)?达成",
+        r"任务[^\n]{0,30}达成退出标准",
         r"用户目标已(?:经)?(?:全部)?达成",
         r"目标已(?:经)?(?:全部)?达成",
         r"已全部达成",
         r"无需再操作",
         r"不需要再操作",
+        r"无需再点击",
+        r"不需要再点击",
+        r"选择已(?:经)?完成",
+        r"已成功选择",
         r"可直接结束任务",
         r"可以直接结束任务",
+        r"直接结束任务",
+        r"直接输出\s*done",
+        r"准备输出\s*done",
         r"task (?:is )?complete(?:d)?",
         r"goal (?:has been )?achieved",
         r"already completed",
@@ -2074,18 +2133,23 @@ async def run_agent(
                 return ()
 
         # LOOP GUARD 覆盖的动作集（Bug #1 修复）
-        _LOOP_GUARD_ACTIONS = ("click", "click_new_tab", "click_point")
+        _LOOP_GUARD_ACTIONS = (
+            "click", "click_new_tab", "click_point", "click_text", "hover_and_click"
+        )
         _extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
         _pagination_probed = False  # 首次 extract 后探测分页器一次（Improvement 1）
         _pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
         _pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
         _first_flip_pending = False  # 首次 extract 后强制下一步走 next_page（引擎层硬约束）
         _first_extract_ever_done = False  # 任务级永久锁：首次 extract 完成过（不会被翻页重置）
+        _prev_action_sig: tuple[str, int, str] = ("", 0, "")  # 上一步 (action, target_id, type_value)，用于"思想-动作分离"检测
+        _repeat_action_count: int = 0  # 同一 action sig 连续重复次数，用于精确触发 AUTO-ADVANCE
         _total_extracted_rows = 0  # 跨页累加的总行数
         _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
         _extracted_page_urls: set = set()  # 已成功提取数据的不同页面 URL 集合
         _extracted_page_keys: set[str] = set()  # URL + table signature; SPA/table pagination stays on one URL
         _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
+        _tooltip_trigger_keys: set[str] = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
 
         def _filter_new_extracted_rows(data, source_text: str = ""):
             target_count = _parse_goal_target_count(goal)
@@ -2106,6 +2170,24 @@ async def run_agent(
                 result.duplicates,
                 result.rejected_total,
             )
+
+        def _record_extract_progress(rows, accepted_count: int) -> tuple[int, int]:
+            nonlocal _total_extracted_rows
+            if not _goal_is_tooltip_extract(goal):
+                _total_extracted_rows += accepted_count
+                return accepted_count, _total_extracted_rows
+
+            new_triggers = 0
+            for row in rows or []:
+                if isinstance(row, dict):
+                    trigger_key = extract_tooltip_primary_key(row)
+                else:
+                    trigger_key = str(row).strip()
+                if trigger_key and trigger_key not in _tooltip_trigger_keys:
+                    _tooltip_trigger_keys.add(trigger_key)
+                    new_triggers += 1
+            _total_extracted_rows = len(_tooltip_trigger_keys)
+            return new_triggers, _total_extracted_rows
 
         async def _extract_visible_table_rows_via_dom(reason: str) -> list[dict]:
             try:
@@ -2700,6 +2782,92 @@ async def run_agent(
 
                 _log_decision = decisions
 
+                # ── 思想-动作分离同步推进（Cascader / 多级菜单 / 多步表单通用）──
+                # 现象：VLM thought 写"已完成应推进下一子目标"但 action 字段
+                # 仍是上一步重复（如连续 4 次 click_text "Guide"，但 thought 反复说应推进）。
+                # 处理：检测 (action, target_id, type_value) 与上步完全相同 + thought 含推进强词
+                # → 自动 set subgoal_status=completed（让 Wave 2 推进），action 改 wait(1s) 跳过重复执行。
+                _SUBGOAL_ADVANCE_MARKERS = (
+                    "应推进", "应进入下一", "应将 subgoal_status 设为 completed",
+                    "应将subgoal_status设为completed",
+                    "subgoal_status 设为 completed", "subgoal_status=completed",
+                    "应标记 completed", "应标记completed",
+                    "已完成，应", "已达成，应", "已成功展开",
+                    "进入下一步", "进入下一子目标", "推进至下一",
+                    "should advance", "advance to next", "next subgoal",
+                )
+                if decisions and _prev_action_sig != ("", 0, ""):
+                    _hd = decisions[0]
+                    _cur_sig = (
+                        str(_hd.get("action", "")),
+                        int(_hd.get("target_id", 0) or 0),
+                        str(_hd.get("type_value", "") or ""),
+                    )
+                    _is_literal_repeat = (_cur_sig == _prev_action_sig)
+                    # 维护重复计数：本步与上步相同则 ++，否则归 1
+                    if _is_literal_repeat:
+                        _repeat_action_count += 1
+                    else:
+                        _repeat_action_count = 1
+                    _thought = str(_hd.get("thought", "") or "")
+                    _has_advance_marker = any(m in _thought for m in _SUBGOAL_ADVANCE_MARKERS)
+                    _already_completed = _hd.get("subgoal_status") == "completed"
+                    # 过渡动作（scroll/smooth_scroll/wait/press_key）合理重复频繁，永不触发
+                    _TRANSITIONAL_ACTIONS = {"scroll", "smooth_scroll", "wait", "press_key"}
+                    _is_transitional = _cur_sig[0] in _TRANSITIONAL_ACTIONS
+
+                    # 两阶段（软警告 → 硬劫持）— 借鉴 Browser-use 哲学：
+                    # 让 VLM 自己刹车，引擎不要轻易篡改动作。
+                    #   阶段 1（重复 2 次）：执行原动作 + 注入软警告，VLM 下一轮自己换路
+                    #   阶段 2（重复 ≥3 次）：仍不收敛 → 硬劫持改 wait 强制推进子目标
+                    if (
+                        _is_literal_repeat
+                        and _repeat_action_count == 2  # 第 2 次重复：先软警告
+                        and not _is_transitional
+                        and not _already_completed
+                    ):
+                        logger.info(
+                            f"[REPEAT WARN] 第 2 次重复 {_cur_sig[0]} {_cur_sig[2]!r}，"
+                            "注入软警告但不改写动作（让 VLM 自决）"
+                        )
+                        vlm.inject_error_feedback(
+                            f"⚠️ 系统警告：你刚连续 2 次输出完全相同的操作 "
+                            f"{_cur_sig[0]} target_id={_cur_sig[1]} type_value={_cur_sig[2]!r}，"
+                            f"目标似乎并未推进。\n"
+                            f"请重新审视当前页面状态：\n"
+                            f"  · 上一步是否真的成功？（看 AX Tree 元素 value/state 有无变化）\n"
+                            f"  · 如果真已完成，把 subgoal_status 设为 \"completed\" 并给出**真正的下一步动作**\n"
+                            f"  · 如果未完成，换 click_text、不同 target_id、或滚动让目标重新就位\n"
+                            f"⛔ 不要再机械重复同一动作。"
+                        )
+                    if (
+                        _is_literal_repeat
+                        and _repeat_action_count >= 3  # 第 3 次重复：硬劫持兜底
+                        and not _is_transitional
+                        and _has_advance_marker
+                        and not _already_completed
+                    ):
+                        logger.info(
+                            f"[SUBGOAL AUTO-ADVANCE] thought 含推进信号但 action 重复 "
+                            f"({_cur_sig[0]} {_cur_sig[1]} {_cur_sig[2]!r})，"
+                            "强制 subgoal_status=completed + 改 wait 跳过重复执行"
+                        )
+                        _broadcast_log_safe(
+                            f"[SUBGOAL AUTO-ADVANCE] 跳过重复 {_cur_sig[0]} {_cur_sig[2]!r}",
+                            level="warn",
+                        )
+                        decisions[0]["subgoal_status"] = "completed"
+                        decisions[0]["action"] = "wait"
+                        decisions[0]["target_id"] = 0
+                        decisions[0]["type_value"] = "1"  # 1 秒占位，让页面状态稳定一下
+                        decisions[0]["thought"] = (
+                            "[SUBGOAL AUTO-ADVANCE 引擎改写] thought 写「已完成应推进」"
+                            f"但原 action={_cur_sig[0]} 与上一步完全相同（已重复 {_repeat_action_count} 次），"
+                            "系统强制推进子目标，本步 wait(1s) 让 VLM 下轮按新子目标决策。\n"
+                            + _thought
+                        )
+                        _repeat_action_count = 0  # 重置，避免 wait 后下一步又被误判为重复
+
                 # ── 首翻引擎硬约束：第一次 extract 之后强制 next_page ──
                 # VLM 即使读到「首翻铁律」prompt 也常受 probe="infinite" 提示误导走 smooth_scroll，
                 # 导致 4-8 步 dedup 弯路。这里在引擎层强行改写决策为 next_page，
@@ -2708,6 +2876,7 @@ async def run_agent(
                 # VLM 下一轮会收到错误反馈正常走 done/click 路径。
                 if (
                     _first_flip_pending
+                    and _goal_needs_pagination_probe(goal)
                     and decisions
                     and decisions[0].get("action") in ("smooth_scroll", "scroll", "extract")
                 ):
@@ -2730,6 +2899,9 @@ async def run_agent(
                     )
                     _first_flip_pending = False  # 一次性消费，不再触发
                 # 即使 VLM 已经选了 next_page，flag 也清掉避免重复触发
+                elif _first_flip_pending and not _goal_needs_pagination_probe(goal):
+                    logger.info("[FIRST FLIP] skipped for non-pagination extraction goal")
+                    _first_flip_pending = False
                 elif _first_flip_pending and decisions and decisions[0].get("action") == "next_page":
                     _first_flip_pending = False
 
@@ -2953,8 +3125,12 @@ async def run_agent(
                                 f"长度={len(_ax_text)})"
                             )
 
-                        _dom_auto_rows = await _extract_visible_table_rows_via_dom(
-                            "auto extract visible table rows"
+                        _dom_auto_rows = (
+                            []
+                            if _goal_is_tooltip_extract(goal)
+                            else await _extract_visible_table_rows_via_dom(
+                                "auto extract visible table rows"
+                            )
                         )
                         if _dom_auto_rows:
                             _auto_extracted = _dom_auto_rows
@@ -2999,9 +3175,20 @@ async def run_agent(
                             )
 
                         saved_path = save_to_excel(
-                            _auto_extracted, _vlm_output,
+                            _auto_extracted,
+                            _vlm_output,
+                            unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
                         )
-                        _total_extracted_rows += _new_rows
+                        _progress_new_rows, _progress_total_rows = _record_extract_progress(
+                            _auto_extracted,
+                            _new_rows,
+                        )
+                        if _goal_is_tooltip_extract(goal):
+                            logger.info(
+                                "[EXTRACT AUTO] tooltip progress: %s new triggers, %s total triggers",
+                                _progress_new_rows,
+                                _progress_total_rows,
+                            )
                         _extract_count += 1
                         _extracted_page_urls.add(browser.current_url)
                         # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放
@@ -3011,11 +3198,18 @@ async def run_agent(
                         # Bug 修复：用任务级永久锁 _first_extract_ever_done，避免 _extract_count
                         # 在翻页/导航后被重置回 0 → 下一次 extract 又把 flag 设回 True →
                         # FIRST FLIP 在每次翻页后反复触发的问题。
-                        if not _first_extract_ever_done:
+                        if (
+                            not _first_extract_ever_done
+                            and _goal_needs_pagination_probe(goal)
+                        ):
                             _first_extract_ever_done = True
                             _first_flip_pending = True
                         # ── Improvement 1：首次 extract 后探测分页器（auto-extract 路径） ──
-                        if not _pagination_probed and _extract_count == 1:
+                        if (
+                            _goal_needs_pagination_probe(goal)
+                            and not _pagination_probed
+                            and _extract_count == 1
+                        ):
                             _pagination_probed = True
                             try:
                                 _probe = await browser.probe_pagination()
@@ -3190,6 +3384,15 @@ async def run_agent(
                     urlparse(browser.current_url).netloc
                     if len(decisions) > 1 else ""
                 )
+
+                # 记录本步 (action, target_id, type_value) 供下一步"思想-动作分离"检测
+                if decisions:
+                    _hd_final = decisions[0]
+                    _prev_action_sig = (
+                        str(_hd_final.get("action", "")),
+                        int(_hd_final.get("target_id", 0) or 0),
+                        str(_hd_final.get("type_value", "") or ""),
+                    )
 
                 for _action_idx, decision in enumerate(decisions):
                     _check_stop(f"before_step_{step}_action_{_action_idx + 1}")
@@ -3390,8 +3593,12 @@ async def run_agent(
                                 except Exception:
                                     _source_text_for_validation = ""
 
-                            _dom_table_rows = await _extract_visible_table_rows_via_dom(
-                                "extract visible table rows"
+                            _dom_table_rows = (
+                                []
+                                if _goal_is_tooltip_extract(goal)
+                                else await _extract_visible_table_rows_via_dom(
+                                    "extract visible table rows"
+                                )
                             )
                             if _dom_table_rows:
                                 extracted = _dom_table_rows
@@ -3466,30 +3673,52 @@ async def run_agent(
                                     _new_rows,
                                 )
 
-                            # 统计本次新增行数
-                            _total_extracted_rows += _new_rows
+                            # 统计本次新增行数。tooltip 任务按 trigger 主键统计，避免
+                            # 中间半成品被 UPSERT 覆盖后仍显示累计过高。
+                            _progress_new_rows, _progress_total_rows = _record_extract_progress(
+                                extracted,
+                                _new_rows,
+                            )
                             logger.info(
                                 f"[EXTRACT] 本次提取 {_new_rows} 条，"
-                                f"累计已提取 {_total_extracted_rows} 条"
+                                f"累计已提取 {_progress_total_rows} 条"
                             )
                             # save_to_excel 内部已支持追加写入 + 去重
-                            saved_path = save_to_excel(extracted, _vlm_output)
-                            logger.info(f"[EXTRACT] Saved to: {saved_path}")
-                            print(
-                                f"\033[1;32m✅ [EXTRACT]\033[0m "
-                                f"成功追加 \033[36m{_new_rows}\033[0m 条数据。"
-                                f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
+                            saved_path = save_to_excel(
+                                extracted,
+                                _vlm_output,
+                                unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
                             )
+                            logger.info(f"[EXTRACT] Saved to: {saved_path}")
+                            if _goal_is_tooltip_extract(goal):
+                                print(
+                                    f"\033[1;32m✅ [EXTRACT]\033[0m "
+                                    f"成功合并 \033[36m{_new_rows}\033[0m 条候选。"
+                                    f"当前唯一提示项: \033[36m{_progress_total_rows}\033[0m 条"
+                                )
+                            else:
+                                print(
+                                    f"\033[1;32m✅ [EXTRACT]\033[0m "
+                                    f"成功追加 \033[36m{_new_rows}\033[0m 条数据。"
+                                    f"当前总计: \033[36m{_progress_total_rows}\033[0m 条"
+                                )
                             _extract_count += 1
                             _extracted_page_urls.add(_current_url)
                             _extracted_page_keys.add(_current_extract_page_key)
                             # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
                             # Bug 修复：用任务级永久锁，避免翻页后 _extract_count 重置反复触发
-                            if not _first_extract_ever_done:
+                            if (
+                                not _first_extract_ever_done
+                                and _goal_needs_pagination_probe(goal)
+                            ):
                                 _first_extract_ever_done = True
                                 _first_flip_pending = True
                             # ── Improvement 1：首次 extract 后探测分页器（显式 extract 路径） ──
-                            if not _pagination_probed and _extract_count == 1:
+                            if (
+                                _goal_needs_pagination_probe(goal)
+                                and not _pagination_probed
+                                and _extract_count == 1
+                            ):
                                 _pagination_probed = True
                                 try:
                                     _probe = await browser.probe_pagination()
@@ -3671,7 +3900,7 @@ async def run_agent(
                     else:
                         # Any real navigation/viewport-changing action resets consecutive extract count.
                         if action in (
-                            "click", "click_text", "click_point", "click_new_tab",
+                            "click", "click_text", "hover_and_click", "click_point", "click_new_tab",
                             "next_page", "scroll", "smooth_scroll", "goto",
                             "press_key", "switch_tab", "close_tab",
                         ):
@@ -3716,7 +3945,11 @@ async def run_agent(
                         extracted = decision.get("extracted_data")
                         if extracted:
                             logger.info(f"[EXTRACT] Final data extracted: {extracted}")
-                            save_to_excel(extracted, _vlm_output)
+                            save_to_excel(
+                                extracted,
+                                _vlm_output,
+                                unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
+                            )
                         # 打印 XHR 拦截汇总
                         if browser.intercepted_count > 0:
                             logger.info(
@@ -3869,7 +4102,7 @@ async def run_agent(
                     _click_target_id = decision.get("target_id", 0)
                     _click_point_bucket = _bucket_point(decision.get("point"))
                     _id_blocked = (
-                        action in ("click", "click_new_tab")
+                        action in ("click", "click_new_tab", "hover_and_click")
                         and _click_target_id != 0
                         and _click_target_id in _loop_guard_blocked_ids
                     )
@@ -3947,6 +4180,10 @@ async def run_agent(
                         _landing_url = browser.current_url
                         _landing_key_url = _norm_url_for_guard(_landing_url)
                         _point_bucket = _bucket_point(decision.get("point"))
+                        if action == "hover_and_click":
+                            _point_bucket = (
+                                "menu:" + str(decision.get("type_value") or "").strip().lower()
+                            )
                         # Bug #1+#3 修复 v2：click_point 的 key 去掉 URL。
                         # 原因：JD/淘宝等风控页每次打空 click_point 会跳到不同 error path，
                         # 带 URL 的 key 永不相等；而 click_point 作为"无 SoM id 的应急坐标点击"
@@ -3984,7 +4221,42 @@ async def run_agent(
                             )
                         if _tab_switched_this_step:
                             _outcome_parts.append("触发TabGuard切换")
+                        if action == "hover_and_click":
+                            _outcome_parts.append(
+                                f"已原子完成 hover #{decision.get('target_id', 0)} "
+                                f"并点击菜单项 {str(decision.get('type_value') or '').strip()!r}"
+                            )
+                        elif action == "hover" and browser.rpa_trail:
+                            _last_hover_rpa = browser.rpa_trail[-1]
+                            if (
+                                isinstance(_last_hover_rpa, dict)
+                                and _last_hover_rpa.get("action") == "hover"
+                                and _last_hover_rpa.get("tooltip_text")
+                            ):
+                                _outcome_parts.append(
+                                    f"tooltip={str(_last_hover_rpa.get('tooltip_text'))[:120]!r}"
+                                )
                         vlm.annotate_last_result("✅ " + " | ".join(_outcome_parts))
+
+                        if action == "hover_and_click" and _click_repeat_count >= 2:
+                            _menu_text = str(decision.get("type_value") or "").strip()
+                            logger.info(
+                                "[HOVER_AND_CLICK GUARD] same menu action succeeded %s times; "
+                                "treating goal as completed to avoid no-result loop.",
+                                _click_repeat_count,
+                            )
+                            _broadcast_log_safe(
+                                f"[DONE] hover_and_click 已成功点击菜单项 {_menu_text!r}，"
+                                "页面无新增可提取结果，自动结束。"
+                            )
+                            _broadcast_done_safe(
+                                True,
+                                f"hover_and_click completed: {_menu_text or 'menu item'}",
+                            )
+                            await browser.mark_and_screenshot(step=99)
+                            _run_succeeded = True
+                            _task_completed = True
+                            break
 
                         if _click_repeat_count >= 3:
                             # 识别是 ID 循环还是坐标循环，构造差异化描述
@@ -4076,6 +4348,10 @@ async def run_agent(
                         # 失败路径没导航，用 _pre_url 构建 key（与成功分支同 schema）。
                         _failed_key_url = _norm_url_for_guard(_pre_url)
                         _failed_point_bucket = _bucket_point(decision.get("point"))
+                        if action == "hover_and_click":
+                            _failed_point_bucket = (
+                                "menu:" + str(decision.get("type_value") or "").strip().lower()
+                            )
                         # 同成功分支：click_point 的 key 去掉 URL
                         _failed_key_url_final = (
                             "" if action == "click_point" else _failed_key_url

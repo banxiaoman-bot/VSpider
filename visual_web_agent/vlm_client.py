@@ -112,6 +112,7 @@ class VSpiderAction(BaseModel):
         "drag_and_drop",  # 拖拽：将 target_id 元素拖到 type_value 指定 ID 的元素上
         "next_page",      # 启发式翻页：底层尝试 [Next/下一页/›/→] 等通用 locator
         "click_text",     # 文本定位点击：底层 page.get_by_text(type_value) 绕开 SoM ID 填位
+        "hover_and_click",# 复合悬浮+菜单项点击（target_id=hover触发器, type_value=菜单项文字）
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(
         default=0,
@@ -316,6 +317,37 @@ class VSpiderAction(BaseModel):
           - click + 非空 type_value（非 URL）→ VLM 实际上想 type，但选错了 action
           - type + 空 type_value   → VLM 忘记填写要输入的文字
         """
+        # VLM 常见“手脑分裂”：thought 明确写了 @e28 / 红框 28，
+        # 但结构化字段 target_id 却填 0。先从推理文本里捞回 ID，
+        # 避免 hover/click 直接撞到 Element #0。
+        if self.target_id == 0 and self.action in {
+            "click", "click_new_tab", "hover", "select", "upload",
+            "extract_link", "download_image", "remove_element",
+            "drag_and_drop", "hover_and_click",
+        }:
+            reasoning_text = " ".join(
+                str(part or "")
+                for part in (
+                    self.progress_review,
+                    self.thought,
+                    self.current_state,
+                )
+            )
+            id_match = re.search(
+                r"(?:@e|红框\s*|ID[:：= ]+|target_id[:：= ]+)(\d{1,4})",
+                reasoning_text,
+                re.IGNORECASE,
+            )
+            if id_match:
+                recovered_id = int(id_match.group(1))
+                if recovered_id > 0:
+                    logging.getLogger(__name__).warning(
+                        "[ACTION FIX] %s target_id=0 but thought mentions target #%s; recovered target_id",
+                        self.action,
+                        recovered_id,
+                    )
+                    self.target_id = recovered_id
+
         if self.action == "click" and self.type_value and self.type_value.strip():
             _tv = self.type_value.strip()
             # ── 自动纠偏：click + URL → goto ────────────────────────────
