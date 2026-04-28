@@ -19,8 +19,18 @@ import pandas as pd
 
 try:
     from .artifact_manager import register_artifact, resolve_artifact_path
+    from .data_sanitizer import (
+        TOOLTIP_INTERNAL_KEY,
+        TOOLTIP_UNIQUE_KEY,
+        extract_tooltip_primary_key,
+    )
 except ImportError:
     from artifact_manager import register_artifact, resolve_artifact_path
+    from data_sanitizer import (
+        TOOLTIP_INTERNAL_KEY,
+        TOOLTIP_UNIQUE_KEY,
+        extract_tooltip_primary_key,
+    )
 
 logger = logging.getLogger("vspider.data")
 
@@ -28,6 +38,27 @@ logger = logging.getLogger("vspider.data")
 _GREEN_BOLD = "\033[1;32m"
 _CYAN = "\033[36m"
 _RESET = "\033[0m"
+
+
+def _apply_tooltip_upsert_key(df_combined: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    before_dedup = len(df_combined)
+    keys: list[str] = []
+    for idx, row in df_combined.iterrows():
+        row_dict = {
+            key: value
+            for key, value in row.to_dict().items()
+            if key != TOOLTIP_INTERNAL_KEY
+        }
+        key = extract_tooltip_primary_key(row_dict)
+        keys.append(key if key else f"row|{idx}")
+
+    df_with_key = df_combined.copy()
+    df_with_key[TOOLTIP_INTERNAL_KEY] = keys
+    df_with_key = df_with_key.drop_duplicates(
+        subset=[TOOLTIP_INTERNAL_KEY], keep="last"
+    ).reset_index(drop=True)
+    df_with_key = df_with_key.drop(columns=[TOOLTIP_INTERNAL_KEY], errors="ignore")
+    return df_with_key, before_dedup - len(df_with_key)
 
 
 # ========== 过滤规则定义 ==========
@@ -138,7 +169,13 @@ def _save_dataframe_to_excel(
         df_combined = df_new
 
     # 去重
-    if unique_key:
+    if unique_key == TOOLTIP_UNIQUE_KEY:
+        df_combined, removed = _apply_tooltip_upsert_key(df_combined)
+        if removed > 0:
+            logger.info(
+                f"[TOOLTIP UPSERT] Dedup by dynamic trigger key: removed {removed} stale rows"
+            )
+    elif unique_key:
         # 显式 unique_key：精确按指定列去重
         subset = [unique_key] if isinstance(unique_key, str) else unique_key
         valid_cols = [c for c in subset if c in df_combined.columns]

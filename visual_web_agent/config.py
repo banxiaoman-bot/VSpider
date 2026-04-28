@@ -21,9 +21,12 @@ for _env_path in _env_candidates:
 VLM_API_BASE = os.getenv("VLM_API_BASE", "http://localhost:8000/v1")
 VLM_API_KEY = os.getenv("VLM_API_KEY", "EMPTY")
 VLM_MODEL_NAME = os.getenv("VLM_MODEL_NAME", "qwen-vl-max")
+VLM_SEMANTIC_MODEL_NAME = os.getenv("VLM_SEMANTIC_MODEL_NAME", "").strip()
 VLM_TIMEOUT = int(os.getenv("VLM_TIMEOUT", "120"))
 VLM_MAX_TOKENS = int(os.getenv("VLM_MAX_TOKENS", "4096"))
 VLM_TEMPERATURE = float(os.getenv("VLM_TEMPERATURE", "0.1"))
+VLM_TEXT_ONLY = os.getenv("VLM_TEXT_ONLY", "false").lower() == "true"
+VLM_HISTORY_WINDOW = int(os.getenv("VLM_HISTORY_WINDOW", "6"))
 
 # ========== Agent 运行配置 ==========
 MAX_STEPS = int(os.getenv("MAX_STEPS", "20"))
@@ -38,6 +41,11 @@ VIEWPORT_HEIGHT = int(os.getenv("VIEWPORT_HEIGHT", "800"))
 BROWSER_USER_DATA_DIR = os.getenv(
     "BROWSER_USER_DATA_DIR",
     str(Path(__file__).parent / "browser_data"),
+)
+AUTH_PROFILES = os.getenv("VSPIDER_AUTH_PROFILES", "").strip()
+AUTH_DIR = os.getenv(
+    "VSPIDER_AUTH_DIR",
+    str(Path(__file__).resolve().parents[1] / ".auth"),
 )
 
 # ========== 页面稳定等待配置 ==========

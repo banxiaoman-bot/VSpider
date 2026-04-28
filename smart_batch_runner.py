@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from visual_web_agent.artifact_manager import register_artifact, resolve_artifact_path
+
 try:
     from api_server import broadcast_done, broadcast_log
 except Exception:
@@ -88,6 +90,8 @@ async def run_smart_batch(
     prompt: str,
     file_path: str | None,
     stop_event: threading.Event | None = None,
+    auth_profiles: str = "",
+    vlm_options: dict | None = None,
 ) -> None:
     """
     批处理入口（供 FastAPI BackgroundTasks 调用）。
@@ -109,7 +113,13 @@ async def run_smart_batch(
     if not file_path:
         try:
             goal = _run_single_goal(prompt)
-            success = await run_agent(start_url=target_url, goal=goal, stop_event=stop_event)
+            success = await run_agent(
+                start_url=target_url,
+                goal=goal,
+                stop_event=stop_event,
+                auth_profiles=auth_profiles or None,
+                vlm_options=vlm_options or None,
+            )
             if stop_event and stop_event.is_set():
                 summary = "⏹️ 单任务已终止"
             elif success:
@@ -146,7 +156,7 @@ async def run_smart_batch(
 
     total = len(df)
     success_count = 0
-    output_file = str(Path(file_path).with_name(f"{Path(file_path).stem}_处理结果.xlsx"))
+    output_file = str(resolve_artifact_path(f"{Path(file_path).stem}_处理结果.xlsx", subdir="batch"))
     _emit_log(f"📫 已载入 {total} 条记录，结果文件: {output_file}")
 
     for index, row in df.iterrows():
@@ -169,7 +179,13 @@ async def run_smart_batch(
         _emit_log(f"▶️ 开始处理第 {row_no}/{total} 行 | 项目编号={project_no}")
 
         try:
-            success = await run_agent(start_url=target_url, goal=goal, stop_event=stop_event)
+            success = await run_agent(
+                start_url=target_url,
+                goal=goal,
+                stop_event=stop_event,
+                auth_profiles=auth_profiles or None,
+                vlm_options=vlm_options or None,
+            )
             if success:
                 df.at[index, "填报状态"] = "成功"
                 df.at[index, "日志备注"] = "Agent 执行完成"
@@ -186,6 +202,7 @@ async def run_smart_batch(
         finally:
             try:
                 df.to_excel(output_file, index=False)
+                register_artifact(output_file)
                 _emit_log(f"💾 已保存进度: {output_file}")
             except Exception as save_exc:
                 _emit_log(f"⚠️ 保存进度失败: {save_exc}", level="warn")
@@ -207,6 +224,8 @@ def run_smart_batch_sync(
     prompt: str,
     file_path: str,
     stop_event: threading.Event | None = None,
+    auth_profiles: str = "",
+    vlm_options: dict | None = None,
 ) -> None:
     """CLI 同步入口。"""
     if sys.platform == "win32" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
@@ -214,7 +233,16 @@ def run_smart_batch_sync(
             asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         except Exception:
             pass
-    asyncio.run(run_smart_batch(target_url, prompt, file_path, stop_event=stop_event))
+    asyncio.run(
+        run_smart_batch(
+            target_url,
+            prompt,
+            file_path,
+            stop_event=stop_event,
+            auth_profiles=auth_profiles,
+            vlm_options=vlm_options or None,
+        )
+    )
 
 
 if __name__ == "__main__":
