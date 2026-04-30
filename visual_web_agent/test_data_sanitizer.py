@@ -176,6 +176,43 @@ def test_sanitizer_does_not_dedup_table_rows_by_repeated_short_fields():
     assert result.duplicates == 0
 
 
+def test_sanitizer_dedups_ranked_list_rows_by_rank():
+    source = """
+    7 星际穿越 Interstellar 9.4 2180674 爱是一种力量，让我们超越时空感知它的存在。
+    8 这个杀手不太冷 9.4 2550313 怪蜀黍和小萝莉不得不说的故事。
+    """
+    seen = set()
+    rows = [
+        {
+            "rank": 7,
+            "title": "星际穿越",
+            "score": "9.4",
+            "reviews": "2180674",
+            "summary": "爱是",
+        },
+        {
+            "rank": "7",
+            "title": "星际穿越",
+            "score": "9.4",
+            "reviews": "2180674人评价",
+            "summary": "爱是一种力量，让我们超越时空感知它的存在。",
+        },
+        {
+            "rank": 8,
+            "title": "这个杀手不太冷",
+            "score": "9.4",
+            "reviews": "2550313",
+            "summary": "怪蜀黍和小萝莉不得不说的故事。",
+        },
+    ]
+
+    result = sanitize_extracted_rows(rows, source, seen)
+
+    assert result.accepted == 2
+    assert result.duplicates == 1
+    assert [row["rank"] for row in result.rows] == [7, 8]
+
+
 def test_tooltip_primary_key_prefers_trigger_fields():
     row = {
         "column_name": "Active Users",

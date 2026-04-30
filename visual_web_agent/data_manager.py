@@ -40,6 +40,210 @@ _CYAN = "\033[36m"
 _RESET = "\033[0m"
 
 
+_SYSTEM_COLS = {"_extracted_at", "_row_hash"}
+
+_COLUMN_ALIAS_SIGNATURES = {
+    "rank": {
+        "rank", "ranking", "no", "num", "number",
+        "序号", "排名", "名次",
+    },
+    "title": {
+        "title", "name", "movie", "film", "product", "item", "subject",
+        "标题", "名称", "电影", "商品", "项目",
+    },
+    "rating": {
+        "score", "rating", "rate", "stars", "star", "grade",
+        "评分", "得分", "分数", "评级",
+    },
+    "review_count": {
+        "reviews", "review", "review_count", "votes", "vote", "comments",
+        "comment", "comment_count", "ratings_count", "评价人数", "评价数",
+        "评论数", "投票数", "人评价", "点评数",
+    },
+    "description": {
+        "summary", "intro", "introduction", "description", "desc", "brief",
+        "quote", "slogan", "tagline", "abstract", "简介", "介绍", "摘要",
+        "一句话简介", "一句话", "短评", "描述",
+    },
+    "price": {"price", "amount", "cost", "售价", "价格", "金额"},
+    "url": {"url", "link", "href", "链接", "地址"},
+}
+
+
+def _column_signature(column: str) -> str:
+    normalized = re.sub(r"[\s_\-（）()]+", "", str(column or "").strip().lower())
+    normalized = re.sub(r"\.\d+$", "", normalized)
+    for signature, aliases in _COLUMN_ALIAS_SIGNATURES.items():
+        for alias in aliases:
+            alias_norm = re.sub(r"[\s_\-（）()]+", "", alias.lower())
+            if normalized == alias_norm or alias_norm in normalized:
+                return signature
+    return normalized
+
+
+def _series_text_values(series: pd.Series) -> list[str]:
+    values: list[str] = []
+    for value in series.dropna().tolist():
+        text = str(value).strip()
+        if text:
+            values.append(text)
+    return values
+
+
+def _values_look_like_review_count(values: list[str]) -> bool:
+    if not values:
+        return False
+    hits = 0
+    for text in values:
+        lower = text.lower()
+        if any(marker in lower for marker in ("review", "reviews", "comment", "vote")):
+            hits += 1
+            continue
+        if re.search(r"\d[\d,.\s]*(?:人评价|人評價|条评价|條評價|评价|評價|评论|評論|votes?)", text):
+            hits += 1
+            continue
+        match = re.search(r"\d[\d,.\s]*", text)
+        if match:
+            try:
+                number = float(match.group(0).replace(",", "").replace(" ", ""))
+            except ValueError:
+                number = 0.0
+            if number > 10:
+                hits += 1
+    return hits >= max(1, len(values) // 2)
+
+
+def _values_look_like_rating(values: list[str]) -> bool:
+    if not values:
+        return False
+    numeric = 0
+    in_range = 0
+    for text in values:
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            continue
+        numeric += 1
+        try:
+            number = float(match.group(0))
+        except ValueError:
+            continue
+        if 0 <= number <= 10:
+            in_range += 1
+    return numeric > 0 and in_range >= max(1, numeric // 2)
+
+
+def _preferred_column_name(column: str, series: pd.Series) -> str:
+    raw = str(column or "").strip() or "value"
+    values = _series_text_values(series)
+    signature = _column_signature(raw)
+
+    if signature == "rating" and _values_look_like_review_count(values):
+        return "review_count"
+    if signature == "rating" and _values_look_like_rating(values):
+        return "rating"
+    if signature in {
+        "rank",
+        "title",
+        "rating",
+        "review_count",
+        "description",
+        "price",
+        "url",
+    }:
+        return signature
+    return raw
+
+
+def _normalize_extracted_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize extracted columns and merge duplicate semantic columns."""
+    if df.empty:
+        return df
+
+    normalized = pd.DataFrame(index=df.index)
+    for idx, column in enumerate(list(df.columns)):
+        series = df.iloc[:, idx]
+        target = _preferred_column_name(str(column), series)
+        if target not in normalized.columns:
+            normalized[target] = series
+            continue
+
+        current = normalized[target]
+        current_empty = current.isna() | (current.astype(str).str.strip() == "")
+        incoming_empty = series.isna() | (series.astype(str).str.strip() == "")
+        equivalent = current.astype(str) == series.astype(str)
+        if (current_empty | incoming_empty | equivalent).all():
+            normalized[target] = current.where(~current_empty, series)
+            continue
+
+        suffix = 2
+        unique_target = f"{target}_{suffix}"
+        while unique_target in normalized.columns:
+            suffix += 1
+            unique_target = f"{target}_{suffix}"
+        normalized[unique_target] = series
+
+    return normalized
+
+
+def _fill_sequential_rank_if_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing rank values when the existing rank column is row-order based."""
+    if df.empty or "rank" not in df.columns:
+        return df
+
+    ranks = pd.to_numeric(df["rank"], errors="coerce")
+    present = ranks.dropna()
+    if present.empty:
+        return df
+
+    # Only auto-fill when existing ranks agree with output row order. This keeps
+    # generic tables safe while repairing common paginated ranked-list drift.
+    for idx, value in present.items():
+        try:
+            if int(value) != int(idx) + 1:
+                return df
+        except Exception:
+            return df
+
+    missing = ranks.isna()
+    if missing.any():
+        df = df.copy()
+        df.loc[missing, "rank"] = [int(idx) + 1 for idx in df.index[missing]]
+    return df
+
+
+def _align_new_columns_to_existing(
+    df_new: pd.DataFrame,
+    df_existing: pd.DataFrame,
+) -> pd.DataFrame:
+    """Map synonymous new columns onto existing output columns before append.
+
+    VLM extraction can drift across pages: e.g. page 1 uses ``reviews`` and
+    ``summary`` while page 2 uses ``votes`` and ``intro``. Prefer the established
+    Excel schema once a file exists, instead of creating split synonym columns.
+    """
+    if df_new.empty or df_existing.empty:
+        return df_new
+
+    existing_cols = [c for c in df_existing.columns if c not in _SYSTEM_COLS]
+    existing_by_sig: dict[str, str] = {}
+    for col in existing_cols:
+        existing_by_sig.setdefault(_column_signature(col), col)
+
+    rename: dict[str, str] = {}
+    for col in df_new.columns:
+        if col in df_existing.columns or col in _SYSTEM_COLS:
+            continue
+        target = existing_by_sig.get(_column_signature(col))
+        if target and target not in df_new.columns:
+            rename[col] = target
+
+    if rename:
+        logger.info("[SCHEMA ALIGN] Renaming extracted columns before append: %s", rename)
+        df_new = df_new.rename(columns=rename)
+
+    return df_new
+
+
 def _apply_tooltip_upsert_key(df_combined: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     before_dedup = len(df_combined)
     keys: list[str] = []
@@ -154,6 +358,8 @@ def _save_dataframe_to_excel(
     Returns:
         (文件绝对路径, 总行数)
     """
+    df_new = _normalize_extracted_dataframe(df_new)
+
     # 添加提取时间戳
     df_new["_extracted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -161,12 +367,24 @@ def _save_dataframe_to_excel(
     if filepath.exists():
         try:
             df_existing = pd.read_excel(filepath, engine="openpyxl")
+            df_existing = _normalize_extracted_dataframe(df_existing)
+            df_new = _align_new_columns_to_existing(df_new, df_existing)
             df_combined = pd.concat([df_existing, df_new], ignore_index=True)
         except Exception as e:
-            logger.warning(f"Failed to read existing file, overwriting: {e}")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fallback = filepath.with_name(f"{filepath.stem}_part_{timestamp}{filepath.suffix}")
+            logger.warning(
+                "Failed to read existing Excel; preserving it and writing "
+                "current batch to a part file instead of overwriting: %s -> %s",
+                e,
+                fallback,
+            )
+            filepath = fallback
             df_combined = df_new
     else:
         df_combined = df_new
+
+    df_combined = _fill_sequential_rank_if_safe(df_combined)
 
     # 去重
     if unique_key == TOOLTIP_UNIQUE_KEY:
@@ -191,7 +409,6 @@ def _save_dataframe_to_excel(
         # 自动 hash 去重：保护快速翻页场景下的"AJAX 未完成 + 上一页 DOM 仍存"导致的重复落盘
         # 适用 DataTables / 动态表格等 URL 不变的翻页场景（fast-pagination race）
         # 哈希基于所有数据列（剥离 _extracted_at 等系统列），保证内容相同的行被识别为重复
-        _SYSTEM_COLS = {"_extracted_at", "_row_hash"}
         _data_cols = [c for c in df_combined.columns if c not in _SYSTEM_COLS]
         if _data_cols and len(df_combined) >= 2:
             import hashlib

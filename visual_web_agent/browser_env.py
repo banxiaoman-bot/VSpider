@@ -229,6 +229,7 @@ class BrowserEnv:
         self._last_action_error: Exception | None = None  # 自愈：记录本轮操作异常
         self._tab_switch_notice: str | None = None  # 标签页切换感知通知
         self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
+        self._visual_blank_reloaded_urls: set[str] = set()
         self._auth_matrix_note: str = ""
         self.auth_matrix_loaded: bool = False
         self.auth_stale_detected: bool = False
@@ -324,6 +325,92 @@ class BrowserEnv:
             r"更多|加载更多|>|›|»|▶|→)$",
             _re.IGNORECASE,
         )
+        dom_probe: dict = {"candidates": []}
+        try:
+            dom_probe = await page.evaluate(
+                """() => {
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        const st = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 &&
+                            st.visibility !== 'hidden' && st.display !== 'none';
+                    };
+                    const disabled = (el) => Boolean(
+                        el && (
+                            el.disabled ||
+                            el.getAttribute('aria-disabled') === 'true' ||
+                            /\\b(disabled|is-disabled|dt-paging-button disabled|paginate_button disabled|ant-pagination-disabled|el-pagination__disabled)\\b/i
+                                .test(String(el.className || ''))
+                        )
+                    );
+                    const textOf = (el) => norm(
+                        el.getAttribute('aria-label') ||
+                        el.getAttribute('title') ||
+                        el.textContent ||
+                        el.value ||
+                        ''
+                    );
+                    const clickable = (el) => el.closest?.('a,button,[role=button],[role=link],li,span') || el;
+                    const scopeSelectors = [
+                        '.dt-paging', '.dataTables_paginate', '.dataTables_wrapper .pagination',
+                        '.paginate_button', '[data-dt-idx]',
+                        '.el-pagination', '.ant-pagination', '.n-pagination', '.v-pagination',
+                        '.pagination', '.pager', '[class*="pagination"]', '[class*="pager"]',
+                        'nav[aria-label*="pagination" i]', 'nav[aria-label*="page" i]'
+                    ];
+                    const scopeEls = Array.from(document.querySelectorAll(scopeSelectors.join(','))).filter(visible);
+                    const roots = Array.from(new Set(scopeEls.map((el) =>
+                        el.closest?.('.dt-paging,.dataTables_paginate,.dataTables_wrapper,.el-pagination,.ant-pagination,.n-pagination,.v-pagination,.pagination,.pager,nav') || el
+                    ))).filter(visible);
+                    const nextRe = /^(next|next page|more|older|下一页|下页|后页|更多|加载更多|>|›|»|→)$/i;
+                    const candidates = [];
+                    let hasNumeric = false;
+                    let hasNext = false;
+                    const pushCandidate = (el, strategy, score) => {
+                        const target = clickable(el);
+                        if (!visible(target) || disabled(target)) return;
+                        const label = textOf(el) || textOf(target);
+                        if (!label) return;
+                        candidates.push({
+                            source: 'dom',
+                            strategy,
+                            role: (target.getAttribute('role') || target.tagName || '').toLowerCase(),
+                            name: label.slice(0, 80),
+                            score,
+                        });
+                    };
+                    for (const root of roots) {
+                        const rootClass = String(root.className || '').toLowerCase();
+                        const controls = Array.from(root.querySelectorAll('a,button,[role=button],[role=link],li,span,[data-dt-idx]'))
+                            .filter(visible);
+                        for (const el of controls) {
+                            const label = textOf(el);
+                            const cls = String(el.className || '').toLowerCase();
+                            const aria = norm(el.getAttribute('aria-label') || '').toLowerCase();
+                            if (/^\\d{1,3}$/.test(label)) {
+                                hasNumeric = true;
+                                pushCandidate(el, rootClass.includes('dt') ? 'datatables_numeric' : 'dom_numeric', 50);
+                            } else if (
+                                nextRe.test(label) ||
+                                /\\b(next|paginate_button next|dt-paging-button next|pagination-next|pager-next)\\b/i.test(cls) ||
+                                /next|下一页|后页/.test(aria)
+                            ) {
+                                hasNext = true;
+                                pushCandidate(el, rootClass.includes('dt') ? 'datatables_next' : 'dom_next', 90);
+                            }
+                        }
+                    }
+                    candidates.sort((a, b) => b.score - a.score);
+                    return {
+                        candidates: candidates.slice(0, 12),
+                        kind: hasNumeric ? 'numeric' : hasNext ? 'next_only' : 'infinite',
+                    };
+                }"""
+            )
+        except Exception as e:
+            logger.debug(f"[PROBE PAGE] DOM probe failed: {e}")
         candidates: list[dict] = []
         has_numeric = False
         has_next = False
@@ -336,15 +423,31 @@ class BrowserEnv:
             if _NUM_RE.match(name):
                 has_numeric = True
                 candidates.append({
-                    "ref": ref, "role": role, "name": name,
+                    "ref": ref, "role": role, "name": name, "source": "ax",
                     "som_id": meta.get("som_id"),
                 })
             elif _NEXT_RE.match(name):
                 has_next = True
                 candidates.append({
-                    "ref": ref, "role": role, "name": name,
+                    "ref": ref, "role": role, "name": name, "source": "ax",
                     "som_id": meta.get("som_id"),
                 })
+        for idx, cand in enumerate((dom_probe or {}).get("candidates", []) or []):
+            name = str(cand.get("name") or "").strip()
+            if not name:
+                continue
+            if _NUM_RE.match(name):
+                has_numeric = True
+            elif _NEXT_RE.match(name) or "next" in str(cand.get("strategy", "")).lower():
+                has_next = True
+            candidates.append({
+                "ref": f"dom:{idx + 1}",
+                "role": cand.get("role") or "button",
+                "name": name,
+                "source": cand.get("source") or "dom",
+                "strategy": cand.get("strategy") or "dom_pagination",
+                "som_id": None,
+            })
 
         # 滚回原位置，不破坏 VLM 视觉锚点
         try:
@@ -358,6 +461,14 @@ class BrowserEnv:
             else "next_only" if has_next
             else "infinite"
         )
+        if candidates:
+            logger.info(
+                "[PROBE PAGE] candidates=%s",
+                ", ".join(
+                    f"{c.get('ref')}:{c.get('name')}:{c.get('strategy') or c.get('source')}"
+                    for c in candidates[:8]
+                ),
+            )
         return {
             "has_paginator": bool(candidates),
             "candidates": candidates,
@@ -1809,6 +1920,86 @@ Object.defineProperty(navigator, 'languages', {
 
         return line
 
+    def _screenshot_looks_visually_blank(self, screenshot_bytes: bytes) -> tuple[bool, str]:
+        """Heuristic visual blank detector for pages whose DOM exists but paint is white.
+
+        It intentionally detects only extreme cases. Many real sites use white
+        backgrounds, so this is combined with DOM text checks before reloading.
+        """
+        try:
+            import io
+            from PIL import Image
+        except Exception:
+            return False, "Pillow unavailable"
+
+        try:
+            with Image.open(io.BytesIO(screenshot_bytes)) as img:
+                rgb = img.convert("RGB")
+                width, height = rgb.size
+                if width <= 0 or height <= 0:
+                    return False, "invalid image size"
+
+                # Sample every N pixels instead of scanning the whole bitmap.
+                step = max(1, int(((width * height) / 12000) ** 0.5))
+                total = 0
+                near_white = 0
+                dark_or_colored = 0
+                # Ignore the first 80px less aggressively by still sampling it;
+                # navigation bars are useful but should not hide a blank body.
+                for y in range(0, height, step):
+                    for x in range(0, width, step):
+                        r, g, b = rgb.getpixel((x, y))
+                        total += 1
+                        if r >= 245 and g >= 245 and b >= 245:
+                            near_white += 1
+                        if min(r, g, b) < 180 or (max(r, g, b) - min(r, g, b)) > 35:
+                            dark_or_colored += 1
+
+                if total == 0:
+                    return False, "empty sample"
+                white_ratio = near_white / total
+                signal_ratio = dark_or_colored / total
+                is_blank = white_ratio >= 0.82 and signal_ratio <= 0.18
+                return (
+                    is_blank,
+                    f"white_ratio={white_ratio:.2f}, signal_ratio={signal_ratio:.2f}, sample={total}",
+                )
+        except Exception as e:
+            return False, f"visual blank probe failed: {e}"
+
+    async def _should_reload_visual_blank(
+        self,
+        page: Page,
+        screenshot_bytes: bytes,
+        total_elements: int,
+    ) -> tuple[bool, str]:
+        looks_blank, visual_reason = self._screenshot_looks_visually_blank(screenshot_bytes)
+        if not looks_blank:
+            return False, visual_reason
+
+        try:
+            stats = await page.evaluate(
+                """() => ({
+                    bodyTextLength: (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().length,
+                    readyState: document.readyState,
+                    title: document.title || '',
+                    url: location.href
+                })"""
+            )
+        except Exception as e:
+            return False, f"{visual_reason}; dom probe failed: {e}"
+
+        body_len = int((stats or {}).get("bodyTextLength") or 0)
+        ready = str((stats or {}).get("readyState") or "")
+        if body_len < 500:
+            return False, f"{visual_reason}; bodyText={body_len}, readyState={ready}"
+
+        # If SoM marked many visible elements, it may simply be a white-themed page.
+        if total_elements > 20:
+            return False, f"{visual_reason}; bodyText={body_len}, som={total_elements}"
+
+        return True, f"{visual_reason}; bodyText={body_len}, som={total_elements}, readyState={ready}"
+
     async def mark_and_screenshot(self, step: int = 0) -> tuple[str, str]:
         """
         注入 SoM 标记脚本并截取全屏截图。
@@ -1985,6 +2176,38 @@ Object.defineProperty(navigator, 'languages', {
                     raise RuntimeError(
                         f"[Screenshot] 致命错误：强制截图依然失败，页面可能已崩溃: {_ss_err2}"
                     )
+
+        try:
+            current_url = page.url or ""
+        except Exception:
+            current_url = ""
+        if (
+            screenshot_bytes
+            and current_url
+            and not current_url.startswith("about:")
+            and current_url not in self._visual_blank_reloaded_urls
+        ):
+            try:
+                should_reload, blank_reason = await self._should_reload_visual_blank(
+                    page,
+                    screenshot_bytes,
+                    total_elements,
+                )
+            except Exception as visual_probe_err:
+                should_reload = False
+                blank_reason = f"visual blank probe error: {visual_probe_err}"
+            if should_reload:
+                logger.warning(
+                    "[VISUAL BLANK RECOVERY] Screenshot looks blank while DOM has content; "
+                    "reloading once. %s",
+                    blank_reason,
+                )
+                self._visual_blank_reloaded_urls.add(current_url)
+                if await self.reload_active_page(reason="visual blank screenshot"):
+                    await self._clear_som_overlays()
+                    return await self.mark_and_screenshot(step=step)
+            else:
+                logger.debug("[VISUAL BLANK RECOVERY] skipped: %s", blank_reason)
 
         debug_path = self._screenshot_dir / f"step_{step:02d}.png"
         debug_path.write_bytes(screenshot_bytes)
@@ -2431,6 +2654,89 @@ Object.defineProperty(navigator, 'languages', {
         except Exception as e:
             logger.warning(f"[AX Extract] AX Tree 提取失败: {e}")
             return ""
+
+    async def probe_data_shape(self) -> dict:
+        """Lightweight DOM probe used to route extraction without prompt keywords."""
+        page = await self._ensure_active_page(reason="probe data shape")
+        if not page:
+            return {}
+        try:
+            result = await page.evaluate(
+                """() => {
+                    const clean = (value) => String(value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const isVisible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    const visible = (selector) => Array.from(
+                        document.querySelectorAll(selector)
+                    ).filter(isVisible);
+
+                    const tables = visible(
+                        'table, [role="grid"], .el-table, .ant-table, .n-data-table, .dataTable'
+                    );
+                    let tableRows = 0;
+                    let tableCells = 0;
+                    for (const table of tables) {
+                        const rows = Array.from(
+                            table.querySelectorAll('tbody tr, [role="row"]')
+                        ).filter(isVisible);
+                        tableRows = Math.max(tableRows, rows.length);
+                        for (const row of rows) {
+                            const cells = Array.from(
+                                row.querySelectorAll('td, [role="cell"], [role="gridcell"]')
+                            ).filter(isVisible);
+                            tableCells = Math.max(tableCells, cells.length);
+                        }
+                    }
+
+                    const containerSelectors = [
+                        'main', 'article', '[role="main"]', '#content', '.content',
+                        '.grid_view', '.list', '.list-wp', '.item-list',
+                        'ul', 'ol', 'section', '.container'
+                    ];
+                    let bestList = {count: 0, classRepeat: 0, avgText: 0};
+                    for (const root of visible(containerSelectors.join(','))) {
+                        const children = Array.from(root.children || []).filter(isVisible);
+                        if (children.length < 3) continue;
+                        const buckets = new Map();
+                        let textTotal = 0;
+                        for (const child of children) {
+                            const cls = clean(child.className || child.tagName || '').slice(0, 80);
+                            buckets.set(cls, (buckets.get(cls) || 0) + 1);
+                            textTotal += clean(child.innerText || child.textContent).length;
+                        }
+                        const repeat = Math.max(...Array.from(buckets.values()), 0);
+                        const avgText = textTotal / Math.max(children.length, 1);
+                        const score = repeat * Math.max(avgText, 1);
+                        const bestScore = bestList.classRepeat * Math.max(bestList.avgText, 1);
+                        if (score > bestScore) {
+                            bestList = {count: children.length, classRepeat: repeat, avgText};
+                        }
+                    }
+
+                    const bodyText = clean(document.body ? document.body.innerText : '');
+                    return {
+                        table_count: tables.length,
+                        table_rows: tableRows,
+                        table_cells: tableCells,
+                        repeated_list_items: bestList.count,
+                        repeated_class_count: bestList.classRepeat,
+                        repeated_avg_text: Math.round(bestList.avgText),
+                        body_text_length: bodyText.length,
+                    };
+                }"""
+            )
+            return result if isinstance(result, dict) else {}
+        except Exception as e:
+            logger.debug("[DATA SHAPE] probe failed: %s", e)
+            return {}
 
     @staticmethod
     def _flatten_ax_tree(

@@ -115,7 +115,7 @@ If the current page is already the main/dashboard/business page, execute the use
         {
             "thought": "在决定动作前，你必须先翻译用户的口语意图，并结合当前截图和 AX Tree 描述你的推理过程（参考下方「语义对齐映射表」和「思考与决策范例」）",
             "current_state": "当前屏幕状态的客观描述（例如：处于首页搜索框前、弹出了错误提示、数据仍显示为空Loading中）",
-            "action": "click | click_new_tab | type | hover | scroll | smooth_scroll | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | click_point | remove_element | drag_and_drop",
+            "action": "click | click_new_tab | type | hover | scroll | smooth_scroll | find_text | form_set | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | click_point | remove_element | drag_and_drop",
             "target_id": 数字序号（click/click_new_tab/type/hover/extract_link/download_image/upload/save_to_memory/switch_tab/remove_element 时必填真实序号；scroll/smooth_scroll/wait/extract/done/press_key/goto/close_tab/click_point 填 0）,
             "type_value": "如果 action 是 type，填写要输入的文本内容（支持 {{变量名}} 引用记忆库中的值）；如果是 scroll 或 smooth_scroll，填写方向（down/up/bottom/top）；如果是 wait，填写等待秒数（1-5）；如果是 upload，填写文件路径；否则留空",
             "memory_key": "仅当 action 为 save_to_memory 时必填，填写存储该值所用的变量名（如 'order_id'、'user_name'）；其他 action 填空字符串",
@@ -171,6 +171,8 @@ If the current page is already the main/dashboard/business page, execute the use
   - 如果执行 hover 后下一轮截图中**子菜单没有出现**，说明父级项选错了，需换一个元素重试。
 - **scroll**：滚动页面。`target_id` 填 0；在 `type_value` 中指定方向：`"down"`（向下一屏，默认）、`"up"`（向上一屏）、`"bottom"`（直接滚到页面最底部）、`"top"`（直接回到顶部）。**注意**：底层会检测滚动前后的位置；如果页面位置没有变化（已到边缘），会自动抛出错误并触发自愈，请不要无意义地重复向同一方向滚动
 - **smooth_scroll**：**人类仿真平滑滚动**（优先于 scroll 使用）。底层使用 `behavior:'smooth'` 模拟人类鼠标滚轮，滚动幅度约 80% 屏高。适用场景：① 瀑布流/无限加载页面（需要触发 Intersection Observer 懒加载）；② Hacker News / 微博等对瞬间跳转敏感的页面；③ 任何用普通 `scroll` 触发死循环熔断的场景。`target_id` 填 0；`type_value` 填 `"down"` 或 `"up"`。
+- **find_text**：滚动定位指定文字或字段标签。`target_id` 填 0；`type_value` 填要找的可见文字（如 `"Activity type"`、`"Resources"`、`"Create"`）。长文档/长表单里找特定字段或按钮时优先用它，不要上下盲滚。
+- **form_set**：按字段标签设置表单控件。`target_id` 填 0；`type_value` 填 `"字段标签=目标值"`，如 `"Activity name=VSpider 测试"`、`"Activity zone=Zone one"`、`"Instant delivery=开启"`。组件库表单、下拉、开关、复选框、单选框优先使用它，不要猜测红框 ID。
 - **wait**：**显式主动等待**。当你执行了搜索提交、翻页跳转、上传触发等操作后，**预判页面需要较长加载动画时**，可使用此动作主动暂停，避免截取到正在 Loading 的中间态页面。`target_id` 填 0；`type_value` 填整数秒数（**范围 1-5**，底层会限制最大 10 秒）。**注意**：轻度等待已由系统自动处理，仅在明显需要额外缓冲时使用，不要滥用。
 - **remove_element**：**物理铲除 DOM 节点**（终极反遮挡手段）。当页面被悬浮广告、Cookie 横幅、登录遮罩、全屏 Modal 等节点挡住，导致 `click` / `press_key Escape` 均无法关闭时，使用此动作直接从 DOM 树中删除该节点。节点一旦删除即永久消失（本次会话内），后续截图将不再看到它。`target_id` 填被遮挡元素（如广告层）的红框 ID；不需要 `type_value`。
 - **drag_and_drop**：**拖拽操作**。将 `target_id` 指定的源元素拖放到 `type_value` 指定 ID 的目标元素上。`target_id` 填拖拽起点的红框 ID；`type_value` 填拖拽终点的红框 ID（字符串形式）。适用场景：文件拖放、列表排序、看板卡片移动等。
@@ -1033,6 +1035,10 @@ def build_plan_prompts(
         "     - 子目标 2（可选）：提取 N 条结构化数据（exit_criteria 是「extract 动作已输出完整 JSON」）\n"
         "   **禁止**把「保存为 Excel」「落盘」「写入文件」拆成独立子目标——系统在 extract 成功时自动落盘，"
         "   拆成独立子目标会造成 VLM 提取成功后反复尝试「再提取一次」以推进子目标计数器，浪费多步。\n"
+        "5c. 🧾 表单填报任务粒度：若 goal 包含「填写 / 填报 / 表单 / form」等关键词，"
+        "   禁止把「让整个表单完整出现在同一屏」作为子目标或退出标准。长表单应拆成按字段顺序填写的子目标，"
+        "   exit_criteria 使用「某字段已显示指定值 / 某选项已选中 / 最终 Create 或 Submit 已点击」这类可观察状态。"
+        "   如果首屏已看见目标字段（如 Activity name），第一个子目标必须是填写当前可见字段，而不是继续向下滚动。\n"
         "6. 🔒 登录墙识别：若完成 goal 显然需要登录态（访问私有内容、发贴、下单等），"
         "   且 goal 文本中**未**明确给出凭证（如 {{phone}} / {{password}} 占位符、"
         "   或直接写出账号密码），则第一个子目标必须设为登录墙探测，其 exit_criteria 写："

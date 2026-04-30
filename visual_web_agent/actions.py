@@ -17,6 +17,7 @@ VSpider 动作执行层（Action Registry）
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -404,6 +405,15 @@ class ScrollHandler(ActionHandler):
                     f"{local.get('before')} → {local.get('after')}"
                 )
                 return None
+            if direction == "up":
+                raise ActionExecutionError(
+                    "页面已滚到顶部，无法继续向上滚动。请观察当前截图，换用其它动作。"
+                )
+            raise ActionExecutionError(
+                "页面已滚到底部，无法继续向下滚动。"
+                "如果需要翻页，请执行 next_page，或点击页面上可见的"
+                "'下一页'/'More'等翻页链接或按钮。"
+            )
             raise ActionExecutionError(
                 f"执行 scroll ({direction}) 无效：页面未发生滚动，"
                 f"可能已到达页面边缘或该方向无滚动条。"
@@ -453,11 +463,22 @@ class SmoothScrollHandler(ActionHandler):
                         f"{'下' if direction != 'up' else '上'}滚动。"
                         f"如果需要翻页，请直接点击页面上可见的'下一页'/'More'等翻页链接或按钮。"
                     )
+                    if direction == "up":
+                        hint = "页面已滚到顶部，无法继续向上滚动。请观察当前截图，换用其它动作。"
+                    else:
+                        hint = (
+                            "页面已滚到底部，无法继续向下滚动。"
+                            "如果需要翻页，请执行 next_page，或点击页面上可见的"
+                            "'下一页'/'More'等翻页链接或按钮。"
+                        )
                     logger.warning(f"[SMOOTH_SCROLL] {hint}")
                     browser._last_action_error = RuntimeError(hint)
+                    raise ActionExecutionError(hint)
             browser.rpa_trail.append(
                 ctx.with_rpa_meta({"action": "smooth_scroll", "type_value": direction})
             )
+        except ActionExecutionError:
+            raise
         except Exception as e:
             browser._last_action_error = e
             logger.error(f"[SMOOTH_SCROLL] Failed: {e}")
@@ -468,6 +489,725 @@ class SmoothScrollHandler(ActionHandler):
 #  批次 2：交互动作（click / type / hover / press_key / select /
 #                     drag_and_drop / remove_element / click_point / switch_tab）
 # ════════════════════════════════════════════════════════════════
+
+@ActionRegistry.register("find_text")
+class FindTextHandler(ActionHandler):
+    async def execute(self, ctx: ActionContext) -> Optional["Page"]:
+        page = ctx.page
+        text = (ctx.action.type_value or "").strip()
+        if not text:
+            raise ActionExecutionError("find_text 缺少 type_value，请填写要定位的可见文字或字段标签。")
+
+        result = await page.evaluate(
+            """(query) => {
+                const q = String(query || '').trim().toLowerCase();
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el.innerText, el.textContent, el.getAttribute('aria-label'),
+                    el.getAttribute('placeholder'), el.getAttribute('title'),
+                    el.getAttribute('value'), el.name, el.id
+                ].filter(Boolean).join(' ').trim();
+                const selector = [
+                    'main *', '[role=main] *', 'article *', 'section *', 'form *',
+                    'label', 'input', 'textarea', 'select', 'button',
+                    '[role=button]', '[role=textbox]', '[role=combobox]',
+                    '[role=checkbox]', '[role=radio]', 'h1', 'h2', 'h3', 'h4',
+                    'p', 'div', 'span'
+                ].join(',');
+                const nodes = Array.from(document.querySelectorAll(selector));
+                const candidates = [];
+                for (const el of nodes) {
+                    if (!isVisible(el)) continue;
+                    const t = textOf(el);
+                    if (!t || !t.toLowerCase().includes(q)) continue;
+                    const r = el.getBoundingClientRect();
+                    let score = 0;
+                    const tag = el.tagName.toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    if (['label','input','textarea','select','button','h1','h2','h3','h4'].includes(tag)) score += 40;
+                    if (['textbox','combobox','checkbox','radio','button'].includes(role)) score += 30;
+                    if (el.closest('form')) score += 35;
+                    if (el.closest('main,[role=main],article')) score += 15;
+                    if (r.left > 180) score += 25;
+                    if (r.width * r.height < 150000) score += 10;
+                    if (t.trim().toLowerCase() === q) score += 25;
+                    score -= Math.abs((r.top + r.height / 2) - window.innerHeight / 2) / 80;
+                    candidates.push({el, score, tag, role, text: t.slice(0, 120), left: r.left, top: r.top});
+                }
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                if (!best) return {found: false, query};
+                best.el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                return {
+                    found: true, query, tag: best.tag, role: best.role,
+                    text: best.text, left: best.left, top: best.top, score: best.score
+                };
+            }""",
+            text,
+        )
+        await asyncio.sleep(0.6)
+        if not result.get("found"):
+            raise ActionExecutionError(
+                f"find_text 未找到可见文本 {text!r}。请换更短的字段标签/按钮文字，或先小幅滚动。"
+            )
+        logger.info(
+            "[FIND_TEXT] query=%r matched tag=%s role=%s text=%r score=%s",
+            text,
+            result.get("tag"),
+            result.get("role"),
+            result.get("text"),
+            result.get("score"),
+        )
+        print(f"[FIND_TEXT] located text: {text}")
+        ctx.browser.rpa_trail.append(
+            ctx.with_rpa_meta({"action": "find_text", "type_value": text})
+        )
+        return None
+
+
+def _parse_form_set_payload(raw: str) -> tuple[str, str]:
+    text = (raw or "").strip()
+    if not text:
+        raise ActionExecutionError(
+            "form_set 缺少 type_value。格式示例：Activity name=VSpider 测试"
+        )
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            label = str(data.get("label") or data.get("field") or "").strip()
+            value = str(data.get("value") or "").strip()
+            if label:
+                return label, value
+        except Exception:
+            pass
+    for sep in ("=>", "=", "：", ":"):
+        if sep in text:
+            left, right = text.split(sep, 1)
+            label = left.strip().strip("\"'")
+            value = right.strip().strip("\"'")
+            if label:
+                return label, value
+    raise ActionExecutionError(
+        "form_set 的 type_value 无法解析。请使用 `字段标签=目标值`，例如 `Activity zone=Zone one`。"
+    )
+
+
+async def _click_visible_text_option(page: "Page", value: str) -> bool:
+    if not value:
+        return False
+    option_selectors = [
+        # Element Plus / Element UI
+        ".el-select-dropdown__item",
+        ".el-dropdown-menu__item",
+        ".el-cascader-node",
+        ".el-radio",
+        ".el-checkbox",
+        # Ant Design
+        ".ant-select-item",
+        ".ant-select-item-option",
+        ".ant-dropdown-menu-item",
+        # 通用 ARIA
+        "[role='option']",
+        "[role='menuitem']",
+        "[role='listitem']",
+        # Naive UI / Vant
+        ".n-base-select-option",
+        ".van-picker-column__item",
+        # 兜底
+        "label", "li", "button", "span",
+    ]
+    # 先轮询等待选项浮层就绪（popper 动画 + teleport 渲染 ~600ms）
+    import time as _t
+    _start = _t.monotonic()
+    _deadline = _start + 2.5  # 最多等 2.5s 等浮层渲染
+    while _t.monotonic() < _deadline:
+        for selector in option_selectors:
+            try:
+                loc = page.locator(selector).filter(has_text=value)
+                count = await loc.count()
+                if count:
+                    # 优先 last（避免命中标签），不行再 first
+                    for _picker in (loc.last, loc.first):
+                        target = _picker
+                        try:
+                            if await target.is_visible(timeout=1500):
+                                await _click_locator_with_js_fallback(
+                                    target, f"form option {value!r}", timeout=2000
+                                )
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+        # popper 还没就绪，短暂等待后重试
+        await asyncio.sleep(0.3)
+    # 最后兜底：精确文字匹配整个 page
+    try:
+        loc = page.get_by_text(value, exact=True).last
+        if await loc.is_visible(timeout=1500):
+            await _click_locator_with_js_fallback(
+                loc, f"form text option {value!r}", timeout=2000
+            )
+            return True
+    except Exception:
+        pass
+    # 子串模糊兜底
+    try:
+        loc = page.get_by_text(value, exact=False).first
+        if await loc.is_visible(timeout=1500):
+            await _click_locator_with_js_fallback(
+                loc, f"form text fuzzy {value!r}", timeout=2000
+            )
+            return True
+    except Exception:
+        return False
+    return False
+
+
+@ActionRegistry.register("form_set")
+class FormSetHandler(ActionHandler):
+    async def execute(self, ctx: ActionContext) -> Optional["Page"]:
+        page = ctx.page
+        label, value = _parse_form_set_payload(ctx.action.type_value)
+        logger.info("[FORM_SET] label=%r value=%r", label, value)
+
+        def _xpath_literal(text: str) -> str:
+            if "'" not in text:
+                return f"'{text}'"
+            parts = text.split("'")
+            return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
+
+        async def _try_open_choice_with_ax() -> bool:
+            if not value:
+                return False
+            choice_label = re.search(
+                r"(zone|type|resource|date|time|下拉|选择|复选|单选|开关|日期|时间)",
+                label,
+                re.I,
+            )
+            if not choice_label:
+                return False
+            locators = []
+            try:
+                locators.append(page.get_by_role("combobox", name=re.compile(re.escape(label), re.I)).first)
+            except Exception:
+                pass
+            try:
+                locators.append(page.get_by_label(label, exact=True).first)
+            except Exception:
+                pass
+            try:
+                label_lit = _xpath_literal(label)
+                locators.append(
+                    page.locator(
+                        "xpath=("
+                        f"//*[normalize-space()={label_lit} or contains(normalize-space(), {label_lit})]"
+                        "/following::*["
+                        "@role='combobox' or self::select or contains(@class,'select') or "
+                        "contains(@class,'picker') or contains(@class,'checkbox') or contains(@class,'radio')"
+                        "][1])"
+                    ).first
+                )
+            except Exception:
+                pass
+            for idx, loc in enumerate(locators):
+                try:
+                    if await loc.count() <= 0:
+                        continue
+                    await loc.scroll_into_view_if_needed(timeout=2000)
+                    await loc.click(timeout=3000, force=True)
+                    await asyncio.sleep(0.8)
+                    if await _click_visible_text_option(page, value):
+                        logger.info("[FORM_SET] AX fast-path selected %r via locator #%s", value, idx)
+                        return True
+                except Exception as err:
+                    logger.debug("[FORM_SET] AX fast-path locator #%s failed: %s", idx, err)
+            return False
+
+        async def _verify_field_state(method: str = "") -> dict[str, Any]:
+            return await page.evaluate(
+                """({label, value, method}) => {
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const expected = norm(value);
+                    const labelNorm = norm(label);
+                    const isVisible = (el) => {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 &&
+                            s.display !== 'none' && s.visibility !== 'hidden' &&
+                            Number(s.opacity || '1') > 0;
+                    };
+                    const textOf = (el) => [
+                        el.innerText, el.textContent, el.getAttribute('aria-label'),
+                        el.getAttribute('placeholder'), el.getAttribute('title'),
+                        el.getAttribute('value'), el.value, el.name, el.id
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    const nodes = Array.from(document.querySelectorAll(
+                        'label,.el-form-item__label,[class*=form-item__label],input,textarea,select,button,[role],span,div'
+                    )).filter(isVisible);
+                    const labelHits = [];
+                    for (const el of nodes) {
+                        const t = norm(textOf(el));
+                        if (!t || (t !== labelNorm && !t.includes(labelNorm))) continue;
+                        const r = el.getBoundingClientRect();
+                        let score = t === labelNorm ? 80 : 30;
+                        if (el.matches('label,.el-form-item__label,[class*=form-item__label]')) score += 60;
+                        if (el.closest('form,.el-form,[class*=form]')) score += 30;
+                        if (r.left > 180) score += 20;
+                        labelHits.push({el, score});
+                    }
+                    labelHits.sort((a, b) => b.score - a.score);
+                    const labelEl = labelHits[0]?.el;
+                    if (!labelEl) return {ok: false, reason: 'label_not_found', observed: '', method};
+                    let formItem = labelEl;
+                    for (let i = 0; formItem && i < 8; i++) {
+                        if (
+                            formItem !== labelEl &&
+                            (
+                                formItem.classList?.contains('el-form-item') ||
+                                formItem.classList?.contains('ant-form-item') ||
+                                formItem.classList?.contains('n-form-item') ||
+                                formItem.tagName?.toLowerCase() === 'form'
+                            )
+                        ) break;
+                        formItem = formItem.parentElement;
+                    }
+                    if (!formItem) formItem = labelEl.parentElement || labelEl;
+
+                    const controls = Array.from(formItem.querySelectorAll('input,textarea,select,[contenteditable=true]')).filter(isVisible);
+                    const controlValues = controls.map(el => {
+                        if (el.tagName?.toLowerCase() === 'select') {
+                            const opt = el.selectedOptions?.[0];
+                            return [el.value, opt?.textContent].filter(Boolean).join(' ');
+                        }
+                        return [el.value, el.textContent, el.getAttribute('aria-label')].filter(Boolean).join(' ');
+                    });
+                    const observed = [textOf(formItem), ...controlValues].join(' ').replace(/\\s+/g, ' ').trim();
+                    const observedNorm = norm(observed);
+
+                    const switchRoot = formItem.querySelector('.el-switch,[role=switch]');
+                    if (switchRoot) {
+                        const checked = switchRoot.classList.contains('is-checked') ||
+                            switchRoot.getAttribute('aria-checked') === 'true' ||
+                            Boolean(formItem.querySelector('input:checked'));
+                        const shouldOn = !/^(false|off|no|0)$/i.test(String(value || ''));
+                        return {ok: checked === shouldOn, observed: checked ? 'checked' : 'unchecked', method, mode: 'switch'};
+                    }
+
+                    const choiceNodes = Array.from(formItem.querySelectorAll('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]'))
+                        .filter(isVisible);
+                    const matchingChoice = choiceNodes.find(el => norm(textOf(el)).includes(expected));
+                    if (matchingChoice) {
+                        const target = matchingChoice.closest?.('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]') || matchingChoice;
+                        const checked = target.matches?.('.is-checked,[aria-checked=true]') ||
+                            Boolean(target.querySelector?.('.is-checked,[aria-checked=true],input:checked')) ||
+                            Boolean(matchingChoice.querySelector?.('.is-checked,[aria-checked=true],input:checked'));
+                        if (checked) return {ok: true, observed, method, mode: 'choice_checked'};
+                    }
+
+                    if (expected && observedNorm.includes(expected)) {
+                        return {ok: true, observed, method, mode: 'value_visible'};
+                    }
+                    return {ok: false, reason: 'value_not_reflected', observed, expected: value, method};
+                }""",
+                {"label": label, "value": value, "method": method},
+            )
+
+        if await _try_open_choice_with_ax():
+            verified = await _verify_field_state("ax_fast_path")
+            if not verified.get("ok"):
+                raise ActionExecutionError(
+                    f"form_set 字段 {label!r} 已执行 AX fast-path，但回读校验失败："
+                    f"expected={value!r}, observed={verified.get('observed')!r}, reason={verified.get('reason')}"
+                )
+            logger.info("[FORM_VERIFY] label=%r ok via %s observed=%r", label, verified.get("method"), verified.get("observed"))
+            ctx.browser.rpa_trail.append(
+                ctx.with_rpa_meta({
+                    "action": "form_set",
+                    "type_value": f"{label}={value}",
+                    "method": "ax_fast_path",
+                    "verified": True,
+                    "observed": verified.get("observed", ""),
+                })
+            )
+            return None
+
+        result = await page.evaluate(
+            """async ({label, value}) => {
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const labelNorm = norm(label);
+                const valueNorm = norm(value);
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el.innerText, el.textContent, el.getAttribute('aria-label'),
+                    el.getAttribute('placeholder'), el.getAttribute('title'),
+                    el.getAttribute('value'), el.name, el.id
+                ].filter(Boolean).join(' ').trim();
+                const setNativeValue = (el, val) => {
+                    const proto = el instanceof HTMLTextAreaElement
+                        ? HTMLTextAreaElement.prototype
+                        : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, val); else el.value = val;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.blur?.();
+                };
+                const clickEl = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                    // 关键修复：Element Plus / Ant Design / Vue 等 SPA 库的 select / dropdown
+                    // 通常监听 `mousedown` 而非 `click`（防 input blur 后再触发）。
+                    // 单纯 el.click() 只会派发 click 事件，组件不会响应 → 下拉永远不展开。
+                    // 这里派发完整 mousedown + mouseup + click 三连，模拟真实鼠标点击。
+                    const r = el.getBoundingClientRect();
+                    const cx = r.left + Math.max(1, r.width / 2);
+                    const cy = r.top + Math.max(1, r.height / 2);
+                    const evtInit = {
+                        bubbles: true, cancelable: true, composed: true,
+                        view: window, button: 0, buttons: 1,
+                        clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                    };
+                    try {
+                        el.dispatchEvent(new MouseEvent('mousedown', evtInit));
+                        el.dispatchEvent(new MouseEvent('mouseup', evtInit));
+                        el.dispatchEvent(new MouseEvent('click', evtInit));
+                    } catch (e) {
+                        // fallback：浏览器极端情况下 MouseEvent 构造失败
+                        if (typeof el.click === 'function') el.click();
+                    }
+                    if (typeof el.focus === 'function') {
+                        try { el.focus({ preventScroll: true }); } catch (e) { el.focus(); }
+                    }
+                };
+                const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                const allVisible = (selector, root = document) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
+                const clickDateValue = async (dateValue, opener) => {
+                    const m = String(dateValue || '').match(/^(\\d{4})-(\\d{2})-(\\d{2})/);
+                    if (!m) return false;
+                    const targetYear = Number(m[1]);
+                    const targetMonth = Number(m[2]);
+                    const targetDay = Number(m[3]);
+                    if (!targetYear || !targetMonth || !targetDay) return false;
+                    clickEl(opener);
+                    await sleep(300);
+
+                    const visiblePanelMonth = () => {
+                        const panels = allVisible('.el-picker-panel,.ant-picker-dropdown,.n-date-panel,.mx-datepicker-main,.datepicker,[role=dialog],.el-popper');
+                        const root = panels[panels.length - 1] || document;
+                        const txt = textOf(root);
+                        const monthNames = {
+                            january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+                            july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+                            jan: 1, feb: 2, mar: 3, apr: 4, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9,
+                            oct: 10, nov: 11, dec: 12
+                        };
+                        let m = txt.match(/(20\\d{2})\\s*[年\\-/\\. ]\\s*(1[0-2]|0?[1-9])\\s*(?:月)?/);
+                        if (m) return {year: Number(m[1]), month: Number(m[2])};
+                        m = txt.match(/(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\\s+(20\\d{2})/i);
+                        if (m) return {year: Number(m[2]), month: monthNames[m[1].toLowerCase()]};
+                        m = txt.match(/(20\\d{2})\\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)/i);
+                        if (m) return {year: Number(m[1]), month: monthNames[m[2].toLowerCase()]};
+                        const currentVal = String(opener?.value || '');
+                        m = currentVal.match(/^(\\d{4})-(\\d{2})-/);
+                        if (m) return {year: Number(m[1]), month: Number(m[2])};
+                        const now = new Date();
+                        return {year: now.getFullYear(), month: now.getMonth() + 1};
+                    };
+                    const panelMonth = visiblePanelMonth();
+                    const monthDelta = (targetYear - panelMonth.year) * 12 + (targetMonth - panelMonth.month);
+                    const nextSelectors = [
+                        '.el-picker-panel__icon-btn.arrow-right',
+                        '.ant-picker-header-next-btn',
+                        'button[aria-label*="Next month"]',
+                        'button[title*="Next month"]'
+                    ].join(',');
+                    const prevSelectors = [
+                        '.el-picker-panel__icon-btn.arrow-left',
+                        '.ant-picker-header-prev-btn',
+                        'button[aria-label*="Previous month"]',
+                        'button[title*="Previous month"]'
+                    ].join(',');
+                    const navSelector = monthDelta >= 0 ? nextSelectors : prevSelectors;
+                    for (let i = 0; i < Math.min(Math.abs(monthDelta), 24); i++) {
+                        const btn = allVisible(navSelector).find(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+                        if (!btn) break;
+                        clickEl(btn);
+                        await sleep(150);
+                    }
+
+                    const ymd = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}`;
+                    const dayText = String(targetDay);
+                    for (let i = 0; i < 10; i++) {
+                        const panels = allVisible('.el-picker-panel,.ant-picker-dropdown,.n-date-panel,.mx-datepicker-main,.datepicker,[role=dialog],.el-popper');
+                        const root = panels[panels.length - 1] || document;
+                        const cells = allVisible('td,button,[role=gridcell],.el-date-table-cell,.ant-picker-cell-inner', root);
+                        const hits = [];
+                        for (const el of cells) {
+                            const cell = el.closest('td,button,[role=gridcell]') || el;
+                            if (!isVisible(cell)) continue;
+                            const disabled = cell.matches('.disabled,.is-disabled,.ant-picker-cell-disabled,[aria-disabled=true]') ||
+                                cell.closest('.disabled,.is-disabled,.ant-picker-cell-disabled,[aria-disabled=true]');
+                            if (disabled) continue;
+                            const raw = [
+                                textOf(el), textOf(cell),
+                                el.getAttribute('aria-label'), cell.getAttribute('aria-label'),
+                                el.getAttribute('title'), cell.getAttribute('title')
+                            ].filter(Boolean).join(' ');
+                            const t = norm(raw);
+                            let score = 0;
+                            if (t === norm(dayText)) score += 80;
+                            if (t.includes(norm(ymd))) score += 120;
+                            if (t.includes(String(targetYear)) && t.includes(String(targetDay))) score += 40;
+                            if (cell.classList?.contains('prev-month') || cell.classList?.contains('next-month')) score -= 90;
+                            if (cell.classList?.contains('available') || cell.classList?.contains('ant-picker-cell-in-view')) score += 20;
+                            if (score > 0) hits.push({cell, score});
+                        }
+                        hits.sort((a, b) => b.score - a.score);
+                        if (hits[0]) {
+                            clickEl(hits[0].cell);
+                            await sleep(250);
+                            return true;
+                        }
+                        await sleep(120);
+                    }
+                    return false;
+                };
+                const nodes = Array.from(document.querySelectorAll(
+                    'label,.el-form-item__label,[class*=form-item__label],input,textarea,select,button,[role],span,div'
+                )).filter(isVisible);
+                const matches = [];
+                for (const el of nodes) {
+                    const t = norm(textOf(el));
+                    if (!t) continue;
+                    const exact = t === labelNorm;
+                    const contains = t.includes(labelNorm);
+                    if (!exact && !contains) continue;
+                    const r = el.getBoundingClientRect();
+                    let score = exact ? 80 : 30;
+                    if (el.matches('label,.el-form-item__label,[class*=form-item__label]')) score += 50;
+                    if (el.closest('form,.el-form,[class*=form]')) score += 30;
+                    if (r.left > 180) score += 30;
+                    if (r.width * r.height < 80000) score += 10;
+                    score -= Math.abs(r.top - window.innerHeight / 2) / 80;
+                    matches.push({el, score, text: textOf(el), left: r.left});
+                }
+                matches.sort((a, b) => b.score - a.score);
+                const labelEl = matches[0]?.el;
+                if (!labelEl) return {ok: false, reason: 'label_not_found', label};
+                labelEl.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+
+                const findContainer = (el) => {
+                    let cur = el;
+                    for (let i = 0; cur && i < 8; i++) {
+                        if (
+                            cur !== el &&
+                            (
+                                cur.classList?.contains('el-form-item') ||
+                                cur.classList?.contains('ant-form-item') ||
+                                cur.classList?.contains('n-form-item') ||
+                                cur.tagName?.toLowerCase() === 'form'
+                            )
+                        ) {
+                            return cur;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    cur = el.parentElement;
+                    for (let i = 0; cur && i < 4; i++) {
+                        if (cur.querySelector?.('input,textarea,select,[role=combobox],[role=checkbox],[role=radio],button,.el-select,.ant-select,.n-select')) {
+                            return cur;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return el.parentElement;
+                };
+                const formItem = findContainer(labelEl);
+                if (!formItem) return {ok: false, reason: 'container_not_found', label};
+
+                const textInputs = Array.from(formItem.querySelectorAll('input,textarea,[contenteditable=true]'))
+                    .filter(el => isVisible(el) && !['hidden','checkbox','radio','button','submit'].includes((el.type || '').toLowerCase()));
+                const explicitSelectRoot = formItem.querySelector('.el-select,.ant-select,.n-select,[data-select]');
+                if (/(date|time|日期|时间)/i.test(label) && /^\\d{4}-\\d{2}-\\d{2}/.test(value) && textInputs.length) {
+                    const picked = await clickDateValue(value, textInputs[0]);
+                    if (picked) return {ok: true, mode: 'date_picker', label, value};
+                    setNativeValue(textInputs[0], value);
+                    return {ok: true, mode: 'date_input', label, value};
+                }
+                const readonlyCombo = textInputs.find(el => {
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const popup = (el.getAttribute('aria-haspopup') || '').toLowerCase();
+                    return el.readOnly || role === 'combobox' || popup === 'listbox' || popup === 'true';
+                });
+                if ((explicitSelectRoot || readonlyCombo) && valueNorm && !formItem.querySelector('textarea')) {
+                    // Idempotent open：检测下拉浮层是否已经可见，避免重试时再点一次反而 toggle 关闭
+                    const _popperOpen = (
+                        document.querySelector('.el-select-dropdown:not([style*="display: none"])') ||
+                        document.querySelector('.ant-select-dropdown:not(.ant-select-dropdown-hidden)') ||
+                        document.querySelector('.n-base-select-menu') ||
+                        document.querySelector('[role=listbox]:not([aria-hidden=true])')
+                    );
+                    if (_popperOpen) {
+                        return {ok: true, mode: 'opened', label, value, already_open: true};
+                    }
+                    // ── 关键修复：找到真正的可点击 wrapper（Element Plus 事件挂在 wrapper 而非 input） ──
+                    // readonlyCombo 找到的常是内层 <input class="el-select__inner">，但 Vue
+                    // 用 @mousedown.stop 委托到 .el-select__wrapper，内层派事件会被 stopPropagation 截胡。
+                    // 向上遍历找到真正监听事件的 wrapper 元素，标记 data 属性供 Python 端 Playwright 点击。
+                    let wrapper = explicitSelectRoot || readonlyCombo;
+                    const _WRAPPER_SELECTORS = [
+                        '.el-select__wrapper', '.el-select',
+                        '.ant-select-selector', '.ant-select',
+                        '.n-base-selection', '[role=combobox]',
+                    ];
+                    for (const sel of _WRAPPER_SELECTORS) {
+                        const child = wrapper?.querySelector?.(sel);
+                        if (child && isVisible(child)) { wrapper = child; break; }
+                    }
+                    let cur = wrapper;
+                    for (let i = 0; cur && i < 8; i++) {
+                        for (const sel of _WRAPPER_SELECTORS) {
+                            if (cur.matches?.(sel)) { wrapper = cur; break; }
+                        }
+                        if (wrapper !== (explicitSelectRoot || readonlyCombo)) break;
+                        cur = cur.parentElement;
+                    }
+                    // 给 wrapper 加唯一 data 标记，Python 端用 Playwright click 派完整事件链
+                    const _marker = '__vspider_form_target__';
+                    document.querySelectorAll(`[data-${_marker}]`).forEach(el =>
+                        el.removeAttribute(`data-${_marker}`)
+                    );
+                    wrapper.setAttribute(`data-${_marker}`, '1');
+                    const rr = wrapper.getBoundingClientRect();
+                    return {
+                        ok: true, mode: 'opened', label, value,
+                        click_selector: `[data-${_marker}="1"]`,
+                        click_point: {x: rr.left + rr.width * 0.5, y: rr.top + rr.height * 0.5},
+                    };
+                }
+                if (textInputs.length) {
+                    const input = textInputs[0];
+                    setNativeValue(input, value);
+                    return {ok: true, mode: 'fill', label, value};
+                }
+
+                const switches = Array.from(formItem.querySelectorAll(
+                    '.el-switch,[role=switch],input[type=checkbox],.el-checkbox,label'
+                )).filter(isVisible);
+                if (switches.length && /^(true|on|yes|1|开启|打开|选中|勾选)$/i.test(value || 'true')) {
+                    const checked = formItem.querySelector('.is-checked,[aria-checked=true],input:checked');
+                    if (!checked) clickEl(switches[0]);
+                    return {ok: true, mode: 'toggle', label, value};
+                }
+
+                if (valueNorm) {
+                    const optionNodes = Array.from(formItem.querySelectorAll('label,.el-radio,.el-checkbox,button,span,div'))
+                        .filter(el => isVisible(el) && norm(textOf(el)).includes(valueNorm));
+                    if (optionNodes.length) {
+                        const choiceHit = optionNodes[0];
+                        const choiceTarget = choiceHit.closest?.('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]') || choiceHit;
+                        clickEl(choiceTarget);
+                        await sleep(150);
+                        return {ok: true, mode: 'local_option', label, value};
+                    }
+                }
+
+                const clickable = Array.from(formItem.querySelectorAll(
+                    '.el-select,.el-input,.el-input__wrapper,[role=combobox],[role=button],button,input'
+                )).filter(isVisible);
+                if (clickable.length) {
+                    clickEl(clickable[0]);
+                    return {ok: true, mode: 'opened', label, value};
+                }
+                clickEl(labelEl);
+                return {ok: true, mode: 'label_click', label, value};
+            }""",
+            {"label": label, "value": value},
+        )
+        await asyncio.sleep(0.6)
+        if not result.get("ok"):
+            raise ActionExecutionError(
+                f"form_set 未找到字段 {label!r}: {result.get('reason')}"
+            )
+        if result.get("mode") in ("opened", "label_click") and value:
+            # JS 端只负责"找控件 + 标记 data 属性"，真正的点击交给 Playwright（CDP 派完整事件链，
+            # 穿透 Vue/React 的 mousedown.stop 委托）。这是修复 Element Plus 下拉打不开的关键。
+            _click_sel = result.get("click_selector")
+            if _click_sel and not result.get("already_open"):
+                try:
+                    _wrapper_loc = page.locator(_click_sel).first
+                    await _wrapper_loc.scroll_into_view_if_needed(timeout=2000)
+                    await _wrapper_loc.click(timeout=3000, force=True)
+                    logger.info(f"[FORM_SET] Playwright 点击 wrapper {_click_sel} 展开下拉")
+                except Exception as _open_err:
+                    _pt = result.get("click_point") or {}
+                    try:
+                        _x = float(_pt.get("x"))
+                        _y = float(_pt.get("y"))
+                        await page.mouse.move(_x, _y)
+                        await page.mouse.down()
+                        await page.mouse.up()
+                        logger.info("[FORM_SET] page.mouse click fallback at %.1f, %.1f", _x, _y)
+                    except Exception as _mouse_err:
+                        logger.warning("[FORM_SET] page.mouse click fallback failed: %s", _mouse_err)
+                    logger.warning(f"[FORM_SET] Playwright wrapper click 失败: {_open_err}")
+            # popper 动画 + teleport 渲染需要充分时间
+            # Element Plus transition 250ms + 内部 mount + 选项 list 渲染 ≈ 600-900ms
+            await asyncio.sleep(1.0)
+            _option_clicked = await _click_visible_text_option(page, value)
+            if not _option_clicked:
+                _pt = result.get("click_point") or {}
+                try:
+                    _x = float(_pt.get("x"))
+                    _y = float(_pt.get("y"))
+                    await page.mouse.click(_x, _y)
+                    await asyncio.sleep(0.8)
+                    _option_clicked = await _click_visible_text_option(page, value)
+                except Exception as _retry_open_err:
+                    logger.debug("[FORM_SET] point reopen retry failed: %s", _retry_open_err)
+            if not _option_clicked:
+                raise ActionExecutionError(
+                    f"form_set 已定位字段 {label!r}，但未能点击选项/值 {value!r}。"
+                    "可能原因：(a) 下拉浮层渲染慢于 2.5s 等待窗口；"
+                    "(b) 选项文字与 value 不完全匹配（含空格/隐藏字符）；"
+                    "(c) 该字段不是下拉而是输入框 — 改用 type 动作直接 fill。"
+                )
+        verified = await _verify_field_state(str(result.get("mode") or "dom_path"))
+        if not verified.get("ok"):
+            raise ActionExecutionError(
+                f"form_set 字段 {label!r} 已执行但回读校验失败："
+                f"expected={value!r}, observed={verified.get('observed')!r}, "
+                f"mode={result.get('mode')!r}, reason={verified.get('reason')}"
+            )
+        logger.info(
+            "[FORM_VERIFY] label=%r ok via %s observed=%r",
+            label,
+            verified.get("method"),
+            verified.get("observed"),
+        )
+        logger.info("[FORM_SET] completed label=%r mode=%s", label, result.get("mode"))
+        print(f"[FORM_SET] {label} = {value}")
+        ctx.browser.rpa_trail.append(
+            ctx.with_rpa_meta({
+                "action": "form_set",
+                "type_value": f"{label}={value}",
+                "verified": True,
+                "observed": verified.get("observed", ""),
+            })
+        )
+        return None
+
 
 @ActionRegistry.register("click")
 class ClickHandler(ActionHandler):
@@ -1379,6 +2119,155 @@ class NextPageHandler(ActionHandler):
             page, before, f"{label}/{click_mode}"
         )
 
+    async def _js_mark_pagination_candidate(self, page) -> dict:
+        """Mark a likely next-page element using in-page DOM heuristics.
+
+        This is intentionally an internal next_page layer, not a VLM-visible
+        action. It handles component-library pagers and numeric pagination
+        where accessible names are sparse or SoM IDs are noisy.
+        """
+        return await page.evaluate(
+            """() => {
+                const MARK = 'data-vspider-next-page-probe';
+                document.querySelectorAll(`[${MARK}]`).forEach(el => el.removeAttribute(MARK));
+
+                const viewportW = window.innerWidth || document.documentElement.clientWidth || 0;
+                const viewportH = window.innerHeight || document.documentElement.clientHeight || 0;
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const textOf = (el) => [
+                    el.innerText, el.textContent, el.getAttribute('aria-label'),
+                    el.getAttribute('title'), el.getAttribute('rel'), el.value
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) return false;
+                    if (r.bottom <= 0 || r.right <= 0 || r.top >= viewportH || r.left >= viewportW) return false;
+                    const s = window.getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0.01;
+                };
+                const disabled = (el) => Boolean(
+                    el.disabled ||
+                    el.getAttribute('disabled') !== null ||
+                    el.getAttribute('aria-disabled') === 'true' ||
+                    /\\b(disabled|is-disabled|dt-paging-button disabled|paginate_button disabled|ant-pagination-disabled|el-pagination__disabled)\\b/i.test(String(el.className || ''))
+                );
+                const clickable = (el) => {
+                    if (!el) return null;
+                    return el.closest('a,button,[role="button"],[role="link"],[tabindex],li,td,span,div') || el;
+                };
+                const area = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return Math.max(0, r.width) * Math.max(0, r.height);
+                };
+
+                let roots = Array.from(document.querySelectorAll([
+                    '.dt-paging', '.dataTables_paginate', '.dataTables_wrapper .pagination',
+                    '.paginate_button', '[data-dt-idx]',
+                    '.el-pagination', '.ant-pagination', '.n-pagination', '.v-pagination',
+                    '.pagination', '.pager', '[class*="pagination"]', '[class*="pager"]',
+                    'nav[aria-label*="pagination" i]', 'nav[aria-label*="page" i]',
+                    '[role="navigation"]'
+                ].join(','))).filter(isVisible);
+                if (!roots.length) roots = [document.body];
+
+                const nextWords = [
+                    'next', 'next page', 'older', 'more',
+                    '\u4e0b\u4e00\u9875', '\u4e0b\u4e00\u9801',
+                    '\u4e0b\u9875', '\u4e0b\u9801',
+                    '\u540e\u4e00\u9875', '\u5f8c\u4e00\u9801',
+                    '\u203a', '\u00bb', '>', '\u2192',
+                    '\u52a0\u8f7d\u66f4\u591a', '\u67e5\u770b\u66f4\u591a'
+                ]; /*
+                    'next', 'next page', 'older', 'more',
+                    '下一页', '下一頁', '下页', '下頁', '后一页', '後一頁',
+                    '›', '»', '>', '→', '加载更多', '查看更多'
+                ];
+
+                */
+                const exactNumber = (el) => {
+                    const t = textOf(el).trim();
+                    return /^\\d{1,5}$/.test(t) ? Number(t) : null;
+                };
+
+                const scoreRoot = (root) => {
+                    if (root === document.body) return 0;
+                    const txt = norm([root.className, root.id, root.getAttribute('aria-label'), root.getAttribute('role')].join(' '));
+                    let score = 10;
+                    if (/pagination|pager|page|paging|paginate/.test(txt)) score += 30;
+                    if (/dt-paging|datatables|paginate_button|el-pagination|ant-pagination|n-pagination|v-pagination/.test(txt)) score += 30;
+                    return score;
+                };
+
+                const rootData = roots.map(root => {
+                    const nodes = Array.from(root.querySelectorAll('a,button,li,span,div,td,[role="button"],[role="link"],[role="option"]'))
+                        .filter(isVisible);
+                    const activeNodes = nodes.filter(el => {
+                        const cls = String(el.className || '');
+                        return el.getAttribute('aria-current') === 'page' ||
+                               el.getAttribute('aria-selected') === 'true' ||
+                               /\\b(active|current|selected|is-active|is-current)\\b/i.test(cls);
+                    });
+                    const activeNum = activeNodes.map(exactNumber).find(n => Number.isInteger(n) && n >= 0) || null;
+                    return {root, nodes, activeNum, score: scoreRoot(root)};
+                }).sort((a, b) => b.score - a.score || area(b.root) - area(a.root));
+
+                const candidates = [];
+                for (const data of rootData) {
+                    for (const el of data.nodes) {
+                        if (disabled(el)) continue;
+                        const label = norm(textOf(el));
+                        const cls = norm([el.className, el.id].join(' '));
+                        if (nextWords.some(w => label.includes(norm(w))) || /\\b(next|pager-next|pagination-next|paginate_button next|dt-paging-button next)\\b/.test(cls)) {
+                            const target = clickable(el);
+                            if (target && isVisible(target) && !disabled(target)) {
+                                candidates.push({el: target, strategy: 'js_next_text', score: data.score + 80, label: textOf(el)});
+                            }
+                        }
+                    }
+                    if (data.activeNum !== null) {
+                        const wanted = String(data.activeNum + 1);
+                        for (const el of data.nodes) {
+                            if (disabled(el)) continue;
+                            if (textOf(el).trim() !== wanted) continue;
+                            const target = clickable(el);
+                            if (target && isVisible(target) && !disabled(target)) {
+                                candidates.push({el: target, strategy: `js_numeric_${data.activeNum}_to_${wanted}`, score: data.score + 70, label: wanted});
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: visible exact "2"/"3" style page number near other numbers.
+                if (!candidates.length) {
+                    const all = Array.from(document.querySelectorAll('a,button,li,span,td,[role="button"],[role="link"]')).filter(isVisible);
+                    const nums = all
+                        .map(el => ({el, n: exactNumber(el)}))
+                        .filter(x => Number.isInteger(x.n) && x.n >= 1 && x.n <= 999);
+                    const current = nums.find(x => {
+                        const cls = String(x.el.className || '');
+                        return x.el.getAttribute('aria-current') === 'page' || /\\b(active|current|selected|is-active)\\b/i.test(cls);
+                    });
+                    if (current) {
+                        const wanted = nums.find(x => x.n === current.n + 1);
+                        if (wanted && !disabled(wanted.el)) {
+                            const target = clickable(wanted.el);
+                            if (target && isVisible(target)) {
+                                candidates.push({el: target, strategy: `js_global_numeric_${current.n}_to_${wanted.n}`, score: 40, label: String(wanted.n)});
+                            }
+                        }
+                    }
+                }
+
+                candidates.sort((a, b) => b.score - a.score);
+                const best = candidates[0];
+                if (!best) return {found: false, reason: 'no-js-pagination-candidate'};
+                best.el.setAttribute(MARK, '1');
+                best.el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+                return {found: true, strategy: best.strategy, label: best.label, score: best.score};
+            }"""
+        )
+
     async def _try_url_mutation(self, page) -> str:
         """Level 0：URL 变异翻页。返回变异后的新 URL（已 goto 完毕）；失败返回 ""。
 
@@ -1641,6 +2530,26 @@ class NextPageHandler(ActionHandler):
         # 关键避坑：scrollY 增量 ≠ 内容增加。HN Algolia 这类**伪无限滚动**站
         # （实为分页器但无标准 Next 控件）滚动只移动视口不加载新条目，
         # 必须同时校验 body innerText 长度 / 列表项数量真实增长，才能判定"翻页成功"。
+        # Strategy 3.5: JS pagination probe for component-library/numeric pagers.
+        if not clicked:
+            try:
+                probe = await self._js_mark_pagination_candidate(page)
+                if probe.get("found"):
+                    loc = page.locator('[data-vspider-next-page-probe="1"]').first
+                    used_strategy = (
+                        f"js_probe {probe.get('strategy')} "
+                        f"label={probe.get('label')!r}"
+                    )
+                    if await self._click_if_effective(page, loc, used_strategy):
+                        clicked = True
+                else:
+                    logger.debug(
+                        "[NEXT_PAGE L3.5] no JS pagination candidate: %s",
+                        probe.get("reason"),
+                    )
+            except Exception as probe_err:
+                logger.debug("[NEXT_PAGE L3.5] JS pagination probe failed: %s", probe_err)
+
         if not clicked:
             try:
                 _state_js = (
@@ -1667,7 +2576,33 @@ class NextPageHandler(ActionHandler):
 
                 # 滚轮没动 = 真到页面底部
                 if _delta_y < 50:
-                    raise ActionExecutionError(
+                    _local = await _scroll_largest_container(page, "down", smooth=True)
+                    await asyncio.sleep(1.0)
+                    _after_local = await page.evaluate(_state_js) or {}
+                    _delta_text_local = (
+                        int(_after_local.get("textLen", 0))
+                        - int(_before.get("textLen", 0))
+                    )
+                    _delta_items_local = (
+                        int(_after_local.get("itemCount", 0))
+                        - int(_before.get("itemCount", 0))
+                    )
+                    if (
+                        _local.get("moved")
+                        and (_delta_text_local >= 200 or _delta_items_local > 0)
+                    ):
+                        used_strategy = (
+                            f"local_infinite_scroll target={_local.get('target')} "
+                            f"delta_text={_delta_text_local} "
+                            f"delta_items={_delta_items_local}"
+                        )
+                        clicked = True
+                        _delta_y = max(_delta_y, 50)
+                        _delta_text = max(_delta_text, _delta_text_local)
+                        _delta_items = max(_delta_items, _delta_items_local)
+                        logger.info("[NEXT_PAGE L4] local scroll succeeded: %s", used_strategy)
+                    if not clicked:
+                        raise ActionExecutionError(
                         "next_page: 启发式翻页全失败 + 已滚到页面底部（scrollY 不再增长），"
                         "可能已是最后一页。请评估累计提取量，若已达目标输出 done。"
                     )

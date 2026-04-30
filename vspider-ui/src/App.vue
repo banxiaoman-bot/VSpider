@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 import {
@@ -33,6 +33,8 @@ const modelTemperature = ref(0.1)
 const modelMaxTokens = ref(4096)
 const modelBaseUrl = ref('')
 const modelApiKey = ref('')
+const semanticBaseUrl = ref('')
+const semanticApiKey = ref('')
 const isHumanInterventionRequired = ref(false)
 const humanInterventionReason = ref('')
 const activeBottomTab = ref('terminal')
@@ -43,11 +45,50 @@ let socket = null
 let reconnectTimer = null
 let isUnmounted = false
 
+const MODEL_SETTINGS_STORAGE_KEY = 'vspider:model-settings:v1'
+
+const loadModelSettings = () => {
+  try {
+    const raw = window.localStorage.getItem(MODEL_SETTINGS_STORAGE_KEY)
+    if (!raw) return
+    const data = JSON.parse(raw)
+    if (typeof data.selectedModel === 'string') selectedModel.value = data.selectedModel
+    if (typeof data.selectedSemanticModel === 'string') selectedSemanticModel.value = data.selectedSemanticModel
+    if (typeof data.modelBaseUrl === 'string') modelBaseUrl.value = data.modelBaseUrl
+    if (typeof data.semanticBaseUrl === 'string') semanticBaseUrl.value = data.semanticBaseUrl
+    if (typeof data.modelTemperature === 'number') modelTemperature.value = data.modelTemperature
+    if (typeof data.modelMaxTokens === 'number') modelMaxTokens.value = data.modelMaxTokens
+  } catch (err) {
+    console.warn('[settings] failed to load model settings', err)
+  }
+}
+
+const saveModelSettings = () => {
+  try {
+    window.localStorage.setItem(MODEL_SETTINGS_STORAGE_KEY, JSON.stringify({
+      selectedModel: selectedModel.value,
+      selectedSemanticModel: selectedSemanticModel.value,
+      modelBaseUrl: modelBaseUrl.value,
+      semanticBaseUrl: semanticBaseUrl.value,
+      modelTemperature: modelTemperature.value,
+      modelMaxTokens: modelMaxTokens.value,
+    }))
+  } catch (err) {
+    console.warn('[settings] failed to save model settings', err)
+  }
+}
+
+watch(
+  [selectedModel, selectedSemanticModel, modelBaseUrl, semanticBaseUrl, modelTemperature, modelMaxTokens],
+  saveModelSettings,
+)
+
 const authProfileNames = computed(() =>
   authProfileOptions.value.map((item) => item.name).filter(Boolean),
 )
 const selectedModelType = computed(() =>
-  ['deepseek-chat'].includes(selectedModel.value) ? 'text' : 'vl',
+  ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro']
+    .includes(selectedModel.value) ? 'text' : 'vl',
 )
 
 const appendLog = async (message) => {
@@ -315,6 +356,12 @@ const submitTask = async () => {
   if (modelApiKey.value.trim()) {
     formData.append('vlm_api_key', modelApiKey.value.trim())
   }
+  if (semanticBaseUrl.value.trim()) {
+    formData.append('semantic_base_url', semanticBaseUrl.value.trim())
+  }
+  if (semanticApiKey.value.trim()) {
+    formData.append('semantic_api_key', semanticApiKey.value.trim())
+  }
   if (selectedAuthProfiles.value.length) {
     formData.append('auth_profiles', selectedAuthProfiles.value.join(','))
   }
@@ -362,6 +409,7 @@ const forceStop = async () => {
 
 onMounted(() => {
   document.documentElement.classList.add('dark')
+  loadModelSettings()
   connectWebSocket()
   loadAuthProfiles()
   fetchArtifacts()
@@ -463,6 +511,21 @@ onUnmounted(() => {
                   :disabled="isRunning"
                   placeholder="empty = backend default"
                 />
+                <label>Semantic Base URL Override</label>
+                <el-input
+                  v-model="semanticBaseUrl"
+                  clearable
+                  :disabled="isRunning"
+                  placeholder="https://api.deepseek.com"
+                />
+                <label>Semantic API Key Override</label>
+                <el-input
+                  v-model="semanticApiKey"
+                  clearable
+                  show-password
+                  :disabled="isRunning"
+                  placeholder="empty = backend/default VLM key"
+                />
               </div>
             </el-popover>
           </div>
@@ -470,8 +533,11 @@ onUnmounted(() => {
           <el-select
             v-model="selectedModel"
             :disabled="isRunning"
+            filterable
+            allow-create
+            default-first-option
             class="full-width"
-            placeholder="选择调度模型"
+            placeholder="选择或输入 Model ID"
           >
             <el-option-group label="视觉多模态大模型 (VL)">
               <el-option value="backend-default" label="Backend Default" />
@@ -480,17 +546,26 @@ onUnmounted(() => {
             </el-option-group>
             <el-option-group label="纯文本逻辑模型 (Text)">
               <el-option value="deepseek-chat" label="DeepSeek-V3" />
+              <el-option value="deepseek-reasoner" label="DeepSeek-R1" />
+              <el-option value="deepseek-v4-flash" label="DeepSeek-V4-Flash" />
+              <el-option value="deepseek-v4-pro" label="DeepSeek-V4-Pro" />
             </el-option-group>
           </el-select>
 
           <el-select
             v-model="selectedSemanticModel"
             :disabled="isRunning"
+            filterable
+            allow-create
+            default-first-option
             class="full-width"
-            placeholder="Semantic model for Planner / Extract / Reflector"
+            placeholder="选择或输入 Model ID"
           >
             <el-option value="backend-default" label="Semantic Backend Default" />
             <el-option value="deepseek-chat" label="DeepSeek-V3" />
+            <el-option value="deepseek-reasoner" label="DeepSeek-R1" />
+            <el-option value="deepseek-v4-flash" label="DeepSeek-V4-Flash" />
+            <el-option value="deepseek-v4-pro" label="DeepSeek-V4-Pro" />
             <el-option value="qwen3-vl-plus" label="Qwen-VL-Plus" />
             <el-option value="local-74b-vl" label="Local 74B VL" />
           </el-select>
@@ -804,6 +879,7 @@ onUnmounted(() => {
 
 .control-panel {
   display: flex;
+  height: 100%;
   min-height: 0;
   overflow: hidden;
   flex-direction: column;
@@ -852,7 +928,7 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 18px 22px;
+  padding: 18px 22px 20px;
 }
 
 .field-group {
@@ -940,6 +1016,9 @@ onUnmounted(() => {
 }
 
 .action-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;

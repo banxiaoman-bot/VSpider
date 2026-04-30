@@ -1,33 +1,41 @@
 .env
 __pycache__/
 *.py[cod]
+
+# Browser/auth local state
 browser_data/
 .auth/
 downloads/
 screenshots/
 
-# 日志文件
+# Logs
 *.log
 run.*.log
 logs/
 visual_web_agent/logs/
 
-# 输出文件
+# Output files
 *.xlsx
 output_*.xlsx
 
-# 运行时缓存
+# Runtime cache
+rpa_cache/
 visual_web_agent/rpa_cache/
 visual_web_agent/browser_data*/
 visual_web_agent/downloads/
 temp_uploads/
 
+# Pytest/transient directories
+.pytest_cache/
+pytest-cache-files-*/
+tmp*/
+
 # IDE / tooling
 .claude/
 .qoder/
 
-# 临时 / 散落产物
+# Temporary generated artifacts
 auto_extract_fallback_*
 
-# 测试文件
+# Local test pages
 test_page.html

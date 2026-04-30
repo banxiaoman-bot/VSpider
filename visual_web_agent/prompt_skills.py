@@ -50,7 +50,7 @@ JSON 输出格式必须严格为：
       "progress_review": "先复盘全局历史和当前子目标进度；若任务已完成，明确写任务已完成",
       "thought": "结合当前截图和 AX Tree 的推理过程",
       "current_state": "客观描述当前页面状态",
-      "action": "click | click_text | click_new_tab | type | hover | hover_and_click | scroll | smooth_scroll | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | ask_human | click_point | remove_element | drag_and_drop | next_page",
+      "action": "click | click_text | click_new_tab | type | hover | hover_and_click | scroll | smooth_scroll | find_text | form_set | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | ask_human | click_point | remove_element | drag_and_drop | next_page",
       "target_id": 0,
       "type_value": "",
       "memory_key": "",
@@ -67,7 +67,7 @@ JSON 输出格式必须严格为：
 - click/type/hover/hover_and_click/select/upload/extract_link/download_image/remove_element/click_new_tab/drag_and_drop
   必须使用真实 target_id。
 - hover_and_click 还必须在 type_value 填写要点击的菜单项可见文字。
-- scroll/smooth_scroll/wait/done/press_key/goto/close_tab/extract/next_page 可用 target_id=0。
+- scroll/smooth_scroll/find_text/form_set/wait/done/press_key/goto/close_tab/extract/next_page 可用 target_id=0。
 - click_point 仅在没有可用 SoM/AX ID 且目标位置非常明确时使用，point 为 0-1000 归一化坐标。
 - extract 的 extracted_data 绝对不能为 null，必须放入当前页面真实结构化数据。
 - 当前子目标满足退出标准时，把 subgoal_status 设为 completed；最后一个子目标完成时 action=done。
@@ -81,6 +81,10 @@ ACTION_REFERENCE_PROMPT = """
 - type：向 textbox/searchbox/combobox 输入文本；type_value 可包含 {{memory_key}} 或 {{env:VAR}}。
 - press_key：按键，如 Enter、Escape、Tab。
 - scroll/smooth_scroll：滚动页面，type_value 填 down/up/bottom/top。
+- find_text：滚动定位指定文字/字段标签，target_id=0，type_value 填要找的文本。用于长表单/长文档中精准回到某个字段或按钮，优先于盲目反复 scroll。
+- form_set：按字段标签设置表单控件，target_id=0，type_value 填 `字段标签=目标值`。
+  适合 Element Plus / Ant Design / Naive UI 等组件库表单，底层会按 label 找输入框、下拉、开关、复选框、单选框并执行。
+  示例：`Activity name=VSpider 测试`、`Activity zone=Zone one`、`Instant delivery=开启`、`Resources=Sponsor`。
 - wait：显式等待 1-5 秒，仅用于加载中、动画中、请求中。
 - goto：跳转到 URL，type_value 填 URL。
 - extract：提取当前可见页面数据，extracted_data 填结构化数据。
@@ -240,19 +244,26 @@ FORM_SKILL = """
 ## Skill: Forms / Search / Filters
 适用：表单、填写、输入、提交、筛选、过滤、查询、搜索、日期、下拉、树形选择、上传。
 
-🚨【表单视口锁定纪律 — 极度重要，违反必死】
-SoM 红框 ID（@eN）是**基于视口实时重新分配**的。当表单只有半截露在屏幕里就动手填，
-会导致下一帧截图时 ID 全部洗牌（@e26 这一帧是 Activity name，下一帧可能是 Activity form）→
-你的短期记忆和当前红框完全错位 → 同一字段被覆写成不同内容 → 任务彻底崩盘。
+🧭【表单工作区纪律 — 极度重要】
+SoM 红框 ID（@eN）是**基于当前视口实时重新分配**的，所以表单任务必须锚定字段标签，
+而不是依赖上一帧的旧 ID。正确姿势是：定位目标表单 -> 逐字段填写 -> 只在下一个目标不可见时滚动。
 
-**填写任何表单字段前必须先做的事**：
-1. **完整滚动**：通过 scroll/smooth_scroll 把**整个表单区域**置入屏幕视口。
-   判定标准：截图里能同时看到表单**第一个字段标签**到**Submit/Create 按钮**。
-2. **稳定 ID**：滚到位之后，**等下一帧截图**确认所有字段红框都在，才开始 type/click。
-3. **绝对禁止**：在表单只露一半时执行 type/click —— 即使 @eN 看起来正确也禁止。
-   正确做法是 scroll 直到完整可见，再操作。
-4. 表单太长一屏装不下时：先填上半部分（确认全部上半字段可见再填），再 scroll 到下半，
-   等下半字段稳定可见再继续。一次只动当前完全可见的字段。
+**填写表单时必须遵守**：
+1. 表单控件优先使用 `form_set`，不要猜红框 ID。只要知道字段标签和值，就输出
+   `{"action":"form_set","target_id":0,"type_value":"字段标签=目标值"}`。
+   例如 Activity name=VSpider 测试、Activity zone=Zone one、Instant delivery=开启。
+2. 一旦看到目标表单标题或任一目标字段（如 Activity name / Activity zone），立即开始填写当前可见字段；
+   不要为了同时看到 Submit/Create 按钮而继续向下滚动。
+3. 长表单允许分段操作：先填当前视口内可见且属于该表单的字段；下一个目标字段不可见时，
+   再 scroll/smooth_scroll 到它附近，等新截图稳定后继续。
+4. 若明确知道要找的字段/按钮文字（如 Activity type、Resources、Create），优先用
+   `find_text` 定位该文字，再观察新截图操作；不要上下盲滚猜位置。
+5. 禁止把字段标签当成输入值。例如不能把 `Activity zone` 输入到 Activity name 输入框；
+   选择 Activity zone 时应使用 `form_set`：`Activity zone=Zone one`。
+6. 禁止在填任何字段前连续向下滚动寻找“完整表单”。如果已经看到目标字段，先操作它。
+7. 如果滚到 Source / Contributors / Footer / 下一组件示例，说明已经越过目标表单；
+   立即 scroll up/top 或回到目标表单锚点，不要继续向下滚动。
+8. 严格按字段标签就近操作，避免左侧导航、代码示例、其它示例表单或页面页脚。
 
 规则：
 1. 先读当前表单标签、placeholder、已选值和校验提示，再写入。

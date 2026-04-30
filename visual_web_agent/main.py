@@ -15,6 +15,7 @@ VSpider 主程序入口
 
 import asyncio
 import argparse
+import calendar
 from difflib import SequenceMatcher
 from functools import lru_cache
 import hashlib
@@ -25,6 +26,7 @@ import re
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from urllib.parse import urlparse, urlsplit, urlunsplit
 from dotenv import load_dotenv
@@ -38,7 +40,7 @@ for _dotenv_path in (_PROJECT_ROOT / ".env", _APP_ROOT / ".env"):
 try:
     from .config import MAX_STEPS, SCREENSHOT_DIR
     from .browser_env import BrowserEnv, ActionExecutionError
-    from .vlm_client import VLMClient, TaskPlan
+    from .vlm_client import VLMClient, TaskPlan, SubGoal
     from .data_manager import save_to_excel
     from .data_sanitizer import (
         TOOLTIP_UNIQUE_KEY,
@@ -51,7 +53,7 @@ try:
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR
     from browser_env import BrowserEnv, ActionExecutionError
-    from vlm_client import VLMClient, TaskPlan
+    from vlm_client import VLMClient, TaskPlan, SubGoal
     from data_manager import save_to_excel
     from data_sanitizer import (
         TOOLTIP_UNIQUE_KEY,
@@ -250,13 +252,600 @@ def _goal_is_tooltip_extract(goal: str) -> bool:
     )
 
 
+def _goal_is_form_fill(goal: str) -> bool:
+    """Whether the goal is an interactive form-filling task."""
+    text = str(goal or "").lower()
+    if _goal_is_tooltip_extract(text):
+        return False
+    form_markers = (
+        "表单", "填报", "填写", "输入框", "下拉框", "复选框", "单选框",
+        "开关", "文本域", "提交", "form", "activity name", "activity zone",
+        "basic form", "create",
+    )
+    return any(marker in text for marker in form_markers)
+
+
+def _text_is_form_visibility_trap(text: str) -> bool:
+    """Planner/decision wording that causes blind scrolling before form work."""
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    has_form = any(
+        marker in lowered
+        for marker in ("表单", "form", "字段", "field", "activity")
+    )
+    has_visibility_trap = any(
+        marker in lowered
+        for marker in (
+            "完整表单", "整个表单", "全部字段可见", "完整可见", "完全可见",
+            "滚动至", "滚动到", "确认可见", "暴露完整", "complete form",
+            "entire form", "all fields visible",
+        )
+    )
+    return has_form and has_visibility_trap
+
+
+def _normalize_form_task_plan(plan: "TaskPlan | None", goal: str) -> "TaskPlan | None":
+    """Collapse poisonous form-visibility plans into one actionable form goal."""
+    if plan is None or not _goal_is_form_fill(goal):
+        return plan
+
+    plan_text = "\n".join(
+        f"{getattr(sg, 'description', '')}\n{getattr(sg, 'exit_criteria', '')}"
+        for sg in getattr(plan, "sub_goals", []) or []
+    )
+    if not _text_is_form_visibility_trap(plan_text):
+        return plan
+
+    plan.sub_goals = [
+        SubGoal(
+            id=1,
+            description=(
+                "按用户要求在目标表单内逐字段填写/选择所有项目，"
+                "字段不可见时用 find_text 或小幅滚动定位，最后点击 Create/Submit"
+            ),
+            exit_criteria=(
+                "用户指定的字段值/选项均已在页面中呈现，且最终 Create/Submit 按钮已点击；"
+                "不得把“完整表单同屏可见”作为完成条件"
+            ),
+            status="active",
+        )
+    ]
+    plan.current_idx = 0
+    return plan
+
+
+def _parse_form_assignments(goal: str) -> dict[str, str]:
+    """Best-effort extraction of label -> desired value from Chinese/English form goals."""
+    text = str(goal or "")
+    assignments: dict[str, str] = {}
+    quote = r"[\"“”'‘’]"
+    chunks = re.split(r"[\r\n]+|(?=\s*\d+\s*[.、)]\s*)", text)
+    for raw_line in chunks:
+        line = raw_line.strip()
+        if not line:
+            continue
+        clean = re.sub(r"^\s*\d+\s*[.、)]\s*", "", line)
+        if re.search(r"(找到网页|完整表单区域|完成以下|以下填报|业务指令|任务要求)", clean) and not re.match(r"^[A-Za-z]", clean):
+            continue
+        label_match = re.match(r"([^：:，,]+?)\s*(?:输入框|下拉框|区域|开关|复选框|单选框|文本域|textarea|input|select|checkbox|radio|switch)?\s*[：:]", clean, re.I)
+        label = label_match.group(1).strip() if label_match else ""
+        if not label:
+            label = clean.split("：", 1)[0].split(":", 1)[0].strip()
+            label = re.sub(r"(输入框|下拉框|区域|开关|复选框|单选框|文本域).*", "", label).strip()
+        ascii_label = re.match(
+            r"^([A-Za-z][A-Za-z0-9_/-]*(?:\s+[A-Za-z][A-Za-z0-9_/-]*){0,3})\b",
+            clean,
+        )
+        if ascii_label and (
+            not label
+            or len(label) > 60
+            or re.search(r"[\"“”]", label)
+            or label.lower().startswith(ascii_label.group(1).lower())
+        ):
+            label = ascii_label.group(1).strip()
+        if re.search(r"^(确认|点击)", label, re.I) or (
+            re.search(r"(按钮|button|submit|create)", clean, re.I)
+            and re.search(r"(确认|点击|最下方|提交|保存)", clean, re.I)
+        ):
+            continue
+        if len(label) > 80:
+            continue
+        value = ""
+        m = re.search(rf"(?:填入|输入|填写|选择|选定|勾选|选中|设为|设置为)\s*{quote}([^\"“”'‘’]+){quote}", clean)
+        if m:
+            value = m.group(1).strip()
+        if not value:
+            m = re.search(rf"{quote}([^\"“”'‘’]+){quote}", clean)
+            if m:
+                value = m.group(1).strip()
+        if not value and re.search(r"开启|打开|切换为开启", clean):
+            value = "开启"
+        if not value and re.search(r"(delivery|switch|toggle|开关)", label, re.I):
+            value = "开启"
+        if value and value.strip().lower() in {"create", "submit", "save", "保存", "提交"} and not re.match(r"^[A-Za-z]", label):
+            continue
+        if value and value.strip().lower() == "basic form" and not re.match(r"^basic form$", label.strip(), re.I):
+            continue
+        if label and value:
+            assignments[label] = value
+    return assignments
+
+
+def _lookup_form_assignment(assignments: dict[str, str], label: str) -> tuple[str, str] | None:
+    needle = re.sub(r"\s+", " ", str(label or "").strip()).lower()
+    if not needle:
+        return None
+    for key, value in assignments.items():
+        key_norm = re.sub(r"\s+", " ", key.strip()).lower()
+        if needle == key_norm or needle in key_norm or key_norm in needle:
+            return key, value
+    return None
+
+
+def _lookup_form_assignment_by_value(
+    assignments: dict[str, str], value: str
+) -> tuple[str, str] | None:
+    needle = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    if not needle:
+        return None
+    for key, candidate in assignments.items():
+        candidate_norm = re.sub(r"\s+", " ", str(candidate).strip()).lower()
+        if needle == candidate_norm:
+            return key, candidate
+    return None
+
+
+def _assignment_is_non_text_control(label: str) -> bool:
+    text = str(label or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "zone", "type", "resources", "delivery", "date", "time",
+            "下拉", "选择", "复选", "单选", "开关", "日期", "时间",
+        )
+    )
+
+
+def _parse_goal_scope_title(goal: str) -> str:
+    text = str(goal or "")
+    patterns = (
+        r"[\"“”'‘’]([^\"“”'‘’]{1,80})[\"“”'‘’]\s*(?:标题|区域|表单|表格)?\s*(?:下方|下面|内部|内|中)",
+        r"(?:标题|区域|表单|表格)\s*[\"“”'‘’]([^\"“”'‘’]{1,80})[\"“”'‘’]",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _next_month_day(day: int) -> str:
+    today = date.today()
+    year = today.year + (1 if today.month == 12 else 0)
+    month = 1 if today.month == 12 else today.month + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return f"{year:04d}-{month:02d}-{min(day, last_day):02d}"
+
+
+def _prepare_form_batch_fields(goal: str) -> dict[str, str]:
+    fields = _parse_form_assignments(goal)
+    text = str(goal or "")
+    if re.search(r"Activity\s*time|活动时间|时间区域", text, re.I):
+        m = re.search(r"下个月\s*的?\s*(\d{1,2})\s*号", text)
+        day = int(m.group(1)) if m else 0
+        if not day:
+            chunks = re.split(r"[\r\n]+|(?=\s*\d+\s*[.、)]\s*)", text)
+            time_chunk = next((c for c in chunks if re.search(r"Activity\s*time|活动时间|时间区域", c, re.I)), "")
+            nums = re.findall(r"\b([1-2]?\d|3[01])\b", time_chunk)
+            day = int(nums[-1]) if nums else 0
+        if day:
+            if 1 <= day <= 31:
+                fields["Activity time"] = _next_month_day(day)
+    return fields
+
+
+async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
+    """Deterministic label/scoped form executor, used before handing control to VLM."""
+    if not _goal_is_form_fill(goal):
+        return False
+    fields = _prepare_form_batch_fields(goal)
+    if len(fields) < 2:
+        return False
+    scope_title = _parse_goal_scope_title(goal)
+    page = await browser._ensure_active_page(reason="before auto form fill")
+    if not page:
+        return False
+    require_submit = bool(
+        re.search(
+            r"(create|submit|提交|保存|确定|点击.+按钮|按钮)",
+            str(goal or ""),
+            re.IGNORECASE,
+        )
+    )
+    logger.info("[AUTO FORM] Trying deterministic form fill. scope=%r fields=%s", scope_title, list(fields))
+    try:
+        result = await page.evaluate(
+            """async ({scopeTitle, fields, requireSubmit}) => {
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el.innerText, el.textContent, el.getAttribute('aria-label'),
+                    el.getAttribute('placeholder'), el.getAttribute('title'),
+                    el.getAttribute('value'), el.name, el.id
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                const setNativeValue = (el, val) => {
+                    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, val); else el.value = val;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                };
+                const clickEl = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                    if (typeof el.click === 'function') el.click();
+                    else el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, composed: true, view: window}));
+                };
+                const allVisible = (selector, root = document) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
+                const labels = Object.keys(fields || {});
+
+                const findScope = () => {
+                    const candidateRoots = allVisible('form,.el-form,.ant-form,.n-form,section,article,main,[role=main],div');
+                    const scored = [];
+                    for (const root of candidateRoots) {
+                        const r = root.getBoundingClientRect();
+                        if (r.left < 180 || r.width < 250 || r.height < 80) continue;
+                        const txt = norm(textOf(root));
+                        let score = 0;
+                        if (scopeTitle && txt.includes(norm(scopeTitle))) score += 100;
+                        for (const label of labels) if (txt.includes(norm(label))) score += 20;
+                        if (root.matches('form,.el-form,.ant-form,.n-form')) score += 60;
+                        if (score > 0) scored.push({root, score, area: r.width * r.height});
+                    }
+                    scored.sort((a, b) => b.score - a.score || a.area - b.area);
+                    if (scored[0]) return scored[0].root;
+                    return document.body;
+                };
+
+                const scope = findScope();
+                const findFieldContainer = (label) => {
+                    const ln = norm(label);
+                    const nodes = allVisible('label,.el-form-item__label,.ant-form-item-label,.n-form-item-label,span,div', scope);
+                    const matches = [];
+                    for (const el of nodes) {
+                        const t = norm(textOf(el));
+                        if (!t || (t !== ln && !t.includes(ln))) continue;
+                        const r = el.getBoundingClientRect();
+                        let score = t === ln ? 80 : 20;
+                        if (el.matches('label,.el-form-item__label,.ant-form-item-label,.n-form-item-label')) score += 60;
+                        if (r.left > 180) score += 20;
+                        matches.push({el, score});
+                    }
+                    matches.sort((a, b) => b.score - a.score);
+                    const labelEl = matches[0]?.el;
+                    if (!labelEl) return null;
+                    let cur = labelEl;
+                    for (let i = 0; cur && i < 8; i++) {
+                        if (cur !== labelEl && (
+                            cur.classList?.contains('el-form-item') ||
+                            cur.classList?.contains('ant-form-item') ||
+                            cur.classList?.contains('n-form-item') ||
+                            cur.tagName?.toLowerCase() === 'form'
+                        )) return cur;
+                        cur = cur.parentElement;
+                    }
+                    cur = labelEl.parentElement;
+                    for (let i = 0; cur && i < 5; i++) {
+                        if (cur.querySelector?.('input,textarea,select,[role=combobox],[role=checkbox],[role=radio],button,.el-select,.ant-select,.n-select')) return cur;
+                        cur = cur.parentElement;
+                    }
+                    return labelEl.parentElement;
+                };
+
+                const clickOption = async (value) => {
+                    const vn = norm(value);
+                    for (let i = 0; i < 12; i++) {
+                        const opts = allVisible([
+                            '.el-select-dropdown__item','.el-radio','.el-checkbox',
+                            '.ant-select-item-option','[role=option]','label','li','span','button'
+                        ].join(','));
+                        const hit = opts.find(el => norm(textOf(el)) === vn) || opts.find(el => norm(textOf(el)).includes(vn));
+                        if (hit) {
+                            clickEl(hit);
+                            await sleep(250);
+                            return true;
+                        }
+                        await sleep(150);
+                    }
+                    return false;
+                };
+                const clickDateValue = async (value, opener) => {
+                    const m = String(value || '').match(/^(\\d{4})-(\\d{2})-(\\d{2})/);
+                    if (!m) return false;
+                    const targetYear = Number(m[1]);
+                    const targetMonth = Number(m[2]);
+                    const targetDay = Number(m[3]);
+                    if (!targetYear || !targetMonth || !targetDay) return false;
+
+                    clickEl(opener);
+                    await sleep(300);
+
+                    const visiblePanelMonth = () => {
+                        const panels = allVisible('.el-picker-panel,.ant-picker-dropdown,.n-date-panel,.mx-datepicker-main,.datepicker,[role=dialog],.el-popper');
+                        const root = panels[panels.length - 1] || document;
+                        const txt = textOf(root);
+                        const monthNames = {
+                            january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+                            july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+                            jan: 1, feb: 2, mar: 3, apr: 4, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9,
+                            oct: 10, nov: 11, dec: 12
+                        };
+                        let m = txt.match(/(20\\d{2})\\s*[年\\-/\\. ]\\s*(1[0-2]|0?[1-9])\\s*(?:月)?/);
+                        if (m) return {year: Number(m[1]), month: Number(m[2])};
+                        m = txt.match(/(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\\s+(20\\d{2})/i);
+                        if (m) return {year: Number(m[2]), month: monthNames[m[1].toLowerCase()]};
+                        m = txt.match(/(20\\d{2})\\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)/i);
+                        if (m) return {year: Number(m[1]), month: monthNames[m[2].toLowerCase()]};
+                        const currentVal = String(opener?.value || '');
+                        m = currentVal.match(/^(\\d{4})-(\\d{2})-/);
+                        if (m) return {year: Number(m[1]), month: Number(m[2])};
+                        const now = new Date();
+                        return {year: now.getFullYear(), month: now.getMonth() + 1};
+                    };
+                    const panelMonth = visiblePanelMonth();
+                    const monthDelta = (targetYear - panelMonth.year) * 12 + (targetMonth - panelMonth.month);
+                    const nextSelectors = [
+                        '.el-picker-panel__icon-btn.arrow-right',
+                        '.ant-picker-header-next-btn',
+                        '.n-date-panel-actions + * button[aria-label*=next]',
+                        'button[aria-label*="Next month"]',
+                        'button[title*="Next month"]'
+                    ].join(',');
+                    const prevSelectors = [
+                        '.el-picker-panel__icon-btn.arrow-left',
+                        '.ant-picker-header-prev-btn',
+                        'button[aria-label*="Previous month"]',
+                        'button[title*="Previous month"]'
+                    ].join(',');
+                    const navSelector = monthDelta >= 0 ? nextSelectors : prevSelectors;
+                    for (let i = 0; i < Math.min(Math.abs(monthDelta), 24); i++) {
+                        const btn = allVisible(navSelector).find(el => !el.disabled && el.getAttribute('aria-disabled') !== 'true');
+                        if (!btn) break;
+                        clickEl(btn);
+                        await sleep(150);
+                    }
+
+                    const ymd = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${String(targetDay).padStart(2, '0')}`;
+                    const dayText = String(targetDay);
+                    for (let i = 0; i < 10; i++) {
+                        const panels = allVisible('.el-picker-panel,.ant-picker-dropdown,.n-date-panel,.mx-datepicker-main,.datepicker,[role=dialog],.el-popper');
+                        const root = panels[panels.length - 1] || document;
+                        const cells = allVisible('td,button,[role=gridcell],.el-date-table-cell,.ant-picker-cell-inner', root);
+                        const hits = [];
+                        for (const el of cells) {
+                            const cell = el.closest('td,button,[role=gridcell]') || el;
+                            if (!isVisible(cell)) continue;
+                            const disabled = cell.matches('.disabled,.is-disabled,.ant-picker-cell-disabled,[aria-disabled=true]') ||
+                                cell.closest('.disabled,.is-disabled,.ant-picker-cell-disabled,[aria-disabled=true]');
+                            if (disabled) continue;
+                            const raw = [
+                                textOf(el), textOf(cell),
+                                el.getAttribute('aria-label'), cell.getAttribute('aria-label'),
+                                el.getAttribute('title'), cell.getAttribute('title')
+                            ].filter(Boolean).join(' ');
+                            const t = norm(raw);
+                            let score = 0;
+                            if (t === norm(dayText)) score += 80;
+                            if (t.includes(norm(ymd))) score += 120;
+                            if (t.includes(String(targetYear)) && t.includes(String(targetDay))) score += 40;
+                            if (cell.classList?.contains('prev-month') || cell.classList?.contains('next-month')) score -= 90;
+                            if (cell.classList?.contains('available') || cell.classList?.contains('ant-picker-cell-in-view')) score += 20;
+                            if (score > 0) hits.push({cell, score});
+                        }
+                        hits.sort((a, b) => b.score - a.score);
+                        if (hits[0]) {
+                            clickEl(hits[0].cell);
+                            await sleep(250);
+                            return true;
+                        }
+                        await sleep(120);
+                    }
+                    return false;
+                };
+                const verifyField = (label, value) => {
+                    const item = findFieldContainer(label);
+                    if (!item) return {label, ok: false, reason: 'field_not_found'};
+                    const expected = norm(value);
+                    const observed = [
+                        textOf(item),
+                        ...allVisible('input,textarea,select,[contenteditable=true]', item).map(el => {
+                            if (el.tagName?.toLowerCase() === 'select') {
+                                return [el.value, el.selectedOptions?.[0]?.textContent].filter(Boolean).join(' ');
+                            }
+                            return [el.value, el.textContent, el.getAttribute('aria-label')].filter(Boolean).join(' ');
+                        })
+                    ].join(' ').replace(/\\s+/g, ' ').trim();
+                    const observedNorm = norm(observed);
+
+                    const switchRoot = allVisible('.el-switch,[role=switch]', item)[0];
+                    if (switchRoot) {
+                        const checked = switchRoot.classList.contains('is-checked') ||
+                            switchRoot.getAttribute('aria-checked') === 'true' ||
+                            Boolean(item.querySelector('input:checked'));
+                        const shouldOn = !/^(false|off|no|0)$/i.test(String(value || ''));
+                        return {label, ok: checked === shouldOn, mode: 'switch', observed: checked ? 'checked' : 'unchecked'};
+                    }
+
+                    const choiceNodes = allVisible('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]', item);
+                    const choiceHit = choiceNodes.find(el => norm(textOf(el)).includes(expected));
+                    if (choiceHit) {
+                        const choiceTarget = choiceHit.closest?.('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]') || choiceHit;
+                        const checked = choiceTarget.matches?.('.is-checked,[aria-checked=true]') ||
+                            Boolean(choiceTarget.querySelector?.('.is-checked,[aria-checked=true],input:checked')) ||
+                            Boolean(choiceHit.querySelector?.('.is-checked,[aria-checked=true],input:checked'));
+                        if (checked) return {label, ok: true, mode: 'choice_checked', observed};
+                    }
+
+                    if (expected && observedNorm.includes(expected)) {
+                        return {label, ok: true, mode: 'value_visible', observed};
+                    }
+                    return {label, ok: false, reason: 'value_not_reflected', expected: value, observed};
+                };
+
+                const results = [];
+                for (const [label, value] of Object.entries(fields || {})) {
+                    const item = findFieldContainer(label);
+                    if (!item) {
+                        results.push({label, ok: false, reason: 'field_not_found'});
+                        continue;
+                    }
+                    item.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                    await sleep(150);
+                    const valueText = String(value || '');
+                    const vn = norm(valueText);
+
+                    const textarea = allVisible('textarea', item)[0];
+                    if (textarea) {
+                        setNativeValue(textarea, valueText);
+                        results.push({label, ok: true, mode: 'textarea'});
+                        continue;
+                    }
+
+                    const selectRoot = allVisible('.el-select,.ant-select,.n-select,[role=combobox]', item)[0];
+                    const inputs = allVisible('input,[contenteditable=true]', item)
+                        .filter(el => !['hidden','checkbox','radio','button','submit'].includes((el.type || '').toLowerCase()));
+                    if (/(date|time|日期|时间)/i.test(label) && /^\\d{4}-\\d{2}-\\d{2}/.test(valueText) && inputs.length) {
+                        const picked = await clickDateValue(valueText, inputs[0]);
+                        if (picked) {
+                            results.push({label, ok: true, mode: 'date_picker'});
+                            continue;
+                        }
+                        setNativeValue(inputs[0], valueText);
+                        results.push({label, ok: true, mode: 'date_input'});
+                        continue;
+                    }
+                    const readonly = inputs.find(el => el.readOnly || (el.getAttribute('role') || '').toLowerCase() === 'combobox' || el.getAttribute('aria-haspopup'));
+                    const isChoiceValue = /(zone|type|resource|delivery|date|time|下拉|选择|复选|单选|开关|日期|时间)/i.test(label);
+                    if ((selectRoot || readonly) && isChoiceValue) {
+                        clickEl(selectRoot || readonly);
+                        await sleep(350);
+                        const ok = await clickOption(valueText);
+                        results.push({label, ok, mode: 'select'});
+                        continue;
+                    }
+
+                    const switchRoot = allVisible('.el-switch,[role=switch]', item)[0];
+                    if (switchRoot) {
+                        const shouldOn = /^(true|on|yes|1|开启|打开|选中|勾选)$/i.test(valueText || '开启');
+                        const checked = switchRoot.classList.contains('is-checked') || switchRoot.getAttribute('aria-checked') === 'true';
+                        if (shouldOn !== checked) clickEl(switchRoot);
+                        results.push({label, ok: true, mode: 'switch'});
+                        continue;
+                    }
+
+                    const choiceHit = allVisible('label,.el-radio,.el-checkbox,span,button', item)
+                        .find(el => norm(textOf(el)) === vn) ||
+                        allVisible('label,.el-radio,.el-checkbox,span,button', item)
+                        .find(el => norm(textOf(el)).includes(vn));
+                    if (choiceHit) {
+                        const choiceTarget = choiceHit.closest?.('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]') || choiceHit;
+                        clickEl(choiceTarget);
+                        await sleep(150);
+                        const checked = choiceTarget.matches?.('.is-checked,[aria-checked=true],input:checked') ||
+                            choiceTarget.querySelector?.('.is-checked,[aria-checked=true],input:checked') ||
+                            choiceHit.matches?.('.is-checked,[aria-checked=true],input:checked') ||
+                            choiceHit.querySelector?.('.is-checked,[aria-checked=true],input:checked');
+                        results.push({label, ok: Boolean(checked) || choiceTarget.tagName === 'BUTTON', mode: 'choice'});
+                        continue;
+                    }
+
+                    if (inputs.length) {
+                        setNativeValue(inputs[0], valueText);
+                        results.push({label, ok: true, mode: 'input'});
+                        continue;
+                    }
+                    results.push({label, ok: false, reason: 'no_control'});
+                }
+
+                await sleep(250);
+                const verifications = Object.entries(fields || {}).map(([label, value]) => verifyField(label, value));
+                const verificationOk = verifications.length > 0 && verifications.every(r => r.ok);
+                if (!verificationOk) {
+                    return {
+                        ok: false,
+                        scopeText: textOf(scope).slice(0, 120),
+                        results,
+                        verifications
+                    };
+                }
+
+                const submit = allVisible('button,.el-button,[role=button]', scope)
+                    .find(el => /^(create|submit|提交|保存|确定)$/i.test(textOf(el).trim())) ||
+                    allVisible('button,.el-button,[role=button]')
+                    .filter(el => el.getBoundingClientRect().left > 180)
+                    .find(el => /^(create|submit|提交|保存|确定)$/i.test(textOf(el).trim()));
+                let submitted = false;
+                let submitText = '';
+                if (submit) {
+                    submitText = textOf(submit).trim();
+                    clickEl(submit);
+                    await sleep(500);
+                    submitted = true;
+                    results.push({label: '__submit__', ok: true, mode: submitText});
+                }
+                if (requireSubmit && !submitted) {
+                    return {
+                        ok: false,
+                        reason: 'submit_not_found',
+                        requireSubmit,
+                        submitted,
+                        scopeText: textOf(scope).slice(0, 120),
+                        results,
+                        verifications
+                    };
+                }
+
+                const fieldResults = results.filter(r => r.label !== '__submit__');
+                return {
+                    ok: fieldResults.length > 0 && fieldResults.every(r => r.ok) && verificationOk && (!requireSubmit || submitted),
+                    submitted,
+                    submitText,
+                    requireSubmit,
+                    scopeText: textOf(scope).slice(0, 120),
+                    results,
+                    verifications
+                };
+            }""",
+            {
+                "scopeTitle": _parse_goal_scope_title(goal),
+                "fields": fields,
+                "requireSubmit": require_submit,
+            },
+        )
+        logger.info("[AUTO FORM] result=%s", result)
+        if isinstance(result, dict) and result.get("ok"):
+            print(f"\033[1;32m✅ [AUTO FORM]\033[0m 已按 DOM scope 执行表单填报")
+            _broadcast_log_safe("[AUTO FORM] Deterministic scoped form fill executed")
+            return True
+    except Exception as err:
+        logger.warning("[AUTO FORM] deterministic fill failed, fallback to VLM: %s", err)
+    return False
+
+
 def _goal_needs_pagination_probe(goal: str) -> bool:
-    """Whether first-extract should force a next_page probe."""
+    """Whether the task likely needs pagination-related hints/probes."""
     text = str(goal or "").lower()
     if _goal_is_tooltip_extract(text):
         return False
     target_count = _parse_goal_target_count(text)
-    if target_count is not None and target_count >= 50:
+    if target_count is not None and target_count >= 20:
         return True
     if _parse_goal_target_pages(text):
         return True
@@ -267,6 +856,85 @@ def _goal_needs_pagination_probe(goal: str) -> bool:
             "逐页", "pagination", "paginate", "next page", "all pages",
         )
     )
+
+
+def _should_force_first_flip_after_successful_extract(goal: str) -> bool:
+    """Whether a successful extract may immediately force next_page.
+
+    Row-count goals (for example "前26条/50条") must be governed by data delta:
+    only a zero-new-row extract proves the current page/viewport is drained.
+    Forcing next_page right after a successful extract can skip lazy-loaded rows
+    still hidden lower on the same page.
+    """
+    text = str(goal or "")
+    if _goal_is_tooltip_extract(text):
+        return False
+    if _parse_goal_target_count(text) is not None:
+        return False
+    return _parse_goal_target_pages(text) is not None
+
+
+def _should_schedule_next_page_after_extract(
+    goal: str,
+    *,
+    new_rows: int,
+    total_rows: int,
+    extract_source: str = "",
+    pagination_kind: str = "",
+    expected_rows: int = 0,
+    physically_drained: bool = False,
+) -> tuple[bool, str]:
+    """Decide whether a successful extract can safely arm next_page immediately.
+
+    This is intentionally stricter than "target not met + paginator exists".
+    We only short-circuit when the current extraction looks like a complete page
+    batch, so lazy-loaded rows lower on the same page are not skipped.
+    """
+    if _goal_is_tooltip_extract(goal):
+        return False, "tooltip extraction is key-value mapping, not page traversal"
+
+    page_target = _parse_goal_target_pages(goal)
+    if page_target is not None and new_rows > 0:
+        return True, "explicit page-count goal"
+
+    target_count = _parse_goal_target_count(goal)
+    if target_count is None:
+        return False, "no row-count target"
+    if total_rows >= target_count:
+        return False, "target already met"
+
+    source = str(extract_source or "").upper()
+    kind = str(pagination_kind or "").lower()
+    try:
+        expected = int(expected_rows or 0)
+    except (TypeError, ValueError):
+        expected = 0
+
+    if physically_drained and new_rows > 0:
+        return True, f"current page physically drained after {new_rows} new rows"
+
+    if expected >= 10:
+        page_floor = max(10, int(expected * 0.7))
+        remaining = max(0, target_count - (total_rows - new_rows))
+        required = min(expected, page_floor, remaining or page_floor)
+        if new_rows >= required:
+            return True, (
+                f"page batch sufficiently extracted: {new_rows}/{expected} "
+                f"(required {required})"
+            )
+        return False, (
+            f"only {new_rows}/{expected} expected rows; "
+            "allow scroll/drain before next_page"
+        )
+
+    if "DOM_TABLE" in source and new_rows >= 5:
+        return True, f"DOM table page extracted {new_rows} rows"
+    if kind == "numeric" and new_rows >= 10:
+        return True, f"numeric paginator with {new_rows} new rows"
+    if new_rows >= 20:
+        return True, f"large page batch extracted {new_rows} rows"
+
+    return False, f"only {new_rows} new rows; allow scroll/drain before next_page"
 
 
 def _derive_effective_max_steps(goal: str) -> int:
@@ -1984,6 +2652,10 @@ async def run_agent(
             _cfg.VLM_MODEL_NAME = str(vlm_options["model"])
         if vlm_options.get("semantic_model"):
             _cfg.VLM_SEMANTIC_MODEL_NAME = str(vlm_options["semantic_model"])
+        if vlm_options.get("semantic_base_url"):
+            _cfg.VLM_SEMANTIC_API_BASE = str(vlm_options["semantic_base_url"])
+        if vlm_options.get("semantic_api_key"):
+            _cfg.VLM_SEMANTIC_API_KEY = str(vlm_options["semantic_api_key"])
         if vlm_options.get("base_url"):
             _cfg.VLM_API_BASE = str(vlm_options["base_url"])
         if vlm_options.get("api_key"):
@@ -2081,6 +2753,8 @@ async def run_agent(
         logger.info(f"[URL] {start_url}")
         _broadcast_log_safe(f"[URL] {start_url}")
         _effective_max_steps = _derive_effective_max_steps(goal)
+        _is_form_fill_goal = _goal_is_form_fill(goal)
+        _form_assignments = _prepare_form_batch_fields(goal) if _is_form_fill_goal else {}
         if _effective_max_steps > MAX_STEPS:
             logger.info(
                 f"[MAX STEPS] bulk extraction budget raised: "
@@ -2094,6 +2768,32 @@ async def run_agent(
         else:
             logger.info(f"[MAX STEPS] {MAX_STEPS}")
         logger.info(f"{'=' * 60}")
+
+        # Component-library forms are more reliable through scoped DOM execution
+        # than through step-by-step VLM clicks. The executor honors a title/scope
+        # phrase such as "Basic Form 标题下方" before touching fields.
+        if _is_form_fill_goal and _form_assignments:
+            _auto_form_ok = await _try_auto_form_fill(browser, goal)
+            if _auto_form_ok:
+                _run_succeeded = True
+                _broadcast_done_safe(True, "Auto form fill completed")
+                try:
+                    _auto_ss, _ = await browser.mark_and_screenshot(step=99)
+                    html_logger.log_step(
+                        step_num=99,
+                        screenshot_path=str(Path(SCREENSHOT_DIR) / "step_99.png") if _auto_ss else None,
+                        action_dict={
+                            "action": "done",
+                            "target_id": 0,
+                            "status": "success",
+                            "thought": "AUTO FORM 已完成字段回读校验，并已点击 Create/Submit（若目标要求提交）。",
+                            "type_value": "auto_form",
+                        },
+                        memory_state=dict(workflow_memory),
+                    )
+                except Exception as _auto_log_err:
+                    logger.debug("[AUTO FORM] failed to log final screenshot: %s", _auto_log_err)
+                return True
 
         # 滑窗：记录最近 6 步的 (action, target_id, landing_url)，用于检测点击死循环
         # 升级为 URL-aware：只有"同一 ID 被点击 ≥ 3 次 **且** 着陆 URL 完全相同"才判定死循环，
@@ -2141,6 +2841,10 @@ async def run_agent(
         _pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
         _pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
         _first_flip_pending = False  # 首次 extract 后强制下一步走 next_page（引擎层硬约束）
+        _force_next_page_pending = False  # 物理触底且未达标：下一轮强制 next_page
+        _force_extract_after_navigation_pending = False  # 翻页落地后：下一轮必须先提取新页，禁止连续翻页跳页
+        _block_next_page_until_drained = False  # 当前页只提到少量数据且还能滚动：禁止过早翻页
+        _block_next_page_reason = ""
         _first_extract_ever_done = False  # 任务级永久锁：首次 extract 完成过（不会被翻页重置）
         _prev_action_sig: tuple[str, int, str] = ("", 0, "")  # 上一步 (action, target_id, type_value)，用于"思想-动作分离"检测
         _repeat_action_count: int = 0  # 同一 action sig 连续重复次数，用于精确触发 AUTO-ADVANCE
@@ -2150,25 +2854,182 @@ async def run_agent(
         _extracted_page_keys: set[str] = set()  # URL + table signature; SPA/table pagination stays on one URL
         _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
         _tooltip_trigger_keys: set[str] = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
+        _form_scroll_down_streak = 0  # 表单未开始填写前，连续向下滚动次数
+        _form_interaction_started = False  # 一旦开始填/点字段，允许正常分段滚动
+        _auto_form_retry_count = 0
+        _form_submit_clicked_once = False  # demo sites may keep the same page after Create/Submit
 
-        def _filter_new_extracted_rows(data, source_text: str = ""):
+        def _sanitize_extraction_candidate(
+            *,
+            name: str,
+            data,
+            source_text: str = "",
+            data_shape: dict | None = None,
+        ) -> dict:
             target_count = _parse_goal_target_count(goal)
             target_remaining = (
                 None if target_count is None
                 else max(0, target_count - _total_extracted_rows)
             )
+            trial_seen = set(_seen_extract_row_keys)
             result = sanitize_extracted_rows(
                 raw_data=data,
                 source_text=source_text,
-                seen_fingerprints=_seen_extract_row_keys,
+                seen_fingerprints=trial_seen,
                 target_remaining=target_remaining,
             )
-            logger.info(result.summary_log(target_remaining=target_remaining))
+            rows = result.rows
+            completeness = 0.0
+            if rows:
+                widths = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        widths.append(
+                            sum(
+                                1
+                                for value in row.values()
+                                if value is not None and str(value).strip()
+                            )
+                        )
+                completeness = (
+                    sum(widths) / max(len(widths), 1)
+                    if widths else 1.0
+                )
+            shape = data_shape or {}
+            source = name.upper()
+            score = result.accepted * 100.0 + completeness * 5.0
+            score -= result.duplicates * 8.0
+            score -= result.rejected_total * 12.0
+            if "DOM_TABLE" in source:
+                if int(shape.get("table_rows") or 0) >= result.accepted >= 2:
+                    score += 35.0
+                else:
+                    score += 12.0
+            elif "FULL_PAGE" in source or "AX_TREE" in source or "INNER_TEXT" in source:
+                if int(shape.get("repeated_class_count") or 0) >= 5:
+                    score += 25.0
+                if result.accepted >= 10:
+                    score += 20.0
+            elif "VIEWPORT" in source or "VLM" in source:
+                score += 3.0
+
+            return {
+                "name": name,
+                "rows": rows,
+                "accepted": result.accepted,
+                "duplicates": result.duplicates,
+                "rejected": result.rejected_total,
+                "fingerprints": set(result.fingerprints),
+                "score": score,
+                "source_text": source_text,
+                "data_shape": shape,
+            }
+
+        def _expected_rows_from_data_shape(data_shape: dict | None) -> int:
+            """Estimate how many structured rows the current page physically exposes.
+
+            This is a guardrail for dense list/table pages: if the DOM clearly
+            contains ~25 repeated items, a viewport-only 3-row extraction should
+            not be treated as a complete page batch.
+            """
+            shape = data_shape or {}
+            try:
+                table_rows = int(shape.get("table_rows") or 0)
+                table_cells = int(shape.get("table_cells") or 0)
+                repeated = int(shape.get("repeated_class_count") or 0)
+                repeated_avg_text = int(shape.get("repeated_avg_text") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+            expected = 0
+            if table_rows >= 3 and table_cells >= 2:
+                expected = max(expected, table_rows)
+            if repeated >= 5 and repeated_avg_text >= 20:
+                expected = max(expected, repeated)
+            return expected
+
+        def _candidate_min_expected_rows(candidate: dict) -> int:
+            target_count = _parse_goal_target_count(goal)
+            target_remaining = (
+                None if target_count is None
+                else max(0, target_count - _total_extracted_rows)
+            )
+            expected_rows = _expected_rows_from_data_shape(
+                candidate.get("data_shape") or {}
+            )
+            if expected_rows < 10:
+                return 0
+            # Dense pages should usually be extracted as a page batch, but if
+            # the remaining target is small we only require that many rows.
+            # Use magnitude matching, not strict equality: DOM probes may count
+            # ads, skeleton rows, placeholders, or hidden repeated nodes.
+            page_floor = max(10, int(expected_rows * 0.7))
+            if target_remaining is not None:
+                return min(expected_rows, target_remaining, page_floor)
+            return min(expected_rows, page_floor)
+
+        def _is_under_yield_viewport_candidate(candidate: dict) -> bool:
+            source = str(candidate.get("name") or "").upper()
+            if "VIEWPORT" not in source and "VLM" not in source:
+                return False
+            shape = candidate.get("data_shape") or {}
+            if bool(shape.get("physically_drained")):
+                return False
+            minimum = _candidate_min_expected_rows(candidate)
+            if minimum <= 0:
+                return False
+            return int(candidate.get("accepted") or 0) < minimum
+
+        def _choose_best_extraction_candidate(candidates: list[dict]) -> dict | None:
+            viable = [c for c in candidates if c.get("accepted", 0) > 0]
+            if not viable:
+                return None
+            filtered: list[dict] = []
+            for c in viable:
+                if _is_under_yield_viewport_candidate(c):
+                    logger.info(
+                        "[EXTRACT ARBITER] reject under-yield viewport candidate: "
+                        "accepted=%s min_expected=%s shape=%s",
+                        c.get("accepted"),
+                        _candidate_min_expected_rows(c),
+                        c.get("data_shape"),
+                    )
+                    continue
+                filtered.append(c)
+            viable = filtered
+            if not viable:
+                return None
+            priority = {"DOM_TABLE": 3, "FULL_PAGE": 2, "VIEWPORT_VLM": 1}
+            viable.sort(
+                key=lambda c: (
+                    float(c.get("score") or 0),
+                    int(c.get("accepted") or 0),
+                    priority.get(str(c.get("name") or ""), 0),
+                ),
+                reverse=True,
+            )
+            chosen = viable[0]
+            logger.info(
+                "[EXTRACT ARBITER] candidates=%s | selected=%s score=%.1f accepted=%s",
+                "; ".join(
+                    f"{c.get('name')}:score={float(c.get('score') or 0):.1f},"
+                    f"accepted={c.get('accepted')},dup={c.get('duplicates')},rej={c.get('rejected')}"
+                    for c in candidates
+                ),
+                chosen.get("name"),
+                float(chosen.get("score") or 0),
+                chosen.get("accepted"),
+            )
+            return chosen
+
+        def _commit_extraction_candidate(candidate: dict) -> tuple[list, int, int, int, str]:
+            _seen_extract_row_keys.update(candidate.get("fingerprints") or set())
             return (
-                result.rows,
-                result.accepted,
-                result.duplicates,
-                result.rejected_total,
+                candidate.get("rows") or [],
+                int(candidate.get("accepted") or 0),
+                int(candidate.get("duplicates") or 0),
+                int(candidate.get("rejected") or 0),
+                str(candidate.get("source_text") or ""),
             )
 
         def _record_extract_progress(rows, accepted_count: int) -> tuple[int, int]:
@@ -2188,6 +3049,38 @@ async def run_agent(
                     new_triggers += 1
             _total_extracted_rows = len(_tooltip_trigger_keys)
             return new_triggers, _total_extracted_rows
+
+        async def _extract_full_page_text_for_data(reason: str) -> tuple[str, str]:
+            """Return the best full-page text source for semantic extraction."""
+            source = "AX_TREE"
+            ax_text = await browser.extract_page_text_via_ax_tree()
+            body_text = ""
+            try:
+                _page_for_text = await browser._ensure_active_page(reason=reason)
+                body_text = await _page_for_text.evaluate(
+                    "() => document.body ? document.body.innerText : ''"
+                )
+                body_text = str(body_text or "").strip()
+            except Exception as text_err:
+                logger.debug("[EXTRACT FULL] innerText fallback skipped: %s", text_err)
+
+            ax_text = str(ax_text or "").strip()
+            if body_text and len(body_text) > max(len(ax_text) * 1.2, 800):
+                if ax_text:
+                    logger.info(
+                        "[EXTRACT FULL] innerText richer than AX (%s vs %s chars), using combined text",
+                        len(body_text),
+                        len(ax_text),
+                    )
+                    return (
+                        "AX_TREE+INNER_TEXT",
+                        f"【AX Tree 语义文本】\n{ax_text}\n\n【DOM innerText 全页文本】\n{body_text}",
+                    )
+                logger.info("[EXTRACT FULL] AX Tree empty/short, using innerText")
+                return "INNER_TEXT_FALLBACK", body_text
+            if ax_text:
+                return source, ax_text
+            return ("INNER_TEXT_FALLBACK", body_text) if body_text else ("", "")
 
         async def _extract_visible_table_rows_via_dom(reason: str) -> list[dict]:
             try:
@@ -2422,6 +3315,62 @@ async def run_agent(
             except Exception as scroll_err:
                 logger.debug("[EXTRACT DEDUP] duplicate-row scroll nudge failed: %s", scroll_err)
 
+        async def _probe_scroll_drain_state(reason: str) -> dict:
+            """Return whether the current page/main scroll container is physically drained."""
+            try:
+                _probe_page = await browser._ensure_active_page(reason=reason)
+                return await _probe_page.evaluate(
+                    """() => {
+                        const viewportW = window.innerWidth || 0;
+                        const viewportH = window.innerHeight || 0;
+                        const doc = document.scrollingElement || document.documentElement || document.body;
+                        const docRemaining = Math.max(
+                            0,
+                            (doc.scrollHeight || 0) - ((window.scrollY || doc.scrollTop || 0) + viewportH)
+                        );
+                        const docScrollable = (doc.scrollHeight || 0) > viewportH + 80;
+
+                        const visibleRect = (el) => {
+                            if (!el || !el.getBoundingClientRect) return null;
+                            const r = el.getBoundingClientRect();
+                            const w = Math.max(0, Math.min(r.right, viewportW) - Math.max(r.left, 0));
+                            const h = Math.max(0, Math.min(r.bottom, viewportH) - Math.max(r.top, 0));
+                            if (w < 160 || h < 120) return null;
+                            const style = window.getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden') return null;
+                            const overflowY = style.overflowY || '';
+                            const scrollable = /(auto|scroll|overlay)/i.test(overflowY)
+                                && el.scrollHeight > el.clientHeight + 80;
+                            if (!scrollable) return null;
+                            return {el, area: w * h, w, h};
+                        };
+
+                        const candidates = Array.from(document.querySelectorAll('main, [role="main"], table, tbody, .el-table__body-wrapper, .ant-table-body, .v-data-table__wrapper, [class*="table"], [class*="list"], [class*="content"], div'))
+                            .map(visibleRect)
+                            .filter(Boolean)
+                            .sort((a, b) => b.area - a.area);
+                        const best = candidates[0] || null;
+                        const containerRemaining = best
+                            ? Math.max(0, best.el.scrollHeight - best.el.scrollTop - best.el.clientHeight)
+                            : 0;
+                        const containerCanScroll = Boolean(best && containerRemaining > 80);
+                        const windowCanScroll = Boolean(docScrollable && docRemaining > 80);
+                        const atBottom = !windowCanScroll && !containerCanScroll;
+                        return {
+                            at_bottom: atBottom,
+                            window_remaining: Math.round(docRemaining),
+                            window_can_scroll: windowCanScroll,
+                            container_remaining: Math.round(containerRemaining),
+                            container_can_scroll: containerCanScroll,
+                            container_tag: best ? String(best.el.tagName || '').toLowerCase() : '',
+                            container_class: best ? String(best.el.className || '').slice(0, 80) : '',
+                        };
+                    }"""
+                ) or {"at_bottom": False, "probe_failed": True}
+            except Exception as probe_err:
+                logger.debug("[EXTRACT DEDUP] scroll drain probe failed: %s", probe_err)
+                return {"at_bottom": False, "probe_failed": True}
+
         # ── 自愈计数器 ────────────────────────────────────────────────
         # 连续执行失败超过 _MAX_CONSECUTIVE_ERRORS 次时强制转 ask_human
         _MAX_CONSECUTIVE_ERRORS = 3
@@ -2434,6 +3383,7 @@ async def run_agent(
         _MAX_REFLECTS = 5          # 一次任务最多 Reflector 调用次数（防 cascade）
         _REFLECT_INTERVAL = 5      # 兜底间隔：连续 N 步未反思时主动触发一次
         _dedup_tripped_last_step = False  # 上一步 extract dedup 命中标志
+        _duplicate_zero_extract_streak = 0  # 连续 extract 净新增为 0 的次数
         _abort_requested = False    # Reflector 判 abort 后允许下一步合法 done
 
         # ── 跨页面记忆库 ──────────────────────────────────────────────
@@ -2525,6 +3475,16 @@ async def run_agent(
                 initial_url=browser.current_url or start_url,
                 workflow_memory=workflow_memory,
             )
+            _original_plan_count = len(_task_plan.sub_goals)
+            _task_plan = _normalize_form_task_plan(_task_plan, goal)
+            if _is_form_fill_goal and _task_plan is not None and len(_task_plan.sub_goals) != _original_plan_count:
+                logger.info(
+                    "[PLANNER] Form plan normalized: removed visibility-only subgoals"
+                )
+                _broadcast_log_safe(
+                    "[PLANNER] 表单任务已改写为逐字段填写计划，禁用完整同屏子目标",
+                    level="warn",
+                )
             print(
                 f"\n\033[1;35m📋 [PLANNER]\033[0m 生成 "
                 f"\033[35m{len(_task_plan.sub_goals)}\033[0m 个子目标："
@@ -2557,6 +3517,31 @@ async def run_agent(
                 )
                 if _login_intercepted:
                     logger.info("[PRELOGIN] Login popup handled before reasoning; refreshing context.")
+
+                if _is_form_fill_goal and _form_assignments and _auto_form_retry_count < 3:
+                    _auto_form_retry_count += 1
+                    logger.info("[AUTO FORM] step-level deterministic retry #%s", _auto_form_retry_count)
+                    _auto_form_ok = await _try_auto_form_fill(browser, goal)
+                    if _auto_form_ok:
+                        _run_succeeded = True
+                        _broadcast_done_safe(True, "Auto form fill completed")
+                        try:
+                            _auto_ss, _ = await browser.mark_and_screenshot(step)
+                            _log_screenshot_path = (
+                                str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png")
+                                if _auto_ss
+                                else None
+                            )
+                        except Exception as _auto_log_err:
+                            logger.debug("[AUTO FORM] failed to capture completion screenshot: %s", _auto_log_err)
+                        _log_decision = {
+                            "action": "done",
+                            "target_id": 0,
+                            "status": "success",
+                            "thought": "AUTO FORM 已完成字段回读校验，并已点击 Create/Submit（若目标要求提交）。",
+                            "type_value": "auto_form",
+                        }
+                        break
 
                 if _goal_prefers_visual_navigation(goal):
                     _page = await browser._ensure_active_page(reason="blank page recovery check")
@@ -2770,15 +3755,85 @@ async def run_agent(
                         + (input_descriptions or "")
                     )
 
-                decisions = await vlm.ask(
-                    screenshot_b64,
-                    goal,
-                    step,
-                    input_descriptions,
-                    workflow_memory,
-                    task_plan=_task_plan,
-                    max_steps=_effective_max_steps,
+                _forced_target = _parse_goal_target_count(goal)
+                _can_force_extract_after_navigation_now = (
+                    _force_extract_after_navigation_pending
+                    and (
+                        _forced_target is None
+                        or _total_extracted_rows < _forced_target
+                    )
                 )
+                _can_force_next_page_now = (
+                    _force_next_page_pending
+                    and (
+                        _forced_target is None
+                        or _total_extracted_rows < _forced_target
+                    )
+                )
+                if _can_force_extract_after_navigation_now:
+                    logger.info(
+                        "[FORCE EXTRACT AFTER NAV] skipping VLM ask; extracting newly landed page"
+                    )
+                    _broadcast_log_safe(
+                        "[FORCE EXTRACT] 翻页已落地，下一步先提取当前页，避免连续翻页跳过目标数据",
+                        level="info",
+                    )
+                    decisions = [{
+                        "action": "extract",
+                        "target_id": 0,
+                        "type_value": "",
+                        "memory_key": "",
+                        "extracted_data": None,
+                        "__extract_downgraded": True,
+                        "thought": (
+                            "[FORCE EXTRACT 翻页后提取锁] 上一步已成功进入新页面。"
+                            "在未提取当前页之前禁止继续 next_page，系统直接启动当前页自动提取。"
+                        ),
+                        "progress_review": "",
+                        "current_state": "",
+                        "subgoal_status": "in_progress",
+                    }]
+                    _force_extract_after_navigation_pending = False
+                elif _can_force_next_page_now:
+                    logger.info(
+                        "[FORCE NEXT_PAGE] skipping VLM ask; executing engine-scheduled next_page"
+                    )
+                    _broadcast_log_safe(
+                        "[FORCE NEXT_PAGE] 引擎已调度下一页，跳过本轮 VLM 决策",
+                        level="info",
+                    )
+                    decisions = [{
+                        "action": "next_page",
+                        "target_id": 0,
+                        "type_value": "",
+                        "memory_key": "",
+                        "extracted_data": None,
+                        "thought": (
+                            "[FORCE NEXT_PAGE 引擎短路] 上一步已确认当前页存在分页器"
+                            "且目标数量未达成，系统直接执行 next_page，优先尝试 URL "
+                            "变异/分页器/页码探测。"
+                        ),
+                        "progress_review": "",
+                        "current_state": "",
+                        "subgoal_status": "in_progress",
+                    }]
+                    _force_next_page_pending = False
+                else:
+                    if _force_extract_after_navigation_pending:
+                        logger.info("[FORCE EXTRACT AFTER NAV] cleared because target is already met")
+                        _force_extract_after_navigation_pending = False
+                    if _force_next_page_pending:
+                        logger.info("[FORCE NEXT_PAGE] cleared because target is already met")
+                        _force_next_page_pending = False
+                    decisions = await vlm.ask(
+                        screenshot_b64,
+                        goal,
+                        step,
+                        input_descriptions,
+                        workflow_memory,
+                        task_plan=_task_plan,
+                        max_steps=_effective_max_steps,
+                    )
 
                 _log_decision = decisions
 
@@ -2813,7 +3868,7 @@ async def run_agent(
                     _has_advance_marker = any(m in _thought for m in _SUBGOAL_ADVANCE_MARKERS)
                     _already_completed = _hd.get("subgoal_status") == "completed"
                     # 过渡动作（scroll/smooth_scroll/wait/press_key）合理重复频繁，永不触发
-                    _TRANSITIONAL_ACTIONS = {"scroll", "smooth_scroll", "wait", "press_key"}
+                    _TRANSITIONAL_ACTIONS = {"scroll", "smooth_scroll", "find_text", "wait", "press_key"}
                     _is_transitional = _cur_sig[0] in _TRANSITIONAL_ACTIONS
 
                     # 两阶段（软警告 → 硬劫持）— 借鉴 Browser-use 哲学：
@@ -2875,6 +3930,36 @@ async def run_agent(
                 # 仅触发一次：执行后立即清 flag；若 next_page L4 真的报错滚不动，
                 # VLM 下一轮会收到错误反馈正常走 done/click 路径。
                 if (
+                    _force_next_page_pending
+                    and decisions
+                    and decisions[0].get("action") not in ("done", "ask_human", "error")
+                    and (
+                        (_parse_goal_target_count(goal) is None)
+                        or (_total_extracted_rows < (_parse_goal_target_count(goal) or 0))
+                    )
+                ):
+                    _orig_action = decisions[0].get("action")
+                    logger.info(
+                        "[FORCE NEXT_PAGE] 页面已物理触底且目标未达成，"
+                        "引擎改写 %r -> next_page",
+                        _orig_action,
+                    )
+                    _broadcast_log_safe(
+                        f"[FORCE NEXT_PAGE] 触底未达量，改写 {_orig_action} → next_page",
+                        level="warn",
+                    )
+                    decisions[0]["action"] = "next_page"
+                    decisions[0]["target_id"] = 0
+                    decisions[0]["type_value"] = ""
+                    decisions[0]["thought"] = (
+                        f"[FORCE NEXT_PAGE 引擎改写] 原决策={_orig_action}，"
+                        "上一轮已确认页面物理触底且目标数量未达成，系统直接使用 next_page "
+                        "让底层优先尝试 URL 变异/分页器/页码探测。"
+                        + (decisions[0].get("thought") or "")
+                    )
+                    decisions = [decisions[0]]
+                    _force_next_page_pending = False
+                elif (
                     _first_flip_pending
                     and _goal_needs_pagination_probe(goal)
                     and decisions
@@ -2897,6 +3982,7 @@ async def run_agent(
                         "首次 extract 后系统强制走 next_page 探测分页器。"
                         + (decisions[0].get("thought") or "")
                     )
+                    decisions = [decisions[0]]
                     _first_flip_pending = False  # 一次性消费，不再触发
                 # 即使 VLM 已经选了 next_page，flag 也清掉避免重复触发
                 elif _first_flip_pending and not _goal_needs_pagination_probe(goal):
@@ -2904,6 +3990,55 @@ async def run_agent(
                     _first_flip_pending = False
                 elif _first_flip_pending and decisions and decisions[0].get("action") == "next_page":
                     _first_flip_pending = False
+
+                # ── 过早翻页护栏 ────────────────────────────────────────
+                # 当上一轮只提到少量行，且物理探针确认当前页/容器还能继续向下滚时，
+                # 不允许 VLM 直接 next_page。这样避免豆瓣/长列表只抓视口前几条就
+                # 翻页，跳过当前页下半部分数据。若当前页已触底，则放行 next_page。
+                if (
+                    _block_next_page_until_drained
+                    and decisions
+                    and decisions[0].get("action") == "next_page"
+                ):
+                    _drain_guard_target = _parse_goal_target_count(goal)
+                    _target_unmet = (
+                        _drain_guard_target is None
+                        or _total_extracted_rows < _drain_guard_target
+                    )
+                    if _target_unmet:
+                        _drain_state = await _probe_scroll_drain_state(
+                            "premature next_page guard"
+                        )
+                        if not bool(_drain_state.get("at_bottom")):
+                            _orig_thought = decisions[0].get("thought") or ""
+                            logger.info(
+                                "[PREMATURE PAGE GUARD] rewrite next_page -> smooth_scroll: %s; state=%s",
+                                _block_next_page_reason,
+                                _drain_state,
+                            )
+                            _broadcast_log_safe(
+                                "[PREMATURE PAGE GUARD] 当前页仍可滚动且只提取到少量数据，先滚动榨干当前页",
+                                level="warn",
+                            )
+                            decisions[0]["action"] = "smooth_scroll"
+                            decisions[0]["target_id"] = 0
+                            decisions[0]["type_value"] = "down"
+                            decisions[0]["thought"] = (
+                                "[PREMATURE PAGE GUARD 引擎改写] 当前页尚未物理触底，"
+                                "且上一轮提取量不足以证明整页已提完；系统将 next_page "
+                                "改为 smooth_scroll，先加载/暴露当前页剩余数据。"
+                                + _orig_thought
+                            )
+                            decisions = [decisions[0]]
+                        else:
+                            logger.info(
+                                "[PREMATURE PAGE GUARD] current page drained; next_page allowed"
+                            )
+                            _block_next_page_until_drained = False
+                            _block_next_page_reason = ""
+                    else:
+                        _block_next_page_until_drained = False
+                        _block_next_page_reason = ""
 
                 # ── Fix 4：连续 ZERO_TARGET_DOWNGRADE RAW LOOP GUARD ───────
                 # 检测 VLM 反复输出 click+target_id=0+type_value="X" 的 schema
@@ -3080,21 +4215,32 @@ async def run_agent(
                         f"(第 {_extract_null_streak} 次)，启动 AX Tree 自动提取"
                     )
                     try:
-                        _auto_extract_text_source = "AX_TREE"
-                        # ── 通过 AX Tree 获取全页语义文本（优于 innerText）──
-                        # AX Tree 天然过滤 script/style/广告噪音，只保留语义内容
-                        _ax_text = await browser.extract_page_text_via_ax_tree()
-                        if not _ax_text:
-                            # AX Tree 失败时降级为 innerText
-                            _auto_extract_text_source = "INNER_TEXT_FALLBACK"
-                            _page_for_extract = await browser._ensure_active_page(
-                                reason="extract auto fallback to innerText"
+                        _data_shape = {}
+                        try:
+                            _data_shape = await browser.probe_data_shape()
+                            logger.info("[DATA SHAPE] %s", _data_shape)
+                            if _expected_rows_from_data_shape(_data_shape) >= 10:
+                                _drain_state = await _probe_scroll_drain_state(
+                                    "auto extract dense-shape drain override"
+                                )
+                                _data_shape = dict(_data_shape)
+                                _data_shape["physically_drained"] = bool(
+                                    _drain_state.get("at_bottom")
+                                )
+                                _data_shape["drain_state"] = _drain_state
+                                logger.info(
+                                    "[DATA SHAPE] dense drain_state=%s",
+                                    _drain_state,
+                                )
+                        except Exception as _shape_err:
+                            logger.debug("[DATA SHAPE] skipped: %s", _shape_err)
+
+                        _auto_extract_text_source, _ax_text = (
+                            await _extract_full_page_text_for_data(
+                                "auto extract full page text"
                             )
-                            _ax_text = await _page_for_extract.evaluate(
-                                "() => document.body.innerText"
-                            )
-                            _ax_text = (_ax_text or "")[:16000]
-                            logger.info("[EXTRACT AUTO] AX Tree 为空，降级使用 innerText")
+                        )
+                        _auto_candidates: list[dict] = []
 
                         # ── 尝试用纯文本 VLM 调用结构化提取 ──
                         _structured_auto = await vlm.extract_structured_data(
@@ -3102,10 +4248,17 @@ async def run_agent(
                             goal=goal,
                         )
                         if _structured_auto and isinstance(_structured_auto, list) and len(_structured_auto) > 0:
-                            _auto_extracted = _structured_auto
-                            _new_rows = len(_auto_extracted)
                             logger.info(
-                                f"[EXTRACT AUTO] 全页结构化提取成功，共 {_new_rows} 条"
+                                "[EXTRACT AUTO] 全页结构化提取候选，共 %s 条",
+                                len(_structured_auto),
+                            )
+                            _auto_candidates.append(
+                                _sanitize_extraction_candidate(
+                                    name="FULL_PAGE",
+                                    data=_structured_auto,
+                                    source_text=_ax_text,
+                                    data_shape=_data_shape,
+                                )
                             )
                         else:
                             # 结构化失败，降级为原始文本 blob
@@ -3133,18 +4286,34 @@ async def run_agent(
                             )
                         )
                         if _dom_auto_rows:
-                            _auto_extracted = _dom_auto_rows
-                            _auto_extract_text_source = "DOM_TABLE"
-                            _new_rows = len(_auto_extracted)
-                            logger.info(
-                                "[EXTRACT AUTO DOM] using %s visible table rows instead of AX/VLM output",
-                                _new_rows,
+                            _auto_candidates.append(
+                                _sanitize_extraction_candidate(
+                                    name="DOM_TABLE",
+                                    data=_dom_auto_rows,
+                                    source_text=_ax_text,
+                                    data_shape=_data_shape,
+                                )
                             )
 
-                        _auto_extracted, _new_rows, _dup_rows, _rejected_rows = _filter_new_extracted_rows(
-                            _auto_extracted,
-                            source_text=_ax_text,
-                        )
+                        _chosen_candidate = _choose_best_extraction_candidate(_auto_candidates)
+                        if _chosen_candidate:
+                            (
+                                _auto_extracted,
+                                _new_rows,
+                                _dup_rows,
+                                _rejected_rows,
+                                _chosen_source_text,
+                            ) = _commit_extraction_candidate(_chosen_candidate)
+                            _auto_extract_text_source = str(
+                                _chosen_candidate.get("name") or _auto_extract_text_source
+                            )
+                        else:
+                            _auto_extracted, _new_rows, _dup_rows, _rejected_rows = (
+                                [],
+                                0,
+                                0,
+                                0,
+                            )
                         if _new_rows == 0:
                             _dedup_tripped_last_step = True
                             logger.warning(
@@ -3154,12 +4323,27 @@ async def run_agent(
                                 _rejected_rows,
                                 _current_auto_url,
                             )
-                            vlm.inject_error_feedback(
-                                "⚠️ 系统尝试提取当前视野/页面，但行级去重发现没有新增数据。\n"
-                                "请不要再次 extract 同一批内容。下一步应优先执行 "
-                                "smooth_scroll(type_value='down') 加载更多列表项，或使用 "
-                                "next_page / click_text 点击明确的下一页控件。"
-                            )
+                            _expected_auto_rows = _expected_rows_from_data_shape(_data_shape)
+                            if _expected_auto_rows >= 10:
+                                _block_next_page_until_drained = True
+                                _block_next_page_reason = (
+                                    f"dense page exposes about {_expected_auto_rows} rows, "
+                                    "but extraction returned too few"
+                                )
+                                vlm.inject_error_feedback(
+                                    "⚠️ 系统探头发现当前页存在密集列表/表格，"
+                                    f"大约 {_expected_auto_rows} 个结构化条目；"
+                                    "但本次自动提取没有得到足够新增行。\n"
+                                    "这说明当前页尚未被可靠提取，下一步先 smooth_scroll down "
+                                    "或重新 extract 当前页，禁止直接 next_page。"
+                                )
+                            else:
+                                vlm.inject_error_feedback(
+                                    "⚠️ 系统尝试提取当前视野/页面，但行级去重发现没有新增数据。\n"
+                                    "请不要再次 extract 同一批内容。下一步应优先执行 "
+                                    "smooth_scroll(type_value='down') 加载更多列表项，或使用 "
+                                    "next_page / click_text 点击明确的下一页控件。"
+                                )
                             await _nudge_scroll_after_duplicate_extract(
                                 "auto extract duplicate rows"
                             )
@@ -3183,6 +4367,7 @@ async def run_agent(
                             _auto_extracted,
                             _new_rows,
                         )
+                        _duplicate_zero_extract_streak = 0
                         if _goal_is_tooltip_extract(goal):
                             logger.info(
                                 "[EXTRACT AUTO] tooltip progress: %s new triggers, %s total triggers",
@@ -3194,13 +4379,18 @@ async def run_agent(
                         # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放
                         _rpa_cache_allowed = False
                         _rpa_skip_reason = "contains auto-extract steps"
+                        _log_extract_text_source = _auto_extract_text_source
+                        _log_decision = [{
+                            "action": "extract",
+                            "extracted_data": _auto_extracted,
+                        }]
                         # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
                         # Bug 修复：用任务级永久锁 _first_extract_ever_done，避免 _extract_count
                         # 在翻页/导航后被重置回 0 → 下一次 extract 又把 flag 设回 True →
                         # FIRST FLIP 在每次翻页后反复触发的问题。
                         if (
                             not _first_extract_ever_done
-                            and _goal_needs_pagination_probe(goal)
+                            and _should_force_first_flip_after_successful_extract(goal)
                         ):
                             _first_extract_ever_done = True
                             _first_flip_pending = True
@@ -3219,19 +4409,116 @@ async def run_agent(
                                     _names = ", ".join(
                                         f"{c['ref']}={c['name']!r}" for c in _cands[:6]
                                     )
-                                    _pagination_hint_msg = (
-                                        f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
-                                        f"已确认页面底部存在翻页控件：{_names}。\n"
-                                        f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
-                                        f"**禁止** smooth_scroll 当无限滚动处理。"
+                                    _should_force_probe_next, _force_probe_reason = (
+                                        _should_schedule_next_page_after_extract(
+                                            goal,
+                                            new_rows=_new_rows,
+                                            total_rows=_total_extracted_rows,
+                                            extract_source=_auto_extract_text_source,
+                                            pagination_kind=_pagination_kind,
+                                            expected_rows=_expected_rows_from_data_shape(_data_shape),
+                                            physically_drained=bool(_data_shape.get("physically_drained")),
+                                        )
                                     )
+                                    if _should_force_probe_next:
+                                        _force_next_page_pending = True
+                                        _first_flip_pending = False
+                                        _block_next_page_until_drained = False
+                                        _block_next_page_reason = ""
+                                        logger.info(
+                                            "[PROBE PAGE] armed next_page after extract: %s",
+                                            _force_probe_reason,
+                                        )
+                                        _broadcast_log_safe(
+                                            f"[PROBE PAGE] 已发现分页器，下一轮直接 next_page：{_force_probe_reason}",
+                                            level="info",
+                                        )
+                                        _pagination_hint_msg = (
+                                            f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                            f"已确认页面底部存在翻页控件：{_names}。\n"
+                                            f"当前页已提取到足够完整的一批数据（{_force_probe_reason}）。"
+                                            f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
+                                            f"**禁止** smooth_scroll 当无限滚动处理。"
+                                        )
+                                    else:
+                                        _drain_state = await _probe_scroll_drain_state(
+                                            "pagination probe low-yield auto extract"
+                                        )
+                                        if not bool(_drain_state.get("at_bottom")):
+                                            _block_next_page_until_drained = True
+                                            _block_next_page_reason = _force_probe_reason
+                                        else:
+                                            _force_next_page_pending = True
+                                            _first_flip_pending = False
+                                            _block_next_page_until_drained = False
+                                            _block_next_page_reason = ""
+                                            _force_probe_reason = (
+                                                f"{_force_probe_reason}; physical bottom reached"
+                                            )
+                                        if _force_next_page_pending:
+                                            _pagination_hint_msg = (
+                                                f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                                f"已确认页面存在翻页控件：{_names}。\n"
+                                                f"本次新增 {_new_rows} 条虽低于探头预期，"
+                                                "但页面已物理触底，继续滚动不会暴露更多当前页数据。"
+                                                "下一步必须使用 next_page 翻页。"
+                                            )
+                                        else:
+                                            if _force_next_page_pending:
+                                                _pagination_hint_msg = (
+                                                    f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                                    f"已确认页面存在翻页控件：{_names}。\n"
+                                                    f"本次新增 {_new_rows} 条虽低于探头预期，"
+                                                    "但页面已物理触底，继续滚动不会暴露更多当前页数据。"
+                                                    "下一步必须使用 next_page 翻页。"
+                                                )
+                                            else:
+                                                _pagination_hint_msg = (
+                                                    f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                                    f"已确认页面存在翻页控件：{_names}。\n"
+                                                    f"但本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
+                                                    "不足以证明当前页已提取完。\n"
+                                                    "下一步请先 smooth_scroll 向下并继续 extract 当前页；"
+                                                    "只有当前页物理触底或无新增后，才使用 next_page。"
+                                                )
                                 else:
-                                    _pagination_hint_msg = (
-                                        "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
-                                        "已滚到底未发现翻页控件，本页是无限滚动列表。\n"
-                                        "**仍然输出 next_page** —— 引擎层会自动走 L4 瀑布流兜底（smooth_scroll）"
-                                        "加载新数据。next_page 是万能翻页动作，不需要你判断模式。"
+                                    _should_force_probe_next, _force_probe_reason = (
+                                        _should_schedule_next_page_after_extract(
+                                            goal,
+                                            new_rows=_new_rows,
+                                            total_rows=_total_extracted_rows,
+                                            extract_source=_auto_extract_text_source,
+                                            pagination_kind=_pagination_kind,
+                                            expected_rows=_expected_rows_from_data_shape(_data_shape),
+                                            physically_drained=bool(_data_shape.get("physically_drained")),
+                                        )
                                     )
+                                    if _should_force_probe_next:
+                                        _force_next_page_pending = True
+                                        _first_flip_pending = False
+                                        _block_next_page_until_drained = False
+                                        _block_next_page_reason = ""
+                                        logger.info(
+                                            "[PROBE PAGE] armed universal next_page after extract: %s",
+                                            _force_probe_reason,
+                                        )
+                                        _broadcast_log_safe(
+                                            f"[PROBE PAGE] 大批量提取未达量，下一轮交给 next_page 宏动作：{_force_probe_reason}",
+                                            level="info",
+                                        )
+                                        _pagination_hint_msg = (
+                                            "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
+                                            "当前提取批次已足够大但目标未达成。"
+                                            "**输出 next_page**，引擎层会自动走 L4 瀑布流兜底（smooth_scroll）"
+                                            "加载新数据。next_page 是万能翻页动作，不需要你判断模式。"
+                                        )
+                                    else:
+                                        _pagination_hint_msg = (
+                                            "📍【系统探测：本页**无分页器**】\n"
+                                            f"本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
+                                            "请继续 smooth_scroll / extract 当前列表；"
+                                            "如果滚动触底且仍未达量，引擎会再调度 next_page 宏动作。"
+                                        )
                                 logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
                             except Exception as _probe_err:
                                 logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
@@ -3263,11 +4550,6 @@ async def run_agent(
                             f"\033[36m{_new_rows}\033[0m 条数据。"
                             f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
                         )
-                        _log_extract_text_source = _auto_extract_text_source
-                        _log_decision = [{
-                            "action": "extract",
-                            "extracted_data": _auto_extracted,
-                        }]
                         # 将降级的 wait 动作替换为已完成的 extract
                         # 不需要执行内层动作循环，直接跳到翻页引导
                         decisions = _log_decision
@@ -3541,43 +4823,48 @@ async def run_agent(
                         if extracted:
                             _log_extract_text_source = "VLM_EXTRACT_OUTPUT"
                             _source_text_for_validation = ""
-                            # ── AX Tree 全页结构化提取：突破视口限制 ──
-                            # VLM 只能看到视口中的 ~10 条，但一页通常有 20+ 条数据。
-                            # 通过 AX Tree 获取全页语义文本，用纯文本 VLM 调用结构化提取全部数据。
+                            _data_shape = {}
                             try:
-                                _full_extract_text_source = "AX_TREE"
-                                _full_page_text = await browser.extract_page_text_via_ax_tree()
-                                if not _full_page_text:
-                                    # AX Tree 失败时降级为 innerText
-                                    _full_extract_text_source = "INNER_TEXT_FALLBACK"
-                                    _page_for_full = await browser._ensure_active_page(
-                                        reason="extract fallback to innerText"
+                                _data_shape = await browser.probe_data_shape()
+                                logger.info("[DATA SHAPE] %s", _data_shape)
+                                if _expected_rows_from_data_shape(_data_shape) >= 10:
+                                    _drain_state = await _probe_scroll_drain_state(
+                                        "explicit extract dense-shape drain override"
                                     )
-                                    _full_page_text = await _page_for_full.evaluate(
-                                        "() => document.body.innerText"
+                                    _data_shape = dict(_data_shape)
+                                    _data_shape["physically_drained"] = bool(
+                                        _drain_state.get("at_bottom")
                                     )
-                                    logger.info("[EXTRACT FULL] AX Tree 为空，降级使用 innerText")
+                                    _data_shape["drain_state"] = _drain_state
+                                    logger.info(
+                                        "[DATA SHAPE] dense drain_state=%s",
+                                        _drain_state,
+                                    )
+                            except Exception as _shape_err:
+                                logger.debug("[DATA SHAPE] skipped: %s", _shape_err)
+
+                            _candidates: list[dict] = []
+                            _full_extract_text_source = ""
+                            _full_page_text = ""
+                            _full_extracted = None
+                            try:
+                                _full_extract_text_source, _full_page_text = (
+                                    await _extract_full_page_text_for_data(
+                                        "extract full page text"
+                                    )
+                                )
                                 _source_text_for_validation = _full_page_text or ""
                                 _full_extracted = await vlm.extract_structured_data(
                                     page_text=_full_page_text,
                                     goal=goal,
                                     example_data=extracted,
                                 )
-                                if _full_extracted and len(_full_extracted) > len(
-                                    extracted if isinstance(extracted, list) else [extracted]
-                                ):
+                                if _full_extracted:
                                     logger.info(
-                                        f"[EXTRACT FULL] {_full_extract_text_source} 全页提取 {len(_full_extracted)} 条 "
-                                        f"vs VLM 视口 {len(extracted) if isinstance(extracted, list) else 1} 条，"
-                                        f"采用全页数据"
-                                    )
-                                    extracted = _full_extracted
-                                    _log_extract_text_source = _full_extract_text_source
-                                elif _full_extracted:
-                                    logger.info(
-                                        f"[EXTRACT FULL] {_full_extract_text_source} 全页 {len(_full_extracted)} 条 "
-                                        f"≤ VLM {len(extracted) if isinstance(extracted, list) else 1} 条，"
-                                        f"保留 VLM 原始数据"
+                                        "[EXTRACT FULL] %s returned %s rows",
+                                        _full_extract_text_source,
+                                        len(_full_extracted)
+                                        if isinstance(_full_extracted, list) else 1,
                                     )
                             except Exception as _full_err:
                                 logger.warning(
@@ -3593,6 +4880,25 @@ async def run_agent(
                                 except Exception:
                                     _source_text_for_validation = ""
 
+                            if extracted:
+                                _candidates.append(
+                                    _sanitize_extraction_candidate(
+                                        name="VIEWPORT_VLM",
+                                        data=extracted,
+                                        source_text=_source_text_for_validation,
+                                        data_shape=_data_shape,
+                                    )
+                                )
+                            if _full_extracted:
+                                _candidates.append(
+                                    _sanitize_extraction_candidate(
+                                        name="FULL_PAGE",
+                                        data=_full_extracted,
+                                        source_text=_full_page_text or _source_text_for_validation,
+                                        data_shape=_data_shape,
+                                    )
+                                )
+
                             _dom_table_rows = (
                                 []
                                 if _goal_is_tooltip_extract(goal)
@@ -3601,16 +4907,6 @@ async def run_agent(
                                 )
                             )
                             if _dom_table_rows:
-                                extracted = _dom_table_rows
-                                _log_extract_text_source = "DOM_TABLE"
-                                _dom_sig = await _visible_table_signature(
-                                    "extract DOM page signature"
-                                )
-                                if _dom_sig:
-                                    _current_extract_page_key = (
-                                        f"{_current_url}#table:"
-                                        f"{hashlib.md5(_dom_sig.encode('utf-8', errors='ignore')).hexdigest()}"
-                                    )
                                 if not _source_text_for_validation:
                                     try:
                                         _page_for_validate = await browser._ensure_active_page(
@@ -3621,17 +4917,38 @@ async def run_agent(
                                         )
                                     except Exception:
                                         _source_text_for_validation = ""
-                                logger.info(
-                                    "[EXTRACT DOM] using %s visible table rows instead of VLM/AX output",
-                                    len(_dom_table_rows),
+                                _candidates.append(
+                                    _sanitize_extraction_candidate(
+                                        name="DOM_TABLE",
+                                        data=_dom_table_rows,
+                                        source_text=_source_text_for_validation,
+                                        data_shape=_data_shape,
+                                    )
                                 )
 
-                            decision["extracted_data"] = extracted
-
-                            extracted, _new_rows, _dup_rows, _rejected_rows = _filter_new_extracted_rows(
-                                extracted,
-                                source_text=_source_text_for_validation,
-                            )
+                            _chosen_candidate = _choose_best_extraction_candidate(_candidates)
+                            if _chosen_candidate:
+                                (
+                                    extracted,
+                                    _new_rows,
+                                    _dup_rows,
+                                    _rejected_rows,
+                                    _source_text_for_validation,
+                                ) = _commit_extraction_candidate(_chosen_candidate)
+                                _log_extract_text_source = str(
+                                    _chosen_candidate.get("name") or "VLM_EXTRACT_OUTPUT"
+                                )
+                                if _log_extract_text_source == "DOM_TABLE":
+                                    _dom_sig = await _visible_table_signature(
+                                        "extract DOM page signature"
+                                    )
+                                    if _dom_sig:
+                                        _current_extract_page_key = (
+                                            f"{_current_url}#table:"
+                                            f"{hashlib.md5(_dom_sig.encode('utf-8', errors='ignore')).hexdigest()}"
+                                        )
+                            else:
+                                extracted, _new_rows, _dup_rows, _rejected_rows = [], 0, 0, 0
                             decision["extracted_data"] = extracted
                             if _new_rows == 0:
                                 _dedup_tripped_last_step = True
@@ -3654,14 +4971,72 @@ async def run_agent(
                                         "请立即输出 action=done 结束任务，不要再 extract。"
                                     )
                                 else:
-                                    vlm.inject_error_feedback(
-                                        "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
-                                        "请不要重复提取当前列表。下一步优先 smooth_scroll 向下加载更多，"
-                                        "或使用 next_page / click_text 点击明确的下一页、页码、Next 控件。"
-                                    )
-                                    await _nudge_scroll_after_duplicate_extract(
-                                        "explicit extract duplicate rows"
-                                )
+                                    _has_prior_extract_page = bool(_extracted_page_urls or _extracted_page_keys)
+                                    if _target_count_pre is not None and _has_prior_extract_page:
+                                        _duplicate_zero_extract_streak += 1
+                                        _scroll_drain = await _probe_scroll_drain_state(
+                                            "duplicate extract drain probe"
+                                        )
+                                        _physically_drained = bool(_scroll_drain.get("at_bottom"))
+                                        _probe_failed = bool(_scroll_drain.get("probe_failed"))
+                                        if _physically_drained or (_probe_failed and _duplicate_zero_extract_streak >= 3):
+                                            _first_flip_pending = True
+                                            _drain_reason = (
+                                                "物理触底"
+                                                if _physically_drained
+                                                else "触底探测失败且连续多次无新增"
+                                            )
+                                            vlm.inject_error_feedback(
+                                                f"⚠️ 系统 extract 净新增为 0，且已确认{_drain_reason}。\n"
+                                                f"当前累计 {_total_extracted_rows}/{_target_count_pre} 条，"
+                                                "说明当前页/当前滚动区域已基本榨干但目标尚未达成。\n"
+                                                "下一步必须执行 next_page（target_id=0, type_value=\"\"），"
+                                                "让底层优先尝试 URL 变异/分页器/页码；不要继续 smooth_scroll "
+                                                "或重复 extract 当前页。"
+                                            )
+                                        else:
+                                            _remaining_hint = (
+                                                f"window_remaining={_scroll_drain.get('window_remaining')}, "
+                                                f"container_remaining={_scroll_drain.get('container_remaining')}"
+                                            )
+                                            vlm.inject_error_feedback(
+                                                "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
+                                                f"当前累计 {_total_extracted_rows}/{_target_count_pre} 条，"
+                                                "这只能证明当前视口没有新行，尚不能证明整页已榨干。\n"
+                                                f"物理滚动探测显示仍有下滑空间（{_remaining_hint}）。"
+                                                "下一步先 smooth_scroll down 暴露同页下方隐藏数据；"
+                                                "只有净新增为 0 且物理触底后，系统才会强制 next_page。"
+                                            )
+                                            await _nudge_scroll_after_duplicate_extract(
+                                                "first duplicate extract before pagination"
+                                            )
+                                    else:
+                                        _duplicate_zero_extract_streak += 1
+                                        _expected_dense_rows = _expected_rows_from_data_shape(
+                                            _data_shape
+                                        )
+                                        if _expected_dense_rows >= 10:
+                                            _block_next_page_until_drained = True
+                                            _block_next_page_reason = (
+                                                f"dense page exposes about {_expected_dense_rows} rows, "
+                                                "but viewport/full extraction under-yielded"
+                                            )
+                                            vlm.inject_error_feedback(
+                                                "⚠️ 系统探头发现当前页存在密集列表/表格，"
+                                                f"大约 {_expected_dense_rows} 个结构化条目；"
+                                                "但本次 extract 没有得到足够新增行。\n"
+                                                "这说明当前页尚未被可靠提取，下一步先 smooth_scroll down "
+                                                "或重新 extract 当前页，禁止直接 next_page。"
+                                            )
+                                        else:
+                                            vlm.inject_error_feedback(
+                                                "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
+                                                "请不要重复提取当前列表。下一步优先 next_page；"
+                                                "若 next_page 报错，再考虑 smooth_scroll 加载更多。"
+                                            )
+                                        await _nudge_scroll_after_duplicate_extract(
+                                            "explicit extract duplicate rows"
+                                        )
                                 break
 
                             if _dup_rows or _rejected_rows:
@@ -3679,6 +5054,7 @@ async def run_agent(
                                 extracted,
                                 _new_rows,
                             )
+                            _duplicate_zero_extract_streak = 0
                             logger.info(
                                 f"[EXTRACT] 本次提取 {_new_rows} 条，"
                                 f"累计已提取 {_progress_total_rows} 条"
@@ -3709,7 +5085,7 @@ async def run_agent(
                             # Bug 修复：用任务级永久锁，避免翻页后 _extract_count 重置反复触发
                             if (
                                 not _first_extract_ever_done
-                                and _goal_needs_pagination_probe(goal)
+                                and _should_force_first_flip_after_successful_extract(goal)
                             ):
                                 _first_extract_ever_done = True
                                 _first_flip_pending = True
@@ -3728,18 +5104,98 @@ async def run_agent(
                                         _names = ", ".join(
                                             f"{c['ref']}={c['name']!r}" for c in _cands[:6]
                                         )
-                                        _pagination_hint_msg = (
-                                            f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
-                                            f"已确认页面底部存在翻页控件：{_names}。\n"
-                                            f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
-                                            f"**禁止** smooth_scroll 当无限滚动处理。"
+                                        _should_force_probe_next, _force_probe_reason = (
+                                            _should_schedule_next_page_after_extract(
+                                                goal,
+                                                new_rows=_new_rows,
+                                                total_rows=_total_extracted_rows,
+                                                extract_source=_log_extract_text_source,
+                                                pagination_kind=_pagination_kind,
+                                                expected_rows=_expected_rows_from_data_shape(_data_shape),
+                                                physically_drained=bool(_data_shape.get("physically_drained")),
+                                            )
                                         )
+                                        if _should_force_probe_next:
+                                            _force_next_page_pending = True
+                                            _first_flip_pending = False
+                                            _block_next_page_until_drained = False
+                                            _block_next_page_reason = ""
+                                            logger.info(
+                                                "[PROBE PAGE] armed next_page after extract: %s",
+                                                _force_probe_reason,
+                                            )
+                                            _broadcast_log_safe(
+                                                f"[PROBE PAGE] 已发现分页器，下一轮直接 next_page：{_force_probe_reason}",
+                                                level="info",
+                                            )
+                                            _pagination_hint_msg = (
+                                                f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                                f"已确认页面底部存在翻页控件：{_names}。\n"
+                                                f"当前页已提取到足够完整的一批数据（{_force_probe_reason}）。"
+                                                f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
+                                                f"**禁止** smooth_scroll 当无限滚动处理。"
+                                            )
+                                        else:
+                                            _drain_state = await _probe_scroll_drain_state(
+                                                "pagination probe low-yield explicit extract"
+                                            )
+                                            if not bool(_drain_state.get("at_bottom")):
+                                                _block_next_page_until_drained = True
+                                                _block_next_page_reason = _force_probe_reason
+                                            else:
+                                                _force_next_page_pending = True
+                                                _first_flip_pending = False
+                                                _block_next_page_until_drained = False
+                                                _block_next_page_reason = ""
+                                                _force_probe_reason = (
+                                                    f"{_force_probe_reason}; physical bottom reached"
+                                                )
+                                            _pagination_hint_msg = (
+                                                f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                                f"已确认页面存在翻页控件：{_names}。\n"
+                                                f"但本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
+                                                "不足以证明当前页已提取完。\n"
+                                                "下一步请先 smooth_scroll 向下并继续 extract 当前页；"
+                                                "只有当前页物理触底或无新增后，才使用 next_page。"
+                                            )
                                     else:
-                                        _pagination_hint_msg = (
-                                            "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
-                                            "已滚到底未发现翻页控件，可视为无限滚动列表。"
-                                            "继续 smooth_scroll down 加载新数据，直到页面无新增或达量。"
+                                        _should_force_probe_next, _force_probe_reason = (
+                                            _should_schedule_next_page_after_extract(
+                                                goal,
+                                                new_rows=_new_rows,
+                                                total_rows=_total_extracted_rows,
+                                                extract_source=_log_extract_text_source,
+                                                pagination_kind=_pagination_kind,
+                                                expected_rows=_expected_rows_from_data_shape(_data_shape),
+                                                physically_drained=bool(_data_shape.get("physically_drained")),
+                                            )
                                         )
+                                        if _should_force_probe_next:
+                                            _force_next_page_pending = True
+                                            _first_flip_pending = False
+                                            _block_next_page_until_drained = False
+                                            _block_next_page_reason = ""
+                                            logger.info(
+                                                "[PROBE PAGE] armed universal next_page after extract: %s",
+                                                _force_probe_reason,
+                                            )
+                                            _broadcast_log_safe(
+                                                f"[PROBE PAGE] 大批量提取未达量，下一轮交给 next_page 宏动作：{_force_probe_reason}",
+                                                level="info",
+                                            )
+                                            _pagination_hint_msg = (
+                                                "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
+                                                "当前提取批次已足够大但目标未达成。"
+                                                "下一步使用 next_page 宏动作；如果确实没有分页器，"
+                                                "底层会自动走 L4 滚动兜底加载新数据。"
+                                            )
+                                        else:
+                                            _pagination_hint_msg = (
+                                                "📍【系统探测：本页**无分页器**】\n"
+                                                f"本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
+                                                "请继续 smooth_scroll / extract 当前列表；"
+                                                "如果滚动触底且仍未达量，引擎会再调度 next_page 宏动作。"
+                                            )
                                     logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
                                 except Exception as _probe_err:
                                     logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
@@ -3901,7 +5357,7 @@ async def run_agent(
                         # Any real navigation/viewport-changing action resets consecutive extract count.
                         if action in (
                             "click", "click_text", "hover_and_click", "click_point", "click_new_tab",
-                            "next_page", "scroll", "smooth_scroll", "goto",
+                            "next_page", "scroll", "smooth_scroll", "find_text", "form_set", "goto",
                             "press_key", "switch_tab", "close_tab",
                         ):
                             _extract_count = 0
@@ -4098,6 +5554,247 @@ async def run_agent(
                             decision["type_value"] = _type_tv
                             action = "click_text"
 
+                    # ── 表单滚动漂移守卫 ─────────────────────────────────────
+                    # 表单任务如果尚未开始填写字段，却连续向下滚动，很容易从目标表单
+                    # 一路滚到文档页脚/其它示例区域。该守卫只在表单填报目标触发。
+                    if _is_form_fill_goal:
+                        _form_thought = str(decision.get("thought") or "")
+                        _form_tv_for_fix = str(decision.get("type_value") or "").strip()
+                        _multi_form_hits = re.findall(
+                            r"([^=;\n\r]{1,80})\s*=\s*([^;\n\r]+)",
+                            _form_tv_for_fix,
+                        )
+                        if action == "form_set" and len(_multi_form_hits) > 1:
+                            for _raw_label, _raw_value in _multi_form_hits:
+                                _raw_label = _raw_label.strip().strip("\"'“”")
+                                _raw_value = _raw_value.strip().strip("\"'“”")
+                                if _lookup_form_assignment(_form_assignments, _raw_label):
+                                    logger.warning(
+                                        "[FORM FIX] multi-field form_set payload %r -> first field %r=%r",
+                                        _form_tv_for_fix,
+                                        _raw_label,
+                                        _raw_value,
+                                    )
+                                    decision["type_value"] = f"{_raw_label}={_raw_value}"
+                                    _form_tv_for_fix = decision["type_value"]
+                                    vlm.inject_error_feedback(
+                                        "⚠️ form_set 一次只执行一个字段。系统已拆出第一个字段执行；"
+                                        "下一步继续用 form_set 分别处理剩余字段。"
+                                    )
+                                    break
+                        _label_value_tv = re.match(r"^\s*([^=\n\r]{1,80})\s*=\s*(.+?)\s*$", _form_tv_for_fix, re.S)
+                        if action == "form_set" and _label_value_tv:
+                            _raw_label = _label_value_tv.group(1).strip().strip("\"'“”")
+                            if re.search(
+                                r"^(create|submit|save|ok)$|提交|保存|确定|创建",
+                                _raw_label,
+                                re.IGNORECASE,
+                            ):
+                                logger.warning(
+                                    "[FORM FIX] submit button pseudo form_set %r -> click_text %r",
+                                    _form_tv_for_fix,
+                                    _raw_label,
+                                )
+                                decision["action"] = "click_text"
+                                decision["target_id"] = 0
+                                decision["type_value"] = _raw_label
+                                action = "click_text"
+                                _form_tv_for_fix = _raw_label
+                        if action in ("type", "click_text") and _label_value_tv:
+                            _raw_label = _label_value_tv.group(1).strip().strip("\"'“”")
+                            _raw_value = _label_value_tv.group(2).strip().strip("\"'“”")
+                            if _lookup_form_assignment(_form_assignments, _raw_label):
+                                logger.warning(
+                                    "[FORM FIX] %s carried label=value payload %r -> form_set",
+                                    action,
+                                    _form_tv_for_fix,
+                                )
+                                decision["action"] = "form_set"
+                                decision["target_id"] = 0
+                                decision["type_value"] = f"{_raw_label}={_raw_value}"
+                                action = "form_set"
+                                vlm.inject_error_feedback(
+                                    f"⚠️ 表单动作纠偏：type_value={_form_tv_for_fix!r} 是字段赋值，"
+                                    "不能作为普通文本输入或点击文本。系统已改为 form_set。"
+                                )
+                        _assignment_hit = _lookup_form_assignment(_form_assignments, _form_tv_for_fix)
+                        if action in ("type", "click_text") and _assignment_hit:
+                            _orig_form_action = action
+                            _label, _value = _assignment_hit
+                            logger.warning(
+                                "[FORM FIX] %s with label-like type_value %r -> form_set %r=%r",
+                                action,
+                                _form_tv_for_fix,
+                                _label,
+                                _value,
+                            )
+                            decision["action"] = "form_set"
+                            decision["target_id"] = 0
+                            decision["type_value"] = f"{_label}={_value}"
+                            action = "form_set"
+                            vlm.inject_error_feedback(
+                                f"⚠️ 表单动作纠偏：你刚把字段标签 {_form_tv_for_fix!r} 当成了"
+                                f"{_orig_form_action} 的目标/输入。系统已改为 form_set：{_label}={_value}。"
+                                "后续遇到组件库表单字段，请优先使用 form_set。"
+                            )
+                        elif action in ("click", "type", "click_text") and _form_assignments:
+                            _thought_assignment_hit = None
+                            for _label, _value in _form_assignments.items():
+                                if _label and _label.lower() in _form_thought.lower():
+                                    _thought_assignment_hit = (_label, _value)
+                                    break
+                            _value_assignment_hit = _lookup_form_assignment_by_value(
+                                _form_assignments, _form_tv_for_fix
+                            )
+                            _route_hit = None
+                            if _thought_assignment_hit and _assignment_is_non_text_control(_thought_assignment_hit[0]):
+                                _route_hit = _thought_assignment_hit
+                            elif _value_assignment_hit and _assignment_is_non_text_control(_value_assignment_hit[0]):
+                                _route_hit = _value_assignment_hit
+                            if _route_hit:
+                                _label, _value = _route_hit
+                                logger.warning(
+                                    "[FORM FIX] %s routed to form_set via thought/value: %r=%r",
+                                    action,
+                                    _label,
+                                    _value,
+                                )
+                                decision["action"] = "form_set"
+                                decision["target_id"] = 0
+                                decision["type_value"] = f"{_label}={_value}"
+                                action = "form_set"
+                                vlm.inject_error_feedback(
+                                    f"⚠️ 表单动作纠偏：当前动作疑似在处理组件控件 {_label!r}，"
+                                    f"系统已改为 form_set：{_label}={_value}，避免把值误输入到其它文本框。"
+                                )
+                        _no_scroll_markers = (
+                            "无需再滚动", "不需要再滚动", "无需滚动", "不用再滚动",
+                            "已经可见", "已可见", "已出现", "满足退出标准",
+                            "no need to scroll", "already visible",
+                        )
+                        if (
+                            action in ("scroll", "smooth_scroll")
+                            and any(marker in _form_thought for marker in _no_scroll_markers)
+                        ):
+                            _cur_sg_text = ""
+                            if _task_plan is not None and _task_plan.current is not None:
+                                _cur_sg_text = (
+                                    f"{_task_plan.current.description}\n"
+                                    f"{_task_plan.current.exit_criteria}"
+                                )
+                            if _text_is_form_visibility_trap(_cur_sg_text):
+                                decision["subgoal_status"] = "completed"
+                            decision["action"] = "wait"
+                            decision["target_id"] = 0
+                            decision["type_value"] = "1"
+                            action = "wait"
+                            vlm.inject_error_feedback(
+                                "⚠️ 表单动作纠偏：你的 thought 已判断目标字段/表单可见，"
+                                "但 action 仍然是滚动。系统已取消本次滚动。下一步请直接填写/选择"
+                                "当前可见字段；若要找某个不可见字段，使用 find_text，而不是盲滚。"
+                            )
+
+                        _scroll_dir = str(
+                            decision.get("direction")
+                            or decision.get("type_value")
+                            or "down"
+                        ).strip().lower()
+                        _is_down_scroll = (
+                            action in ("scroll", "smooth_scroll")
+                            and _scroll_dir in ("", "down", "bottom", "next")
+                        )
+                        _is_up_scroll = (
+                            action in ("scroll", "smooth_scroll")
+                            and _scroll_dir in ("up", "top", "previous", "prev")
+                        )
+                        _form_action_roles = {
+                            "textbox", "searchbox", "combobox", "spinbutton",
+                            "textarea", "input", "checkbox", "radio", "switch",
+                            "button", "option",
+                        }
+                        _target_role_for_form = ""
+                        try:
+                            _target_id_int = int(decision.get("target_id", 0) or 0)
+                            if _target_id_int:
+                                _target_meta_for_form = next(
+                                    (
+                                        el for el in getattr(browser, "_last_som_elements", [])
+                                        if int(el.get("id", -1)) == _target_id_int
+                                    ),
+                                    None,
+                                )
+                                _target_role_for_form = str(
+                                    (_target_meta_for_form or {}).get("role")
+                                    or (_target_meta_for_form or {}).get("tag")
+                                    or ""
+                                ).strip().lower()
+                        except Exception:
+                            _target_role_for_form = ""
+
+                        _form_value_hint = str(
+                            decision.get("type_value") or ""
+                        ).strip().lower()
+                        _form_value_markers = (
+                            "activity", "zone", "date", "time", "delivery",
+                            "online", "sponsor", "resource", "create",
+                            "submit", "pick a date", "表单", "提交",
+                        )
+                        _click_looks_like_form = (
+                            _target_role_for_form in _form_action_roles
+                            or any(marker in _form_value_hint for marker in _form_value_markers)
+                        )
+                        if action in ("type", "select", "form_set", "upload", "press_key") or (
+                            action in ("click", "click_text", "hover_and_click")
+                            and _click_looks_like_form
+                        ):
+                            _form_interaction_started = True
+                            _form_scroll_down_streak = 0
+                        elif _is_up_scroll:
+                            _form_scroll_down_streak = 0
+                        elif _is_down_scroll and not _form_interaction_started:
+                            _form_scroll_down_streak += 1
+                            _visible_text = " ".join(
+                                str(
+                                    el.get("name")
+                                    or el.get("text")
+                                    or el.get("label")
+                                    or ""
+                                )
+                                for el in getattr(browser, "_last_som_elements", [])
+                            ).lower()
+                            _footer_markers = (
+                                "source", "contributors", "edit this page",
+                                "previous", "next", "footer", "sitemap",
+                                "源码", "贡献者", "页脚",
+                            )
+                            _looks_like_footer = any(
+                                marker in _visible_text for marker in _footer_markers
+                            )
+                            if _looks_like_footer or _form_scroll_down_streak >= 7:
+                                _reason = (
+                                    "当前视口已出现页脚/文档导航信号"
+                                    if _looks_like_footer
+                                    else "尚未填写任何字段却连续向下滚动过多"
+                                )
+                                _block_msg = (
+                                    f"🚫 表单滚动守卫已取消本次 {action} down：{_reason}。\n"
+                                    "你正在执行表单填报任务。不要为了让整张表单和 Create/Submit "
+                                    "按钮同时出现在一屏而继续向下滚动。\n"
+                                    "【强制指令】下一步请用 find_text 定位当前要处理的字段/按钮"
+                                    "（如 Activity name / Activity zone / Create），或回到目标表单区域后立即逐字段填写。"
+                                )
+                                logger.warning(
+                                    "[FORM GUARD] Blocked pre-fill down scroll: "
+                                    "streak=%s footer=%s",
+                                    _form_scroll_down_streak,
+                                    _looks_like_footer,
+                                )
+                                vlm.inject_error_feedback(_block_msg)
+                                vlm.annotate_last_result(
+                                    "🚫 表单滚动守卫：未执行继续向下滚动，要求回到表单并开始填字段"
+                                )
+                                break
+
                     # ── LOOP GUARD 前置拦截：已进入黑名单的 target_id 直接阻断 ───
                     _click_target_id = decision.get("target_id", 0)
                     _click_point_bucket = _bucket_point(decision.get("point"))
@@ -4165,6 +5862,23 @@ async def run_agent(
                                     _np_strategy,
                                     str(_np_landed)[:160],
                                 )
+                                _nav_target = _parse_goal_target_count(goal)
+                                if _nav_target is None or _total_extracted_rows < _nav_target:
+                                    _force_extract_after_navigation_pending = True
+                                    _force_next_page_pending = False
+                                    _nav_feedback = (
+                                        "已成功翻页到新页面，下一步必须先执行 extract 提取当前页；"
+                                        "在当前页完成提取前禁止继续 next_page，避免跳过目标数据。"
+                                    )
+                                    try:
+                                        vlm.inject_error_feedback(_nav_feedback)
+                                    except Exception:
+                                        pass
+                                    logger.info(
+                                        "[FORCE EXTRACT AFTER NAV] armed after next_page; progress=%s/%s",
+                                        _total_extracted_rows,
+                                        _nav_target if _nav_target is not None else "?",
+                                    )
 
                         # ── 标签页切换感知：将 Tab Guard 切换事件注入 VLM 反馈 ──────
                         _tab_switched_this_step = bool(browser._tab_switch_notice)
@@ -4237,6 +5951,53 @@ async def run_agent(
                                     f"tooltip={str(_last_hover_rpa.get('tooltip_text'))[:120]!r}"
                                 )
                         vlm.annotate_last_result("✅ " + " | ".join(_outcome_parts))
+
+                        _submit_marker_text = " ".join(
+                            str(decision.get(k) or "")
+                            for k in ("type_value", "thought", "progress_review", "current_state")
+                        ).lower()
+                        _looks_like_form_submit = (
+                            _is_form_fill_goal
+                            and action in ("click", "click_text", "click_point")
+                            and bool(
+                                re.search(
+                                    r"\b(create|submit|save|ok)\b|提交|保存|确定|创建",
+                                    _submit_marker_text,
+                                    re.IGNORECASE,
+                                )
+                            )
+                        )
+                        if _looks_like_form_submit:
+                            if _form_submit_clicked_once:
+                                logger.info(
+                                    "[FORM SUBMIT GUARD] submit was already clicked once; "
+                                    "treating inert demo page as completed."
+                                )
+                            else:
+                                logger.info(
+                                    "[FORM SUBMIT GUARD] submit clicked once; "
+                                    "ending form task even if the demo page has no visual response."
+                                )
+                            _form_submit_clicked_once = True
+                            _broadcast_log_safe(
+                                "[DONE] 表单提交按钮已点击一次；页面无反馈按演示站/无跳转提交处理，自动结束。"
+                            )
+                            _broadcast_done_safe(True, "Form submit clicked")
+                            await browser.mark_and_screenshot(step=99)
+                            _log_screenshot_path = str(Path(SCREENSHOT_DIR) / "step_99.png")
+                            _log_decision = {
+                                "action": "done",
+                                "target_id": int(decision.get("target_id", 0) or 0),
+                                "type_value": str(decision.get("type_value") or "submit"),
+                                "status": "success",
+                                "thought": (
+                                    "表单字段已完成回读验收，且提交按钮已点击一次。"
+                                    "当前页面无跳转/无提示，按演示站或静默提交处理，任务结束。"
+                                ),
+                            }
+                            _run_succeeded = True
+                            _task_completed = True
+                            break
 
                         if action == "hover_and_click" and _click_repeat_count >= 2:
                             _menu_text = str(decision.get("type_value") or "").strip()
@@ -4393,6 +6154,42 @@ async def run_agent(
                         # 方案②：失败也回填历史，避免 VLM 误以为动作已经成功
                         vlm.annotate_last_result(f"❌ 失败: {err_msg[:80]}")
 
+                        _scroll_down_failed_at_bottom = (
+                            action in ("scroll", "smooth_scroll")
+                            and str(decision.get("type_value") or "down").lower()
+                            in ("", "down", "bottom", "next")
+                            and any(
+                                marker in err_msg
+                                for marker in (
+                                    "已滚到底",
+                                    "页面已滚到底部",
+                                    "无法继续向下滚动",
+                                    "已到页面底部",
+                                    "bottom",
+                                )
+                            )
+                        )
+                        _target_after_scroll_fail = _parse_goal_target_count(goal)
+                        _scroll_bottom_target_unmet = (
+                            _target_after_scroll_fail is not None
+                            and _total_extracted_rows < _target_after_scroll_fail
+                        )
+                        if _scroll_down_failed_at_bottom and _scroll_bottom_target_unmet:
+                            _force_next_page_pending = True
+                            _first_flip_pending = False
+                            vlm.inject_error_feedback(
+                                "⚠️ 底层已确认页面/主滚动区域向下滚动到达底部，"
+                                f"但当前仅累计 {_total_extracted_rows}/{_target_after_scroll_fail} 条。\n"
+                                "下一轮系统将强制执行 next_page（target_id=0, type_value=\"\"），"
+                                "优先尝试 URL 变异、分页器和页码探测；不要继续 smooth_scroll。"
+                            )
+                            logger.info(
+                                "[FORCE NEXT_PAGE] armed after bottom scroll failure: "
+                                "%s/%s rows",
+                                _total_extracted_rows,
+                                _target_after_scroll_fail,
+                            )
+
                         if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                             # 连续失败达到上限，交人工处理
                             _print_manual_warning(
@@ -4406,7 +6203,8 @@ async def run_agent(
                             vlm.inject_error_feedback("")  # 清空积压反馈
                         else:
                             # 将错误注入下一轮 VLM 提示，引导换策略
-                            vlm.inject_error_feedback(err_msg)
+                            if not _force_next_page_pending:
+                                vlm.inject_error_feedback(err_msg)
                         break  # 中止本批次，进入下一步（重新截图）
 
                 # 内层批次循环结束：若任务完成则退出外层主循环

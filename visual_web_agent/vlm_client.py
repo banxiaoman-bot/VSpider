@@ -35,6 +35,8 @@ try:
         VLM_API_BASE,
         VLM_API_KEY,
         VLM_MODEL_NAME,
+        VLM_SEMANTIC_API_BASE,
+        VLM_SEMANTIC_API_KEY,
         VLM_TIMEOUT,
         VLM_MAX_TOKENS,
         VLM_TEMPERATURE,
@@ -47,6 +49,8 @@ except ImportError:
         VLM_API_BASE,
         VLM_API_KEY,
         VLM_MODEL_NAME,
+        VLM_SEMANTIC_API_BASE,
+        VLM_SEMANTIC_API_KEY,
         VLM_TIMEOUT,
         VLM_MAX_TOKENS,
         VLM_TEMPERATURE,
@@ -110,6 +114,8 @@ class VSpiderAction(BaseModel):
         "remove_element", # 物理铲除：从 DOM 树直接删除广告遮罩/悬浮弹窗等阻挡节点
         "wait",           # 显式等待：主动暂停 N 秒，应对长动画/慢加载中间态
         "drag_and_drop",  # 拖拽：将 target_id 元素拖到 type_value 指定 ID 的元素上
+        "find_text",      # 滚动定位文本/字段标签：target_id=0, type_value=可见文字
+        "form_set",       # 按字段标签设置表单控件：target_id=0, type_value="label=value"
         "next_page",      # 启发式翻页：底层尝试 [Next/下一页/›/→] 等通用 locator
         "click_text",     # 文本定位点击：底层 page.get_by_text(type_value) 绕开 SoM ID 填位
         "hover_and_click",# 复合悬浮+菜单项点击（target_id=hover触发器, type_value=菜单项文字）
@@ -517,11 +523,20 @@ class VSpiderAction(BaseModel):
                 "规则：左上角 [0, 0]，右下角 [1000, 1000]，正中心 [500, 500]。\n"
                 "请仔细观察截图中目标元素的相对位置，换算为 0-1000 范围后重新提交。"
             )
-        if self.action == "extract" and self.extracted_data is None:
+        _extract_payload_empty = (
+            self.extracted_data is None
+            or self.extracted_data == []
+            or self.extracted_data == {}
+            or (
+                isinstance(self.extracted_data, str)
+                and not self.extracted_data.strip()
+            )
+        )
+        if self.action == "extract" and _extract_payload_empty:
             import logging as _logging
             _logging.getLogger(__name__).warning(
-                "[ACTION FIX] extract + extracted_data=null → 自动降级为 wait(2s) + "
-                "自愈提示，下一步 VLM 将重新观察截图提取数据"
+                "[ACTION FIX] extract + empty extracted_data → 自动降级为 wait(2s) + "
+                "AX/全文自动提取兜底"
             )
             # 降级为 wait 2 秒：让主循环重新截图后 VLM 再次尝试提取
             self.action = "wait"           # type: ignore[assignment]
@@ -680,6 +695,14 @@ class VLMClient:
         self.semantic_model = (
             getattr(runtime_config, "VLM_SEMANTIC_MODEL_NAME", "") or self.model
         )
+        self.semantic_api_base = (
+            getattr(runtime_config, "VLM_SEMANTIC_API_BASE", "")
+            or self.api_base
+        )
+        self.semantic_api_key = (
+            getattr(runtime_config, "VLM_SEMANTIC_API_KEY", "")
+            or self.api_key
+        )
         self.timeout = getattr(runtime_config, "VLM_TIMEOUT", VLM_TIMEOUT)
         self.max_tokens = getattr(runtime_config, "VLM_MAX_TOKENS", VLM_MAX_TOKENS)
         self.temperature = getattr(runtime_config, "VLM_TEMPERATURE", VLM_TEMPERATURE)
@@ -696,6 +719,14 @@ class VLMClient:
             timeout=self.timeout,
             http_client=_http_client,
         )
+        self.semantic_client = self.client
+        if self.semantic_api_base != self.api_base or self.semantic_api_key != self.api_key:
+            self.semantic_client = AsyncOpenAI(
+                api_key=self.semantic_api_key,
+                base_url=self.semantic_api_base,
+                timeout=self.timeout,
+                http_client=httpx.AsyncClient(timeout=httpx.Timeout(self.timeout)),
+            )
         # 操作历史：存储每轮批次中各动作的 (step, thought, action, target_id, type_value) 摘要
         self._history: list[dict] = []
         self._history_window: int = max(2, int(VLM_HISTORY_WINDOW or self._HISTORY_WINDOW))
@@ -705,7 +736,8 @@ class VLMClient:
         self._pending_error: str | None = None
         logger.info(
             f"VLM client initialized | model={self.model} | base={self.api_base} | "
-            f"semantic_model={self.semantic_model} | text_only={self.text_only} | "
+            f"semantic_model={self.semantic_model} | semantic_base={self.semantic_api_base} | "
+            f"text_only={self.text_only} | "
             f"max_tokens={self.max_tokens} | temperature={self.temperature}"
         )
 
@@ -1171,7 +1203,7 @@ class VLMClient:
                 "[EXTRACT FULL] 启动全页 AX Tree 结构化提取（纯文本 LLM 调用）..."
             )
 
-            response = await self.client.chat.completions.create(
+            response = await self.semantic_client.chat.completions.create(
                 model=self.semantic_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1277,10 +1309,10 @@ class VLMClient:
                 }
 
             try:
-                response = await self.client.chat.completions.create(**api_kwargs)
+                response = await self.semantic_client.chat.completions.create(**api_kwargs)
             except BadRequestError:
                 api_kwargs.pop("response_format", None)
-                response = await self.client.chat.completions.create(**api_kwargs)
+                response = await self.semantic_client.chat.completions.create(**api_kwargs)
 
             raw = (response.choices[0].message.content or "").strip()
             if raw.startswith("```"):
@@ -1364,10 +1396,10 @@ class VLMClient:
                 }
 
             try:
-                response = await self.client.chat.completions.create(**api_kwargs)
+                response = await self.semantic_client.chat.completions.create(**api_kwargs)
             except BadRequestError:
                 api_kwargs.pop("response_format", None)
-                response = await self.client.chat.completions.create(**api_kwargs)
+                response = await self.semantic_client.chat.completions.create(**api_kwargs)
 
             raw = (response.choices[0].message.content or "").strip()
             if raw.startswith("```"):
@@ -1417,12 +1449,12 @@ class VLMClient:
                     if thought.startswith(_EXTRACT_MARKER):
                         decisions[idx]["__extract_downgraded"] = True
                         self.inject_error_feedback(
-                            "⚠️ 你上一步想执行 extract 动作，但 extracted_data 是 null，"
+                            "⚠️ 你上一步想执行 extract 动作，但 extracted_data 是 null/空数组/空对象，"
                             "已被系统自动降级为 wait。\n"
                             "【本步要求】请重新执行 extract 动作，这次必须仔细观察截图，"
                             "将目标数据整理为结构化 JSON 写入 extracted_data 字段。\n"
                             "例如：extracted_data: {\"rank\": 1, \"title\": \"...\", \"views\": \"...\"}\n"
-                            "extracted_data 绝对不能是 null！"
+                            "extracted_data 绝对不能是空值！"
                         )
                         break
                     if _ZERO_MARKER in thought:

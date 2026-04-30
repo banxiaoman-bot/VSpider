@@ -40,8 +40,9 @@ WRAPPER_META_KEYS = {
 
 IDENTITY_KEY_MARKERS = (
     "id", "uuid", "url", "link", "href", "sku", "code", "no", "sn",
+    "rank", "ranking",
     "bh", "编号", "序号", "序列号", "编码", "设备编码", "工单号", "单号",
-    "资产编号", "表计号", "户号",
+    "资产编号", "表计号", "户号", "排名", "名次",
 )
 
 VOLATILE_EVIDENCE_KEY_MARKERS = (

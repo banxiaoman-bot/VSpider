@@ -660,6 +660,8 @@ async def start_batch(
     vlm_max_tokens: str = Form("", description="Runtime VLM max_tokens override"),
     vlm_base_url: str = Form("", description="Runtime VLM base URL override"),
     vlm_api_key: str = Form("", description="Runtime VLM API key override"),
+    semantic_base_url: str = Form("", description="Runtime semantic/text base URL override"),
+    semantic_api_key: str = Form("", description="Runtime semantic/text API key override"),
     file: UploadFile | None = File(
         None,
         description="Excel (.xlsx) or CSV file, optional",
@@ -718,6 +720,8 @@ async def start_batch(
         "model_type": vlm_model_type.strip().lower() or "vl",
         "base_url": vlm_base_url.strip(),
         "api_key": vlm_api_key.strip(),
+        "semantic_base_url": semantic_base_url.strip(),
+        "semantic_api_key": semantic_api_key.strip(),
     }
     if vlm_temperature.strip():
         try:
@@ -753,7 +757,8 @@ async def start_batch(
         f"  auth       : {auth_profiles.strip() or '<auto/default>'}\n"
         f"  vlm        : {vlm_options.get('model') or '<default>'}"
         f" ({vlm_options.get('model_type') or 'vl'}), "
-        f"semantic={vlm_options.get('semantic_model') or '<default>'}\n"
+        f"semantic={vlm_options.get('semantic_model') or '<default>'}, "
+        f"semantic_base={vlm_options.get('semantic_base_url') or '<default>'}\n"
         f"  file       : {safe_name!r}  ({file_size_kb:.1f} KB)\n"
         f"  saved_to   : {saved_path or '<none>'}\n"
         f"  overwritten: {existed}"
