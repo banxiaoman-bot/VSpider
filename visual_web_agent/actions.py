@@ -34,11 +34,13 @@ try:
     from .browser_env import ActionExecutionError
     from .auth_vault import SecretResolutionError, resolve_env_placeholders
     from .artifact_manager import register_artifact
+    from .page_data_controller import DATA_SIGNATURE_JS, pagination_moved
 except ImportError:
     from vlm_client import VSpiderAction
     from browser_env import ActionExecutionError
     from auth_vault import SecretResolutionError, resolve_env_placeholders
     from artifact_manager import register_artifact
+    from page_data_controller import DATA_SIGNATURE_JS, pagination_moved
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -1927,6 +1929,53 @@ class NextPageHandler(ActionHandler):
     # offset 默认步长（豆瓣 25 / 多数搜索 10）—— 找不到 size 参数时回退
     _DEFAULT_OFFSET_STEPS: ClassVar[tuple[int, ...]] = (25, 10, 20, 50)
 
+    async def _has_visible_dom_pagination(self, page) -> bool:
+        """Return True when the current viewport already exposes a pager.
+
+        This is a guard for URL seed mutation. If the page shows a real
+        numeric/next pager, clicking that DOM control is safer than inventing
+        a query parameter such as page=1.
+        """
+        try:
+            return bool(await page.evaluate(
+                """() => {
+                    const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+                    const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+                    const visible = (el) => {
+                        if (!el || !el.getBoundingClientRect) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 8 || r.height < 8) return false;
+                        if (r.bottom <= 0 || r.right <= 0 || r.top >= vh || r.left >= vw) return false;
+                        const st = window.getComputedStyle(el);
+                        return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) > 0.01;
+                    };
+                    const textOf = (el) => norm([
+                        el.innerText, el.textContent, el.getAttribute('aria-label'),
+                        el.getAttribute('title'), el.value
+                    ].filter(Boolean).join(' '));
+                    const controls = Array.from(document.querySelectorAll(
+                        'a,button,[role="button"],[role="link"],li,span'
+                    )).filter(visible);
+                    let numeric = 0;
+                    let nextLike = 0;
+                    for (const el of controls) {
+                        const t = textOf(el);
+                        const cls = String(el.className || '').toLowerCase();
+                        if (/^\\d{1,4}$/.test(t)) numeric += 1;
+                        if (/^(next|next page|more|older|>|>>|\\u203a|\\u00bb|\\u2192)$/i.test(t) ||
+                            /\\b(next|pager-next|pagination-next|paginate_button next|dt-paging-button next)\\b/i.test(cls)) {
+                            nextLike += 1;
+                        }
+                    }
+                    if (nextLike > 0) return true;
+                    if (numeric >= 2) return true;
+                    return false;
+                }"""
+            ))
+        except Exception:
+            return False
+
     async def _dom_confirms_pagination_param(
         self, page, key: str, expected_next: int
     ) -> bool:
@@ -1987,8 +2036,19 @@ class NextPageHandler(ActionHandler):
             scroll_height = 0
         return url, text, text_len, scroll_height
 
+    async def _page_data_signature(self, page) -> dict:
+        try:
+            return await page.evaluate(DATA_SIGNATURE_JS) or {}
+        except Exception as exc:
+            logger.debug("[NEXT_PAGE] data signature probe failed: %s", exc)
+            return {}
+
     async def _wait_for_pagination_change(
-        self, page, before: tuple[str, str, int, int], label: str
+        self,
+        page,
+        before: tuple[str, str, int, int],
+        label: str,
+        before_data: dict | None = None,
     ) -> bool:
         """Return True only if a click changed URL or visible page text."""
         try:
@@ -2001,7 +2061,16 @@ class NextPageHandler(ActionHandler):
             pass
         await asyncio.sleep(0.5)
         after = await self._page_signature(page)
+        after_data = await self._page_data_signature(page) if before_data else {}
         if after != before:
+            if self._looks_like_browser_error_signature(after):
+                logger.warning(
+                    "[NEXT_PAGE] candidate %s landed on a browser/network error "
+                    "page; restoring list page",
+                    label,
+                )
+                await self._restore_after_bad_candidate(page, before[0], label)
+                return False
             if self._looks_like_detail_navigation(before[0], after[0]):
                 logger.warning(
                     "[NEXT_PAGE] candidate %s changed page, but landed on a "
@@ -2012,9 +2081,41 @@ class NextPageHandler(ActionHandler):
                 )
                 await self._restore_after_bad_candidate(page, before[0], label)
                 return False
+            if before_data:
+                moved, data_reason = pagination_moved(before_data, after_data)
+                if not moved:
+                    logger.info(
+                        "[NEXT_PAGE] candidate %s changed page shell but not data page: %s",
+                        label,
+                        data_reason,
+                    )
+                    return False
+                logger.info("[NEXT_PAGE] data-page movement confirmed: %s", data_reason)
             return True
         logger.info(f"[NEXT_PAGE] candidate {label} clicked but page did not change")
         return False
+
+    def _looks_like_browser_error_signature(
+        self, signature: tuple[str, str, int, int]
+    ) -> bool:
+        """Detect browser error pages so PAC does not treat them as success."""
+        url, text, _text_len, _scroll_height = signature
+        blob = f"{url}\n{text}".lower()
+        return any(marker in blob for marker in (
+            "err_name_not_resolved",
+            "err_connection",
+            "err_timed_out",
+            "err_internet_disconnected",
+            "err_tunnel_connection_failed",
+            "err_ssl_protocol_error",
+            "dns_probe",
+            "this site can't be reached",
+            "this site can’t be reached",
+            "can't reach this page",
+            "无法访问此网站",
+            "服务器 ip 地址",
+            "chrome-error://",
+        ))
 
     def _query_has_page_signal(self, url: str) -> bool:
         try:
@@ -2077,6 +2178,17 @@ class NextPageHandler(ActionHandler):
         if not before_url or not before_url.startswith(("http://", "https://")):
             return
         try:
+            await page.go_back(wait_until="domcontentloaded", timeout=5000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=2000)
+            except Exception:
+                pass
+            if (page.url or "").split("#", 1)[0] == before_url.split("#", 1)[0]:
+                logger.info("[NEXT_PAGE] restored original page via go_back after %s", label)
+                return
+        except Exception:
+            pass
+        try:
             await page.goto(before_url, wait_until="domcontentloaded", timeout=10000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=3000)
@@ -2114,9 +2226,10 @@ class NextPageHandler(ActionHandler):
             logger.debug(f"[NEXT_PAGE] skip disabled/current candidate {label}")
             return False
         before = await self._page_signature(page)
+        before_data = await self._page_data_signature(page)
         click_mode = await _click_locator_with_js_fallback(loc, label, timeout=3000)
         return await self._wait_for_pagination_change(
-            page, before, f"{label}/{click_mode}"
+            page, before, f"{label}/{click_mode}", before_data
         )
 
     async def _js_mark_pagination_candidate(self, page) -> dict:
@@ -2189,6 +2302,17 @@ class NextPageHandler(ActionHandler):
                     const t = textOf(el).trim();
                     return /^\\d{1,5}$/.test(t) ? Number(t) : null;
                 };
+                const hasNextIntent = (label) => {
+                    const raw = String(label || '').trim();
+                    const text = norm(raw);
+                    if (!text || text.length > 80) return false;
+                    if (/^(>|›|»|→)$/.test(text)) return true;
+                    if (/^(next|next page|older|more|load more|show more)$/.test(text)) return true;
+                    if (/\\b(next|older)\\b/.test(text)) return true;
+                    if (/\\b(load|show|view)\\s+more\\b/.test(text)) return true;
+                    if (/(下一页|下一頁|下页|下頁|后一页|後一頁|加载更多|查看更多)/.test(raw)) return true;
+                    return false;
+                };
 
                 const scoreRoot = (root) => {
                     if (root === document.body) return 0;
@@ -2218,7 +2342,10 @@ class NextPageHandler(ActionHandler):
                         if (disabled(el)) continue;
                         const label = norm(textOf(el));
                         const cls = norm([el.className, el.id].join(' '));
-                        if (nextWords.some(w => label.includes(norm(w))) || /\\b(next|pager-next|pagination-next|paginate_button next|dt-paging-button next)\\b/.test(cls)) {
+                        if (label.length > 120 && !/\\b(next|pager-next|pagination-next|paginate_button next|dt-paging-button next)\\b/.test(cls)) {
+                            continue;
+                        }
+                        if (hasNextIntent(label) || /\\b(next|pager-next|pagination-next|paginate_button next|dt-paging-button next)\\b/.test(cls)) {
                             const target = clickable(el);
                             if (target && isVisible(target) && !disabled(target)) {
                                 candidates.push({el: target, strategy: 'js_next_text', score: data.score + 80, label: textOf(el)});
@@ -2232,7 +2359,7 @@ class NextPageHandler(ActionHandler):
                             if (textOf(el).trim() !== wanted) continue;
                             const target = clickable(el);
                             if (target && isVisible(target) && !disabled(target)) {
-                                candidates.push({el: target, strategy: `js_numeric_${data.activeNum}_to_${wanted}`, score: data.score + 70, label: wanted});
+                                candidates.push({el: target, strategy: `js_numeric_${data.activeNum}_to_${wanted}`, score: data.score + 100, label: wanted});
                             }
                         }
                     }
@@ -2242,7 +2369,7 @@ class NextPageHandler(ActionHandler):
                 if (!candidates.length) {
                     const all = Array.from(document.querySelectorAll('a,button,li,span,td,[role="button"],[role="link"]')).filter(isVisible);
                     const nums = all
-                        .map(el => ({el, n: exactNumber(el)}))
+                        .map(el => ({el, n: exactNumber(el), r: el.getBoundingClientRect()}))
                         .filter(x => Number.isInteger(x.n) && x.n >= 1 && x.n <= 999);
                     const current = nums.find(x => {
                         const cls = String(x.el.className || '');
@@ -2254,6 +2381,26 @@ class NextPageHandler(ActionHandler):
                             const target = clickable(wanted.el);
                             if (target && isVisible(target)) {
                                 candidates.push({el: target, strategy: `js_global_numeric_${current.n}_to_${wanted.n}`, score: 40, label: String(wanted.n)});
+                            }
+                        }
+                    } else if (nums.length >= 2) {
+                        const bottomNums = nums
+                            .filter(x => x.r.top > viewportH * 0.35)
+                            .sort((a, b) => a.n - b.n || a.r.left - b.r.left);
+                        const unique = [];
+                        const seen = new Set();
+                        for (const x of bottomNums) {
+                            if (seen.has(x.n)) continue;
+                            seen.add(x.n);
+                            unique.push(x);
+                        }
+                        const first = unique[0];
+                        const wanted = unique.find(x => first && x.n === first.n + 1) ||
+                            unique.find(x => x.n > 1);
+                        if (wanted && !disabled(wanted.el)) {
+                            const target = clickable(wanted.el);
+                            if (target && isVisible(target)) {
+                                candidates.push({el: target, strategy: `js_global_numeric_sequence_to_${wanted.n}`, score: 88, label: String(wanted.n)});
                             }
                         }
                     }
@@ -2295,6 +2442,16 @@ class NextPageHandler(ActionHandler):
                 return ""
             try:
                 logger.info(f"[NEXT_PAGE L0] {reason}; restoring original URL before fallback")
+                try:
+                    await page.go_back(wait_until="domcontentloaded", timeout=5000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=2000)
+                    except Exception:
+                        pass
+                    if (page.url or "").split("#", 1)[0] == cur_url.split("#", 1)[0]:
+                        return ""
+                except Exception:
+                    pass
                 await page.goto(cur_url, wait_until="domcontentloaded", timeout=10000)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=3000)
@@ -2415,6 +2572,11 @@ class NextPageHandler(ActionHandler):
         # 主动 seed page=1，下一次 next_page 再来就能 1→2 走原 query 递增路径。
         # 仅当 URL 看起来像列表/搜索结果页（query 有内容）时才 seed，避免对静态详情页乱加。
         if not new_url and parsed.query:
+            if await self._has_visible_dom_pagination(page):
+                logger.info(
+                    "[NEXT_PAGE L0] skip seed page=1 because visible DOM pagination exists"
+                )
+                return ""
             params.append(("page", "1"))
             new_query = urlencode(params, doseq=True)
             new_url = urlunparse(parsed._replace(query=new_query))
@@ -2449,6 +2611,9 @@ class NextPageHandler(ActionHandler):
 
         # 校验内容：URL 已变但正文签名完全一致 → 翻页未生效
         _after_signature = await self._page_signature(page)
+        if self._looks_like_browser_error_signature(_after_signature):
+            logger.warning("[NEXT_PAGE L0] landed on browser/network error page, downgrade")
+            return await _restore_original("landed browser error page")
         if _before_signature[1:] == _after_signature[1:]:
             logger.warning("[NEXT_PAGE L0] 着陆页内容与上一页一致，翻页未生效，降级")
             return await _restore_original("landed content unchanged")
@@ -2462,6 +2627,76 @@ class NextPageHandler(ActionHandler):
             raise ActionExecutionError("next_page: 无活动页面。")
 
         # ── Strategy 0: URL Mutation（最高效，零依赖 DOM）──
+        clicked = False
+        used_strategy = ""
+
+        # Strategy -1: visible DOM pager first. If the page already exposes a
+        # numeric/Next pager, clicking it is safer than inventing a URL query.
+        _probe_clicked_but_undetected = False  # 幽灵双击防护标志
+        try:
+            probe = await self._js_mark_pagination_candidate(page)
+            if probe.get("found"):
+                loc = page.locator('[data-vspider-next-page-probe="1"]').first
+                used_strategy = (
+                    f"js_probe_pre_url {probe.get('strategy')} "
+                    f"label={probe.get('label')!r}"
+                )
+                if await self._click_if_effective(page, loc, used_strategy):
+                    clicked = True
+                else:
+                    # 客户端分页（DataTables 等）不改 URL，且 body.innerText
+                    # 前 5000 字符可能被 hero/nav 占据导致 _page_signature
+                    # 检测不到变化。但按钮已经被点击，内部状态已翻页。
+                    # 若不拦截，L0/L1 会再点同一个按钮造成双击跳页。
+                    _probe_score = probe.get("score", 0)
+                    _probe_label = str(probe.get("label") or "")
+                    if len(_probe_label) > 120:
+                        _probe_clicked_but_undetected = True
+                        logger.info(
+                            "[NEXT_PAGE L-1] probe clicked but label is too broad "
+                            "(len=%s); refusing unchanged-page trust",
+                            len(_probe_label),
+                        )
+                    elif _probe_score >= 80:
+                        # 高置信度候选（pagination 容器内 + next 文本），
+                        # 信任点击已生效，不穿透到 L0/L1。
+                        logger.warning(
+                            "[NEXT_PAGE L-1] probe clicked (score=%s) but "
+                            "page_signature unchanged; trusting click to "
+                            "avoid phantom double-advance",
+                            _probe_score,
+                        )
+                        clicked = True
+                    else:
+                        # 低置信度候选，记录标志但仍允许穿透。
+                        # L0/L1 会跳过与探针相同的元素。
+                        _probe_clicked_but_undetected = True
+                        logger.info(
+                            "[NEXT_PAGE L-1] probe clicked (score=%s) but "
+                            "undetected; allowing fallthrough with guard",
+                            _probe_score,
+                        )
+            else:
+                logger.debug(
+                    "[NEXT_PAGE L-1] no visible JS pagination candidate: %s",
+                    probe.get("reason"),
+                )
+        except Exception as probe_err:
+            logger.debug("[NEXT_PAGE L-1] JS pagination probe failed: %s", probe_err)
+
+        if clicked:
+            logger.info("[NEXT_PAGE] hit strategy %s", used_strategy)
+            browser.rpa_trail.append(
+                ctx.with_rpa_meta({
+                    "action": "next_page",
+                    "method": "dom_heuristic",
+                    "strategy": used_strategy,
+                    "landed_url": page.url or "",
+                })
+            )
+            await browser._wait_after_action()
+            return None
+
         try:
             mutated = await self._try_url_mutation(page)
         except Exception as e:
@@ -2608,7 +2843,7 @@ class NextPageHandler(ActionHandler):
                     )
                 # Fix 2 关键：滚轮动了但内容没增长 = 伪无限滚动（实际是分页器但无标准控件）
                 # 这种情况 L4 不算成功，应当报错让上层换路（ask_human / done / click 真实 target_id）
-                if _delta_text < 200 and _delta_items <= 0:
+                if _delta_text < 50 and _delta_items <= 0:
                     raise ActionExecutionError(
                         f"next_page: L4 滚动后内容未增长（textLen Δ={_delta_text}，"
                         f"itemCount Δ={_delta_items}），本页**不是**真无限滚动 —— "

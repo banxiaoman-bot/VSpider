@@ -251,14 +251,21 @@ class VSpiderAction(BaseModel):
         action=done 必须带非空 thought，说明裁定依据（任务完成 / blocked / abort）。
 
         修复 Task C 式的静默 done：VLM 在登录墙前 1 步 done、thought 为空，
-        用户看日志完全不知道为什么结束。强制 VLM 把理由写出来。
+        用户看日志完全不知道为什么结束。
+
+        ⚠️ 关键改造（2026-05-06）：原先 raise ValueError 会让整个 batch 校验失败 →
+        全 batch 降级为 _ERROR_DECISION → action=error → 反复 done 被全 batch 罚成
+        error → 3 步熔断（DataTables 任务 step 1-3 死循环复现）。
+        改为**软标记**：写入兜底 thought + 标记 __empty_done_thought=True，
+        让上层 PLAN GATE / 主循环 dispatch 看到此标记后决定如何处理（注入反馈让
+        VLM 补理由而不是直接全 batch 死）。
         """
         if self.action == "done" and not (self.thought or "").strip():
-            raise ValueError(
-                "action=done 必须在 thought 中说明裁定依据："
-                "是所有子目标已完成？还是遇到登录墙/风控/验证码无法继续？"
-                "或是 Reflector 判定不可完成？"
-                "空 thought 的 done 被拒绝，用户看不到任务为何结束。"
+            self.thought = (
+                "[EMPTY DONE THOUGHT] 系统检测到你输出 action=done 但未在 thought 中"
+                "说明裁定依据。可能是任务真已完成（应说明哪些子目标 ✅、累计提取 N 条），"
+                "或 VLM 误判提前 done（应改为继续 extract / next_page 等动作）。"
+                "请下一轮明确说明：是真完成还是误判？"
             )
         return self
 
@@ -502,6 +509,23 @@ class VSpiderAction(BaseModel):
                 + _diag_extra
             ) + (self.thought or "")
             return self
+        # ── click_text type_value 长度防呆 ──────────────────────────
+        # VLM 偶发把推理段落塞进 type_value（应只放可见按钮/链接文字）
+        if self.action == "click_text" and self.type_value and len(self.type_value) > 30:
+            _raw_tv = self.type_value
+            # 尝试从引号内提取真实目标文本
+            _quote_match = re.search(r"['\"]([^'\"]{1,30})['\"]" , _raw_tv)
+            if _quote_match:
+                _fixed_tv = _quote_match.group(1).strip()
+            else:
+                # 取第一个空格分隔的短词或前 20 字符
+                _first_word = _raw_tv.split()[0] if _raw_tv.split() else _raw_tv[:20]
+                _fixed_tv = _first_word if len(_first_word) <= 20 else _raw_tv[:20]
+            logging.getLogger(__name__).warning(
+                f"[ACTION FIX] click_text type_value 过长({len(_raw_tv)}字), "
+                f"截取修复: {_raw_tv[:50]!r}... → {_fixed_tv!r}"
+            )
+            self.type_value = _fixed_tv
         if self.action == "press_key" and not (self.type_value and self.type_value.strip()):
             raise ValueError(
                 "动作缺陷！你选择了 'press_key' 动作，但未提供按键名称。"
@@ -523,18 +547,19 @@ class VSpiderAction(BaseModel):
                 "规则：左上角 [0, 0]，右下角 [1000, 1000]，正中心 [500, 500]。\n"
                 "请仔细观察截图中目标元素的相对位置，换算为 0-1000 范围后重新提交。"
             )
-        _extract_payload_empty = (
-            self.extracted_data is None
-            or self.extracted_data == []
-            or self.extracted_data == {}
-            or (
-                isinstance(self.extracted_data, str)
-                and not self.extracted_data.strip()
+        # Check the ACTUAL current state of extracted_data (not just serialized payload)
+        # This avoids false-positive downgrade when SCHEMA RESCUE has already populated data.
+        if isinstance(self.extracted_data, (list, dict)):
+            _has_real_data = len(self.extracted_data) > 0
+        elif isinstance(self.extracted_data, str):
+            _has_real_data = self.extracted_data.strip().lower() not in (
+                "", "[]", "{}", "null", "none", "undefined"
             )
-        )
-        if self.action == "extract" and _extract_payload_empty:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
+        else:
+            _has_real_data = self.extracted_data is not None
+
+        if self.action == "extract" and not _has_real_data:
+            logger.warning(
                 "[ACTION FIX] extract + empty extracted_data → 自动降级为 wait(2s) + "
                 "AX/全文自动提取兜底"
             )
@@ -544,6 +569,38 @@ class VSpiderAction(BaseModel):
             self.target_id = 0
             # 在 thought 中加入显式标记，供 _validate_batch / main.py 精确识别
             self.thought = "[EXTRACT_NULL_DOWNGRADE] " + (self.thought or "")
+        elif self.action == "extract" and _has_real_data:
+            _data_len = len(self.extracted_data) if isinstance(self.extracted_data, (list, dict)) else len(str(self.extracted_data))
+            logger.info(f"[ACTION FIX] extract + extracted_data 非空 ({_data_len} items)，跳过 NULL_DOWNGRADE")
+        return self
+
+    @model_validator(mode="after")
+    def _final_completion_arbiter(self) -> "VSpiderAction":
+        """所有降级 validator 跑完后的最后裁决：thought 强完成词 + action 仍非 done → 强改 done"""
+        if self.action == "done":
+            return self  # 已是 done，不动
+
+        _thought = self.thought or ""
+        _final_done_markers = (
+            "任务已完成", "✅ 任务", "进入 done", "可以 done",
+            "所有数据已提取", "目标已达成", "全部完成",
+        )
+        _thought_implies_done = any(m in _thought for m in _final_done_markers)
+
+        if _thought_implies_done:
+            # Only force done if extracted_data has real data (avoid false positive on empty extract)
+            _has_data = (
+                self.extracted_data is not None
+                and self.extracted_data != []
+                and self.extracted_data != {}
+            )
+            if self.action in ("wait", "extract") and _has_data:
+                logger.info(
+                    f"[FINAL ARBITER] thought 含完成标记但 action={self.action!r}，"
+                    f"extracted_data 非空 → 强制 action=done"
+                )
+                self.action = "done"
+
         return self
 
     def to_dict(self) -> dict:
@@ -1117,7 +1174,7 @@ class VLMClient:
         return list(_ERROR_DECISION_LIST)
 
     # ════════════════════════════════════════════════════════════════
-    #  全页结构化数据提取（DOM 全文 + 纯文本 VLM 结构化调用）
+    #  全页结构化数据提取（页面文本 + 纯文本 VLM 结构化调用）
     # ════════════════════════════════════════════════════════════════
 
     async def extract_structured_data(
@@ -1127,14 +1184,15 @@ class VLMClient:
         example_data: Any = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """
-        从页面 DOM 全文中提取结构化数据（纯文本 LLM 调用，无需截图）。
+        从页面文本中提取结构化数据（纯文本 LLM 调用，无需截图）。
 
         借鉴 browser-use 的 extract_clean_markdown 架构：
-        VLM 只负责发出 extract 意图，数据由系统从 DOM 获取全页文本后，
+        VLM 只负责发出 extract 意图，数据由系统从 AX Tree、DOM innerText
+        或压缩后的列表条目文本获取页面内容后，
         用一次纯文本 LLM 调用完成结构化，突破视口截图只能看到 ~10 条的限制。
 
         Args:
-            page_text: document.body.innerText 获取的完整页面文本
+            page_text: AX Tree / DOM innerText / compact list items 等页面文本
             goal: 用户的任务目标描述
             example_data: VLM 之前提取的数据样本（用于推断字段名和格式）
 
@@ -1146,8 +1204,14 @@ class VLMClient:
             logger.warning("[EXTRACT FULL] 页面文本为空，跳过结构化提取")
             return None
 
-        # 截断防止 token 溢出（纯文本 token 效率高，给 16K 字符）
-        page_text = page_text[:16000]
+        # 截断防止 token 溢出（纯文本 token 效率高，给 16K 字符）。
+        # 压缩列表文本以 "\n\nItem N:" 分隔，优先在条目边界截断，避免最后一行半截。
+        if len(page_text) > 16000:
+            clipped = page_text[:16000]
+            marker = clipped.rfind("\n\nItem ")
+            if marker >= 12000:
+                clipped = clipped[:marker].rstrip()
+            page_text = clipped
 
         # ── 解析用户目标里的数量需求（如"前 3 条"），指导后端 LLM 一次返回够数 ──
         _count_match = re.search(
@@ -1188,8 +1252,8 @@ class VLMClient:
         user_prompt = (
             f"用户任务：{goal}\n"
             f"{format_hint}{count_hint}\n\n"
-            f"以下是网页的完整文本内容（通过 DOM 提取，包含页面上所有数据，"
-            f"不受视口限制），请从中提取**全部**符合用户任务要求的数据项：\n\n"
+            f"以下是网页文本内容（来源可能是 AX Tree、DOM innerText 或压缩列表条目，"
+            f"通常不受当前截图视口限制），请从中提取**全部**符合用户任务要求的数据项：\n\n"
             f"---页面文本开始---\n{page_text}\n---页面文本结束---\n\n"
             f"请输出 JSON 数组，包含页面中所有匹配项。只输出 JSON，不要输出其他内容。"
         )
@@ -1200,7 +1264,7 @@ class VLMClient:
                 f"页面文本长度={len(page_text)}，目标={goal[:60]}"
             )
             _broadcast_log_safe(
-                "[EXTRACT FULL] 启动全页 AX Tree 结构化提取（纯文本 LLM 调用）..."
+                "[EXTRACT FULL] 启动页面文本结构化提取（纯文本 LLM 调用）..."
             )
 
             response = await self.semantic_client.chat.completions.create(
@@ -1449,12 +1513,10 @@ class VLMClient:
                     if thought.startswith(_EXTRACT_MARKER):
                         decisions[idx]["__extract_downgraded"] = True
                         self.inject_error_feedback(
-                            "⚠️ 你上一步想执行 extract 动作，但 extracted_data 是 null/空数组/空对象，"
-                            "已被系统自动降级为 wait。\n"
-                            "【本步要求】请重新执行 extract 动作，这次必须仔细观察截图，"
-                            "将目标数据整理为结构化 JSON 写入 extracted_data 字段。\n"
-                            "例如：extracted_data: {\"rank\": 1, \"title\": \"...\", \"views\": \"...\"}\n"
-                            "extracted_data 绝对不能是空值！"
+                            "⚠️ 你上一步想执行 extract 动作，但 extracted_data 是 null/空数组/空对象。\n"
+                            "系统已自动尝试提取并向下滚动加载新内容。\n"
+                            "【本步要求】如果页面有新内容可见，请执行 extract 并填充数据；\n"
+                            "如果视口内容未变化，请执行 smooth_scroll(type_value='down') 向下滚动加载更多。"
                         )
                         break
                     if _ZERO_MARKER in thought:

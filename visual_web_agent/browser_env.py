@@ -1944,6 +1944,10 @@ Object.defineProperty(navigator, 'languages', {
                 total = 0
                 near_white = 0
                 dark_or_colored = 0
+                content_total = 0
+                content_near_white = 0
+                content_signal = 0
+                content_y_start = min(height - 1, max(80, int(height * 0.18)))
                 # Ignore the first 80px less aggressively by still sampling it;
                 # navigation bars are useful but should not hide a blank body.
                 for y in range(0, height, step):
@@ -1954,15 +1958,32 @@ Object.defineProperty(navigator, 'languages', {
                             near_white += 1
                         if min(r, g, b) < 180 or (max(r, g, b) - min(r, g, b)) > 35:
                             dark_or_colored += 1
+                        if y >= content_y_start and x < width - 24:
+                            content_total += 1
+                            if r >= 245 and g >= 245 and b >= 245:
+                                content_near_white += 1
+                            if min(r, g, b) < 180 or (max(r, g, b) - min(r, g, b)) > 35:
+                                content_signal += 1
 
                 if total == 0:
                     return False, "empty sample"
                 white_ratio = near_white / total
                 signal_ratio = dark_or_colored / total
-                is_blank = white_ratio >= 0.82 and signal_ratio <= 0.18
+                content_white_ratio = (
+                    content_near_white / content_total if content_total else 0.0
+                )
+                content_signal_ratio = (
+                    content_signal / content_total if content_total else 1.0
+                )
+                is_blank = (
+                    (white_ratio >= 0.78 and signal_ratio <= 0.12)
+                    or (content_white_ratio >= 0.88 and content_signal_ratio <= 0.06)
+                )
                 return (
                     is_blank,
-                    f"white_ratio={white_ratio:.2f}, signal_ratio={signal_ratio:.2f}, sample={total}",
+                    f"white_ratio={white_ratio:.2f}, signal_ratio={signal_ratio:.2f}, "
+                    f"content_white={content_white_ratio:.2f}, "
+                    f"content_signal={content_signal_ratio:.2f}, sample={total}",
                 )
         except Exception as e:
             return False, f"visual blank probe failed: {e}"

@@ -21,6 +21,7 @@ from functools import lru_cache
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -50,6 +51,7 @@ try:
     from .artifact_manager import resolve_artifact_path
     from .trajectory_logger import HtmlLogger
     from .auth_vault import SecretResolutionError, resolve_env_placeholders
+    from .page_data_controller import PageDataController
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR
     from browser_env import BrowserEnv, ActionExecutionError
@@ -63,6 +65,7 @@ except ImportError:
     from artifact_manager import resolve_artifact_path
     from trajectory_logger import HtmlLogger
     from auth_vault import SecretResolutionError, resolve_env_placeholders
+    from page_data_controller import PageDataController
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -238,6 +241,95 @@ def _parse_goal_target_pages(goal: str) -> int | None:
     if m:
         return int(m.group(1))
     return None
+
+
+def _normalize_output_field_key(value: object) -> str:
+    """Normalize output field names for loose user-goal matching."""
+    return re.sub(
+        r"[^a-z0-9\u4e00-\u9fff]+",
+        "",
+        str(value or "").strip().lower(),
+    )
+
+
+def _parse_goal_requested_fields(goal: str) -> list[str]:
+    """Parse explicit requested output columns from natural-language goals.
+
+    This intentionally only activates when the user says fields/columns/字段/列,
+    so normal goals such as "抓取前 50 条数据" keep the site's natural schema.
+    """
+    text = _extract_core_goal(goal)
+    if not text:
+        return []
+
+    patterns = (
+        r"(?:字段|列名|列|表头|fields?|columns?)\s*(?:为|是|包括|包含|只要|仅保留|:|：|=)\s*([^。\n；;]+)",
+        r"(?:提取|抓取|获取|保存|导出)\s*(?:以下|这些|指定)?\s*(?:字段|列|fields?|columns?)\s*(?:[:：为是=])?\s*([^。\n；;]+)",
+        r"(?:with|including|only)\s+(?:fields?|columns?)\s*(?:[:：=])?\s*([^.\n;]+)",
+    )
+    raw = ""
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            raw = match.group(1)
+            break
+    if not raw:
+        # Also support wording like "提取 Name, Position, Office 字段".
+        match = re.search(
+            r"(?:提取|抓取|获取|保存|导出)\s+([^。\n；;]{2,160}?)\s*(?:字段|列|fields?\b|columns?\b)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            raw = match.group(1)
+    if not raw:
+        # Support goals like "前26部电影的标题、评分、评价人数和一句话简介".
+        matches = re.findall(
+            r"的([^。\n；;]{2,120}?)(?=，?\s*(?:保存|导出|写入|存入|并保存|并导出)|[。\n；;]|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        field_markers = (
+            "标题", "名称", "名字", "评分", "评价", "人数", "简介", "摘要",
+            "作者", "时间", "链接", "网址", "title", "name", "rating",
+            "score", "review", "summary", "description", "url",
+        )
+        for candidate in reversed(matches):
+            if any(marker.lower() in candidate.lower() for marker in field_markers):
+                raw = candidate
+                break
+    if not raw:
+        return []
+
+    raw = re.split(
+        r"\s*(?:并(?:保存|导出|写入|存入)?|然后|再|保存到|导出到|写入|存入|to\s+excel|as\s+excel)\s*",
+        raw,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    raw = raw.strip(" ：:=[({【\"'`“”‘’")
+    raw = raw.strip(" )]}】\"'`“”‘’")
+    if not raw:
+        return []
+
+    parts = re.split(r"[,，、;；|/]+|\s+(?:and|or)\s+|(?:以及|和|及)", raw)
+    fields: list[str] = []
+    seen: set[str] = set()
+    stop_words = {"数据", "内容", "信息", "记录", "excel", "xlsx", "csv"}
+    for part in parts:
+        field = re.sub(r"\s+", " ", part).strip(" ：:=[({【\"'`“”‘’)]}】")
+        if not field:
+            continue
+        field = re.sub(r"^(?:and|or|和|及|以及)\s+", "", field, flags=re.IGNORECASE).strip()
+        field = re.sub(r"\s+(?:and|or|和|及|以及)$", "", field, flags=re.IGNORECASE).strip()
+        norm = _normalize_output_field_key(field)
+        if not norm or norm in stop_words or norm in seen:
+            continue
+        if len(field) > 50:
+            continue
+        seen.add(norm)
+        fields.append(field)
+    return fields
 
 
 def _goal_is_tooltip_extract(goal: str) -> bool:
@@ -2755,6 +2847,10 @@ async def run_agent(
         _effective_max_steps = _derive_effective_max_steps(goal)
         _is_form_fill_goal = _goal_is_form_fill(goal)
         _form_assignments = _prepare_form_batch_fields(goal) if _is_form_fill_goal else {}
+        _requested_output_fields = _parse_goal_requested_fields(goal)
+        _data_controller = PageDataController(_requested_output_fields)
+        if _requested_output_fields:
+            logger.info("[EXTRACT SCHEMA] requested fields=%s", _requested_output_fields)
         if _effective_max_steps > MAX_STEPS:
             logger.info(
                 f"[MAX STEPS] bulk extraction budget raised: "
@@ -2841,6 +2937,7 @@ async def run_agent(
         _pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
         _pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
         _first_flip_pending = False  # 首次 extract 后强制下一步走 next_page（引擎层硬约束）
+        _page_is_infinite_scroll = False  # 标记当前页面是无限滚动（无分页器）
         _force_next_page_pending = False  # 物理触底且未达标：下一轮强制 next_page
         _force_extract_after_navigation_pending = False  # 翻页落地后：下一轮必须先提取新页，禁止连续翻页跳页
         _block_next_page_until_drained = False  # 当前页只提到少量数据且还能滚动：禁止过早翻页
@@ -2850,10 +2947,12 @@ async def run_agent(
         _repeat_action_count: int = 0  # 同一 action sig 连续重复次数，用于精确触发 AUTO-ADVANCE
         _total_extracted_rows = 0  # 跨页累加的总行数
         _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
+        _extract_null_total_resets = 0  # 防止无限重试：streak 被重置的总次数
         _extracted_page_urls: set = set()  # 已成功提取数据的不同页面 URL 集合
         _extracted_page_keys: set[str] = set()  # URL + table signature; SPA/table pagination stays on one URL
         _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
         _tooltip_trigger_keys: set[str] = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
+        _pagination_exhausted = False  # 分页已耗尽（滚到底+翻页失败），用于容差退出
         _form_scroll_down_streak = 0  # 表单未开始填写前，连续向下滚动次数
         _form_interaction_started = False  # 一旦开始填/点字段，允许正常分段滚动
         _auto_form_retry_count = 0
@@ -2871,9 +2970,27 @@ async def run_agent(
                 None if target_count is None
                 else max(0, target_count - _total_extracted_rows)
             )
+            raw_data = data
+            if _requested_output_fields and isinstance(data, list):
+                filtered_rows, schema_stats = _data_controller.filter_undercomplete_rows(
+                    data,
+                    normalize_row=lambda row: (
+                        _normalize_extracted_row_fields([row], project=True)[0]
+                    ),
+                )
+                if schema_stats.get("dropped"):
+                    logger.info(
+                        "[EXTRACT SCHEMA] %s dropped %s under-complete rows "
+                        "(required_hits=%s/%s)",
+                        name,
+                        schema_stats.get("dropped"),
+                        schema_stats.get("required_hits"),
+                        schema_stats.get("total_fields"),
+                    )
+                raw_data = filtered_rows
             trial_seen = set(_seen_extract_row_keys)
             result = sanitize_extracted_rows(
-                raw_data=data,
+                raw_data=raw_data,
                 source_text=source_text,
                 seen_fingerprints=trial_seen,
                 target_remaining=target_remaining,
@@ -2900,7 +3017,12 @@ async def run_agent(
             score = result.accepted * 100.0 + completeness * 5.0
             score -= result.duplicates * 8.0
             score -= result.rejected_total * 12.0
-            if "DOM_TABLE" in source:
+            if "DOM_LIST" in source:
+                if int(shape.get("repeated_list_items") or 0) >= result.accepted >= 2:
+                    score += 45.0
+                else:
+                    score += 25.0
+            elif "DOM_TABLE" in source:
                 if int(shape.get("table_rows") or 0) >= result.accepted >= 2:
                     score += 35.0
                 else:
@@ -2923,6 +3045,7 @@ async def run_agent(
                 "score": score,
                 "source_text": source_text,
                 "data_shape": shape,
+                "data_signature": _data_controller.rows_signature(rows),
             }
 
         def _expected_rows_from_data_shape(data_shape: dict | None) -> int:
@@ -2999,12 +3122,23 @@ async def run_agent(
             viable = filtered
             if not viable:
                 return None
-            priority = {"DOM_TABLE": 3, "FULL_PAGE": 2, "VIEWPORT_VLM": 1}
+            def _candidate_priority(candidate: dict) -> int:
+                source = str(candidate.get("name") or "").upper()
+                if "DOM_LIST" in source:
+                    return 4
+                if "DOM_TABLE" in source:
+                    return 3
+                if "FULL_PAGE" in source or "LIST_ITEMS_TEXT" in source:
+                    return 2
+                if "VIEWPORT" in source or "VLM" in source:
+                    return 1
+                return 0
+
             viable.sort(
                 key=lambda c: (
                     float(c.get("score") or 0),
                     int(c.get("accepted") or 0),
-                    priority.get(str(c.get("name") or ""), 0),
+                    _candidate_priority(c),
                 ),
                 reverse=True,
             )
@@ -3050,8 +3184,471 @@ async def run_agent(
             _total_extracted_rows = len(_tooltip_trigger_keys)
             return new_triggers, _total_extracted_rows
 
+        def _compact_link_match_text(value: object) -> str:
+            return re.sub(r"\W+", "", str(value or "").lower(), flags=re.UNICODE)
+
+        def _row_has_url_value(row: dict) -> bool:
+            for key, value in row.items():
+                key_norm = str(key or "").strip().lower()
+                if key_norm in {"url", "link", "href"} and str(value or "").strip():
+                    return True
+            return False
+
+        def _classify_url_role(value: object) -> str:
+            """Classify a URL into a generic extraction role."""
+            text = str(value or "").strip().lower()
+            if not text:
+                return ""
+            if "news.ycombinator.com/item" in text:
+                return "detail"
+            if re.search(r"/(item|story|post|posts|article|articles|thread|threads|comment|comments|detail|details|product|products|issues?)(/|\\?|#|$)", text):
+                return "detail"
+            return "source"
+
+        def _is_probable_url(value: object) -> bool:
+            text = str(value or "").strip()
+            return bool(re.match(r"^https?://", text, flags=re.IGNORECASE))
+
+        def _first_int_value(value: object) -> int | object:
+            text = str(value or "").strip()
+            match = re.search(r"\d[\d,]*", text)
+            if not match:
+                return value
+            try:
+                return int(match.group(0).replace(",", ""))
+            except ValueError:
+                return value
+
+        def _field_aliases(field: str) -> set[str]:
+            norm = _normalize_output_field_key(field)
+            aliases = {norm} if norm else set()
+            alias_map = {
+                "url": {"url", "link", "href", "primaryurl", "sourceurl", "detailurl", "网址", "链接"},
+                "link": {"url", "link", "href", "primaryurl", "sourceurl", "detailurl", "网址", "链接"},
+                "href": {"url", "link", "href"},
+                "title": {"title", "name", "heading", "subject", "标题", "名称", "名字"},
+                "标题": {"title", "name", "heading", "subject", "标题", "名称", "名字"},
+                "name": {"name", "title", "名称", "姓名", "名字"},
+                "名称": {"name", "title", "名称", "姓名", "名字"},
+                "position": {"position", "职位", "职务", "岗位"},
+                "office": {"office", "location", "city", "地区", "地点", "办公室"},
+                "age": {"age", "年龄"},
+                "time": {"time", "date", "age", "created", "published", "时间", "日期"},
+                "author": {"author", "user", "username", "by", "作者", "用户"},
+                "rating": {"rating", "score", "评分", "分数", "星级"},
+                "score": {"rating", "score", "评分", "分数", "星级"},
+                "评分": {"rating", "score", "评分", "分数", "星级"},
+                "points": {"points", "score", "votes", "积分", "分数", "点赞"},
+                "comments": {"comments", "commentcount", "reviewcount", "评论", "评论数"},
+                "reviewcount": {"comments", "commentcount", "reviewcount", "评论", "评论数"},
+                "reviews": {"reviews", "reviewcount", "votes", "评价人数", "评价数", "评论数"},
+                "评价人数": {"reviews", "reviewcount", "votes", "评价人数", "评价数", "评论数"},
+                "summary": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+                "description": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+                "intro": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+                "一句话简介": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+            }
+            for key, values in alias_map.items():
+                if norm == key or norm in values:
+                    aliases.update(values)
+            return aliases
+
+        def _requested_field_coverage(row: dict) -> tuple[int, int]:
+            if not _requested_output_fields or not isinstance(row, dict):
+                return 0, 0
+            normalized_keys = {
+                key: _normalize_output_field_key(key)
+                for key in row.keys()
+                if row.get(key) is not None and str(row.get(key)).strip()
+            }
+            hit = 0
+            total = 0
+            for field in _requested_output_fields:
+                aliases = _field_aliases(field)
+                if not aliases:
+                    continue
+                total += 1
+                for norm_key in normalized_keys.values():
+                    if (
+                        norm_key in aliases
+                        or any(alias and alias in norm_key for alias in aliases)
+                        or any(alias and norm_key in alias for alias in aliases)
+                    ):
+                        hit += 1
+                        break
+            return hit, total
+
+        def _min_requested_field_hits(total: int) -> int:
+            if total <= 0:
+                return 0
+            if total <= 4:
+                return total
+            return max(2, int(math.ceil(total * 0.75)))
+
+        def _project_row_to_requested_fields(row: dict) -> dict:
+            if not _requested_output_fields or not isinstance(row, dict):
+                return row
+
+            normalized_keys = {
+                key: _normalize_output_field_key(key)
+                for key in row.keys()
+            }
+            column_keys = sorted(
+                [
+                    key for key, norm in normalized_keys.items()
+                    if re.fullmatch(r"column\d+", norm or "")
+                ],
+                key=lambda key: int(re.search(r"\d+", normalized_keys[key]).group(0)),
+            )
+            requested = [
+                field for field in _requested_output_fields
+                if _normalize_output_field_key(field)
+            ]
+            if not requested:
+                return row
+
+            if (
+                column_keys
+                and len(column_keys) >= len(requested)
+                and len(column_keys) >= max(2, len(row) - 1)
+            ):
+                return {
+                    field: row.get(key)
+                    for field, key in zip(requested, column_keys)
+                }
+
+            projected = {}
+            used_keys: set[str] = set()
+            for field in requested:
+                aliases = _field_aliases(field)
+                best_key = None
+                best_score = 0
+                for key, norm_key in normalized_keys.items():
+                    if key in used_keys or not norm_key:
+                        continue
+                    score = 0
+                    if norm_key in aliases:
+                        score = 100
+                    elif any(alias and alias in norm_key for alias in aliases):
+                        score = 80
+                    elif any(alias and norm_key in alias for alias in aliases):
+                        score = 70
+                    if score > best_score:
+                        best_key = key
+                        best_score = score
+                if best_key is not None:
+                    projected[field] = row.get(best_key)
+                    used_keys.add(best_key)
+
+            if not projected and column_keys:
+                return {
+                    field: row.get(key)
+                    for field, key in zip(requested, column_keys)
+                }
+
+            return projected or row
+
+        def _normalize_extracted_row_fields(rows: list, *, project: bool = True) -> list:
+            """Stabilize common forum/list fields before saving."""
+            out: list = []
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    out.append(row)
+                    continue
+                normalized = dict(row)
+                if "time" not in normalized and normalized.get("age"):
+                    normalized["time"] = normalized.get("age")
+                normalized.pop("age", None)
+
+                for key in ("points", "score", "votes", "review_count", "comments", "comment_count"):
+                    if key in normalized and normalized.get(key) is not None:
+                        normalized[key] = _first_int_value(normalized.get(key))
+
+                if "review_count" not in normalized and "comments" in normalized:
+                    normalized["review_count"] = normalized.get("comments")
+                normalized.pop("comments", None)
+
+                for legacy_key in ("story_url", "discussion_url"):
+                    if legacy_key in normalized and "source_url" not in normalized and "detail_url" not in normalized:
+                        role = "detail" if legacy_key == "discussion_url" else "source"
+                        normalized[f"{role}_url"] = normalized.get(legacy_key)
+                    normalized.pop(legacy_key, None)
+
+                for url_key in ("primary_url", "source_url", "detail_url", "url", "link", "href"):
+                    raw_url = normalized.get(url_key)
+                    if not (raw_url and _is_probable_url(raw_url)):
+                        continue
+                    role = _classify_url_role(raw_url)
+                    if role == "detail":
+                        normalized.setdefault("detail_url", raw_url)
+                    else:
+                        normalized.setdefault("source_url", raw_url)
+                if normalized.get("source_url"):
+                    normalized["primary_url"] = normalized.get("source_url")
+                elif normalized.get("detail_url"):
+                    normalized["primary_url"] = normalized.get("detail_url")
+                if normalized.get("primary_url"):
+                    normalized["url"] = normalized.get("primary_url")
+                if project:
+                    normalized = _project_row_to_requested_fields(normalized)
+                out.append(normalized)
+            return out
+
+        def _row_primary_link_text(row: dict) -> str:
+            preferred_markers = (
+                "title", "name", "product", "item", "subject", "label",
+                "heading", "caption", "标题", "名称", "商品", "项目",
+            )
+            preferred: list[str] = []
+            fallback: list[str] = []
+            for key, value in row.items():
+                if value is None:
+                    continue
+                key_norm = str(key or "").strip().lower()
+                text = re.sub(r"\s+", " ", str(value).strip())
+                if len(_compact_link_match_text(text)) < 8:
+                    continue
+                if any(marker in key_norm for marker in preferred_markers):
+                    preferred.append(text)
+                elif not re.fullmatch(r"[\d\s,.:/%+\-]+", text):
+                    fallback.append(text)
+            candidates = preferred or fallback
+            return max(candidates, key=lambda s: len(_compact_link_match_text(s))) if candidates else ""
+
+        async def _enrich_rows_with_dom_links(rows: list) -> list:
+            """Fill row URLs by matching title/name text to page anchors.
+
+            This is schema-agnostic: it enriches rows only when a stable text
+            field has an unambiguous anchor match in the current DOM.
+            """
+            rows = _normalize_extracted_row_fields(rows, project=False)
+            if not rows or not any(isinstance(row, dict) for row in rows):
+                return rows
+            page = await browser._ensure_active_page(reason="enrich extracted rows with links")
+            if not page:
+                return rows
+            try:
+                anchors = await page.evaluate(
+                    """() => {
+                        const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                        const nearestText = (a) => {
+                            const direct = clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title'));
+                            const row = a.closest('article, [role="article"], [role="listitem"], li, tr, .Story, .story, .ais-Hits-item, .hit');
+                            const rowText = clean(row ? row.innerText : '');
+                            return clean([direct, rowText].filter(Boolean).join(' '));
+                        };
+                        return Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                            text: nearestText(a),
+                            own_text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+                            href: a.href || ''
+                        })).filter(x => x.text && x.href && !x.href.startsWith('javascript:'));
+                    }"""
+                )
+            except Exception as exc:
+                logger.debug("[LINK ENRICH] anchor scan skipped: %s", exc)
+                return rows
+
+            anchor_rows: list[dict] = []
+            for anchor in anchors or []:
+                text = str(anchor.get("text") or "").strip()
+                own_text = str(anchor.get("own_text") or "").strip()
+                href = str(anchor.get("href") or "").strip()
+                compact = _compact_link_match_text(text)
+                if len(compact) >= 8 and href:
+                    anchor_rows.append(
+                        {
+                            "href": href,
+                            "compact": compact,
+                            "own_compact": _compact_link_match_text(own_text),
+                        }
+                    )
+            if not anchor_rows:
+                return rows
+
+            enriched_source = 0
+            enriched_detail = 0
+            out: list = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    out.append(row)
+                    continue
+                primary_compact = _compact_link_match_text(_row_primary_link_text(row))
+                if len(primary_compact) < 8:
+                    out.append(row)
+                    continue
+                matches = []
+                for anchor in anchor_rows:
+                    a_compact = anchor["compact"]
+                    if primary_compact in a_compact or a_compact in primary_compact:
+                        matches.append((min(len(primary_compact), len(a_compact)), anchor))
+                matches.sort(key=lambda item: item[0], reverse=True)
+                best_match = matches[0][1] if matches and (len(matches) == 1 or matches[0][0] > matches[1][0]) else None
+                if best_match:
+                    row = dict(row)
+                    href = best_match["href"]
+                    role = _classify_url_role(href)
+                    if role == "detail":
+                        if not row.get("detail_url"):
+                            row["detail_url"] = href
+                            enriched_detail += 1
+                    elif not row.get("source_url"):
+                        row["source_url"] = href
+                        enriched_source += 1
+                    if not row.get("primary_url"):
+                        row["primary_url"] = row.get("source_url") or row.get("detail_url") or href
+                    row["url"] = row.get("primary_url")
+
+                if isinstance(row, dict) and not row.get("detail_url"):
+                    detail_matches = []
+                    for anchor in anchor_rows:
+                        href = anchor["href"]
+                        if _classify_url_role(href) != "detail":
+                            continue
+                        a_compact = anchor["compact"]
+                        if primary_compact in a_compact or a_compact in primary_compact:
+                            detail_matches.append((min(len(primary_compact), len(a_compact)), anchor))
+                    detail_matches.sort(key=lambda item: item[0], reverse=True)
+                    if detail_matches:
+                        row = dict(row)
+                        row["detail_url"] = detail_matches[0][1]["href"]
+                        enriched_detail += 1
+                out.append(row)
+            if enriched_source or enriched_detail:
+                logger.info(
+                    "[LINK ENRICH] Filled source_url=%s detail_url=%s",
+                    enriched_source,
+                    enriched_detail,
+                )
+            return _normalize_extracted_row_fields(out)
+
+        async def _extract_compact_list_text_via_dom(reason: str) -> tuple[str, str, int]:
+            """Return compact repeated-list item text when the DOM exposes clear rows."""
+            try:
+                _page_for_items = await browser._ensure_active_page(reason=reason)
+                result = await _page_for_items.evaluate(
+                    """() => {
+                        const clean = (value) => String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        const compact = (value) => clean(value).toLowerCase()
+                            .replace(/[^a-z0-9\\u4e00-\\u9fff]+/g, '');
+                        const isVisible = (el) => {
+                            if (!el || !(el instanceof Element)) return false;
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const candidates = [];
+                        const addCandidate = (el, source) => {
+                            if (!isVisible(el)) return;
+                            const text = clean(el.innerText || el.textContent);
+                            if (text.length < 20 || text.length > 1800) return;
+                            const childBlocks = Array.from(el.querySelectorAll(
+                                'article, [role="article"], [role="listitem"], li, tbody tr'
+                            )).filter(node => node !== el && isVisible(node));
+                            if (childBlocks.length >= 3 && text.length > 800) return;
+                            const links = Array.from(el.querySelectorAll('a[href]'))
+                                .filter(isVisible)
+                                .map(a => ({
+                                    text: clean(a.innerText || a.textContent || a.getAttribute('aria-label')),
+                                    href: a.href || ''
+                                }))
+                                .filter(a => a.href)
+                                .slice(0, 6);
+                            const key = links[0]?.href || compact(text).slice(0, 180);
+                            if (!key) return;
+                            candidates.push({source, key, text, links});
+                        };
+
+                        const directSelectors = [
+                            'article', '[role="article"]', '[role="listitem"]',
+                            '.Story', '.story', '.ais-Hits-item', '.hit',
+                            '.search-result', '.result', '.item'
+                        ];
+                        for (const el of document.querySelectorAll(directSelectors.join(','))) {
+                            addCandidate(el, 'selector');
+                        }
+
+                        const containerSelectors = [
+                            'main', '[role="main"]', '#content', '.content',
+                            '.list', '.item-list', '.results', '.search-results',
+                            'ol', 'ul', 'section'
+                        ];
+                        for (const root of document.querySelectorAll(containerSelectors.join(','))) {
+                            if (!isVisible(root)) continue;
+                            const children = Array.from(root.children || []).filter(isVisible);
+                            if (children.length < 4) continue;
+                            const buckets = new Map();
+                            for (const child of children) {
+                                const cls = clean(child.className || child.tagName).slice(0, 80);
+                                buckets.set(cls, (buckets.get(cls) || 0) + 1);
+                            }
+                            const repeat = Math.max(...Array.from(buckets.values()), 0);
+                            if (repeat < 4) continue;
+                            for (const child of children) addCandidate(child, 'container');
+                        }
+
+                        const seen = new Set();
+                        const rows = [];
+                        for (const candidate of candidates) {
+                            if (seen.has(candidate.key)) continue;
+                            seen.add(candidate.key);
+                            rows.push(candidate);
+                        }
+                        rows.sort((a, b) => {
+                            const aTop = document.body.innerText.indexOf(a.text.slice(0, 40));
+                            const bTop = document.body.innerText.indexOf(b.text.slice(0, 40));
+                            return (aTop < 0 ? 1e9 : aTop) - (bTop < 0 ? 1e9 : bTop);
+                        });
+                        const selected = rows.slice(0, 120);
+                        const lines = selected.map((row, index) => {
+                            const linkText = row.links
+                                .map(link => {
+                                    const label = link.text ? `${link.text} -> ` : '';
+                                    return `${label}${link.href}`;
+                                })
+                                .join(' ; ');
+                            return [
+                                `Item ${index + 1}: ${row.text}`,
+                                linkText ? `Links: ${linkText}` : ''
+                            ].filter(Boolean).join('\\n');
+                        });
+                        return {
+                            count: selected.length,
+                            text: lines.join('\\n\\n')
+                        };
+                    }"""
+                )
+                if not isinstance(result, dict):
+                    return "", "", 0
+                text = str(result.get("text") or "").strip()
+                count = int(result.get("count") or 0)
+                if count >= 5 and len(text) >= 400:
+                    logger.info(
+                        "[EXTRACT FULL] DOM compact list candidate: %s items, %s chars",
+                        count,
+                        len(text),
+                    )
+                    return "LIST_ITEMS_TEXT", text, count
+            except Exception as list_err:
+                logger.debug("[EXTRACT FULL] compact list DOM probe skipped: %s", list_err)
+            return "", "", 0
+
         async def _extract_full_page_text_for_data(reason: str) -> tuple[str, str]:
             """Return the best full-page text source for semantic extraction."""
+            list_source, list_text, list_count = await _extract_compact_list_text_via_dom(reason)
+            if list_text and list_count >= 10:
+                logger.info(
+                    "[EXTRACT FULL] using compact DOM list text before AX/innerText "
+                    "(items=%s, chars=%s)",
+                    list_count,
+                    len(list_text),
+                )
+                return list_source, list_text
+
             source = "AX_TREE"
             ax_text = await browser.extract_page_text_via_ax_tree()
             body_text = ""
@@ -3065,6 +3662,15 @@ async def run_agent(
                 logger.debug("[EXTRACT FULL] innerText fallback skipped: %s", text_err)
 
             ax_text = str(ax_text or "").strip()
+            if list_text and len(list_text) > max(len(ax_text) * 0.5, 1200):
+                logger.info(
+                    "[EXTRACT FULL] compact DOM list richer than AX slice "
+                    "(items=%s, list=%s chars, ax=%s chars), using list text",
+                    list_count,
+                    len(list_text),
+                    len(ax_text),
+                )
+                return list_source, list_text
             if body_text and len(body_text) > max(len(ax_text) * 1.2, 800):
                 if ax_text:
                     logger.info(
@@ -3082,6 +3688,205 @@ async def run_agent(
                 return source, ax_text
             return ("INNER_TEXT_FALLBACK", body_text) if body_text else ("", "")
 
+        async def _extract_list_rows_via_dom(reason: str) -> tuple[list[dict], str]:
+            """Extract repeated list/card rows directly with DOM semantics."""
+            try:
+                _list_page = await browser._ensure_active_page(reason=reason)
+                result = await _list_page.evaluate(
+                    """() => {
+                        const clean = (value) => String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+                        const compact = (value) => clean(value).toLowerCase()
+                            .replace(/[^a-z0-9\\u4e00-\\u9fff]+/g, '');
+                        const isVisible = (el) => {
+                            if (!el || !(el instanceof Element)) return false;
+                            const style = window.getComputedStyle(el);
+                            const rect = el.getBoundingClientRect();
+                            return style.display !== 'none'
+                                && style.visibility !== 'hidden'
+                                && rect.width > 0
+                                && rect.height > 0;
+                        };
+                        const classifyUrl = (href) => {
+                            const text = String(href || '').toLowerCase();
+                            if (!text) return '';
+                            if (text.includes('news.ycombinator.com/item')) return 'detail';
+                            if (/\\/(item|story|post|posts|article|articles|thread|threads|comment|comments|detail|details|product|products|issues?)(\\/|\\?|#|$)/.test(text)) {
+                                return 'detail';
+                            }
+                            return 'source';
+                        };
+                        const firstInt = (value) => {
+                            const match = String(value || '').match(/\\d[\\d,]*/);
+                            return match ? Number(match[0].replace(/,/g, '')) : null;
+                        };
+                        const looksMetaLink = (text) => {
+                            const t = clean(text).toLowerCase();
+                            return !t
+                                || /^\\d+[\\d,]*\\s*(points?|comments?|replies?)$/.test(t)
+                                || /^\\d+\\s+(seconds?|minutes?|hours?|days?|months?|years?)\\s+ago$/.test(t)
+                                || /^\\d+[smhdwy]$/.test(t)
+                                || /^(reply|hide|flag|past|favorite|save|share)$/.test(t);
+                        };
+                        const titleFromRow = (el, links, text) => {
+                            const semantic = el.querySelector('h1,h2,h3,h4,[role="heading"],.title,.story-title,.ais-Highlight');
+                            const semanticText = clean(semantic ? semantic.innerText || semantic.textContent : '');
+                            if (semanticText && semanticText.length >= 4) return semanticText;
+                            const link = links.find(l => l.text && !looksMetaLink(l.text));
+                            if (link) return link.text;
+                            const firstLine = clean((text || '').split(/\\n|\\r/)[0]);
+                            return firstLine.length > 220 ? firstLine.slice(0, 220) : firstLine;
+                        };
+                        const parseMeta = (text, links, el) => {
+                            const row = {};
+                            const pointMatch = text.match(/(\\d[\\d,]*)\\s*points?/i);
+                            if (pointMatch) row.points = firstInt(pointMatch[1]);
+                            const commentMatch = text.match(/(\\d[\\d,]*)\\s*(?:comments?|replies?)/i);
+                            if (commentMatch) row.review_count = firstInt(commentMatch[1]);
+                            const reviewMatch = text.match(/(\\d[\\d,]*)\\s*(?:人评价|评价|条评价|reviews?|ratings?|votes?)/i);
+                            if (reviewMatch && !row.review_count) row.review_count = firstInt(reviewMatch[1]);
+                            const timeMatch = text.match(/\\b(\\d+\\s+(?:seconds?|minutes?|hours?|days?|months?|years?)\\s+ago|\\d+[smhdwy])\\b/i);
+                            if (timeMatch) row.time = clean(timeMatch[1]);
+
+                            const ratingEl = el.querySelector(
+                                '.rating_num, .rating_nums, .score, .rating-score, [class*="score"]'
+                            );
+                            const ratingText = clean(ratingEl ? ratingEl.innerText || ratingEl.textContent : '');
+                            const ratingMatch = ratingText.match(/\\b(\\d(?:\\.\\d)?)\\b/)
+                                || text.match(/(?:评分|rating|score)\\s*[:：]?\\s*(\\d(?:\\.\\d)?)/i)
+                                || text.match(/(?:^|\\s)(\\d\\.\\d)(?:\\s|$)/);
+                            if (ratingMatch) row.rating = ratingMatch[1];
+
+                            const summaryEl = el.querySelector(
+                                '.quote .inq, .inq, p.quote, .summary, .description, .desc, .intro, [class*="summary"], [class*="description"], [class*="intro"]'
+                            );
+                            const summaryText = clean(summaryEl ? summaryEl.innerText || summaryEl.textContent : '');
+                            if (summaryText && summaryText.length >= 3 && summaryText.length <= 260) {
+                                row.summary = summaryText.replace(/^["“”'‘’]+|["“”'‘’]+$/g, '');
+                            } else {
+                                const quoteMatch = text.match(/[“"']([^“”"']{3,260})[”"']/);
+                                if (quoteMatch) row.summary = clean(quoteMatch[1]);
+                            }
+
+                            const metaTexts = links.map(l => clean(l.text)).filter(Boolean);
+                            const timeIndex = metaTexts.findIndex(t => /^(\\d+\\s+(?:seconds?|minutes?|hours?|days?|months?|years?)\\s+ago|\\d+[smhdwy])$/i.test(t));
+                            if (timeIndex > 0 && !row.author) {
+                                const prev = metaTexts[timeIndex - 1];
+                                if (prev && !looksMetaLink(prev)) row.author = prev;
+                            }
+                            return row;
+                        };
+                        const collectLinks = (el) => Array.from(el.querySelectorAll('a[href]'))
+                            .filter(isVisible)
+                            .map(a => ({
+                                text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+                                href: a.href || ''
+                            }))
+                            .filter(link => link.href && !link.href.startsWith('javascript:'));
+
+                        const candidates = [];
+                        const addCandidate = (el, source) => {
+                            if (!isVisible(el)) return;
+                            const text = clean(el.innerText || el.textContent);
+                            if (text.length < 20 || text.length > 2400) return;
+                            const nested = Array.from(el.querySelectorAll(
+                                'article, [role="article"], [role="listitem"], li, tbody tr'
+                            )).filter(node => node !== el && isVisible(node));
+                            if (nested.length >= 3 && text.length > 900) return;
+                            const links = collectLinks(el);
+                            const key = links[0]?.href || compact(text).slice(0, 220);
+                            if (!key) return;
+                            candidates.push({el, source, key, text, links});
+                        };
+
+                        const directSelectors = [
+                            'article', '[role="article"]', '[role="listitem"]',
+                            '.Story', '.story', '.ais-Hits-item', '.hit',
+                            '.search-result', '.result', '.item', '.card'
+                        ];
+                        for (const el of document.querySelectorAll(directSelectors.join(','))) {
+                            addCandidate(el, 'selector');
+                        }
+
+                        const containerSelectors = [
+                            'main', '[role="main"]', '#content', '.content',
+                            '.list', '.item-list', '.results', '.search-results',
+                            'ol', 'ul', 'section'
+                        ];
+                        for (const root of document.querySelectorAll(containerSelectors.join(','))) {
+                            if (!isVisible(root)) continue;
+                            const children = Array.from(root.children || []).filter(isVisible);
+                            if (children.length < 4) continue;
+                            const buckets = new Map();
+                            for (const child of children) {
+                                const cls = clean(child.className || child.tagName).slice(0, 80);
+                                buckets.set(cls, (buckets.get(cls) || 0) + 1);
+                            }
+                            const repeat = Math.max(...Array.from(buckets.values()), 0);
+                            if (repeat < 4) continue;
+                            for (const child of children) addCandidate(child, 'container');
+                        }
+
+                        const seen = new Set();
+                        const rows = [];
+                        for (const candidate of candidates) {
+                            if (seen.has(candidate.key)) continue;
+                            seen.add(candidate.key);
+                            const links = candidate.links;
+                            const row = parseMeta(candidate.text, links, candidate.el);
+                            row.title = titleFromRow(candidate.el, links, candidate.text);
+                            row._dom_text = candidate.text.slice(0, 1200);
+
+                            for (const link of links) {
+                                const role = classifyUrl(link.href);
+                                if (role === 'detail' && !row.detail_url) row.detail_url = link.href;
+                                if (role === 'source' && !row.source_url) row.source_url = link.href;
+                            }
+                            row.primary_url = row.source_url || row.detail_url || links[0]?.href || '';
+                            if (row.primary_url) row.url = row.primary_url;
+
+                            if (!row.title || row.title.length < 4) continue;
+                            if (!row.url && candidate.text.length < 40) continue;
+                            rows.push(row);
+                        }
+                        const bodyText = document.body ? document.body.innerText || '' : '';
+                        rows.sort((a, b) => {
+                            const aTop = bodyText.indexOf(String(a.title || '').slice(0, 40));
+                            const bTop = bodyText.indexOf(String(b.title || '').slice(0, 40));
+                            return (aTop < 0 ? 1e9 : aTop) - (bTop < 0 ? 1e9 : bTop);
+                        });
+                        const selected = rows.slice(0, 120);
+                        const sourceText = selected.map((row, index) => [
+                            `Item ${index + 1}: ${row.title}`,
+                            row._dom_text,
+                            row.source_url ? `source_url: ${row.source_url}` : '',
+                            row.detail_url ? `detail_url: ${row.detail_url}` : ''
+                        ].filter(Boolean).join('\\n')).join('\\n\\n');
+                        const publicRows = selected.map(row => {
+                            const copy = {...row};
+                            delete copy._dom_text;
+                            return copy;
+                        });
+                        return {rows: publicRows, sourceText};
+                    }"""
+                )
+                if not isinstance(result, dict):
+                    return [], ""
+                rows = result.get("rows") or []
+                source_text = str(result.get("sourceText") or "")
+                if isinstance(rows, list) and len(rows) >= 2:
+                    rows = _normalize_extracted_row_fields(rows)
+                    logger.info(
+                        "[EXTRACT DOM] list rows=%s source_chars=%s",
+                        len(rows),
+                        len(source_text),
+                    )
+                    return rows, source_text
+            except Exception as list_err:
+                logger.debug("[EXTRACT DOM] list extraction skipped: %s", list_err)
+            return [], ""
+
         async def _extract_visible_table_rows_via_dom(reason: str) -> list[dict]:
             try:
                 _table_page = await browser._ensure_active_page(reason=reason)
@@ -3090,7 +3895,14 @@ async def run_agent(
                         const clean = (value) => String(value || '')
                             .replace(/\\s+/g, ' ')
                             .trim();
+                        const cleanHeader = (value) => clean(value)
+                            .replace(/\\s*:?[\\s-]*activate to sort column (?:ascending|descending)/ig, '')
+                            .replace(/\\s*:?[\\s-]*activate to sort/ig, '')
+                            .replace(/\\s*排序(?:升序|降序)?\\s*/g, '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
                         const isVisible = (el) => {
+                            if (!el || !(el instanceof Element)) return false;
                             const style = window.getComputedStyle(el);
                             const rect = el.getBoundingClientRect();
                             return style.display !== 'none'
@@ -3098,22 +3910,101 @@ async def run_agent(
                                 && rect.width > 0
                                 && rect.height > 0;
                         };
+                        const headerText = (el) => cleanHeader(
+                            el.getAttribute('aria-label')
+                            || el.getAttribute('data-label')
+                            || el.getAttribute('title')
+                            || el.innerText
+                            || el.textContent
+                        );
+                        const rowCells = (tr, includeTh = false) => {
+                            const selector = includeTh
+                                ? 'th, td, [role="columnheader"], [role="rowheader"], [role="cell"], [role="gridcell"]'
+                                : 'td, [role="cell"], [role="gridcell"]';
+                            return Array.from(tr.querySelectorAll(selector))
+                                .filter(cell => isVisible(cell))
+                                .map(cell => clean(cell.innerText || cell.textContent));
+                        };
+                        const uniqueHeaders = (headers) => {
+                            const seen = new Map();
+                            return headers.map((header, index) => {
+                                let key = cleanHeader(header) || `column_${index + 1}`;
+                                const base = key;
+                                const count = (seen.get(base) || 0) + 1;
+                                seen.set(base, count);
+                                if (count > 1) key = `${base}_${count}`;
+                                return key;
+                            });
+                        };
+                        const headerCandidatesFor = (table) => {
+                            const candidates = [];
+                            const add = (nodes, source) => {
+                                const headers = Array.from(nodes || [])
+                                    .filter(node => node instanceof Element)
+                                    .map(headerText)
+                                    .filter(Boolean);
+                                if (headers.length) candidates.push({source, headers});
+                            };
+
+                            add(table.querySelectorAll('thead th, thead td, [role="columnheader"]'), 'table-head');
+                            const headerRows = Array.from(table.querySelectorAll('tr'))
+                                .filter(tr => tr.querySelector('th, [role="columnheader"]'));
+                            for (const tr of headerRows.slice(0, 3)) {
+                                add(tr.querySelectorAll('th, td, [role="columnheader"]'), 'header-row');
+                            }
+
+                            const id = table.id ? CSS.escape(table.id) : '';
+                            const wrapper = table.closest(
+                                '.dt-container, .dataTables_wrapper, .datatable, .table-responsive, .table-container, [role="grid"]'
+                            );
+                            if (wrapper) {
+                                add(wrapper.querySelectorAll('thead th, thead td, [role="columnheader"]'), 'wrapper-head');
+                                if (id) {
+                                    add(
+                                        wrapper.querySelectorAll(`[aria-controls="${id}"], [data-dt-column]`),
+                                        'wrapper-controls'
+                                    );
+                                }
+                            }
+
+                            return candidates;
+                        };
+                        const chooseHeaders = (table, width) => {
+                            const candidates = headerCandidatesFor(table);
+                            candidates.sort((a, b) => {
+                                const aExact = a.headers.length === width ? 1 : 0;
+                                const bExact = b.headers.length === width ? 1 : 0;
+                                return (bExact - aExact)
+                                    || (Math.abs(a.headers.length - width) - Math.abs(b.headers.length - width))
+                                    || (b.headers.length - a.headers.length);
+                            });
+                            const best = candidates.find(c => c.headers.length >= width)
+                                || candidates.find(c => c.headers.length > 0);
+                            if (!best) return [];
+                            return uniqueHeaders(best.headers.slice(0, width));
+                        };
                         const tables = Array.from(document.querySelectorAll('table'));
                         let best = { score: 0, rows: [] };
 
                         for (const table of tables) {
                             if (!isVisible(table)) continue;
-                            let headers = Array.from(table.querySelectorAll('thead th'))
-                                .map(th => clean(th.innerText))
-                                .filter(Boolean);
                             const bodyRows = Array.from(table.querySelectorAll('tbody tr'))
                                 .filter(tr => isVisible(tr));
+                            const allRows = Array.from(table.querySelectorAll('tr'))
+                                .filter(tr => isVisible(tr));
+                            const dataRows = bodyRows.length ? bodyRows : allRows.filter(tr => {
+                                const hasDataCells = tr.querySelector('td, [role="cell"], [role="gridcell"]');
+                                const hasHeaderCells = tr.querySelector('th, [role="columnheader"]');
+                                return hasDataCells && !hasHeaderCells;
+                            });
+                            const firstDataCells = dataRows.length ? rowCells(dataRows[0]) : [];
+                            let headers = firstDataCells.length
+                                ? chooseHeaders(table, firstDataCells.length)
+                                : [];
                             const parsedRows = [];
 
-                            for (const tr of bodyRows) {
-                                const cells = Array.from(tr.querySelectorAll('td'))
-                                    .filter(td => isVisible(td))
-                                    .map(td => clean(td.innerText));
+                            for (const tr of dataRows) {
+                                const cells = rowCells(tr);
                                 if (cells.length < 2) continue;
                                 if (cells.some(cell => /no matching records|no data/i.test(cell))) {
                                     continue;
@@ -3128,7 +4019,8 @@ async def run_agent(
                                 parsedRows.push(row);
                             }
 
-                            const score = parsedRows.length * Math.max(headers.length, 1);
+                            const namedHeaderBonus = headers.some(h => !/^column_\\d+$/.test(h)) ? 10 : 0;
+                            const score = parsedRows.length * Math.max(headers.length, 1) + namedHeaderBonus;
                             if (parsedRows.length >= 2 && score > best.score) {
                                 best = { score, rows: parsedRows };
                             }
@@ -3301,19 +4193,32 @@ async def run_agent(
                 logger.debug("[TABLE AUTOPAGER] skipped: %s", pager_err)
                 return False
 
-        async def _nudge_scroll_after_duplicate_extract(reason: str) -> None:
+        async def _nudge_scroll_after_duplicate_extract(reason: str, scroll_amount: int = 2000) -> bool:
             try:
                 _scroll_page = await browser._ensure_active_page(reason=reason)
+                before_size = await _scroll_page.evaluate("() => document.body.innerText.length")
                 await _scroll_page.evaluate(
-                    """() => {
-                        const before = window.scrollY;
-                        window.scrollBy({top: Math.max(600, window.innerHeight * 0.75), behavior: 'smooth'});
-                        return before !== window.scrollY;
-                    }"""
+                    """(amt) => {
+                        window.scrollBy({top: Math.max(amt, window.innerHeight * 1.5), behavior: 'smooth'});
+                    }""",
+                    scroll_amount,
                 )
-                logger.info("[EXTRACT DEDUP] nudged page downward after duplicate rows")
+                await _scroll_page.wait_for_timeout(1500)
+                try:
+                    await _scroll_page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass
+                after_size = await _scroll_page.evaluate("() => document.body.innerText.length")
+                delta = after_size - before_size
+                pct = (delta / before_size * 100) if before_size > 0 else 0.0
+                logger.info(
+                    "[EXTRACT DEDUP] nudged page downward (%s): %d→%d bytes (+%d, %.1f%%)",
+                    reason, before_size, after_size, delta, pct,
+                )
+                return delta > 100
             except Exception as scroll_err:
                 logger.debug("[EXTRACT DEDUP] duplicate-row scroll nudge failed: %s", scroll_err)
+                return False
 
         async def _probe_scroll_drain_state(reason: str) -> dict:
             """Return whether the current page/main scroll container is physically drained."""
@@ -3966,23 +4871,37 @@ async def run_agent(
                     and decisions[0].get("action") in ("smooth_scroll", "scroll", "extract")
                 ):
                     _orig_action = decisions[0].get("action")
-                    logger.info(
-                        f"[FIRST FLIP] 引擎硬约束：首次 extract 后下一步必须 next_page，"
-                        f"已将 VLM 决策 {_orig_action!r} 改写为 next_page"
-                    )
-                    _broadcast_log_safe(
-                        f"[FIRST FLIP] 改写 {_orig_action} → next_page", level="warn"
-                    )
-                    decisions[0]["action"] = "next_page"
-                    decisions[0]["target_id"] = 0
-                    decisions[0]["type_value"] = ""
-                    # 保留 thought / extracted_data 等原字段，仅改动作类型
-                    decisions[0]["thought"] = (
-                        f"[FIRST FLIP 引擎改写] 原决策={_orig_action}，"
-                        "首次 extract 后系统强制走 next_page 探测分页器。"
-                        + (decisions[0].get("thought") or "")
-                    )
-                    decisions = [decisions[0]]
+                    if not _page_is_infinite_scroll:
+                        # Normal paginated page: rewrite to next_page
+                        logger.info(
+                            f"[FIRST FLIP] 引擎硬约束：首次 extract 后下一步必须 next_page，"
+                            f"已将 VLM 决策 {_orig_action!r} 改写为 next_page"
+                        )
+                        _broadcast_log_safe(
+                            f"[FIRST FLIP] 改写 {_orig_action} → next_page", level="warn"
+                        )
+                        decisions[0]["action"] = "next_page"
+                        decisions[0]["target_id"] = 0
+                        decisions[0]["type_value"] = ""
+                        # 保留 thought / extracted_data 等原字段，仅改动作类型
+                        decisions[0]["thought"] = (
+                            f"[FIRST FLIP 引擎改写] 原决策={_orig_action}，"
+                            "首次 extract 后系统强制走 next_page 探测分页器。"
+                            + (decisions[0].get("thought") or "")
+                        )
+                        decisions = [decisions[0]]
+                    else:
+                        # Infinite scroll page: allow smooth_scroll, only rewrite extract → smooth_scroll
+                        if _orig_action == "extract":
+                            logger.info(
+                                "[FIRST FLIP] 无限滚动页面，改写 extract → smooth_scroll"
+                            )
+                            decisions[0]["action"] = "smooth_scroll"
+                        else:
+                            logger.info(
+                                f"[FIRST FLIP] 无限滚动页面，保留原动作 {_orig_action}"
+                            )
+                        # keep smooth_scroll/scroll as-is
                     _first_flip_pending = False  # 一次性消费，不再触发
                 # 即使 VLM 已经选了 next_page，flag 也清掉避免重复触发
                 elif _first_flip_pending and not _goal_needs_pagination_probe(goal):
@@ -4116,10 +5035,23 @@ async def run_agent(
                     # 修复"豆瓣 Top250 / 京东搜索 N 条"这类任务在步骤 1 extract 成功后
                     # 被门闸强留反复重提取的 6-7 步冗余循环。
                     _goal_target = _parse_goal_target_count(goal)
+                    # Adaptive tolerance: larger targets get proportionally larger tolerance
+                    _tolerance = min(5, max(1, int(_goal_target * 0.05))) if _goal_target else 0
                     _extraction_complete = (
                         _goal_target is not None
-                        and _total_extracted_rows >= _goal_target
+                        and (
+                            _total_extracted_rows >= _goal_target
+                            or (
+                                _pagination_exhausted
+                                and _total_extracted_rows >= _goal_target - _tolerance
+                            )
+                        )
                     )
+                    if _extraction_complete and _total_extracted_rows < _goal_target:
+                        logger.info(
+                            f"[CLOSE ENOUGH] 容差退出: {_total_extracted_rows}/{_goal_target} "
+                            f"(容差 {_tolerance}，分页已耗尽)"
+                        )
                     # 允许 done 的条件：已完成子目标数 >= 总数 - 1（仅剩当前 = 最后一个）
                     # 或提取已达量（Fix B）
                     if _extraction_complete:
@@ -4142,26 +5074,20 @@ async def run_agent(
                     ):
                         logger.warning(
                             f"[PLAN GATE] VLM 过早 action=done（进度 "
-                            f"{_done_or_failed}/{_total} 子目标完成），降级为 error"
+                            f"{_done_or_failed}/{_total} 子目标完成），改为 subgoal 完成 + wait"
                         )
                         _broadcast_log_safe(
                             f"[PLAN GATE] 拦截过早 done（{_done_or_failed}/{_total}）",
                             level="warn",
                         )
-                        decisions[0]["action"] = "error"
-                        decisions[0]["target_id"] = 0
-                        decisions[0]["type_value"] = ""
+                        decisions[0]["action"] = "wait"
+                        decisions[0]["type_value"] = "1"
+                        decisions[0]["subgoal_status"] = "completed"
+                        # Inject feedback to prevent VLM repeating done
+                        _remaining = _total - _done_or_failed - 1
                         vlm.inject_error_feedback(
-                            f"🛑 你输出了 action=done，但当前只完成 {_done_or_failed}/{_total} 个子目标，"
-                            f"任务远未结束。\n"
-                            f"【语义区分】：\n"
-                            f"  · 完成**当前子目标**（如「首页已加载」）→ subgoal_status=\"completed\" "
-                            f"+ 给出真正的下一步动作（click/type/scroll/...）\n"
-                            f"  · 完成**全部子目标**或**确认任务不可完成** → action=\"done\"\n"
-                            f"当前子目标 {_cur_idx + 1}/{_total}："
-                            f"「{_task_plan.sub_goals[_cur_idx].description}」，"
-                            f"退出标准：「{_task_plan.sub_goals[_cur_idx].exit_criteria}」。"
-                            f"请给出达成该退出标准的具体动作，不要直接 done。"
+                            f"✅ 当前子目标已声明完成；但任务仍有 {_remaining} 个子目标未达成，"
+                            f"请下一步直接执行 extract 或 next_page，不要重复输出 done。"
                         )
 
                 # ── Wave 2 子目标自宣告推进 ─────────────────────────────
@@ -4254,7 +5180,7 @@ async def run_agent(
                             )
                             _auto_candidates.append(
                                 _sanitize_extraction_candidate(
-                                    name="FULL_PAGE",
+                                    name=f"FULL_PAGE:{_auto_extract_text_source}",
                                     data=_structured_auto,
                                     source_text=_ax_text,
                                     data_shape=_data_shape,
@@ -4276,6 +5202,23 @@ async def run_agent(
                                 f"[EXTRACT AUTO] 结构化提取未返回数据，"
                                 f"降级保存原始页面文本 (source={_auto_extract_text_source}, "
                                 f"长度={len(_ax_text)})"
+                            )
+
+                        _dom_list_rows, _dom_list_text = (
+                            ([], "")
+                            if _goal_is_tooltip_extract(goal)
+                            else await _extract_list_rows_via_dom(
+                                "auto extract visible list rows"
+                            )
+                        )
+                        if _dom_list_rows:
+                            _auto_candidates.append(
+                                _sanitize_extraction_candidate(
+                                    name="DOM_LIST",
+                                    data=_dom_list_rows,
+                                    source_text=_dom_list_text or _ax_text,
+                                    data_shape=_data_shape,
+                                )
                             )
 
                         _dom_auto_rows = (
@@ -4345,7 +5288,7 @@ async def run_agent(
                                     "next_page / click_text 点击明确的下一页控件。"
                                 )
                             await _nudge_scroll_after_duplicate_extract(
-                                "auto extract duplicate rows"
+                                "auto extract duplicate rows", scroll_amount=1500
                             )
                             continue
 
@@ -4358,6 +5301,7 @@ async def run_agent(
                                 _new_rows,
                             )
 
+                        _auto_extracted = await _enrich_rows_with_dom_links(_auto_extracted)
                         saved_path = save_to_excel(
                             _auto_extracted,
                             _vlm_output,
@@ -4482,6 +5426,8 @@ async def run_agent(
                                                     "只有当前页物理触底或无新增后，才使用 next_page。"
                                                 )
                                 else:
+                                    # No paginator detected — mark as infinite scroll
+                                    _page_is_infinite_scroll = True
                                     _should_force_probe_next, _force_probe_reason = (
                                         _should_schedule_next_page_after_extract(
                                             goal,
@@ -4522,6 +5468,25 @@ async def run_agent(
                                 logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
                             except Exception as _probe_err:
                                 logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
+                        # ── Re-arm：已知分页器 + 目标未达 → 每次 extract 后强制 next_page ──
+                        # 首次探测一次性完成（_pagination_probed=True），但后续 extract
+                        # 仍需引擎兜底翻页，避免 VLM 自行翻页出错浪费步数。
+                        if (
+                            _pagination_probed
+                            and _pagination_kind not in ("", "infinite")
+                            and not _page_is_infinite_scroll
+                            and not _force_next_page_pending
+                        ):
+                            _rearm_target = _parse_goal_target_count(goal)
+                            if _rearm_target is not None and _total_extracted_rows < _rearm_target:
+                                _force_next_page_pending = True
+                                logger.info(
+                                    "[REARM NEXT_PAGE] paginator known (%s), target not met "
+                                    "(%s/%s); re-armed for next step",
+                                    _pagination_kind,
+                                    _total_extracted_rows,
+                                    _rearm_target,
+                                )
                         # ── Path C：Hard Kill — 引擎层强杀，达量直接终止主循环 ──
                         # 不再注入提示让 VLM 决策，避免它走神或重提取浪费步数。
                         _hk_target = _parse_goal_target_count(goal)
@@ -4639,13 +5604,40 @@ async def run_agent(
                             )
                     # 跳过内层动作循环（因为 extract 已自动完成）
                     # 但如果连续太多次自动提取同一页面，强制结束
-                    if _extract_null_streak >= 3:
-                        logger.warning(
-                            "[EXTRACT AUTO] 连续 3 次自动提取，强制结束任务"
-                        )
-                        _run_succeeded = True
-                        _task_completed = True
-                        break
+                    if _extract_null_streak >= 2:  # lowered from 3
+                        # Check if we should retry instead of terminating
+                        _should_terminate = True
+                        if (
+                            _goal_target is not None
+                            and _total_extracted_rows < _goal_target
+                            and _extract_null_total_resets < 5  # raised from 3
+                        ):
+                            _should_terminate = False
+                            _extract_null_total_resets += 1
+                            _scroll_escalation = {1: 1500, 2: 3000, 3: 4000, 4: 5000, 5: 5000}
+                            _scroll_amount = _scroll_escalation.get(_extract_null_total_resets, 5000)
+                            logger.warning(
+                                f"[EXTRACT AUTO] streak={_extract_null_streak} 但进度 "
+                                f"{_total_extracted_rows}/{_goal_target}，"
+                                f"递增滚动 {_scroll_amount}px (reset #{_extract_null_total_resets}/5)"
+                            )
+                            _content_changed = await _nudge_scroll_after_duplicate_extract(
+                                f"extract_null_streak={_extract_null_streak}, reset #{_extract_null_total_resets}",
+                                scroll_amount=_scroll_amount
+                            )
+                            if not _content_changed:
+                                logger.warning(
+                                    f"[EXTRACT AUTO] 滚动后内容未变化，下次重试将使用更大滚动量"
+                                )
+                            _extract_null_streak = 0
+                            continue
+                        if _should_terminate:
+                            logger.warning(
+                                "[EXTRACT AUTO] 连续空提取且重试耗尽，强制结束任务"
+                            )
+                            _run_succeeded = True
+                            _task_completed = True
+                            break
                     continue  # 跳到下一步重新截图
                 else:
                     if _extract_null_streak > 0:
@@ -4804,6 +5796,71 @@ async def run_agent(
                         )
                         break
 
+                    _extract_goal_target = _parse_goal_target_count(goal)
+                    _extract_goal_pages = _parse_goal_target_pages(goal)
+                    _is_bulk_extract_goal = (
+                        not _goal_is_tooltip_extract(goal)
+                        and bool(
+                            re.search(
+                                r"获取|提取|抓取|采集|爬取|抽取|\bextract(?:_link)?\b|\bscrape\b|\bcrawl\b",
+                                str(goal or ""),
+                                re.IGNORECASE,
+                            )
+                        )
+                    )
+                    if action == "done" and _is_bulk_extract_goal:
+                        _need_more_rows = (
+                            _extract_goal_target is not None
+                            and _total_extracted_rows < _extract_goal_target
+                        )
+                        _need_more_pages = (
+                            _extract_goal_pages is not None
+                            and len(_extracted_page_keys) < _extract_goal_pages
+                        )
+                        if _need_more_rows or _need_more_pages:
+                            if decision.get("extracted_data"):
+                                logger.warning(
+                                    "[DONE GUARD] Premature done with extracted_data before extraction "
+                                    "target met; downgrading to extract "
+                                    "(rows=%s/%s, pages=%s/%s)",
+                                    _total_extracted_rows,
+                                    _extract_goal_target,
+                                    len(_extracted_page_keys),
+                                    _extract_goal_pages,
+                                )
+                                decision["action"] = "extract"
+                                if isinstance(decision.get("thought"), str):
+                                    decision["thought"] = (
+                                        "[DONE_DOWNGRADED_TO_EXTRACT] "
+                                        + str(decision.get("thought") or "")
+                                    )
+                                decisions[_action_idx] = decision
+                                status = decision.get("status", "")
+                                action = "extract"
+                            else:
+                                _remaining_parts: list[str] = []
+                                if _need_more_rows and _extract_goal_target is not None:
+                                    _remaining_parts.append(
+                                        f"系统记账仅 {_total_extracted_rows}/{_extract_goal_target} 条"
+                                    )
+                                if _need_more_pages and _extract_goal_pages is not None:
+                                    _remaining_parts.append(
+                                        f"仅完成 {len(_extracted_page_keys)}/{_extract_goal_pages} 页"
+                                    )
+                                logger.warning(
+                                    "[DONE GUARD] Blocked premature done on extraction goal: %s",
+                                    "; ".join(_remaining_parts) or "progress target not met",
+                                )
+                                vlm.inject_error_feedback(
+                                    "⚠️ 当前仍是抓取/提取任务，但系统权威进度尚未达标（"
+                                    + "；".join(_remaining_parts)
+                                    + "）。不要直接 done。"
+                                    "如果当前页刚刚翻到新页，请先执行 extract，"
+                                    "不要把当前可见片段塞进 done 里冒充整页结果；"
+                                    "如果当前页已经完整提取过且仍未达量，再继续 next_page。"
+                                )
+                                break
+
                     # 4. 数据提取（跨页累加模式）
                     if action == "extract":
                         _rpa_cache_allowed = False
@@ -4892,9 +5949,26 @@ async def run_agent(
                             if _full_extracted:
                                 _candidates.append(
                                     _sanitize_extraction_candidate(
-                                        name="FULL_PAGE",
+                                        name=f"FULL_PAGE:{_full_extract_text_source}",
                                         data=_full_extracted,
                                         source_text=_full_page_text or _source_text_for_validation,
+                                        data_shape=_data_shape,
+                                    )
+                                )
+
+                            _dom_list_rows, _dom_list_text = (
+                                ([], "")
+                                if _goal_is_tooltip_extract(goal)
+                                else await _extract_list_rows_via_dom(
+                                    "extract visible list rows"
+                                )
+                            )
+                            if _dom_list_rows:
+                                _candidates.append(
+                                    _sanitize_extraction_candidate(
+                                        name="DOM_LIST",
+                                        data=_dom_list_rows,
+                                        source_text=_dom_list_text or _source_text_for_validation,
                                         data_shape=_data_shape,
                                     )
                                 )
@@ -5050,6 +6124,8 @@ async def run_agent(
 
                             # 统计本次新增行数。tooltip 任务按 trigger 主键统计，避免
                             # 中间半成品被 UPSERT 覆盖后仍显示累计过高。
+                            extracted = await _enrich_rows_with_dom_links(extracted)
+                            decision["extracted_data"] = extracted
                             _progress_new_rows, _progress_total_rows = _record_extract_progress(
                                 extracted,
                                 _new_rows,
@@ -5159,6 +6235,8 @@ async def run_agent(
                                                 "只有当前页物理触底或无新增后，才使用 next_page。"
                                             )
                                     else:
+                                        # No paginator detected — mark as infinite scroll
+                                        _page_is_infinite_scroll = True
                                         _should_force_probe_next, _force_probe_reason = (
                                             _should_schedule_next_page_after_extract(
                                                 goal,
@@ -5199,7 +6277,24 @@ async def run_agent(
                                     logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
                                 except Exception as _probe_err:
                                     logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
-                            # ── Path C：Hard Kill 引擎层强杀（同上） ──
+                            # ── Re-arm：已知分页器 + 目标未达 → 每次 extract 后强制 next_page ──
+                            if (
+                                _pagination_probed
+                                and _pagination_kind not in ("", "infinite")
+                                and not _page_is_infinite_scroll
+                                and not _force_next_page_pending
+                            ):
+                                _rearm_target = _parse_goal_target_count(goal)
+                                if _rearm_target is not None and _total_extracted_rows < _rearm_target:
+                                    _force_next_page_pending = True
+                                    logger.info(
+                                        "[REARM NEXT_PAGE] paginator known (%s), target not met "
+                                        "(%s/%s); re-armed for next step",
+                                        _pagination_kind,
+                                        _total_extracted_rows,
+                                        _rearm_target,
+                                    )
+                            # ── Path C：Hard Kill 引擎层强杀（同上）──
                             _hk_target = _parse_goal_target_count(goal)
                             if _hk_target is not None and _total_extracted_rows >= _hk_target:
                                 logger.info(
@@ -5349,6 +6444,13 @@ async def run_agent(
                             )
                             _run_succeeded = True
                             _task_completed = True
+                            # ── PROGRESS SAFEGUARD ──
+                            _pg_target = _parse_goal_target_count(goal)
+                            if _pg_target is not None and _total_extracted_rows < _pg_target:
+                                logger.warning(
+                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                )
+                                _run_succeeded = False
                             break
 
                         # 提取后中止本批次，下一步重新截图（VLM 可能还需要翻页提取更多）
@@ -5406,6 +6508,8 @@ async def run_agent(
                                 _vlm_output,
                                 unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
                             )
+                            # 同步更新进度计数器，避免 PROGRESS SAFEGUARD 用到过期数值
+                            _record_extract_progress(extracted, len(extracted))
                         # 打印 XHR 拦截汇总
                         if browser.intercepted_count > 0:
                             logger.info(
@@ -5468,6 +6572,13 @@ async def run_agent(
 
                         _task_completed = True
                         _run_succeeded = True
+                        # ── PROGRESS SAFEGUARD ──
+                        _pg_target = _parse_goal_target_count(goal)
+                        if _pg_target is not None and _total_extracted_rows < _pg_target:
+                            logger.warning(
+                                f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                            )
+                            _run_succeeded = False
                         break
 
                     # 7. 执行浏览器操作
@@ -5835,6 +6946,27 @@ async def run_agent(
                         len(browser._context.pages) if browser._context else 0
                     )
                     _pre_url = browser.current_url
+                    _pre_click_is_pagination_candidate = False
+                    if action in ("click", "click_text", "click_point"):
+                        try:
+                            _pagination_links_pre = browser.find_pagination_links()
+                            _pagination_ids_pre = {
+                                int(link.get("id"))
+                                for link in _pagination_links_pre
+                                if link.get("id") is not None
+                            }
+                            _decision_target_id = int(decision.get("target_id") or 0)
+                            if _decision_target_id and _decision_target_id in _pagination_ids_pre:
+                                _pre_click_is_pagination_candidate = True
+                            elif action == "click_text":
+                                _decision_text = str(decision.get("type_value") or "").strip().lower()
+                                _pre_click_is_pagination_candidate = any(
+                                    _decision_text
+                                    and _decision_text == str(link.get("name") or "").strip().lower()
+                                    for link in _pagination_links_pre
+                                )
+                        except Exception:
+                            _pre_click_is_pagination_candidate = False
 
                     # ── 自愈执行：捕获 ActionExecutionError 并注入 VLM 反馈 ──────────
                     try:
@@ -5879,6 +7011,36 @@ async def run_agent(
                                         _total_extracted_rows,
                                         _nav_target if _nav_target is not None else "?",
                                     )
+
+                        if (
+                            action in ("click", "click_text", "click_point")
+                            and _pre_click_is_pagination_candidate
+                        ):
+                            _nav_target = _parse_goal_target_count(goal)
+                            _nav_pages = _parse_goal_target_pages(goal)
+                            if (
+                                (_nav_target is None or _total_extracted_rows < _nav_target)
+                                or (
+                                    _nav_pages is not None
+                                    and len(_extracted_page_keys) < _nav_pages
+                                )
+                            ):
+                                _force_extract_after_navigation_pending = True
+                                _force_next_page_pending = False
+                                _nav_feedback = (
+                                    "已通过分页控件进入下一页，下一步必须先执行 extract 提取当前页；"
+                                    "在当前页完成提取前不要继续点击分页器，也不要直接 done。"
+                                )
+                                try:
+                                    vlm.inject_error_feedback(_nav_feedback)
+                                except Exception:
+                                    pass
+                                logger.info(
+                                    "[FORCE EXTRACT AFTER NAV] armed after pagination click; "
+                                    "progress=%s/%s",
+                                    _total_extracted_rows,
+                                    _nav_target if _nav_target is not None else "?",
+                                )
 
                         # ── 标签页切换感知：将 Tab Guard 切换事件注入 VLM 反馈 ──────
                         _tab_switched_this_step = bool(browser._tab_switch_notice)
@@ -5997,6 +7159,13 @@ async def run_agent(
                             }
                             _run_succeeded = True
                             _task_completed = True
+                            # ── PROGRESS SAFEGUARD ──
+                            _pg_target = _parse_goal_target_count(goal)
+                            if _pg_target is not None and _total_extracted_rows < _pg_target:
+                                logger.warning(
+                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                )
+                                _run_succeeded = False
                             break
 
                         if action == "hover_and_click" and _click_repeat_count >= 2:
@@ -6017,6 +7186,13 @@ async def run_agent(
                             await browser.mark_and_screenshot(step=99)
                             _run_succeeded = True
                             _task_completed = True
+                            # ── PROGRESS SAFEGUARD ──
+                            _pg_target = _parse_goal_target_count(goal)
+                            if _pg_target is not None and _total_extracted_rows < _pg_target:
+                                logger.warning(
+                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                )
+                                _run_succeeded = False
                             break
 
                         if _click_repeat_count >= 3:
@@ -6175,6 +7351,7 @@ async def run_agent(
                             and _total_extracted_rows < _target_after_scroll_fail
                         )
                         if _scroll_down_failed_at_bottom and _scroll_bottom_target_unmet:
+                            _pagination_exhausted = True
                             _force_next_page_pending = True
                             _first_flip_pending = False
                             vlm.inject_error_feedback(
@@ -6189,6 +7366,15 @@ async def run_agent(
                                 _total_extracted_rows,
                                 _target_after_scroll_fail,
                             )
+                            # Check close-enough with tolerance
+                            _tolerance = min(5, max(1, int(_target_after_scroll_fail * 0.05)))
+                            if _total_extracted_rows >= _target_after_scroll_fail - _tolerance:
+                                logger.info(
+                                    f"[CLOSE ENOUGH] scroll 到底且进度 {_total_extracted_rows}/{_target_after_scroll_fail} "
+                                    f"在容差 {_tolerance} 内，标记完成"
+                                )
+                                _extraction_complete = True
+                                _pagination_exhausted = True
 
                         if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                             # 连续失败达到上限，交人工处理

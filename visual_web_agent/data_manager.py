@@ -48,7 +48,7 @@ _COLUMN_ALIAS_SIGNATURES = {
         "序号", "排名", "名次",
     },
     "title": {
-        "title", "name", "movie", "film", "product", "item", "subject",
+        "title", "movie", "film", "product", "item", "subject",
         "标题", "名称", "电影", "商品", "项目",
     },
     "rating": {
@@ -67,6 +67,15 @@ _COLUMN_ALIAS_SIGNATURES = {
     },
     "price": {"price", "amount", "cost", "售价", "价格", "金额"},
     "url": {"url", "link", "href", "链接", "地址"},
+    # Do not canonicalize to a single output name here: "age" can be the
+    # established schema in one run while "time" is used in another. The shared
+    # signature lets _align_new_columns_to_existing merge later drift into the
+    # first established column without forcing a domain-specific column name.
+    "temporal": {
+        "time", "age", "date", "created", "created_at", "published",
+        "published_at", "posted", "posted_at", "updated", "updated_at",
+        "时间", "日期", "发布时间", "创建时间", "更新时间",
+    },
 }
 
 

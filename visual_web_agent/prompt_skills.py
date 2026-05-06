@@ -217,6 +217,14 @@ C. 末选：`click + target_id` —— 传统视觉定位（仅当 next_page 和
 注：若系统探测信号说「本页**无分页器**（infinite 模式）」，next_page 也会自动走 L4，
 你照样输出 next_page 即可，**不要**自作主张换 smooth_scroll。
 
+⚠️【去重后滚动例外】
+当系统反馈"行级去重发现没有新增数据"或"EXTRACT_NULL_DOWNGRADE"时：
+- 说明当前页面很可能是无限滚动（无分页器），系统已检测到 kind=infinite
+- 此时不必遵守"首翻必 next_page"规则
+- **直接输出** smooth_scroll(type_value='down') 加载更多内容
+- 滚动后再执行 extract 提取新加载的数据
+- 重复 smooth_scroll → extract 循环直到累计达目标行数
+
 🛡️【防呆铁律 — 翻页纪律，必须严格遵守】
 当前页 extract 一旦输出 extracted_data，立刻进入「翻页或终止」二选一模式：
   · 绝对禁止：再次对同一页发起 extract（系统会 dedup 拦截，浪费一步）
