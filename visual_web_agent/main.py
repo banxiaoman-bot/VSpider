@@ -2812,6 +2812,7 @@ async def run_agent(
             min_list_size=20,
             url_pattern=xhr_pattern or None,
         )
+        browser.configure_network_intelligence(_run_ts)
         if xhr_pattern:
             logger.info(
                 f"[XHR HYBRID] Primary engine (url_pattern={xhr_pattern!r}) → "

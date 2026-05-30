@@ -35,12 +35,14 @@ try:
     from .auth_manager import apply_storage_state_to_context, load_auth_profiles
     from .artifact_manager import artifact_root, register_artifact
     from .data_manager import save_intercepted_data
+    from .network_intelligence import record_candidate as _record_network_candidate
     from .vlm_client import VSpiderAction
 except ImportError:
     import config
     from auth_manager import apply_storage_state_to_context, load_auth_profiles
     from artifact_manager import artifact_root, register_artifact
     from data_manager import save_intercepted_data
+    from network_intelligence import record_candidate as _record_network_candidate
     from vlm_client import VSpiderAction
 
 # ── 网络资源拦截配置 ────────────────────────────────────────────────────────
@@ -3426,6 +3428,67 @@ Object.defineProperty(navigator, 'languages', {
             f"min_list={min_list_size} | url_pattern={self._intercept_url_pattern!r}"
         )
 
+    def configure_network_intelligence(self, run_id: str | None) -> None:
+        """Enable per-run network candidate indexing.
+
+        ``run_id`` is normally the same timestamp used for HTML log /
+        phase jsonl. Passing ``None`` disables persistence while keeping
+        existing XHR Excel interception untouched.
+        """
+        rid = str(run_id or "").strip()
+        self._network_run_id = rid or None
+        self._network_candidates_seen.clear()
+
+    def _record_network_candidate_safe(
+        self,
+        *,
+        response: Response,
+        rows: list[dict],
+        score: int = 0,
+    ) -> None:
+        if not self._network_run_id or not rows:
+            return
+        try:
+            method = response.request.method
+        except Exception:
+            method = "GET"
+        try:
+            resource_type = response.request.resource_type
+        except Exception:
+            resource_type = "xhr"
+        try:
+            content_type = response.headers.get("content-type", "")
+        except Exception:
+            content_type = ""
+        try:
+            req_headers = dict(response.request.headers or {})
+        except Exception:
+            req_headers = {}
+        try:
+            req_body = response.request.post_data
+        except Exception:
+            req_body = None
+        fp = f"{response.url}|{len(rows)}|{self._schema_fingerprint(rows)}"
+        fp_hash = self._stable_json_hash(fp)
+        if fp_hash in self._network_candidates_seen:
+            return
+        self._network_candidates_seen.add(fp_hash)
+        try:
+            _record_network_candidate(
+                run_id=self._network_run_id,
+                url=response.url,
+                method=method,
+                status=response.status,
+                resource_type=resource_type,
+                rows=rows,
+                score=score,
+                content_type=content_type,
+                request_headers=req_headers,
+                request_body=req_body,
+            )
+        except Exception as exc:
+            logger.debug("[NETWORK INTEL] record candidate failed: %s", exc)
+
     async def _handle_xhr_response(self, response: Response) -> None:
         """
         XHR/Fetch 响应拦截处理器（双轨制）。
@@ -3450,7 +3513,8 @@ Object.defineProperty(navigator, 'languages', {
         # ── 提前检查：两条轨道都不需要时直接返回 ──────────────────────────
         pattern_active = bool(self._intercept_url_pattern)
         general_active = self._intercept_enabled
-        if not pattern_active and not general_active:
+        network_active = bool(self._network_run_id)
+        if not pattern_active and not general_active and not network_active:
             return
 
         # 只处理 API 请求（fetch / xhr）
@@ -3510,15 +3574,22 @@ Object.defineProperty(navigator, 'languages', {
                     )
                     return  # 核心数据已处理，无需再走通用轨道重复保存
 
-        # ── 轨道 2：通用拦截 ── 启发式全量收集 ──────────────────────────
-        if not general_active:
-            return
-
+        # ── 轨道 2/3：通用拦截 + Network Intelligence ────────────────
+        # Network Intelligence 只记录候选接口摘要，不保存 Excel；它应能
+        # 独立于旧的 --xhr 通用拦截开关运行。
         data_list = self._extract_data_list(json_body)
         if not data_list:
             return
 
         score, fingerprint = self._score_intercept_candidate(url, data_list)
+        if network_active:
+            self._record_network_candidate_safe(
+                response=response,
+                rows=[r for r in data_list if isinstance(r, dict)],
+                score=score,
+            )
+        if not general_active:
+            return
         if score < 5:
             logger.debug(
                 f"[XHR SENTINEL] Candidate ignored score={score} "
