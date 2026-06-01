@@ -1,0 +1,584 @@
+[
+  {
+    "id": "element_form_basic",
+    "category": "interaction",
+    "capability": [
+      "form",
+      "component_select",
+      "date_picker",
+      "switch",
+      "checkbox",
+      "radio"
+    ],
+    "url": "https://element-plus.org/en-US/component/form.html#typical-form",
+    "goal": "找到网页中 \"Basic Form\" 标题下方的那个完整表单区域，严格在这个表单内完成以下填报： 1. Activity name 输入框：填入 \"VSpider 测试\" 2. Activity zone 下拉框：点击展开后，选择 \"Zone one\" 3. Activity time 区域：点击左侧的 \"Pick a date\" 输入框，在弹出的日历中选定下个月的 15 号 4. Instant delivery 开关：确保将其切换为开启状态 5. Activity type 复选框：勾选 \"Online activities\" 6. Resources 单选框：选中 \"Sponsor\" 7. Activity form 文本域：填入 \"这是一个自动化填报测试\" 8. 确认以上信息填报完毕后，点击该表单最下方的 \"Create\" 按钮。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "element_dropdown_hover_click",
+    "category": "interaction",
+    "capability": [
+      "hover",
+      "dropdown",
+      "menu_click"
+    ],
+    "url": "https://element-plus.org/en-US/component/dropdown.html#hover-trigger",
+    "goal": "找到 \"Basic usage\" 标题下方的那个 \"Dropdown List\" 按钮，对其执行悬浮（hover）操作。等待菜单展开后，点击弹出的菜单项 \"Action 3\"，并提取动作结果。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "element_tooltip_four_directions",
+    "category": "interaction",
+    "capability": [
+      "hover",
+      "tooltip",
+      "extract"
+    ],
+    "url": "https://element-plus.org/en-US/component/tooltip.html#basic-usage",
+    "goal": "依次将鼠标悬浮在页面的四个方向按钮（Top, Bottom, Left, Right）上，提取它们弹出的黑色提示框里的文字内容。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 4
+    }
+  },
+  {
+    "id": "element_cascader_basic",
+    "category": "interaction",
+    "capability": [
+      "cascader",
+      "multi_level_menu"
+    ],
+    "url": "https://element-plus.org/en-US/component/cascader.html#basic-usage",
+    "goal": "在基础级联选择器中，依次点击展开：Guide -> Navigation -> Top Navigation。最后确认输入框里出现了对应的值。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "element_date_picker_enter_date",
+    "category": "interaction",
+    "capability": [
+      "date_picker",
+      "relative_date"
+    ],
+    "url": "https://element-plus.org/en-US/component/date-picker.html#enter-date",
+    "goal": "找到 \"Enter Date\" 标题下方第一个带有 \"Pick a day\" 占位符的日期输入框，点击它。然后在弹出的日历面板中，选择下个月的 15 号。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "rpa_challenge_once",
+    "category": "interaction",
+    "capability": [
+      "form",
+      "label_binding",
+      "dynamic_layout"
+    ],
+    "url": "https://rpachallenge.com/",
+    "goal": "在表单中填入以下数据：First Name=\"John\", Last Name=\"Doe\", Company Name=\"Google\", Role in Company=\"Engineer\", Address=\"123 AI St\", Email=\"john@test.com\", Phone Number=\"1234567890\"。最后点击 Submit。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "demoqa_student_registration",
+    "category": "interaction",
+    "capability": [
+      "form",
+      "radio",
+      "checkbox",
+      "autocomplete",
+      "submit"
+    ],
+    "url": "https://demoqa.com/automation-practice-form",
+    "goal": "填写学生注册表：First Name=\"Alice\", Last Name=\"Smith\", Gender=\"Female\", Mobile=\"1234567890\", Subjects 输入 \"Math\" 并选中联想出的 \"Maths\", Hobbies=\"Reading\"。最后提交表单。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "hn_algolia_ai_agent_50",
+    "category": "extraction",
+    "capability": [
+      "list_extract",
+      "pagination",
+      "xhr",
+      "excel"
+    ],
+    "url": "https://hn.algolia.com/?q=AI+Agent",
+    "goal": "抓取关于 AI Agent 的讨论前 50 条数据并保存到 Excel。字段尽量包含：Title, URL, Author, Points, Comments, CreatedAt。",
+    "enable_xhr": true,
+    "expected": {
+      "success": true,
+      "min_output_rows": 50
+    }
+  },
+  {
+    "id": "douban_top250_26",
+    "category": "extraction",
+    "capability": [
+      "list_extract",
+      "pagination",
+      "excel"
+    ],
+    "url": "https://movie.douban.com/top250",
+    "goal": "提取豆瓣电影 Top 250 中前26部电影的标题、评分、评价人数和一句话简介，保存为结构化数据。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 26
+    }
+  },
+  {
+    "id": "datatables_30_next",
+    "category": "extraction",
+    "capability": [
+      "table_extract",
+      "next_page",
+      "excel"
+    ],
+    "url": "https://datatables.net/",
+    "goal": "抓取页面核心数据表格中的前 30 条员工数据，提取字段为：Name, Position, Office。每抓取完一页，请点击表格右下角的 \"Next\" 按钮进行翻页。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 30
+    }
+  },
+  {
+    "id": "google_sheets_student_20",
+    "category": "extraction",
+    "capability": [
+      "table_extract",
+      "spreadsheet",
+      "excel"
+    ],
+    "url": "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit?gid=0#gid=0",
+    "goal": "这是一个表格，请提取表头以及前 20 行数据，包含 Student Name, Gender, Class Level, Home State 等所有列，并保存为结构化数据。",
+    "enable_xhr": true,
+    "expected": {
+      "success": true,
+      "min_output_rows": 20
+    }
+  },
+  {
+    "id": "juejin_feed_latest_20",
+    "category": "extraction",
+    "capability": [
+      "list_extract",
+      "feed_filter",
+      "xhr",
+      "excel"
+    ],
+    "url": "https://juejin.cn/",
+    "goal": "请提取信息流中最新的 20 篇文章的标题、作者和点赞数。注意：必须跳过带有 '广告' 或 '推广' 标签的条目，只提取真实的技术文章，并保存为结构化数据。",
+    "enable_xhr": true,
+    "expected": {
+      "success": true,
+      "min_output_rows": 20
+    }
+  },
+  {
+    "id": "demoqa_modal_dialogs",
+    "category": "interaction",
+    "capability": [
+      "modal",
+      "dialog",
+      "extract",
+      "close"
+    ],
+    "url": "https://demoqa.com/modal-dialogs",
+    "goal": "点击 'Small modal' 按钮，提取弹窗里的文本内容。然后点击弹窗上的 'Close' 按钮。接着点击 'Large modal' 按钮，提取内容并关闭。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 2
+    }
+  },
+  {
+    "id": "reactrouter_docs_sidebar_titles",
+    "category": "interaction",
+    "capability": [
+      "navigation",
+      "sidebar",
+      "expand",
+      "extract"
+    ],
+    "url": "https://reactrouter.com/",
+    "goal": "请先点击页面中部的 'Docs' 按钮进入文档主页。进入后，在左侧侧边栏找到 'Upgrading' 并点击展开它。接着，点击它下方出现的子菜单 'Upgrading from v6'，提取此时右侧主内容区的大标题。最后，在左侧侧边栏下方找到 'Form' 链接（位于 API/COMPONENTS 下），点击它并提取右侧刷新的新大标题，然后结束。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 2
+    }
+  },
+  {
+    "id": "internet_hovers_middle_profile",
+    "category": "interaction",
+    "capability": [
+      "hover",
+      "hidden_text",
+      "link_click",
+      "navigation",
+      "extract"
+    ],
+    "url": "https://the-internet.herokuapp.com/hovers",
+    "goal": "将鼠标悬浮在页面中间的头像图片上，等待浮层出现后，记录显示的 name: userX 用户名。然后点击 'View profile' 链接，跳转到个人主页（可能显示 Not Found）。提取并输出以下字段：username、profile_link_text、final_title_or_heading、final_url。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "demoqa_droppable_then_slider_80",
+    "category": "interaction",
+    "capability": [
+      "drag_drop",
+      "slider",
+      "extract",
+      "navigation"
+    ],
+    "url": "https://demoqa.com/droppable",
+    "goal": "将左侧的 'Drag me' 元素拖拽到右侧的 'Drop here' 区域，确认拖拽成功后记录结果文本。然后导航到 https://demoqa.com/slider 页面，将滑块精确拖动到 80 的位置，确认数值显示正确。提取并输出 droppable_text 和 slider_value。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 2
+    }
+  },
+  {
+    "id": "demoqa_slider_exact_80",
+    "category": "interaction",
+    "capability": [
+      "slider",
+      "drag",
+      "precision",
+      "extract"
+    ],
+    "url": "https://demoqa.com/slider",
+    "goal": "页面上有一个滑块，默认值为 25。请将滑块精确拖动到数值 80 的位置，拖动完成后检查旁边的 Input 数值显示框确认显示为 80。如果数值不对请微调直到精确。提取并输出 slider_value。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "selectorshub_shadow_iframe_table",
+    "category": "interaction",
+    "capability": [
+      "shadow_dom",
+      "iframe",
+      "table_filter",
+      "checkbox",
+      "extract"
+    ],
+    "url": "https://selectorshub.com/xpath-practice-page/",
+    "goal": "先找到 'Shadow DOM' 区域中的 'Enter Pizza name' 输入框（位于 Shadow root 内），输入 'VSpider Pizza'。然后滚动到下方的 'iframe and table' 区域，进入 Iframe 内，在 'Search:' 搜索框中输入 'mac'，在筛选后的表格中找到 OS 为 'mac' 的那一行，提取对应的 City 和 Country。最终输出 pizza_name、city、country。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "wikipedia_new_tabs_first_paragraphs",
+    "category": "interaction",
+    "capability": [
+      "new_tab",
+      "link_open",
+      "tab_switch",
+      "extract",
+      "close_tab"
+    ],
+    "url": "https://en.wikipedia.org/wiki/Web_scraping",
+    "goal": "在当前维基百科页面中找到包含 'Contact scraping is a type of web scraping...' 的段落，定位其中的 'data mining' 超链接，用鼠标中键或右键菜单在新标签页 (New Tab) 中打开该链接。切换到新标签页，提取页面标题和第一段摘要。然后找到包含 'Web pages are built using...' 的段落，定位 'artificial intelligence' 链接，同样在新 Tab 中打开并提取标题和第一段。最后关闭这两个新标签页，回到原始页面。输出每条链接的 link_text、target_title、first_paragraph。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 2
+    }
+  },
+  {
+    "id": "weather_cn_urumqi_3day",
+    "category": "extraction",
+    "capability": [
+      "list_extract",
+      "weather",
+      "table_extract",
+      "excel"
+    ],
+    "url": "https://www.weather.com.cn/weather/101130101.shtml",
+    "goal": "打开中国天气网乌鲁木齐7日预报页，提取“今天”、“明天”及“后天”的天气现象、最高/最低温度、风力等级。请整理为结构化数据，每行对应一天，字段包含 day_label, weather, high_temp, low_temp, wind_level，并保存为结果。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 3,
+      "required_fields": [
+        "day_label",
+        "weather",
+        "high_temp",
+        "low_temp",
+        "wind_level"
+      ]
+    }
+  },
+  {
+    "id": "weather_cn_urumqi_7day",
+    "category": "extraction",
+    "capability": [
+      "list_extract",
+      "weather",
+      "table_extract",
+      "excel"
+    ],
+    "url": "https://www.weather.com.cn/weather/101130101.shtml",
+    "goal": "打开中国天气网乌鲁木齐7日预报页，提取未来7天每天的天气现象、最高/最低温度、风力等级。请整理为结构化数据，每行对应一天，字段包含 day_label, weather, high_temp, low_temp, wind_level，并保存为结果。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 7,
+      "required_fields": [
+        "day_label",
+        "weather",
+        "high_temp",
+        "low_temp",
+        "wind_level"
+      ]
+    }
+  },
+  {
+    "id": "xj_chinanews_politics_3",
+    "category": "extraction",
+    "capability": [
+      "list_extract",
+      "news_filter",
+      "date_extract",
+      "excel"
+    ],
+    "url": "https://www.xj.chinanews.com.cn/",
+    "goal": "打开中新网新疆频道首页，从新闻列表中筛选出与时政要闻相关的3条新闻标题，并提取其发布时间。请整理为结构化数据，每行一条新闻，字段包含 title 和 publish_time。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 3,
+      "required_fields": [
+        "title",
+        "publish_time"
+      ]
+    }
+  },
+  {
+    "id": "demoqa_upload_excel_echo",
+    "enabled": false,
+    "category": "interaction",
+    "capability": [
+      "file_upload",
+      "form",
+      "assertion"
+    ],
+    "url": "https://demoqa.com/upload-download",
+    "goal": "点击“选择文件”按钮，上传一个本地的 excel 文件。上传成功后确认页面显示文件路径或文件名，形如 C:\\Users\\banxi\\OneDrive\\桌面\\test.xlsx 或 test.xlsx。",
+    "upload_file": "C:\\Users\\banxi\\OneDrive\\桌面\\test.xlsx",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "demoqa_download_sample_file",
+    "category": "interaction",
+    "capability": [
+      "file_download",
+      "download",
+      "assertion"
+    ],
+    "url": "https://demoqa.com/upload-download",
+    "goal": "点击“Download”按钮，下载示例文件，然后检查本地下载目录中是否生成了 sampleFile.jpeg。完成后输出 done。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "download_file": "sampleFile.jpeg"
+    }
+  },
+  {
+    "id": "p1_weather_then_ctrip_indoor",
+    "enabled": false,
+    "category": "planning",
+    "capability": [
+      "multi_page",
+      "memory",
+      "search",
+      "reasoning"
+    ],
+    "url": "https://www.weather.com.cn/weather/101130101.shtml",
+    "goal": "先打开乌鲁木齐7天天气预报页，提取“今天”的最高温度。然后打开 https://www.ctrip.com ，在目的地搜索框中输入“乌鲁木齐”并点击搜索。在搜索结果页找到一个推荐的景点或酒店，判断其是否适合室内活动。最后输出一句话：“今天乌鲁木齐最高 XX°C，推荐室内活动。”",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "last_done_contains": "室内"
+    }
+  },
+  {
+    "id": "v1_nasdaq_aapl_volume",
+    "enabled": false,
+    "category": "visual",
+    "capability": [
+      "dense_ui",
+      "data_extract",
+      "visual_fallback"
+    ],
+    "url": "https://www.nasdaq.com/market-activity/stocks/aapl",
+    "goal": "在当前页面找到“Volume”（成交量）这个数值，它位于密集的数据表格中，周围有 Open, High, Low, Close 等。提取 Volume 对应的数值并输出为结构化数据，字段包含 label 和 value。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "a1_w3schools_form_submit_assert",
+    "category": "interaction",
+    "capability": [
+      "form",
+      "submit",
+      "assertion"
+    ],
+    "url": "https://www.w3schools.com/html/html_forms.asp",
+    "goal": "在页面中找到“First name”和“Last name”输入框，输入“测试”和“用户”。然后点击“Submit”按钮。提交后，断言页面新出现的内容中包含“测试 用户”或类似字符串。最后输出 done。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "r1_httpbin_404_graceful",
+    "category": "recovery",
+    "capability": [
+      "http_error",
+      "guard",
+      "done"
+    ],
+    "url": "https://www.httpbin.org/status/404",
+    "goal": "访问该页面。由于页面返回404错误，你的任务是：检测到错误后，不要卡住，而是输出“检测到404，任务终止”，并结束。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "last_done_contains": "404"
+    }
+  },
+  {
+    "id": "m1_bing_multitab_context",
+    "category": "tabs",
+    "capability": [
+      "search",
+      "new_tab",
+      "switch_tab",
+      "close_tab"
+    ],
+    "url": "https://www.bing.com",
+    "goal": "在必应搜索“Python教程”。点击第一个结果，确保在新标签页打开。然后切换回最初的必应标签页。在必应搜索框里重新输入“VLM Agent”，点击搜索。最后关闭第一个结果的那个标签页，不要关闭当前必应页。输出“done”。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
+  },
+  {
+    "id": "b1_reddit_scroll_3_extract_top",
+    "category": "stress",
+    "capability": [
+      "infinite_scroll",
+      "scroll",
+      "extract"
+    ],
+    "url": "https://www.reddit.com/r/all/",
+    "goal": "向下滚动页面至少 3 次，每次滚动约 800 像素，每次滚动后等待 2 秒。滚动完成后，提取页面顶部可见的第一篇文章标题。输出该标题。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "s1_bing_images_upload_cat_search",
+    "enabled": false,
+    "category": "multimodal",
+    "capability": [
+      "image_search",
+      "file_upload",
+      "visual"
+    ],
+    "url": "https://www.bing.com/images",
+    "goal": "点击搜索框旁边的相机图标，上传本地测试图片 cat.jpg，搜索完成后从结果页中提取第一个搜索结果的标题或描述并输出。",
+    "upload_file": "workspace\\test_assets\\cat.jpg",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "c1_baidu_shanghai_tomorrow_weather",
+    "category": "natural_language",
+    "capability": [
+      "search",
+      "intent",
+      "weather",
+      "extract"
+    ],
+    "url": "https://www.baidu.com",
+    "goal": "帮我查一下明天上海会不会下雨？如果可能的话，把气温也告诉我。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "last_done_contains": "上海"
+    }
+  },
+  {
+    "id": "baidu_wenxin_deepseek_model_45t",
+    "category": "ai_portal",
+    "capability": [
+      "search",
+      "new_tab",
+      "chat",
+      "model_switch"
+    ],
+    "url": "https://www.baidu.com/",
+    "goal": "打开页面，找到文心助手入口并点击进去，跳转到新页面后，在文心助手正中间输入框中输入“介绍一下deepseek”，点击切换模型的图案，选择“文心4.5T”模型，然后回车或点击发送图案，等待获取 AI 返回的内容并提取。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  },
+  {
+    "id": "x1_cross_site_internet_to_demoqa",
+    "category": "planning",
+    "capability": [
+      "cross_system",
+      "navigation",
+      "extract",
+      "memory"
+    ],
+    "url": "https://the-internet.herokuapp.com/",
+    "goal": "先在 https://the-internet.herokuapp.com/ 首页提取页面主标题文字并记住它。然后打开 https://demoqa.com/ ，提取首页 \"Elements\" 等分类卡片中的第一个卡片名称。最后输出 source_title 和 first_category 两个字段，每行一个系统的结果。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true,
+      "min_output_rows": 1
+    }
+  }
+]
