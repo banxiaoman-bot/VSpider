@@ -527,3 +527,37 @@ Acceptance:
 - Disabled run_id / empty rows are no-ops; identical `(url, schema)` deduped
   within a run; reconfigure clears the dedup set.
 - `tests/test_network_intelligence_wiring.py` 11 passed; existing NET suite green.
+
+## Slice MM-1: Image Attachment Multimodal Primitives (Phase 1)
+
+Status: implemented (Phase 1 of 2 — primitives only; run_agent wiring deferred).
+
+Goal:
+
+- Make image attachments (`intent=prompt_context`) feedable to the VLM as real
+  multimodal images, replacing the caption-only stub. Phase 1 lands the reusable
+  primitives; Phase 2 wires them through `run_agent` + callers.
+
+Add:
+
+- `attachment_adapters/base.py` — `AdapterResult.image_b64: list[str]` +
+  `image_count` in `to_dict`.
+- `attachment_adapters/image.py` — return a base64 `data:` URL (downscale large
+  images via Pillow to bound token cost) + keep a caption for text fallback;
+  drop the `multimodal_feeding_not_yet_wired` reason.
+- `vlm_client.VLMClient._build_user_content(screenshot, text, extra_images)` —
+  assemble OpenAI/Qwen-VL content (screenshot -> extra_images -> text, with
+  data-URL normalization and text-only graceful degrade); `ask()` gains an
+  `extra_images` parameter that flows into the payload.
+
+Acceptance:
+
+- `tests/test_attachment_image_multimodal.py` 12 passed (adapter base64, payload
+  ordering/normalization, text-only fallback, ask() signature).
+- No production caller changed (Phase 2): `run_agent` does not yet pass
+  `extra_images`; existing-run behavior is unchanged.
+
+Next (Phase 2):
+
+- Thread `prompt_context` image attachments through `run_agent` + api_server/CLI
+  so uploaded images actually reach `vlm.ask(extra_images=...)`.

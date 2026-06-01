@@ -42,8 +42,23 @@ try:
         VLM_TEMPERATURE,
         VLM_HISTORY_WINDOW,
         MAX_STEPS,
+        COMPACTION_ENABLED,
+        COMPACTION_TRIGGER_COUNT,
+        COMPACTION_TRIGGER_CHARS,
+        COMPACTION_KEEP_LAST,
+        COMPACTION_COOLDOWN,
+        CACHE_MODE,
+        CACHE_DIR,
+        CACHE_SESSION_ID,
+        CACHE_REPLAY_STRICT,
+        CACHE_REPLAY_FALLBACK,
+        ELEMENT_TRACKER_ENABLED,
+        ELEMENT_TRACKER_MATCH_THRESHOLD,
+        ELEMENT_TRACKER_HIGH_CONFIDENCE,
     )
     from .prompts import build_system_prompt, build_user_message
+    from .response_cache import ResponseCache, CacheMode, CacheReplayMissError
+    from .element_tracker import ElementTracker, TrackerConfig, RelocateResult
 except ImportError:
     from config import (
         VLM_API_BASE,
@@ -56,8 +71,23 @@ except ImportError:
         VLM_TEMPERATURE,
         VLM_HISTORY_WINDOW,
         MAX_STEPS,
+        COMPACTION_ENABLED,
+        COMPACTION_TRIGGER_COUNT,
+        COMPACTION_TRIGGER_CHARS,
+        COMPACTION_KEEP_LAST,
+        COMPACTION_COOLDOWN,
+        CACHE_MODE,
+        CACHE_DIR,
+        CACHE_SESSION_ID,
+        CACHE_REPLAY_STRICT,
+        CACHE_REPLAY_FALLBACK,
+        ELEMENT_TRACKER_ENABLED,
+        ELEMENT_TRACKER_MATCH_THRESHOLD,
+        ELEMENT_TRACKER_HIGH_CONFIDENCE,
     )
     from prompts import build_system_prompt, build_user_message
+    from response_cache import ResponseCache, CacheMode, CacheReplayMissError
+    from element_tracker import ElementTracker, TrackerConfig, RelocateResult
 
 logger = logging.getLogger("vspider.vlm")
 
@@ -70,6 +100,16 @@ def _broadcast_log_safe(message: str, level: str = "info") -> None:
         broadcast_log(message, level=level)
     except Exception:
         pass
+
+
+def _looks_like_auth_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "401" in text
+        or "invalid_api_key" in text
+        or "incorrect api key" in text
+        or "authenticationerror" in text
+    )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -109,7 +149,10 @@ class VSpiderAction(BaseModel):
         "close_tab", "switch_tab", "save_to_memory", "done", "ask_human", "error",
         "captcha_detected",
         "click_point",    # 无选择器坐标点击：直接用像素坐标操控鼠标，跳过 SoM ID 定位
+        "targeted_probe", # 局部元素探针：按目标查找 input/button/link/table/dialog 候选，不改变页面状态
         "click_new_tab",  # 中键点击：强制在新标签页打开链接，避免 click+switch_tab 循环
+        "fetch_link_content",  # JS-driven 后台拉取：context.new_page+goto+evaluate+close，免 VLM 进环
+        "fetch_links_batch",   # 批量后台拉取：type_value JSON {target_ids/urls, mode, selectors}
         "smooth_scroll",  # 平滑滚动：behavior:'smooth' 模拟人类滚轮，更易触发懒加载
         "remove_element", # 物理铲除：从 DOM 树直接删除广告遮罩/悬浮弹窗等阻挡节点
         "wait",           # 显式等待：主动暂停 N 秒，应对长动画/慢加载中间态
@@ -119,6 +162,12 @@ class VSpiderAction(BaseModel):
         "next_page",      # 启发式翻页：底层尝试 [Next/下一页/›/→] 等通用 locator
         "click_text",     # 文本定位点击：底层 page.get_by_text(type_value) 绕开 SoM ID 填位
         "hover_and_click",# 复合悬浮+菜单项点击（target_id=hover触发器, type_value=菜单项文字）
+        "row_action",     # 按行筛选定位行内按钮：target_id=0, type_value="<行筛选文本>||<按钮文字>" 如 "张三||删除"
+        "extract_row",   # 行值取用：按行筛选 + 列标题抓单值或整行，写回 memory
+        "tree_check",    # 树控件复选框：按节点文本定位 + check / uncheck / toggle
+        "set_prompt_response", # 预装填下一次原生 prompt() 的回答（一次性）
+        "chat_extract",   # 通用 AI 聊天回答提取：等待流式完成 + 选择器级联 + 兜底大文本块，避开"搜索-然后-回答"页面的搜索结果干扰
+        "chat_submit",    # 通用 AI 聊天发送按钮点击：当 SoM 漏标了图标式发送按钮（<div>+SVG）或 press_key Enter 无效时使用；底层用启发式 locator 直接点击
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(
         default=0,
@@ -330,6 +379,80 @@ class VSpiderAction(BaseModel):
           - click + 非空 type_value（非 URL）→ VLM 实际上想 type，但选错了 action
           - type + 空 type_value   → VLM 忘记填写要输入的文字
         """
+        reasoning_text = " ".join(
+            str(part or "")
+            for part in (
+                self.progress_review,
+                self.thought,
+                self.current_state,
+            )
+        )
+        _scroll_intent_direction = ""
+        if re.search(
+            r"scroll\s*(?:up|to top)|smooth_scroll\s*(?:up|to top)|向上滚动|往上滚|上滚|回到顶部|滚到顶部",
+            reasoning_text,
+            re.IGNORECASE,
+        ):
+            _scroll_intent_direction = "up"
+        elif re.search(
+            r"scroll\s*(?:down|to bottom)|smooth_scroll\s*(?:down|to bottom)|向下滚动|往下滚|下滚|继续向下|滚到下方|滚到表单|滚到按钮|不在当前视口|未在当前视口|视口.*下方|按钮未.*可见|submit.*未.*可见|submit button.*not visible|not in (?:the )?viewport|below the viewport",
+            reasoning_text,
+            re.IGNORECASE,
+        ):
+            _scroll_intent_direction = "down"
+        _has_scroll_intent = bool(_scroll_intent_direction)
+
+        _tab_switch_intent = bool(
+            re.search(
+                r"\bswitch_tab\b|切换.{0,8}(?:标签|tab|页)|切回.{0,10}(?:标签|tab|必应|搜索|原页|起始|首页)",
+                reasoning_text,
+                re.IGNORECASE,
+            )
+        )
+        if self.action in {"click", "click_new_tab", "hover", "hover_and_click"} and _tab_switch_intent:
+            tab_idx: int | None = None
+            for pat in (
+                r"(?:标签页?|tab)\s*(?:索引|index)?\s*[#:]?\s*(\d+)",
+                r"switch_tab\s*\(\s*(\d+)",
+                r"target_id[:：= ]+(\d+).{0,40}(?:标签|tab)",
+                r"第\s*(\d+)\s*(?:个)?标签",
+            ):
+                m = re.search(pat, reasoning_text, re.IGNORECASE)
+                if m:
+                    tab_idx = int(m.group(1))
+                    break
+            if tab_idx is None and re.search(
+                r"第一个|最初|索引\s*0|标签\s*0|起始标签|原标签",
+                reasoning_text,
+                re.I,
+            ):
+                tab_idx = 0
+            if tab_idx is not None:
+                logging.getLogger(__name__).warning(
+                    "[ACTION FIX] %s with switch_tab intent in thought -> switch_tab(%s)",
+                    self.action,
+                    tab_idx,
+                )
+                self.action = "switch_tab"  # type: ignore[assignment]
+                self.target_id = tab_idx
+                self.type_value = str(tab_idx)
+                return self
+
+        if (
+            self.action == "click"
+            and self.target_id == 0
+            and not (self.type_value and self.type_value.strip())
+            and _has_scroll_intent
+        ):
+            logging.getLogger(__name__).info(
+                "[ACTION FIX] click target_id=0 with scroll intent -> scroll(%s)",
+                _scroll_intent_direction,
+            )
+            self.action = "scroll"  # type: ignore[assignment]
+            self.target_id = 0
+            self.type_value = _scroll_intent_direction
+            return self
+
         # VLM 常见“手脑分裂”：thought 明确写了 @e28 / 红框 28，
         # 但结构化字段 target_id 却填 0。先从推理文本里捞回 ID，
         # 避免 hover/click 直接撞到 Element #0。
@@ -337,15 +460,7 @@ class VSpiderAction(BaseModel):
             "click", "click_new_tab", "hover", "select", "upload",
             "extract_link", "download_image", "remove_element",
             "drag_and_drop", "hover_and_click",
-        }:
-            reasoning_text = " ".join(
-                str(part or "")
-                for part in (
-                    self.progress_review,
-                    self.thought,
-                    self.current_state,
-                )
-            )
+        } and not _has_scroll_intent and not _tab_switch_intent:
             id_match = re.search(
                 r"(?:@e|红框\s*|ID[:：= ]+|target_id[:：= ]+)(\d{1,4})",
                 reasoning_text,
@@ -363,6 +478,35 @@ class VSpiderAction(BaseModel):
 
         if self.action == "click" and self.type_value and self.type_value.strip():
             _tv = self.type_value.strip()
+            _tv_lower = _tv.lower()
+            _input_like_intent = bool(
+                re.search(
+                    r"输入框|输入|搜索框|搜索|textbox|searchbox|combobox|textarea|\binput\b",
+                    reasoning_text,
+                    re.IGNORECASE,
+                )
+            )
+            _looks_like_long_explanation = bool(
+                len(_tv) > 24
+                and re.search(r"\s|,|，|。|；|;|\.", _tv)
+                and re.search(
+                    r"click|result|link|tab|switch|open|点击|结果|链接|标签|切换|打开",
+                    _tv_lower,
+                    re.IGNORECASE,
+                )
+            )
+            if _tv_lower in {"down", "up", "top", "bottom"} and (
+                self.target_id == 0 or _has_scroll_intent
+            ):
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "[ACTION FIX] click + type_value=%r 自动纠偏为 scroll",
+                    _tv,
+                )
+                self.action = "scroll"  # type: ignore[assignment]
+                self.target_id = 0
+                self.type_value = _tv_lower
+                return self
             # ── 自动纠偏：click + URL → goto ────────────────────────────
             # VLM 常见幻觉：想导航到某个 URL，但错用了 click 动作并将 URL 填入 type_value
             if _tv.startswith(("http://", "https://", "www.")):
@@ -385,6 +529,22 @@ class VSpiderAction(BaseModel):
                 )
                 self.action = "press_key"  # type: ignore[assignment]
                 self.target_id = 0
+            elif _tv_lower in {"click_new_tab", "new_tab", "open_new_tab", "open in new tab"}:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    "[ACTION FIX] click + type_value=%r 自动纠偏为 click_new_tab",
+                    _tv,
+                )
+                self.action = "click_new_tab"  # type: ignore[assignment]
+                self.type_value = ""
+            elif self.target_id > 0 and _input_like_intent and not _looks_like_long_explanation:
+                import logging as _logging
+                _logging.getLogger(__name__).info(
+                    f"[ACTION FIX] click + 输入文本 type_value={_tv!r} 自动纠偏为 type"
+                )
+                self.action = "type"       # type: ignore[assignment]
+                self.type_value = _tv
+                return self
             # ── Fix 5：click + 短文本/标签字 → 静默擦掉 type_value，保留 click ─
             # VLM 常见 schema 错位：想点击「页码 2」「下一页」「>」按钮，
             # 错把按钮可见文字塞进 type_value（type_value 实际只用于 type 动作输入）。
@@ -396,6 +556,18 @@ class VSpiderAction(BaseModel):
                 or (len(_tv) <= 6 and (_tv.isdigit() or all(c in "<>«»‹›←→▲▼▶◀" for c in _tv)))
             ):
                 import logging as _logging
+                _looks_like_navigation_label = (
+                    _tv.isdigit()
+                    or _tv_lower in {"next", "prev", "previous", "more"}
+                    or (len(_tv) <= 6 and all(c in "<>«»‹›←→▲▼▶◀" for c in _tv))
+                )
+                if self.target_id > 0 and _input_like_intent and not _looks_like_navigation_label:
+                    _logging.getLogger(__name__).info(
+                        f"[ACTION FIX] click + 短输入文本 type_value={_tv!r} 自动纠偏为 type"
+                    )
+                    self.action = "type"       # type: ignore[assignment]
+                    self.type_value = _tv
+                    return self
                 _logging.getLogger(__name__).info(
                     f"[ACTION FIX] click + 短标签 type_value={_tv!r} 静默擦除"
                     f"（保留 click，target_id 应为该按钮的 @eN 数字）"
@@ -416,9 +588,9 @@ class VSpiderAction(BaseModel):
             else:
                 import logging as _logging
                 _logging.getLogger(__name__).info(
-                    f"[ACTION FIX] click + type_value='{_tv[:40]}' 自动纠偏为 type"
+                    f"[ACTION FIX] click + misplaced long type_value={_tv[:40]!r}; preserving click"
                 )
-                self.action = "type"       # type: ignore[assignment]
+                self.type_value = ""
         if self.action == "type" and not (self.type_value and self.type_value.strip()):
             raise ValueError(
                 "动作缺陷！你选择了 'type' 动作，但 type_value 是空的。"
@@ -459,6 +631,17 @@ class VSpiderAction(BaseModel):
                     )
                 )
             )
+            if _prev_action == "type" and _prev_tv and not _looks_like_click_text:
+                _logging.getLogger(__name__).info(
+                    "[ACTION FIX] type + target_id=0 preserved for targeted input handoff "
+                    "(type_value=%r)",
+                    _prev_tv[:80],
+                )
+                self.thought = (
+                    "[TARGETED_TYPE_PENDING] type target_id=0 will be resolved by "
+                    "targeted input handoff before falling back. "
+                ) + (self.thought or "")
+                return self
             if _looks_like_click_text:
                 _logging.getLogger(__name__).warning(
                     f"[ACTION FIX] {_prev_action} + target_id=0 + label "
@@ -702,6 +885,53 @@ class ReflectorDecision(BaseModel):
         description="abort 专用，最终裁决"
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_reflector_payload(cls, data):
+        if not isinstance(data, dict):
+            return data
+        payload = dict(data)
+        if not str(payload.get("reason") or "").strip():
+            payload["reason"] = (
+                payload.get("thought")
+                or payload.get("summary")
+                or payload.get("explanation")
+                or "Reflector returned no reason."
+            )
+
+        status_map = {
+            "todo": "pending",
+            "not_started": "pending",
+            "in_progress": "active",
+            "current": "active",
+            "completed": "done",
+            "complete": "done",
+            "success": "done",
+            "error": "failed",
+        }
+        allowed = {"pending", "active", "done", "failed"}
+        goals = payload.get("new_sub_goals")
+        if isinstance(goals, list):
+            normalized = []
+            for idx, goal in enumerate(goals, start=1):
+                if not isinstance(goal, dict):
+                    normalized.append(goal)
+                    continue
+                item = dict(goal)
+                item.setdefault("id", idx)
+                if not str(item.get("exit_criteria") or "").strip():
+                    item["exit_criteria"] = (
+                        item.get("description") or "Complete this sub-goal."
+                    )
+                status = str(item.get("status") or "pending").strip().lower()
+                item["status"] = status_map.get(
+                    status,
+                    status if status in allowed else "pending",
+                )
+                normalized.append(item)
+            payload["new_sub_goals"] = normalized
+        return payload
+
 
 _TASK_PLAN_SCHEMA: dict = TaskPlan.model_json_schema()
 _REFLECTOR_DECISION_SCHEMA: dict = ReflectorDecision.model_json_schema()
@@ -791,6 +1021,55 @@ class VLMClient:
         self._use_structured: bool = True
         # 自愈反馈：下一轮 ask() 会将上一轮的执行错误注入提示
         self._pending_error: str | None = None
+        # ── Message Compaction：长任务历史智能压缩 ─────────────────────
+        try:
+            from .message_compaction import MessageCompactor, CompactionConfig
+        except ImportError:
+            from message_compaction import MessageCompactor, CompactionConfig
+        self._compactor = MessageCompactor(
+            config=CompactionConfig(
+                enabled=COMPACTION_ENABLED,
+                trigger_count=COMPACTION_TRIGGER_COUNT,
+                trigger_char_count=COMPACTION_TRIGGER_CHARS,
+                keep_last_items=COMPACTION_KEEP_LAST,
+                summary_max_chars=2000,
+                compact_cooldown_steps=COMPACTION_COOLDOWN,
+            ),
+            vlm_client=self,
+        )
+        # ── Response Cache：record / replay 模式 ────────────────────────
+        # off 时构造一个透传实例，所有 lookup 返回 None / store 是 no-op；
+        # record 时把每步的 (输入哈希, 输出) 落盘到 JSONL；
+        # replay 时按步骤号从 JSONL 返回缓存输出，跳过真实 VLM 调用。
+        self._response_cache = ResponseCache(
+            mode=CacheMode.from_str(CACHE_MODE),
+            cache_dir=CACHE_DIR,
+            session_id=CACHE_SESSION_ID or None,
+            replay_strict=CACHE_REPLAY_STRICT,
+            replay_fallback_on_miss=CACHE_REPLAY_FALLBACK,
+        )
+        if self._response_cache.is_active():
+            logger.info(
+                f"[CACHE] mode={self._response_cache.mode.value} "
+                f"session={self._response_cache.session_id} "
+                f"path={self._response_cache.session_path()}"
+            )
+        # ── Element Tracker：自适应元素重定位 ──────────────────────────
+        # 启用后通过 vlm.track_element() / vlm.relocate_element() 在
+        # DOM 重排后按结构签名找回元素。开关关闭时这些方法是 no-op，
+        # 不影响任何现有调用路径。
+        self._element_tracker_enabled = bool(ELEMENT_TRACKER_ENABLED)
+        self._element_tracker = ElementTracker(
+            config=TrackerConfig(
+                match_threshold=ELEMENT_TRACKER_MATCH_THRESHOLD,
+                high_confidence_threshold=ELEMENT_TRACKER_HIGH_CONFIDENCE,
+            ),
+        ) if self._element_tracker_enabled else None
+        if self._element_tracker_enabled:
+            logger.info(
+                f"[TRACKER] enabled | match≥{ELEMENT_TRACKER_MATCH_THRESHOLD} "
+                f"high≥{ELEMENT_TRACKER_HIGH_CONFIDENCE}"
+            )
         logger.info(
             f"VLM client initialized | model={self.model} | base={self.api_base} | "
             f"semantic_model={self.semantic_model} | semantic_base={self.semantic_api_base} | "
@@ -799,13 +1078,22 @@ class VLMClient:
         )
 
     def _build_history_summary(self) -> str:
-        """构建最近 N 轮操作的历史摘要文本（含执行结果）。"""
-        if not self._history:
-            return ""
+        """构建最近 N 轮操作的历史摘要文本（含执行结果）。
 
-        lines = ["## 最近操作历史（含执行结果，避免重复）"]
+        当历史较长时，前缀包含 MessageCompactor 生成的压缩摘要，
+        后跟最近 N 条原始记录，保证 VLM 既有全局上下文又有精确近况。
+        """
+        if not self._history:
+            return self._compactor.get_summary_prefix() or ""
+
+        lines = []
+        # 注入早期历史的 LLM 压缩摘要（若有）
+        compaction_prefix = self._compactor.get_summary_prefix()
+        if compaction_prefix:
+            lines.append(compaction_prefix)
+        lines.append("## 最近操作历史（含执行结果，避免重复）")
         older_count = max(0, len(self._history) - self._history_window)
-        if older_count:
+        if older_count and not compaction_prefix:
             lines.append(f"- Earlier {older_count} history item(s) omitted; rely on current goal and recent results.")
         for h in self._history[-self._history_window:]:
             _result = h.get("result")
@@ -836,8 +1124,33 @@ class VLMClient:
                 "type_value": decision.get("type_value", ""),
                 "result": None,
             })
-        # 只保留窗口大小的历史
+        # ── Message Compaction：智能压缩替代硬截断 ─────────────────────
+        # 旧逻辑：if len > window*2: 硬截断到 window 条
+        # 新逻辑：超阈值时异步压缩旧记录为摘要，保留最近 window 条原始
         if len(self._history) > self._history_window * 2:
+            if self._compactor.needs_compaction(self._history, step):
+                # 标记需要压缩（实际压缩在 maybe_compact_history 中异步执行）
+                self._pending_compaction_step = step
+            else:
+                # 降级：若压缩冷却中则仍做硬截断
+                self._history = self._history[-self._history_window:]
+
+    async def maybe_compact_history(self, goal: str = "") -> None:
+        """在每步结束后调用，若有待压缩任务则执行异步摘要。
+
+        设计为异步方法，因为 LLM 摘要需要网络请求。
+        main.py 在每步 action 执行完毕后调用此方法。
+        """
+        pending_step = getattr(self, "_pending_compaction_step", None)
+        if pending_step is None:
+            return
+        self._pending_compaction_step = None
+        try:
+            self._history = await self._compactor.compact(
+                self._history, pending_step, goal=goal
+            )
+        except Exception as e:
+            logger.warning(f"[COMPACTION] 压缩执行异常，降级为硬截断: {e}")
             self._history = self._history[-self._history_window:]
 
     def annotate_last_result(self, note: str) -> None:
@@ -869,6 +1182,235 @@ class VLMClient:
         logger.info(f"[SELF-HEAL] Error feedback injected for next ask(): {error_msg[:120]}")
         _broadcast_log_safe(f"[SELF-HEAL] Error feedback injected: {error_msg[:120]}", level="warn")
 
+    def reset_decision_history(self, reason: str = "") -> None:
+        """Clear VLM decision history after AGENT_STUCK — force fresh screenshot reasoning."""
+        try:
+            from .stuck_recovery_guard import build_recovery_feedback
+        except ImportError:
+            from stuck_recovery_guard import build_recovery_feedback
+
+        self._history.clear()
+        self._pending_error = build_recovery_feedback(reason)
+        logger.warning("[STUCK RECOVERY] VLM decision history cleared: %s", reason[:160])
+
+    # ════════════════════════════════════════════════════════════════
+    #  Element Tracker —— 自适应元素重定位（按结构签名找回元素）
+    # ════════════════════════════════════════════════════════════════
+    #
+    # 这一组方法把 element_tracker.ElementTracker 暴露为 VLMClient 的 public API。
+    # 设计原则：**开关关闭时所有方法都是 no-op**，不抛错、不影响调用方逻辑。
+    # 这样 main.py 的 guard 可以无脑调用，业务侧不需要做 try/except 包裹。
+    #
+    # 典型用法：
+    #   # main.py：成功执行 click 后注册元素
+    #   vlm.track_element("submit_btn", element=som_elements[5], step=current_step)
+    #
+    #   # 后续任意一步：DOM 重排后想再点 submit_btn
+    #   result = vlm.relocate_element("submit_btn", som_elements_now)
+    #   if result and result.is_high_confidence:
+    #       new_target_id = result.new_som_id
+    #       # 直接复用 new_target_id 触发动作，无需 VLM 重新视觉定位
+    # ════════════════════════════════════════════════════════════════
+
+    def track_element(
+        self,
+        name: str,
+        element: dict[str, Any],
+        step: int = 0,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """注册一个元素到追踪器。返回是否真的写入（开关关闭时返回 False）。"""
+        if not self._element_tracker_enabled or self._element_tracker is None:
+            return False
+        try:
+            self._element_tracker.track(
+                name=name, element=element, step=step, metadata=metadata,
+            )
+            logger.debug(f"[TRACKER] tracked name={name!r}")
+            return True
+        except Exception as e:
+            logger.warning(f"[TRACKER] track failed name={name!r}: {e}")
+            return False
+
+    def untrack_element(self, name: str) -> bool:
+        """删除一个追踪条目。返回是否真的存在过。"""
+        if not self._element_tracker_enabled or self._element_tracker is None:
+            return False
+        return self._element_tracker.untrack(name)
+
+    def relocate_element(
+        self,
+        name: str,
+        current_elements: list[dict[str, Any]],
+        current_step: int = 0,
+    ) -> Optional["RelocateResult"]:
+        """在当前 SoM 快照里重新定位。开关关闭时返回 None。"""
+        if not self._element_tracker_enabled or self._element_tracker is None:
+            return None
+        try:
+            return self._element_tracker.relocate(
+                name=name,
+                current_elements=current_elements,
+                current_step=current_step,
+            )
+        except Exception as e:
+            logger.warning(f"[TRACKER] relocate failed name={name!r}: {e}")
+            return None
+
+    def relocate_all_tracked(
+        self,
+        current_elements: list[dict[str, Any]],
+        current_step: int = 0,
+    ) -> dict[str, "RelocateResult"]:
+        """批量重定位所有追踪条目。开关关闭时返回空 dict。"""
+        if not self._element_tracker_enabled or self._element_tracker is None:
+            return {}
+        try:
+            return self._element_tracker.relocate_all(
+                current_elements=current_elements,
+                current_step=current_step,
+            )
+        except Exception as e:
+            logger.warning(f"[TRACKER] relocate_all failed: {e}")
+            return {}
+
+    def list_tracked_elements(self) -> list[str]:
+        """列出当前所有追踪名。开关关闭时返回空列表。"""
+        if not self._element_tracker_enabled or self._element_tracker is None:
+            return []
+        return self._element_tracker.list_tracked()
+
+    def reset_element_tracker(self) -> None:
+        """清空追踪条目（新任务开始时调用）。开关关闭时是 no-op。"""
+        if self._element_tracker is not None:
+            self._element_tracker.reset()
+
+    def _build_named_anchor_section(
+        self,
+        som_elements: Optional[list[dict[str, Any]]],
+        current_step: int,
+    ) -> str:
+        """构建 Named Anchors 提示段落：在当前快照中重新定位所有追踪元素。
+
+        VLM 看到这段话后能够：
+          1) 知道之前操作过的元素现在的 SoM ID
+          2) 识别 "已经操作过" → 避免重复
+          3) 在 thought 中按名字（last_click 等）描述意图，main.py
+             可在事后日志检索
+
+        返回空字符串表示无追踪条目 / 未启用 / 无候选。
+        """
+        if not self._element_tracker_enabled or self._element_tracker is None:
+            return ""
+        if not som_elements:
+            return ""
+        tracked_names = self._element_tracker.list_tracked()
+        if not tracked_names:
+            return ""
+
+        # 把 SoM 元素映射到 tracker 期望的格式（兼容 _last_som_elements 的 'id' 字段）
+        normalized: list[dict[str, Any]] = []
+        for el in som_elements:
+            normalized.append({
+                "som_id": el.get("som_id") or el.get("id") or 0,
+                "tag": el.get("tag", ""),
+                "text": el.get("text") or el.get("name", ""),
+                "role": el.get("role", ""),
+                "aria_label": el.get("aria_label", ""),
+                "class_list": el.get("class_list", []),
+                "bbox": el.get("bbox") or el.get("rect") or {},
+                "parent_chain": el.get("parent_chain") or (
+                    [el.get("parentContext") or ""] if el.get("parentContext") else []
+                ),
+            })
+
+        try:
+            results = self._element_tracker.relocate_all(
+                normalized, current_step=current_step,
+            )
+        except Exception as e:
+            logger.debug(f"[TRACKER] anchor section relocate_all failed: {e}")
+            return ""
+
+        if not results:
+            return ""
+
+        # 拼装可读的 markdown 段落
+        lines: list[str] = [
+            "## 📍 Named Anchors (元素追踪锚点)",
+            "",
+            "你在之前的步骤里操作过这些元素。系统已用结构签名在本次快照里重新定位：",
+            "",
+        ]
+        for name in sorted(results.keys()):
+            r = results[name]
+            sig = self._element_tracker.get(name)
+            ago = (current_step - sig.captured_step) if sig else 0
+            text_preview = (sig.text or "")[:40] if sig else ""
+            tag_str = sig.tag if sig else ""
+            if r.found:
+                conf_tag = "✓" if r.is_high_confidence else "?"
+                lines.append(
+                    f"- **`{name}`** {conf_tag} → 当前 som_id=**{r.new_som_id}** "
+                    f"(置信度 {r.confidence:.2f}) | "
+                    f"text={text_preview!r} tag={tag_str} | 上次操作于 step {sig.captured_step if sig else '?'}（{ago} 步前）"
+                )
+            else:
+                lines.append(
+                    f"- **`{name}`** ✗ 未找到匹配元素（最高分 {r.confidence:.2f}） | "
+                    f"text={text_preview!r} tag={tag_str} | 该元素可能已被替换/移除"
+                )
+        lines.append("")
+        lines.append(
+            "⚠️ 锚点只是**只读上下文**，不是新字段。需要操作元素时仍然在 JSON 里写 "
+            "`target_id=<数字>`。"
+        )
+        lines.append(
+            "- 看到 `✓` 高置信锚点时：可直接复用该 som_id，不必再视觉识别"
+        )
+        lines.append(
+            "- 看到 `?` 中等置信锚点时：先在截图上确认该 ID 确实是你要的元素"
+        )
+        lines.append(
+            "- 看到 `✗` 未找到时：原元素已不存在，请按当前页面状态重新选择策略"
+        )
+        lines.append(
+            "- **避免循环**：若某锚点显示你 1~2 步前刚操作过，且任务目标已达成（按 progress_review），优先 done"
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_user_content(
+        screenshot_b64: str | None,
+        user_text: str,
+        extra_images: list[str] | None = None,
+    ) -> list[dict] | str:
+        """Assemble OpenAI / Qwen-VL multimodal user content.
+
+        Order: primary screenshot -> attachment ``extra_images`` -> text.
+        Raw base64 is normalized to a ``data:image`` URL (idempotent). When no
+        image is available the plain text string is returned so the request
+        still succeeds (graceful degrade).
+        """
+        def _norm(b64: str) -> str:
+            if b64.startswith("data:image"):
+                return b64
+            return f"data:image/jpeg;base64,{b64}"
+
+        image_urls: list[str] = []
+        if screenshot_b64:
+            image_urls.append(_norm(screenshot_b64))
+        for img in (extra_images or []):
+            if img:
+                image_urls.append(_norm(img))
+        if not image_urls:
+            return user_text
+        content: list[dict] = [
+            {"type": "image_url", "image_url": {"url": u}} for u in image_urls
+        ]
+        content.append({"type": "text", "text": user_text})
+        return content
+
     async def ask(
         self,
         screenshot_b64: str | None,
@@ -878,9 +1420,18 @@ class VLMClient:
         workflow_memory: dict | None = None,
         task_plan: Optional["TaskPlan"] = None,
         max_steps: int | None = None,
+        som_elements: Optional[list[dict[str, Any]]] = None,
+        capability_route: Optional[dict[str, Any]] = None,
+        extra_images: list[str] | None = None,
     ) -> list[dict]:
         """
         向 VLM/LLM 发送当前状态，请求下一批次动作（连招模式）。
+
+        Response Cache 集成（Replay / Record 模式）：
+          - REPLAY 模式：跳过实际 LLM 调用，按 step 从 JSONL 缓存返回；
+            缺失时按配置抛错或回落到真实调用。
+          - RECORD 模式：正常调用 LLM，但额外把 (输入哈希, 输出) 落盘。
+          - OFF（默认）：完全透传，无任何额外开销。
 
         图文双模态融合 (Hybrid Modality)：
           - 默认每次都携带 SoM 截图 + 无障碍语义树 (AX Tree)，VLM 用图文两路信息综合决策。
@@ -899,6 +1450,31 @@ class VLMClient:
             thought/action/target_id/type_value/memory_key/status 等字段
         """
         history_text = self._build_history_summary()
+        # ── Cache Replay：命中即返回，绕过真实 LLM 调用 ───────────────────
+        if self._response_cache.mode == CacheMode.REPLAY:
+            try:
+                cached = self._response_cache.lookup(
+                    step=step,
+                    goal=goal,
+                    screenshot_b64=screenshot_b64,
+                    history_summary=history_text,
+                )
+                if cached is not None:
+                    # 仍要把缓存输出写入历史，保证后续步骤的 history 摘要一致
+                    self._record_history(step, cached)
+                    logger.info(
+                        f"[CACHE] step={step} replay hit "
+                        f"({len(cached)} cached actions)"
+                    )
+                    return cached
+                # 走到这里说明 fallback_on_miss=True 且 lookup 返回 None
+                logger.warning(
+                    f"[CACHE] step={step} replay miss → falling back to real LLM call"
+                )
+            except CacheReplayMissError:
+                # 严格模式 / 默认行为：缺失即抛错，由调用方处理
+                raise
+        # 真实路径继续执行（OFF / RECORD / REPLAY-fallback）
         system_prompt = build_system_prompt(
             goal=goal,
             browser_state=input_descriptions,
@@ -912,7 +1488,18 @@ class VLMClient:
         user_text = build_user_message(
             goal, step, max_steps or MAX_STEPS, history_text, input_descriptions, workflow_memory,
             task_plan=task_plan,
+            capability_route=capability_route,
         )
+        # ── Named Anchors：注入元素追踪锚点 ────────────────────────────
+        # 把所有已 track 的元素在当前快照里 relocate，作为 read-only 上下文
+        # 附在 user_text 后。VLM 看到后可以：
+        #   1) 知道之前操作过的元素当前的 SoM ID（可能已变）
+        #   2) 避免对同一逻辑元素重复操作
+        #   3) 决定下一步是该回到旧元素还是切换到新元素
+        # 不修改 schema、不要求 VLM 用新字段，最大向后兼容。
+        anchor_section = self._build_named_anchor_section(som_elements, step)
+        if anchor_section:
+            user_text = user_text + "\n\n" + anchor_section
         if self.text_only and screenshot_b64:
             screenshot_b64 = None
             user_text += (
@@ -978,23 +1565,10 @@ class VLMClient:
         # ── 图文双模态 Payload 组装：默认图 + 文，image 缺失时优雅降级 ─────────
         # 兼容 OpenAI / 通义千问 Qwen-VL 的 multimodal messages 协议：
         #   content = [{"type": "image_url", ...}, {"type": "text", ...}]
-        if screenshot_b64:
-            # SoM 截图与 AX Tree 已经在 input_descriptions 中融合到 user_text 里，
-            # 下方 image_url 提供视觉通道，VLM 会结合两路信息做综合决策。
-            #
-            # 安全校验：识别 "data:image" 前缀（覆盖 jpeg/png/webp 等所有 image/* 子类型），
-            # 避免拼出 `data:image/jpeg;base64,data:image/...` 这种双重前缀引发 400。
-            image_url = screenshot_b64
-            if screenshot_b64 and not screenshot_b64.startswith("data:image"):
-                image_url = f"data:image/jpeg;base64,{screenshot_b64}"
-
-            user_content = [
-                {"type": "image_url", "image_url": {"url": image_url}},
-                {"type": "text", "text": user_text},
-            ]
-        else:
-            # 极端降级：截图缺失时仅发文本，确保任务不中断
-            user_content = user_text
+        # 截图 + 附件图片(extra_images) + 文本；全缺图时降级为纯文本。
+        user_content = self._build_user_content(
+            screenshot_b64, user_text, extra_images
+        )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1092,6 +1666,15 @@ class VLMClient:
                 # 记录到历史
                 self._record_history(step, decisions)
 
+                # ── Cache Record：把本步 (输入哈希, 输出) 落盘 ────────────
+                self._response_cache.store(
+                    step=step,
+                    goal=goal,
+                    screenshot_b64=screenshot_b64,
+                    input_descriptions=input_descriptions,
+                    output=decisions,
+                    history_summary=history_text,
+                )
                 return decisions
 
             except Exception as e:
@@ -1150,6 +1733,15 @@ class VLMClient:
                                 f"type_value={d.get('type_value', '')!r}"
                             )
                         self._record_history(step, decisions)
+                        # ── Cache Record：纯文本降级路径也要落盘 ────────────
+                        self._response_cache.store(
+                            step=step,
+                            goal=goal,
+                            screenshot_b64=screenshot_b64,
+                            input_descriptions=input_descriptions,
+                            output=decisions,
+                            history_summary=history_text,
+                        )
                         return decisions
                     except Exception as _fallback_err:
                         logger.error(
@@ -1171,7 +1763,20 @@ class VLMClient:
 
         logger.error(f"[步骤 {step}] VLM 请求最终失败: {last_error}")
         _broadcast_log_safe(f"[步骤 {step}] VLM 请求最终失败: {last_error}", level="error")
-        return list(_ERROR_DECISION_LIST)
+        # ── Surface the real exception in the fallback decision ───────────
+        # Without this, the trajectory just shows "VLM 请求失败或返回格式异常"
+        # for every retry exhaustion and there's no way to tell auth /
+        # rate-limit / parse / network issues apart. We keep the original
+        # action="error" / status="error" contract so main.py's consecutive-
+        # failure counter still trips, but stuff the exception type + message
+        # into thought so it surfaces in the HTML log and event stream.
+        _err_kind = type(last_error).__name__ if last_error else "Unknown"
+        _err_msg = (str(last_error) if last_error else "no exception captured")[:400]
+        _fallback = dict(_ERROR_DECISION)
+        _fallback["thought"] = (
+            f"VLM 请求最终失败（{_err_kind}）: {_err_msg}"
+        )
+        return [_fallback]
 
     # ════════════════════════════════════════════════════════════════
     #  全页结构化数据提取（页面文本 + 纯文本 VLM 结构化调用）
@@ -1316,6 +1921,86 @@ class VLMClient:
             return None
 
     # ════════════════════════════════════════════════════════════════
+    #  Visual Judge —— 语义宏（date_pick / form_set 等）的慢路径兜底
+    # ════════════════════════════════════════════════════════════════
+
+    async def judge_screenshot(
+        self,
+        screenshot_b64: Optional[str],
+        question: str,
+        context: str = "",
+        timeout: float = 12.0,
+    ) -> dict:
+        """
+        视觉断言：JS 自检失败时调一次 VLM 看截图判 yes/no/unclear。
+
+        设计：
+        - 严格 yes/no/unclear 输出，避免开放式发挥
+        - 截图缺失时返回 unclear，让调用方按"快路径已失败 + 兜底无答案"处理
+        - 单独超时（默认 12s）避免拖慢 RPA 回放
+
+        Returns:
+            {"verdict": "yes"|"no"|"unclear", "reason": str}
+        """
+        if not screenshot_b64:
+            return {"verdict": "unclear", "reason": "screenshot unavailable"}
+
+        image_url = screenshot_b64
+        if not image_url.startswith("data:image"):
+            image_url = f"data:image/jpeg;base64,{image_url}"
+
+        system_prompt = (
+            "你是网页 UI 视觉裁判。只看截图，回答关于页面状态的 yes/no 问题。\n"
+            "规则：\n"
+            "1. 只输出 JSON：{\"verdict\":\"yes\"|\"no\"|\"unclear\",\"reason\":\"...\"}\n"
+            "2. yes = 完全确定问题描述的状态已达成\n"
+            "3. no = 看到证据反驳（值不对 / 状态相反 / 元素未变）\n"
+            "4. unclear = 截图被遮挡、信息不足、或两种解释都说得通\n"
+            "5. reason 用一句话引用截图里的具体可见证据（输入框文本 / 选中态 / 标签等）"
+        )
+        user_text = f"问题：{question}"
+        if context:
+            user_text += f"\n\n上下文：{context}"
+        user_text += "\n\n请只输出 JSON。"
+
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": image_url}},
+                                {"type": "text", "text": user_text},
+                            ],
+                        },
+                    ],
+                    max_tokens=200,
+                    temperature=0.0,
+                ),
+                timeout=timeout,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                raw = re.sub(r"\n?\s*```$", "", raw)
+            data = json.loads(raw)
+            verdict = str(data.get("verdict") or "").strip().lower()
+            if verdict not in {"yes", "no", "unclear"}:
+                return {"verdict": "unclear", "reason": f"invalid verdict: {raw[:120]}"}
+            reason = str(data.get("reason") or "").strip() or "(no reason)"
+            logger.info(f"[VL JUDGE] verdict={verdict} reason={reason[:120]}")
+            return {"verdict": verdict, "reason": reason}
+        except asyncio.TimeoutError:
+            logger.warning(f"[VL JUDGE] timed out after {timeout}s")
+            return {"verdict": "unclear", "reason": f"vlm timeout {timeout}s"}
+        except Exception as e:
+            logger.warning(f"[VL JUDGE] call failed: {e}")
+            return {"verdict": "unclear", "reason": f"vlm call failed: {e}"}
+
+    # ════════════════════════════════════════════════════════════════
     #  Wave 2 — Planner / Reflector（纯文本 LLM，无截图）
     # ════════════════════════════════════════════════════════════════
 
@@ -1372,11 +2057,36 @@ class VLMClient:
                     },
                 }
 
+            async def _create_plan_response(client, model_name: str):
+                call_kwargs = dict(api_kwargs)
+                call_kwargs["model"] = model_name
+                try:
+                    return await client.chat.completions.create(**call_kwargs)
+                except BadRequestError:
+                    call_kwargs.pop("response_format", None)
+                    return await client.chat.completions.create(**call_kwargs)
+
             try:
-                response = await self.semantic_client.chat.completions.create(**api_kwargs)
-            except BadRequestError:
-                api_kwargs.pop("response_format", None)
-                response = await self.semantic_client.chat.completions.create(**api_kwargs)
+                response = await _create_plan_response(
+                    self.semantic_client,
+                    self.semantic_model,
+                )
+            except Exception as semantic_exc:
+                semantic_is_primary = (
+                    self.semantic_client is self.client
+                    and self.semantic_model == self.model
+                )
+                if semantic_is_primary or not _looks_like_auth_error(semantic_exc):
+                    raise
+                logger.warning(
+                    "[PLANNER] semantic client auth failed; retrying with primary VLM client/model=%s",
+                    self.model,
+                )
+                _broadcast_log_safe(
+                    "[PLANNER] semantic key failed; retrying planner with primary VLM model",
+                    level="warning",
+                )
+                response = await _create_plan_response(self.client, self.model)
 
             raw = (response.choices[0].message.content or "").strip()
             if raw.startswith("```"):
@@ -1389,6 +2099,67 @@ class VLMClient:
             if not plan.sub_goals:
                 logger.warning("[PLANNER] LLM 返回空子目标列表，降级为单子目标计划")
                 return fallback_plan
+
+            # ── Strip login-probe subgoals when user did NOT request login ─
+            # Universal "use-it-if-you-can, ask-human-only-when-blocked"
+            # principle: the Planner LLM frequently prefixes tasks with a
+            # defensive "探测登录 / 检查是否已登录" subgoal even when the goal
+            # never mentioned authentication. This forces the VLM to click
+            # "登录" on its first step and derails the run.
+            #
+            # Drop login-probe subgoals UNLESS the goal text itself committed
+            # to logging in (explicit verbs or credential placeholders).
+            # Real login walls at runtime are handled reactively by the
+            # PRELOGIN system + ask_human fallback — Planner doesn't need to
+            # repeat that defence at planning time.
+            try:
+                try:
+                    from .main import _goal_has_explicit_login_intent  # type: ignore
+                except ImportError:  # pragma: no cover
+                    from main import _goal_has_explicit_login_intent  # type: ignore[no-redef]
+                if not _goal_has_explicit_login_intent(goal):
+                    _login_needles = (
+                        "登录", "登陆", "登入", "认证", "验证页",
+                        "login", "logged", "signin", "sign in", "signed in",
+                        "signed-in", "auth", "authenticated",
+                    )
+                    _probe_verbs = (
+                        "探测", "检查", "确认", "判断", "校验", "检测",
+                        "是否", "probe", "check", "verify", "detect",
+                        "ensure", "确保",
+                    )
+                    _kept = []
+                    _dropped = []
+                    for sg in plan.sub_goals:
+                        _desc = (sg.description or "").lower()
+                        _is_login_probe = (
+                            any(n in _desc for n in _login_needles)
+                            and any(v in _desc for v in _probe_verbs)
+                        )
+                        if _is_login_probe:
+                            _dropped.append(sg.description)
+                        else:
+                            _kept.append(sg)
+                    # Edge: if filter would empty the plan (LLM only emitted
+                    # a login probe), keep the original to avoid an empty
+                    # plan crash downstream.
+                    if _dropped and _kept:
+                        logger.info(
+                            "[PLANNER] no explicit login intent — dropped %d "
+                            "login-probe subgoal(s): %s",
+                            len(_dropped),
+                            [d[:60] for d in _dropped],
+                        )
+                        # Re-number IDs sequentially after stripping
+                        for new_id, sg in enumerate(_kept, start=1):
+                            sg.id = new_id
+                            sg.status = "pending"
+                        plan.sub_goals = _kept
+            except Exception as _filter_err:
+                logger.debug(
+                    "[PLANNER] login-probe filter skipped: %s",
+                    _filter_err,
+                )
 
             # 首个子目标默认置为 active
             if plan.sub_goals[0].status != "active":
@@ -1459,11 +2230,32 @@ class VLMClient:
                     },
                 }
 
+            async def _create_reflect_response(client, model_name: str):
+                call_kwargs = dict(api_kwargs)
+                call_kwargs["model"] = model_name
+                try:
+                    return await client.chat.completions.create(**call_kwargs)
+                except BadRequestError:
+                    call_kwargs.pop("response_format", None)
+                    return await client.chat.completions.create(**call_kwargs)
+
             try:
-                response = await self.semantic_client.chat.completions.create(**api_kwargs)
-            except BadRequestError:
-                api_kwargs.pop("response_format", None)
-                response = await self.semantic_client.chat.completions.create(**api_kwargs)
+                response = await _create_reflect_response(
+                    self.semantic_client,
+                    self.semantic_model,
+                )
+            except Exception as semantic_exc:
+                semantic_is_primary = (
+                    self.semantic_client is self.client
+                    and self.semantic_model == self.model
+                )
+                if semantic_is_primary or not _looks_like_auth_error(semantic_exc):
+                    raise
+                logger.warning(
+                    "[REFLECTOR] semantic client auth failed; retrying with primary VLM client/model=%s",
+                    self.model,
+                )
+                response = await _create_reflect_response(self.client, self.model)
 
             raw = (response.choices[0].message.content or "").strip()
             if raw.startswith("```"):
