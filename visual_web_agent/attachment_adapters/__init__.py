@@ -80,6 +80,10 @@ _SPREADSHEET_SUFFIXES = frozenset({
 _EMAIL_MIMES = frozenset({"message/rfc822", "application/vnd.ms-outlook"})
 _EMAIL_SUFFIXES = frozenset({".eml", ".msg"})
 
+_IMAGE_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"
+})
+
 
 def _suffix_of(spec: AttachmentSpec) -> str:
     name = (spec.filename or spec.path or "").lower()
@@ -107,7 +111,7 @@ def adapt_attachment(
     if intent == "prompt_context":
         mime = (spec.mime or "").lower()
         suffix = _suffix_of(spec)
-        if mime.startswith("image/"):
+        if mime.startswith("image/") or suffix in _IMAGE_SUFFIXES:
             return _image.adapt(spec, goal=goal, options=options or {})
         if mime == "application/pdf" or suffix == ".pdf":
             return _pdf.adapt(spec, goal=goal, options=options or {})

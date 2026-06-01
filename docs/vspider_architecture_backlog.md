@@ -561,3 +561,46 @@ Next (Phase 2):
 
 - Thread `prompt_context` image attachments through `run_agent` + api_server/CLI
   so uploaded images actually reach `vlm.ask(extra_images=...)`.
+
+## Slice MM-2: Image Attachment Wiring into the Agent Loop (Phase 2)
+
+Status: implemented (Phase 2 of 2 — primitives now reach the live loop).
+
+Goal:
+
+- Thread `prompt_context` image attachments end-to-end so an uploaded image
+  actually reaches `vlm.ask(extra_images=...)` during a run, with a
+  deterministic, token-bounded schedule (no per-step blind resend).
+
+Add / change:
+
+- `prompt_image_policy.should_include_prompt_images(step, *, policy,
+  last_sent_url, current_url, early_steps=1)` — deterministic schedule.
+  Policies: `adaptive` (default: first step + on page-URL change), `always`,
+  `first`, `off`. Configurable via `vlm_options["prompt_image_policy"]`.
+- `main.run_agent` — new `prompt_images: list[str] | None` param; reads the
+  policy; the single `vlm.ask` callsite now passes
+  `extra_images=(_prompt_images if scheduled else None)` and tracks
+  `_last_prompt_image_url` for the adaptive page-change signal.
+- `smart_batch_runner` Branch A — extracts `attachment_result.image_b64` and
+  forwards it as `run_agent(prompt_images=...)` via the `_run_one` closure
+  (no orchestrator change; reuses the existing `setdefault` pattern). This is
+  the api_server path (api -> run_smart_batch -> run_agent).
+- `attachment_adapters.adapt_attachment` — bugfix: route `prompt_context`
+  images to the image adapter by **suffix** too (`_IMAGE_SUFFIXES`), not just
+  mime. Uploaded files usually carry only a suffix, so the image adapter was
+  previously unreachable (fell through to the text adapter), which left
+  Phase 1's image path dead on the real api flow.
+
+Acceptance:
+
+- `tests/test_attachment_image_phase2_wiring.py` 10 passed (policy matrix,
+  run_agent signature, smart_batch forwards a png as `prompt_images`, text
+  attachment injects nothing).
+- Backward compatible: `prompt_images` defaults to None; existing callers and
+  runs are unchanged.
+
+Out of scope (deliberate, YAGNI):
+
+- CLI `--upload-file` keeps `set_input_files` (upload_to_page) semantics; no
+  new CLI image-as-prompt flag this slice.
