@@ -1,1 +1,110 @@
 @import "tailwindcss";
+
+/* ============================================================
+   VSpider design tokens (Phase 0) — single source of truth.
+   Exact values preserved (zero visual change). Theme via these.
+   ============================================================ */
+:root {
+  /* --- color channels "R G B" for alpha composition --- */
+  --rgb-accent: 99 226 183;
+  --rgb-slate: 148 163 184;
+  --rgb-danger: 239 68 68;
+  --rgb-warn: 251 191 36;
+  --rgb-success: 34 197 94;
+  --rgb-info: 112 192 255;
+  --rgb-indigo: 99 102 241;
+  --rgb-indigo-bright: 129 140 248;
+  --rgb-ink: 15 23 42;
+  --rgb-ink-deep: 2 6 23;
+  --rgb-black: 0 0 0;
+  --rgb-rose: 232 128 128;
+  --rgb-danger-deep: 127 29 29;
+  --rgb-danger-soft: 254 202 202;
+  --rgb-violet: 168 85 247;
+  --rgb-blue: 59 130 246;
+  --rgb-blue-deep: 30 64 175;
+  --rgb-blue-strong: 37 99 235;
+  --rgb-sky: 14 165 233;
+  --rgb-sky-bright: 56 189 248;
+  --rgb-danger-base: 248 113 113;
+  --rgb-yellow: 250 204 21;
+  --rgb-warn-soft: 253 230 138;
+  --rgb-surface-2: 13 17 24;
+  --rgb-gold: 245 215 122;
+
+  /* --- semantic / palette colors --- */
+  --vsp-bg: #101014;
+  --vsp-bg-deep: #0a0d12;
+  --vsp-surface: #18181c;
+  --vsp-surface-2: rgb(var(--rgb-surface-2));
+  --vsp-surface-sunken: #080a0d;
+  --vsp-surface-mint: #06110d;
+  --vsp-border: #2d2d30;
+  --vsp-slate-900: rgb(var(--rgb-ink));
+  --vsp-slate-950: rgb(var(--rgb-ink-deep));
+  --vsp-slate-800: #1e293b;
+  --vsp-gray-800: #1f2937;
+  --vsp-gray-900: #111827;
+  --vsp-slate-700: #334155;
+  --vsp-slate-600: #475569;
+  --vsp-text: #f4f7fb;
+  --vsp-slate-50: #f8fafc;
+  --vsp-text-strong: #f1f5f9;
+  --vsp-text-bright: #e6ecf3;
+  --vsp-slate-200: #e2e8f0;
+  --vsp-text-label: #d8dee9;
+  --vsp-text-2: #cbd5e1;
+  --vsp-text-2-alt: #c9d4e1;
+  --vsp-text-2-alt2: #c8d0dc;
+  --vsp-text-muted: rgb(var(--rgb-slate));
+  --vsp-text-muted-alt: #9aa4b2;
+  --vsp-text-faint: #8f96a3;
+  --vsp-text-dim: #64748b;
+  --vsp-text-dim-alt: #626b79;
+  --vsp-gray-500: #6b7280;
+  --vsp-white: #fff;
+  --vsp-accent: rgb(var(--rgb-accent));
+  --vsp-accent-bright: #78edc6;
+  --vsp-success: #34d399;
+  --vsp-success-soft: #86efac;
+  --vsp-success-vivid: #00e676;
+  --vsp-info: rgb(var(--rgb-info));
+  --vsp-info-soft: #9bd4ff;
+  --vsp-info-200: #93c5fd;
+  --vsp-blue-500: rgb(var(--rgb-blue));
+  --vsp-blue-400: #60a5fa;
+  --vsp-sky-100: #e0f2fe;
+  --vsp-cyan-300: #67e8f9;
+  --vsp-indigo-200: #c7d2fe;
+  --vsp-indigo-300: #a5b4fc;
+  --vsp-indigo-500: rgb(var(--rgb-indigo));
+  --vsp-indigo-100: #e0e7ff;
+  --vsp-purple-200: #e9d5ff;
+  --vsp-purple-300: #d8b4fe;
+  --vsp-purple-400: #c084fc;
+  --vsp-warn: rgb(var(--rgb-warn));
+  --vsp-warn-soft: rgb(var(--rgb-warn-soft));
+  --vsp-warn-strong: #f59e0b;
+  --vsp-warn-muted: #f6c177;
+  --vsp-warn-brown: #d19a66;
+  --vsp-warn-gold: rgb(var(--rgb-gold));
+  --vsp-warn-pale: #fef9c3;
+  --vsp-danger-soft: rgb(var(--rgb-danger-soft));
+  --vsp-danger: rgb(var(--rgb-danger-base));
+  --vsp-danger-vivid: #ff6b6b;
+  --vsp-danger-rose: rgb(var(--rgb-rose));
+  --vsp-rose-300: #fda4af;
+  --vsp-danger-pale: #f5d0d0;
+}
+
+@theme inline {
+  --color-vsp-bg: var(--vsp-bg);
+  --color-vsp-surface: var(--vsp-surface);
+  --color-vsp-border: var(--vsp-border);
+  --color-vsp-accent: var(--vsp-accent);
+  --color-vsp-info: var(--vsp-info);
+  --color-vsp-success: var(--vsp-success);
+  --color-vsp-warn: var(--vsp-warn);
+  --color-vsp-danger: var(--vsp-danger);
+  --color-vsp-text: var(--vsp-text);
+}
