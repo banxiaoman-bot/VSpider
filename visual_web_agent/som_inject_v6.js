@@ -84,6 +84,165 @@
         } catch (_) { return null; }
     }
 
+    function _classNameOf(el) {
+        try {
+            const cls = el?.className || '';
+            return (cls.baseVal !== undefined ? cls.baseVal : cls).toString();
+        } catch (_) { return ''; }
+    }
+
+    function _directText(el) {
+        try {
+            return Array.from(el.childNodes || [])
+                .filter(n => n.nodeType === Node.TEXT_NODE)
+                .map(n => (n.textContent || '').trim())
+                .join('')
+                .trim();
+        } catch (_) { return ''; }
+    }
+
+    function _hasIconChild(el) {
+        try {
+            return !!el?.querySelector?.('svg, img, i[class], [class*="icon" i]');
+        } catch (_) { return false; }
+    }
+
+    function _isCompactIconShape(el) {
+        try {
+            const r = el.getBoundingClientRect();
+            return (
+                r.width >= 20 && r.width <= 90 &&
+                r.height >= 20 && r.height <= 90 &&
+                Math.abs(r.width - r.height) <= 18
+            );
+        } catch (_) { return false; }
+    }
+
+    function _explicitIconName(el) {
+        try {
+            const innerIcon = el.querySelector?.('svg, img, i[class], [class*="icon" i]');
+            const svgTitle = el.querySelector?.('svg > title, svg > desc');
+            const raw = [
+                el.getAttribute('aria-label') || '',
+                el.getAttribute('title') || '',
+                el.getAttribute('alt') || '',
+                el.getAttribute('data-testid') || '',
+                el.getAttribute('data-test') || '',
+                el.id || '',
+                _classNameOf(el),
+                innerIcon?.getAttribute?.('aria-label') || '',
+                innerIcon?.getAttribute?.('title') || '',
+                innerIcon?.getAttribute?.('alt') || '',
+                innerIcon?.getAttribute?.('data-testid') || '',
+                innerIcon?.getAttribute?.('data-test') || '',
+                innerIcon?.id || '',
+                _classNameOf(innerIcon),
+                svgTitle ? (svgTitle.textContent || '') : '',
+            ].join(' ').toLowerCase();
+            if (/(send|submit|paper[-_ ]?plane|airplane|arrow[-_ ]?up|arrow[-_ ]?right|发送|提交)/i.test(raw)) return 'send';
+            if (/(mic|microphone|voice|语音|麦克风)/i.test(raw)) return 'mic';
+            if (/(plus|add|attach|upload|attachment|附件|上传|添加)/i.test(raw)) return 'plus';
+            if (/(code|terminal|slash|prompt|coding|码|代码)/i.test(raw)) return 'code';
+            if (/(search|magnify|搜索)/i.test(raw)) return 'search';
+            if (/(copy|clipboard|duplicate|copy[-_ ]?text)/i.test(raw)) return 'copy';
+            if (/(retry|refresh|regenerate|reload|again)/i.test(raw)) return 'refresh';
+            if (/(speaker|volume|audio|listen|read[-_ ]?aloud|voice[-_ ]?play)/i.test(raw)) return 'audio';
+            if (/(bookmark|favorite|favourite|collect|star|save)/i.test(raw)) return 'favorite';
+            if (/(share|forward|send[-_ ]?to)/i.test(raw)) return 'share';
+            if (/(more|ellipsis|kebab|menu|dots?)/i.test(raw)) return 'more';
+            if (/(thumbs?[-_ ]?up|like|praise|good|upvote)/i.test(raw)) return 'like';
+            if (/(thumbs?[-_ ]?down|dislike|bad|downvote)/i.test(raw)) return 'dislike';
+        } catch (_) {}
+        return '';
+    }
+
+    function _visibleEditableRects() {
+        try {
+            const nodes = Array.from(document.querySelectorAll(
+                'textarea, input:not([type="hidden"]), [contenteditable="true"], [role="textbox"]'
+            ));
+            return nodes
+                .filter(el => {
+                    try { return isVisible(el, { top: 0, left: 0 }); } catch (_) { return false; }
+                })
+                .map(el => ({ el, r: el.getBoundingClientRect() }))
+                .filter(x => x.r.width >= 120 && x.r.height >= 24);
+        } catch (_) { return []; }
+    }
+
+    function _isComposerIconCandidate(el) {
+        if (!_hasIconChild(el) || !_isCompactIconShape(el)) return false;
+        if (_directText(el).length > 4) return false;
+        try {
+            const r = el.getBoundingClientRect();
+            for (const item of _visibleEditableRects()) {
+                const er = item.r;
+                const horizontallyInside = r.left >= er.left - 24 && r.right <= er.right + 24;
+                const verticallyInside = r.top >= er.top - 24 && r.bottom <= er.bottom + 24;
+                const inLowerHalf = r.top >= er.top + er.height * 0.45;
+                const nearBottomBand = r.bottom >= er.bottom - 96 && r.top <= er.bottom + 24;
+                if (horizontallyInside && verticallyInside && (inLowerHalf || nearBottomBand)) {
+                    return true;
+                }
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function _isIconToolbarCandidate(el) {
+        if (!_hasIconChild(el) || !_isCompactIconShape(el)) return false;
+        if (_directText(el).length > 4) return false;
+        try {
+            const r = el.getBoundingClientRect();
+            const cy = r.top + r.height / 2;
+            let root = el.parentElement;
+            for (let depth = 0; root && depth < 4; depth++, root = root.parentElement) {
+                const rr = root.getBoundingClientRect?.();
+                if (!rr || rr.width <= 0 || rr.height <= 0) continue;
+                if (rr.height > 140 || rr.width * rr.height > 160000) continue;
+                const rowMates = Array.from(root.querySelectorAll('*')).filter(node => {
+                    if (node === el || node.contains?.(el) || el.contains?.(node)) return false;
+                    if (!_hasIconChild(node) || !_isCompactIconShape(node)) return false;
+                    if (_directText(node).length > 4) return false;
+                    const nr = node.getBoundingClientRect();
+                    const ncy = nr.top + nr.height / 2;
+                    return Math.abs(ncy - cy) <= 18 && Math.abs(nr.left - r.left) <= 360;
+                });
+                if (rowMates.length >= 2) return true;
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    function _isRightmostComposerIcon(el) {
+        if (!_isComposerIconCandidate(el)) return false;
+        try {
+            const r = el.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            for (const item of _visibleEditableRects()) {
+                const er = item.r;
+                const inSameEditor = (
+                    r.left >= er.left - 24 && r.right <= er.right + 24 &&
+                    r.top >= er.top - 24 && r.bottom <= er.bottom + 24
+                );
+                if (!inSameEditor) continue;
+                const icons = Array.from(document.querySelectorAll('*'))
+                    .filter(node => node !== el && _isComposerIconCandidate(node))
+                    .map(node => {
+                        const nr = node.getBoundingClientRect();
+                        return { r: nr, cx: nr.left + nr.width / 2 };
+                    })
+                    .filter(x =>
+                        x.r.left >= er.left - 24 && x.r.right <= er.right + 24 &&
+                        x.r.top >= er.top - 24 && x.r.bottom <= er.bottom + 24
+                    );
+                const maxCx = Math.max(cx, ...icons.map(x => x.cx));
+                return cx >= maxCx - 3 && cx >= er.left + er.width * 0.72;
+            }
+        } catch (_) {}
+        return false;
+    }
+
     /**
      * Layer 1-4 综合可见性检查
      * 借鉴 browser-use 的 _is_element_visible() + Skyvern 的 isElementVisible()
@@ -359,6 +518,42 @@
             if (txt) return txt.slice(0, 80);
             const alt = el.getAttribute('alt');
             if (alt?.trim()) return alt.trim().slice(0, 80);
+
+            // ★ 图标按钮兜底命名（解决 yiyan/豆包/ChatGPT 等 chat UI 的
+            //   纯图标 div 按钮无法被 SoM 标号的问题）：依次尝试
+            //   (a) 子 SVG 的 <title>/<desc>
+            //   (b) 子 SVG/img 自己的 aria-label / title
+            //   (c) icon class 命名（如 class="icon-send" → "send"）
+            //   (d) 通用占位符 [icon]
+            try {
+                const svgTitle = el.querySelector('svg > title, svg > desc');
+                if (svgTitle) {
+                    const t = (svgTitle.textContent || '').trim();
+                    if (t) return t.slice(0, 80);
+                }
+                const innerIcon = el.querySelector('svg, img, i[class], [class*="icon" i]');
+                if (innerIcon) {
+                    const il = (innerIcon.getAttribute('aria-label') || '').trim();
+                    if (il) return il.slice(0, 80);
+                    const it = (innerIcon.getAttribute('title') || '').trim();
+                    if (it) return it.slice(0, 80);
+                    const ialt = (innerIcon.getAttribute('alt') || '').trim();
+                    if (ialt) return ialt.slice(0, 80);
+                    const explicit = _explicitIconName(el);
+                    if (explicit) return '[' + explicit + ']';
+                    if (_isRightmostComposerIcon(el)) return '[send]';
+                    // 从 class 命名提取语义（icon-send / icon_plus / sendIcon）
+                    const cls = _classNameOf(innerIcon);
+                    const m = cls.match(/(?:icon[_-]|[_-]icon\b|^icon)([a-z][a-z0-9_-]{1,20})/i)
+                          || cls.match(/(send|submit|mic|voice|attach|upload|plus|add|search|menu|more|close|delete|edit|save)\b/i);
+                    if (m && m[1]) {
+                        return '[' + m[1].replace(/[_-]+/g, ' ').toLowerCase().slice(0, 30) + ']';
+                    }
+                    // 真的没线索 → 通用占位符，让 VLM 至少能看见这是个图标按钮
+                    return '[icon]';
+                }
+            } catch (_) {}
+
             return '';
         } catch (_) { return ''; }
     }
@@ -530,9 +725,22 @@
             if (area > 50000 || area < 25) return 0;  // 太大或太小都排除
             try {
                 const s = cachedStyle(el);
-                if (s && s.cursor === 'pointer') {
+                const composerIconCandidate = _isComposerIconCandidate(el);
+                const toolbarIconCandidate = _isIconToolbarCandidate(el);
+                const explicitIconName = _explicitIconName(el);
+                if (s && (s.cursor === 'pointer' || composerIconCandidate || toolbarIconCandidate || explicitIconName)) {
                     const name = deriveName(el);
-                    if (name.length < 1) return 0;
+                    // ★ 图标按钮（无文字、含 SVG/img/icon 子元素）：当尺寸像
+                    //   独立按钮（20-90px 接近正方形）时也接受。这条修复了
+                    //   yiyan/豆包/ChatGPT 等 chat UI 的 + / mic / 飞机
+                    //   send 等纯图标 div 按钮被 SoM 漏标的问题。
+                    const hasIconChild = _hasIconChild(el);
+                    const isCompactIconShape = _isCompactIconShape(el);
+                    if (name.length < 1) {
+                        if (!(hasIconChild && isCompactIconShape && (composerIconCandidate || toolbarIconCandidate || explicitIconName || s.cursor === 'pointer'))) return 0;
+                        // fall through：让 deriveName 兜底名称生效
+                        return 3;
+                    }
                     // 排除只有长文本但无直接文字节点的包装容器
                     const directTxt = Array.from(el.childNodes)
                         .filter(n => n.nodeType === Node.TEXT_NODE)
@@ -788,6 +996,7 @@
         for (let i = 0; i < filtered.length; i++) {
             const text = deriveName(filtered[i].el);
             if (!text || text.length < 2) continue;
+            if (text === '[icon]') continue;
             const r = filtered[i].el.getBoundingClientRect();
             const area = r.width * r.height;
             if (!textMap.has(text)) textMap.set(text, []);

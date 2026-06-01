@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from playwright.async_api import (
     async_playwright,
     BrowserContext,
@@ -34,6 +35,7 @@ try:
     from . import config
     from .auth_manager import apply_storage_state_to_context, load_auth_profiles
     from .artifact_manager import artifact_root, register_artifact
+    from .action_result import ActionResult
     from .data_manager import save_intercepted_data
     from .network_intelligence import record_candidate as _record_network_candidate
     from .vlm_client import VSpiderAction
@@ -41,6 +43,7 @@ except ImportError:
     import config
     from auth_manager import apply_storage_state_to_context, load_auth_profiles
     from artifact_manager import artifact_root, register_artifact
+    from action_result import ActionResult
     from data_manager import save_intercepted_data
     from network_intelligence import record_candidate as _record_network_candidate
     from vlm_client import VSpiderAction
@@ -96,7 +99,12 @@ class ActionExecutionError(Exception):
 #  独立函数：不依赖 BrowserEnv 实例，可单独测试
 # ════════════════════════════════════════════════════════════════
 
-async def ensure_active_page(context: BrowserContext, current_page: Page) -> Page:
+async def ensure_active_page(
+    context: BrowserContext,
+    current_page: Page,
+    *,
+    known_pages: set[int] | None = None,
+) -> Page:
     """
     多标签页焦点守护状态机（3 层安全网）。
 
@@ -110,6 +118,10 @@ async def ensure_active_page(context: BrowserContext, current_page: Page) -> Pag
     Args:
         context:      Playwright BrowserContext 实例
         current_page: 执行动作前持有的 Page 引用
+        known_pages:  执行动作前已存在的 Page 的 id() 集合。如果提供，
+                      L3「向前跟随」只在最新页面**确实是本次动作新开的**
+                      时触发；老 tab（动作前就存在）不会被当成"刚弹出"
+                      抢走焦点。传 None 时退化为旧行为（永远跟随 latest）。
 
     Returns:
         绝对处于激活状态的 Page 对象。
@@ -139,10 +151,22 @@ async def ensure_active_page(context: BrowserContext, current_page: Page) -> Pag
         )
         return fallback
 
-    # ── 层 3：向前跟随 (Follow) ───────────────────────────────
-    # open_pages 安全取最后一个（L1 已确保列表非空，此处无越界风险）
+    # ── 层 3：向前跟随 (Follow) — 只对**新开的** tab 生效 ────────
+    # 旧行为：永远 follow open_pages[-1]，导致非交互动作（wait/type/scroll）
+    # 也会把焦点抢到上一轮残留的 aidaxue tab，破坏 switch_tab 锚定。
+    # 新行为：只在最新 tab 不在 known_pages（动作前快照）里时才 follow。
+    # 传 None 时为兼容旧调用方，保留全跟随。
     latest = open_pages[-1]
     if latest is not current_page:
+        is_new_tab = known_pages is None or id(latest) not in known_pages
+        if not is_new_tab:
+            logger.debug(
+                "[TAB GUARD L3] latest tab %s is pre-existing; "
+                "leaving current page %s active",
+                (latest.url or 'about:blank')[:60],
+                (current_page.url or 'about:blank')[:60],
+            )
+            return current_page
         await latest.bring_to_front()
         try:
             # 等待新标签页加载完成；广告页/无限 loading 页超时后宽松跳过
@@ -208,6 +232,7 @@ class BrowserEnv:
         self._playwright = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._closed: bool = False
         self._som_js: str = ""
         self._screenshot_dir: Path = Path(config.SCREENSHOT_DIR)
         self._download_dir: Path = artifact_root() / "downloads"
@@ -227,9 +252,31 @@ class BrowserEnv:
         self._intercept_seen_row_keys: set[str] = set()
         self._intercept_schema_fingerprints: set[str] = set()
         self._intercept_endpoint_scores: dict[str, int] = {}
+        self._network_run_id: str | None = None
+        self._network_candidates_seen: set[str] = set()
         self._upload_file: Path | None = None   # --upload-file 预配置路径
+        self.last_navigation_status: int | None = None
+        self.last_navigation_url: str = ""
+        self.last_download_path: str = ""
+        self.last_download_name: str = ""
         self._last_action_error: Exception | None = None  # 自愈：记录本轮操作异常
+        self._last_action_result: ActionResult | None = None
         self._tab_switch_notice: str | None = None  # 标签页切换感知通知
+        # 机器可读的分级（G1 观测性强化）。set_tab_notice() 会自动写入；
+        # 旧式直接赋值 _tab_switch_notice 仍可用（视为 "info"）。
+        # 取值: "info" | "warn" | "error"
+        self._last_notice_severity: str = "info"
+        self._last_native_dialog: dict | None = None  # 原生 alert/confirm/prompt 本次拦截文本
+        self._next_prompt_response: str | None = None  # 由 set_prompt_response 预装填的下一次 prompt() 回填值
+        # Real page title cache — populated lazily by ``domcontentloaded`` /
+        # ``framenavigated`` listeners in ``_register_page``. Keyed by
+        # ``id(Page)`` (object identity, so close/reopen with same URL gets
+        # a fresh entry). Used by ``tab_state_tracker.snapshot_tabs`` to
+        # surface real titles (not URL-derived guesses) to the VLM —
+        # otherwise the VLM's thought-cached "title" can stay stale forever
+        # (run_log_20260514_183718: VLM kept calling tab [1] "百度文心助手"
+        # even though it had become a "rules / terms" page).
+        self._page_titles: dict[int, str] = {}
         self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
         self._visual_blank_reloaded_urls: set[str] = set()
         self._auth_matrix_note: str = ""
@@ -247,11 +294,69 @@ class BrowserEnv:
         self._semantic_fallback_count: int = 0
         # ── RPA 肌肉记忆：记录本次任务每步成功动作的真实 XPath / 坐标 ──────
         self.rpa_trail: list[dict] = []
+        # ── Tab Visit Stack ────────────────────────────────────────────
+        # 栈记录"从哪个 tab 跳过来的"，用于 click_new_tab → close_tab 的
+        # 父子回溯。栈顶 = 最近的父 tab。
+        #   click_new_tab 成功后：push 当前 page
+        #   close_tab 时：pop 栈顶，焦点切到那个 page（跳过已关闭的栈项）
+        #   switch_tab 是 VLM 自主侧向导航，不动栈（保留原回溯路径）
+        # 存 Page 对象而非 index，因为 close 会让索引漂移。
+        self._tab_visit_stack: list[Page] = []
 
     def clear_rpa_trail(self) -> None:
         """清空本次任务的 RPA 动作轨迹，在任务开始前调用。"""
         self.rpa_trail.clear()
         logger.debug("[RPA] Trail cleared")
+
+    # ── Tab Visit Stack API ───────────────────────────────────────────────
+    def push_tab_visit(self, parent_page: Page) -> None:
+        """Called by click_new_tab handler when a child tab is opened.
+
+        Records ``parent_page`` so a subsequent close_tab on the child can
+        return to the parent. No-op if ``parent_page`` is already at the
+        top of the stack (avoid duplicate pushes from retries).
+        """
+        if parent_page is None or parent_page.is_closed():
+            return
+        if self._tab_visit_stack and self._tab_visit_stack[-1] is parent_page:
+            return
+        self._tab_visit_stack.append(parent_page)
+        logger.info(
+            "[TAB STACK] push parent (depth=%d): %s",
+            len(self._tab_visit_stack),
+            (parent_page.url or "about:blank")[:60],
+        )
+
+    def pop_tab_visit(self) -> Page | None:
+        """Called by close_tab handler. Pop the most recent alive parent.
+
+        Skips dead pages (parent might have been closed too). Returns None
+        if the stack is empty or every entry is dead — caller falls back to
+        ``open_pages[-1]`` for legacy behavior.
+        """
+        while self._tab_visit_stack:
+            candidate = self._tab_visit_stack.pop()
+            if candidate is not None and not candidate.is_closed():
+                logger.info(
+                    "[TAB STACK] pop -> parent: %s (remaining depth=%d)",
+                    (candidate.url or "about:blank")[:60],
+                    len(self._tab_visit_stack),
+                )
+                return candidate
+        return None
+
+    def peek_tab_visit(self) -> Page | None:
+        """Read the stack top without popping. Skips dead pages but keeps
+        them on the stack (caller may decide to clean later)."""
+        for candidate in reversed(self._tab_visit_stack):
+            if candidate is not None and not candidate.is_closed():
+                return candidate
+        return None
+
+    def clear_tab_visit_stack(self) -> None:
+        """Reset the stack at task boundaries."""
+        self._tab_visit_stack.clear()
+        logger.debug("[TAB STACK] cleared")
 
     def find_pagination_links(self) -> list[dict]:
         """
@@ -1038,16 +1143,100 @@ class BrowserEnv:
             )
             page.on("close", lambda *_: self._handle_page_closed(page))
 
-            # 自动处理 alert/confirm/prompt 弹窗，避免阻塞 Agent
-            async def _auto_dismiss_dialog(dialog):
+            # ── Real page title cache ────────────────────────────────────
+            # Fire-and-forget title refresh on navigation events. The cached
+            # value is read SYNC by ``tab_state_tracker.snapshot_tabs`` so
+            # the TAB STATE CHANGE notice surfaces the *actual* page title
+            # rather than a URL-tail guess. This is the fix for the
+            # 18:37 Wenxin run where VLM kept calling tab [1] "百度文心助手"
+            # even though it had become a terms-of-service page.
+            async def _refresh_title(p: Page) -> None:
                 try:
-                    logger.info(
-                        f"[DIALOG] Auto-accepting {dialog.type}: "
-                        f"{dialog.message[:100] if dialog.message else ''}"
+                    if p.is_closed():
+                        self._page_titles.pop(id(p), None)
+                        return
+                    t = (await p.title()) or ""
+                    if t:
+                        self._page_titles[id(p)] = t
+                except Exception as _title_err:
+                    logger.debug(
+                        "[TITLE CACHE] refresh failed for %s: %s",
+                        (p.url or "?")[:60], _title_err,
                     )
-                    await dialog.accept()
+
+            # Bind ``page`` by default-arg so the lambda captures the
+            # specific Page object instead of the loop variable.
+            page.on(
+                "domcontentloaded",
+                lambda _p=page: self._track_background_task(_refresh_title(_p)),
+            )
+            page.on(
+                "framenavigated",
+                lambda _frame, _p=page: self._track_background_task(_refresh_title(_p))
+                if _frame == _p.main_frame else None,
+            )
+            # Initial fetch — page may already be loaded by the time we
+            # register (e.g. context.new_page() returns ready).
+            self._track_background_task(_refresh_title(page))
+
+            # 自动处理 alert/confirm/prompt 弹窗，避免阻塞 Agent
+
+            async def _auto_dismiss_dialog(dialog):
+                # NOTE: This used to be a fire-and-forget acceptor with no
+                # VLM feedback path. Native confirm()/alert()/prompt() are
+                # *not* in DOM, so the VLM never sees them and would loop
+                # ("click delete again -- still there!"). We now surface the
+                # dialog text via _last_native_dialog + _tab_switch_notice
+                # so the next turn knows the destructive action was confirmed.
+                _type = "dialog"
+                _msg = ""
+                try:
+                    _type = str(dialog.type or "dialog")
+                    _msg = str(dialog.message or "")[:200]
+                    _armed = self._next_prompt_response
+                    if _type == "prompt" and _armed is not None:
+                        # Consume the armed value (one-shot).
+                        self._next_prompt_response = None
+                        logger.info(
+                            "[DIALOG] Auto-accepting %s with armed value: %r",
+                            _type, _armed[:80],
+                        )
+                        await dialog.accept(prompt_text=_armed)
+                        _msg = f"[ARMED] {_armed}"
+                    else:
+                        logger.info(
+                            "[DIALOG] Auto-accepting %s: %s", _type, _msg[:100]
+                        )
+                        await dialog.accept()
                 except Exception as e:
-                    logger.debug(f"[DIALOG] Accept failed: {e}")
+                    logger.debug("[DIALOG] Accept failed: %s", e)
+                    return
+                try:
+                    # Persist for AX summary / debugging
+                    self._last_native_dialog = {
+                        "type": _type,
+                        "message": _msg,
+                        "ts": time.time(),
+                    }
+                except Exception:
+                    pass
+                try:
+                    _notice = (
+                        f"✅ [DIALOG ACCEPTED] type={_type} "
+                        f"message={_msg!r}\n"
+                        "→ 浏览器原生确认弹窗已被系统自动 accept，"
+                        "上一步的破坏性操作（删除/提交/清空）"
+                        "已真正生效。下一步看页面状态确认结果即可。"
+                    )
+                    # J: coalesce=True is the helper-level equivalent of the
+                    # old "if not prior: set; else: append" branch — when no
+                    # prior notice exists we just set, otherwise we append
+                    # with a blank-line separator. set_tab_notice also keeps
+                    # _last_notice_severity in sync (taking max(prior, new))
+                    # so observability layers see the right level.
+                    self.set_tab_notice(_notice, severity="info", coalesce=True)
+                except Exception:
+                    pass
 
             page.on("dialog", lambda d: self._track_background_task(_auto_dismiss_dialog(d)))
 
@@ -1092,13 +1281,27 @@ class BrowserEnv:
         if self._page and not self._page.is_closed():
             return self._page
 
-        if not self._context:
+        if not self._context or getattr(self, "_closed", False):
             return self._page
 
         open_pages = [page for page in self._context.pages if not page.is_closed()]
         if not open_pages:
-            self._page = None
-            return None
+            try:
+                logger.warning(
+                    "[TAB GUARD L1] No open pages during %s; creating emergency blank tab",
+                    reason or "active-page recovery",
+                )
+                new_page = await self._context.new_page()
+                await self._register_page(
+                    new_page,
+                    reason=reason or "emergency active page",
+                    activate=True,
+                )
+                return self._page
+            except Exception as exc:
+                logger.error("[TAB GUARD L1] Failed to create emergency tab: %s", exc)
+                self._page = None
+                return None
 
         await self._register_page(
             open_pages[-1], reason=reason or "recover active page", activate=True
@@ -1120,6 +1323,115 @@ class BrowserEnv:
                 reason=reason or "new window/tab detected",
                 activate=True,
             )
+
+    # ── G1 观测性：分级 notice 助手 ─────────────────────────────────────
+    # 三档严重程度：
+    #   info  — 正常进度反馈（页面切换、动作完成）
+    #   warn  — 异常但不致命（候选不唯一、网络降级、HTTP 4xx）
+    #   error — 操作失败需 VLM 切换策略（元素消失、HTTP 5xx、超时）
+    # 用法：
+    #   browser.set_tab_notice("点击成功", severity="info")
+    #   browser.set_tab_notice("候选不唯一,已取首项", severity="warn", coalesce=True)
+    #   browser.set_tab_notice("元素已消失", severity="error", coalesce=False)
+    _NOTICE_TAG = {
+        "info": "ℹ️ [INFO]",
+        "warn": "⚠️ [WARN]",
+        "error": "🚨 [ERROR]",
+    }
+    _SEVERITY_RANK = {"info": 0, "warn": 1, "error": 2}
+
+    def set_tab_notice(
+        self,
+        text: str,
+        *,
+        severity: str = "info",
+        coalesce: bool = True,
+    ) -> None:
+        """Set or append a notice that will be injected into the next VLM step.
+
+        Parameters
+        ----------
+        text : str
+            The notice content. If it already starts with a recognized emoji
+            (ℹ️/⚠️/🚨/✅/🛑), the severity tag is **not** re-prepended (avoids
+            double-stamping when handlers compose their own markers).
+        severity : {"info", "warn", "error"}, default "info"
+            Machine-readable severity. Recorded in ``_last_notice_severity``
+            so observability layers (logs/api_server/frontend) can color or
+            alert without parsing the text.
+        coalesce : bool, default True
+            If True and a notice is already present, append with a blank line
+            separator (preserves earlier context — e.g. tab switch + drag
+            done). If False, **overwrite** (use for fresh errors that should
+            dominate the VLM's attention).
+
+            When coalescing, the resulting severity is the **max** of the
+            existing and incoming severity, so a later ``error`` upgrades an
+            earlier ``info`` block but a later ``info`` cannot downgrade.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if severity not in self._SEVERITY_RANK:
+            severity = "info"
+        # Re-stamp tag only when caller didn't bring their own visual marker.
+        # Whitelist covers every emoji prefix in use by actions.py / browser_env.py
+        # handlers (✅ success, ❌ fail, ⏭️ no-op, ↪️ redirect, ❓ unknown,
+        # ☑️ check, ✂️ extract, 🗒️ note, 🔒 lock, ⏱️ timing, etc.) so the
+        # migration to set_tab_notice doesn't double-stamp markers like
+        # "❌ click_new_tab failed" into "🚨 ❌ click_new_tab failed".
+        _SKIP_RESTAMP = (
+            "ℹ️", "⚠️", "🚨", "✅", "🛑", "[",
+            "❌", "⏭️", "↪️", "❓", "☑️", "✂️", "🗒️", "🔒", "⏱️",
+        )
+        if not text.startswith(_SKIP_RESTAMP):
+            tag = self._NOTICE_TAG.get(severity, "")
+            stamped = f"{tag} {text}" if tag else text
+        else:
+            stamped = text
+        prior = self._tab_switch_notice
+        if not prior:
+            self._tab_switch_notice = stamped
+            self._last_notice_severity = severity
+            return
+        if not coalesce:
+            self._tab_switch_notice = stamped
+            self._last_notice_severity = severity
+            return
+        # coalesce: append + take the higher severity
+        self._tab_switch_notice = prior + "\n\n" + stamped
+        prior_rank = self._SEVERITY_RANK.get(self._last_notice_severity, 0)
+        new_rank = self._SEVERITY_RANK.get(severity, 0)
+        if new_rank > prior_rank:
+            self._last_notice_severity = severity
+
+    def consume_tab_notice(self) -> tuple[str | None, str]:
+        """Return ``(text, severity)`` and clear the slot atomically.
+
+        Callers (main.py loop) should prefer this over reading
+        ``_tab_switch_notice`` directly so severity stays in sync. Returns
+        ``(None, "info")`` when nothing is pending.
+        """
+        text = self._tab_switch_notice
+        severity = self._last_notice_severity
+        if text is None:
+            return None, "info"
+        self._tab_switch_notice = None
+        self._last_notice_severity = "info"
+        return text, severity
+
+    def clear_tab_notice(self) -> None:
+        """Explicitly drop any pending notice and reset severity.
+
+        Use this when a Tab Guard / state tracker has determined the
+        previous handler's notice is no longer relevant for the next VLM
+        step (e.g. no tab switch happened, but a stale notice from an
+        earlier action would mislead). Prefer this over a bare
+        ``self._tab_switch_notice = None`` assignment so the severity
+        stays in lock-step.
+        """
+        self._tab_switch_notice = None
+        self._last_notice_severity = "info"
 
     async def _clear_som_overlays(self) -> None:
         """Remove visual SoM overlays before interactions while keeping target ids."""
@@ -1387,6 +1699,7 @@ class BrowserEnv:
             url: 初始页面 URL
         """
         # 加载 SoM 注入脚本
+        self._closed = False
         self._som_js = config.SOM_SCRIPT_PATH.read_text(encoding="utf-8")
         logger.info(f"SoM script loaded ({len(self._som_js)} chars)")
 
@@ -1409,6 +1722,18 @@ class BrowserEnv:
         )
 
         logger.info(f"Launching persistent context: {user_data_path.resolve()}")
+        _proxy_cfg = None
+        _proxy_server = str(getattr(config, "PROXY_SERVER", "") or "").strip()
+        if _proxy_server:
+            _proxy_cfg = {"server": _proxy_server}
+            _proxy_user = str(getattr(config, "PROXY_USERNAME", "") or "").strip()
+            _proxy_pass = str(getattr(config, "PROXY_PASSWORD", "") or "").strip()
+            if _proxy_user:
+                _proxy_cfg["username"] = _proxy_user
+            if _proxy_pass:
+                _proxy_cfg["password"] = _proxy_pass
+            logger.info("[BROWSER] proxy enabled: %s", _proxy_server)
+
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_path.resolve()),
             headless=config.HEADLESS,
@@ -1417,7 +1742,12 @@ class BrowserEnv:
             ignore_https_errors=True,
             args=self._BROWSER_ARGS,
             accept_downloads=True,  # 启用下载接管
+            proxy=_proxy_cfg,
         )
+        try:
+            self._context.on("close", lambda *_: setattr(self, "_closed", True))
+        except Exception:
+            pass
         try:
             await self._context.clear_permissions()
             logger.info("Browser permissions cleared at context startup")
@@ -1664,6 +1994,16 @@ Object.defineProperty(navigator, 'languages', {
                     )
                     for warning in auth_result.warnings:
                         logger.warning("[AUTH MATRIX] %s", warning)
+                    try:
+                        from .auth_harvester import cf_clearance_profile_hint
+                    except ImportError:
+                        from auth_harvester import cf_clearance_profile_hint
+                    from urllib.parse import urlparse as _urlparse_cf
+                    _cf_host = _urlparse_cf(url or "").netloc.split("@")[-1].split(":")[0]
+                    _cf_hint = cf_clearance_profile_hint(host=_cf_host)
+                    if _cf_hint:
+                        self.auth_status_note = f"{self.auth_status_note}\n{_cf_hint}"
+                        logger.info("[AUTH MATRIX] %s", _cf_hint)
                 else:
                     self._auth_matrix_note = (
                         f"已启用 auth profile 选择（{auth_profiles}），但没有匹配到可加载的状态。"
@@ -1730,9 +2070,84 @@ Object.defineProperty(navigator, 'languages', {
             f"UserDataDir={user_data_path.resolve()}"
         )
 
-        # 导航到初始页面
+        # 导航到初始页面 — nav_resilience 逐级降级
         logger.info(f"Navigating to: {url}")
-        await self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            from .nav_resilience import navigate_with_retry, check_page_health
+        except ImportError:
+            from nav_resilience import navigate_with_retry, check_page_health
+        nav_result = await navigate_with_retry(
+            self._page, url, base_timeout_ms=30_000,
+            strategies=["domcontentloaded", "load", "commit"],
+        )
+        response = None
+        if nav_result.success:
+            self.last_navigation_url = nav_result.final_url or str(url)
+            if nav_result.degraded:
+                logger.info(
+                    "[NAV RESILIENCE] strategy=%s attempts=%s",
+                    nav_result.final_strategy, nav_result.attempt_count,
+                )
+            health = await check_page_health(self._page)
+            if not health["healthy"]:
+                logger.warning("[NAV HEALTH] issues: %s", health["issues"])
+        else:
+            nav_err_text = nav_result.attempts[-1].error if nav_result.attempts else "navigation failed"
+            parsed = urlsplit(str(url or ""))
+            host = (parsed.netloc or "").lower()
+            error_text = nav_err_text.lower()
+            if "err_http_response_code_failure" in error_text:
+                status_match = re.search(r"/status/(\d{3})(?:[/?#]|$)", parsed.path)
+                self.last_navigation_status = int(status_match.group(1)) if status_match else 400
+                self.last_navigation_url = str(url or "")
+                response = None
+                logger.warning(
+                    "[HTTP STATUS] navigation raised HTTP response code failure; status=%s url=%s",
+                    self.last_navigation_status,
+                    self.last_navigation_url,
+                )
+            else:
+                can_retry_without_www = (
+                    host.startswith("www.")
+                    and "err_name_not_resolved" in error_text
+                )
+                if not can_retry_without_www:
+                    raise Exception(nav_err_text)
+                retry_url = urlunsplit((
+                    parsed.scheme or "https",
+                    parsed.netloc[4:],
+                    parsed.path,
+                    parsed.query,
+                    parsed.fragment,
+                ))
+                logger.warning(
+                    "[NAV RETRY] %s failed DNS; retrying without www: %s",
+                    url,
+                    retry_url,
+                )
+                fallback = await navigate_with_retry(
+                    self._page, retry_url, base_timeout_ms=30_000,
+                    strategies=["domcontentloaded", "commit"],
+                )
+                if fallback.success:
+                    nav_result = fallback
+                    self.last_navigation_url = fallback.final_url or retry_url
+                else:
+                    raise Exception(nav_err_text)
+        if nav_result.success and response is None:
+            try:
+                self.last_navigation_status = 200
+            except Exception:
+                self.last_navigation_status = 200
+        if response is not None:
+            self.last_navigation_status = response.status
+            self.last_navigation_url = response.url
+        if self.last_navigation_status and self.last_navigation_status >= 400:
+            logger.warning(
+                "[HTTP STATUS] initial navigation returned %s for %s",
+                self.last_navigation_status,
+                self.last_navigation_url,
+            )
 
         # 首次导航后等待 SPA 完全渲染
         await self._wait_for_page_stable()
@@ -1744,6 +2159,24 @@ Object.defineProperty(navigator, 'languages', {
         logger.info("Page-level interceptors will auto-register for new tabs and popups")
 
         # 挂载全局底层下载拦截器（绕过弹窗）
+
+    async def restart(self, url: str, reason: str = "") -> None:
+        """Restart the persistent browser context in-place and navigate again."""
+        logger.warning("[BROWSER RECOVERY] Restarting browser context: %s", reason or "no reason")
+        try:
+            await self.close()
+        except Exception as exc:
+            logger.debug("[BROWSER RECOVERY] close before restart skipped: %s", exc)
+        self._playwright = None
+        self._context = None
+        self._page = None
+        self._registered_pages.clear()
+        self._background_tasks.clear()
+        self._tab_visit_stack.clear()
+        self._last_action_error = None
+        self._last_action_result = None
+        self._closed = False
+        await self.start(url)
 
     async def refresh_auth_sentinel(self) -> str:
         """
@@ -2078,6 +2511,8 @@ Object.defineProperty(navigator, 'languages', {
         frames_to_eval = list(page.frames)
         all_som_elements: list[dict] = []
 
+        # H1: 计时 SoM 注入耗时，慢页 / 重页发出告警 + 阶段事件
+        _som_t0 = time.time()
         for frame in frames_to_eval:
             try:
                 result = await frame.evaluate(self._som_js, current_id)
@@ -2094,14 +2529,45 @@ Object.defineProperty(navigator, 'languages', {
                         )
             except Exception as eval_err:
                 logger.warning(f"Frame evaluation failed: {eval_err}")
+        _som_dur_ms = int((time.time() - _som_t0) * 1000)
 
         # 缓存本轮 SoM 结果，供翻页引导等后续逻辑查找特定元素
         self._last_som_elements = all_som_elements
 
-        logger.info(
-            f"[Step {step}] SoM injected across {injected_frames} frames, "
-            f"marked {total_elements} interactive elements"
-        )
+        # H1 性能记账：常态 INFO，慢页 / 重页升级 WARN，并通过 broadcast_phase
+        # 把数据推给前端（让大页面的 perf 问题立刻可见）。
+        # 阈值：>150 元素 或 >2000ms 视为 heavy；info 用于常态观测。
+        _som_heavy = total_elements > 150 or _som_dur_ms > 2000
+        if _som_heavy:
+            logger.warning(
+                f"[Step {step}] SoM HEAVY: {total_elements} elements across "
+                f"{injected_frames} frames in {_som_dur_ms}ms "
+                f"(threshold: >150 elements or >2s)"
+            )
+        else:
+            logger.info(
+                f"[Step {step}] SoM injected across {injected_frames} frames, "
+                f"marked {total_elements} interactive elements in {_som_dur_ms}ms"
+            )
+        # Phase event (G2 channel) so the frontend timeline shows SoM cost.
+        try:
+            from api_server import broadcast_phase
+
+            broadcast_phase(
+                "som_inject",
+                severity="warn" if _som_heavy else "info",
+                message=f"{total_elements} elements / {injected_frames} frames",
+                notice_severity=self._last_notice_severity,
+                step=step,
+                duration_ms=_som_dur_ms,
+                extra={
+                    "element_count": int(total_elements),
+                    "frame_count": int(injected_frames),
+                    "heavy": bool(_som_heavy),
+                },
+            )
+        except Exception:
+            pass
 
         # ── SoM 零元素重试：tab 切换 / visibilitychange 重渲染可能导致暂时性空白 ──
         if total_elements == 0 and not page.is_closed():
@@ -2190,15 +2656,52 @@ Object.defineProperty(navigator, 'languages', {
                         f"[Screenshot] 替代 Page 截图仍失败: {_ss_err_retry}"
                     )
             else:
+                # Tier 2: window.stop() then retry Playwright screenshot.
                 logger.info("[Screenshot] 执行 window.stop() 强制停止挂起资源，重新截图...")
+                _tier2_ok = False
                 try:
                     await page.evaluate("window.stop()")
                     await asyncio.sleep(1)
                     screenshot_bytes = await page.screenshot(**_SS_KWARGS)
+                    _tier2_ok = True
                 except Exception as _ss_err2:
-                    raise RuntimeError(
-                        f"[Screenshot] 致命错误：强制截图依然失败，页面可能已崩溃: {_ss_err2}"
+                    logger.warning(
+                        "[Screenshot] window.stop() 重试仍失败 (%s)；启动 CDP 兜底",
+                        _ss_err2,
                     )
+
+                if not _tier2_ok:
+                    # Tier 3: CDP Page.captureScreenshot — bypasses Playwright's
+                    # implicit ``document.fonts.ready`` wait that hangs on
+                    # heavy SPA / 自定义字体 landing pages (e.g. comate.baidu.com
+                    # via SEM redirect). Used by browser-use / puppeteer-extra
+                    # for the same reason. Captures the rendered frame as-is.
+                    try:
+                        cdp = await page.context.new_cdp_session(page)
+                        result = await cdp.send(
+                            "Page.captureScreenshot",
+                            {
+                                "format": "jpeg",
+                                "quality": 70,
+                                "fromSurface": True,
+                                "captureBeyondViewport": False,
+                            },
+                        )
+                        screenshot_bytes = base64.b64decode(result["data"])
+                        logger.info(
+                            "[Screenshot] CDP captureScreenshot 兜底成功 "
+                            "(%d bytes, font-loading 死锁已绕开)",
+                            len(screenshot_bytes),
+                        )
+                        try:
+                            await cdp.detach()
+                        except Exception:
+                            pass
+                    except Exception as _cdp_err:
+                        raise RuntimeError(
+                            "[Screenshot] 三层兜底全败 "
+                            f"(playwright+stop+cdp 均失败): {_cdp_err}"
+                        )
 
         try:
             current_url = page.url or ""
@@ -3041,6 +3544,7 @@ Object.defineProperty(navigator, 'languages', {
 
         # ── 每轮开始前清空上轮残留错误标记 ──────────────────────────────────
         self._last_action_error = None
+        self._last_action_result = None
 
         # ── 输入标准化：dict → VSpiderAction（同时剥离 RPA 元数据） ────────
         rpa_required_keys: list[str] = []
@@ -3057,27 +3561,154 @@ Object.defineProperty(navigator, 'languages', {
         else:
             action_model = action
 
+        _action_started = time.perf_counter()
+        _initial_pages = len(self._context.pages) if self._context else 0
+        # Snapshot of pages that existed BEFORE this action. Tab Guard L3 uses
+        # this to distinguish "freshly opened by this action" (should follow)
+        # from "old tab sitting around from a previous step" (should not steal
+        # focus from an explicit switch_tab).
+        _known_page_ids: set[int] = (
+            {id(p) for p in self._context.pages} if self._context else set()
+        )
+        # Full structural snapshot for the post-action TAB STATE CHANGE notice.
+        # Cheap (O(N tabs), no async I/O); fires when opens/closes/focus drift.
+        try:
+            from .tab_state_tracker import (
+                compute_tab_delta_notice as _compute_tab_delta_notice,
+                snapshot_tabs as _snapshot_tabs,
+            )
+        except ImportError:  # pragma: no cover — direct script import
+            from tab_state_tracker import (  # type: ignore[no-redef]
+                compute_tab_delta_notice as _compute_tab_delta_notice,
+                snapshot_tabs as _snapshot_tabs,
+            )
+        _pre_action_tab_snapshot = _snapshot_tabs(self)
+
+        def _maybe_set_tab_delta_notice() -> None:
+            """Compose a tab-delta notice unless a handler already set one
+            (handlers like click_new_tab / fetch_link_content / Tab Guard
+            produce richer per-action notices and we don't want to clobber)."""
+            if self._tab_switch_notice:
+                return
+            try:
+                _delta = _compute_tab_delta_notice(
+                    self,
+                    _pre_action_tab_snapshot,
+                    last_action=str(action_model.action or ""),
+                    last_target_id=int(action_model.target_id or 0),
+                )
+            except Exception as _delta_err:
+                logger.debug("[TAB STATE] delta notice skipped: %s", _delta_err)
+                return
+            if _delta:
+                # J: use set_tab_notice so severity stays in sync. The
+                # guard at the top of _maybe_set_tab_delta_notice already
+                # ensures no prior notice; coalesce flag is therefore moot.
+                self.set_tab_notice(_delta, severity="info", coalesce=False)
+                logger.info(
+                    "[TAB STATE] delta detected for action=%s tid=%s; "
+                    "feedback injected for next VLM step",
+                    action_model.action, action_model.target_id,
+                )
+
         page = await self._ensure_active_page(reason="before execute_action")
         if not page:
             logger.error("No active page available for action execution")
+            self._last_action_result = ActionResult.from_action(
+                action_model,
+                success=False,
+                error="No active page available for action execution",
+                before_pages=_initial_pages,
+                after_pages=len(self._context.pages) if self._context else 0,
+                metadata={
+                    "duration_ms": round((time.perf_counter() - _action_started) * 1000, 2)
+                },
+            )
             return None
+
+        _before_url = page.url or ""
+        _before_pages = len(self._context.pages) if self._context else _initial_pages
+
+        def _safe_page_url(candidate: Page | None) -> str:
+            if candidate is not None:
+                try:
+                    if not candidate.is_closed():
+                        return candidate.url or ""
+                except Exception:
+                    pass
+            try:
+                return self.current_url or ""
+            except Exception:
+                return ""
+
+        def _record_action_result(
+            *,
+            success: bool,
+            message: str = "",
+            error: str = "",
+            active: Page | None = None,
+            metadata: dict | None = None,
+        ) -> ActionResult:
+            merged_metadata = dict(metadata or {})
+            merged_metadata.setdefault(
+                "duration_ms",
+                round((time.perf_counter() - _action_started) * 1000, 2),
+            )
+            result = ActionResult.from_action(
+                action_model,
+                success=success,
+                message=message,
+                error=error,
+                before_url=_before_url,
+                after_url=_safe_page_url(active),
+                before_pages=_before_pages,
+                after_pages=len(self._context.pages) if self._context else 0,
+                metadata=merged_metadata,
+            )
+            self._last_action_result = result
+            return result
 
         # ── Dispatch 到 Registry 中注册的 Handler ─────────────────────────
         try:
             handler = ActionRegistry.get(action_model.action)
         except UnknownActionError:
             logger.warning(f"Unknown action type: {action_model.action}")
+            _record_action_result(
+                success=False,
+                error=f"Unknown action type: {action_model.action}",
+                active=page,
+            )
             return page  # 与原 else 分支一致：直接返回当前页，跳过 Tab Guard
 
+        # ``workflow_memory or {}`` was a reference-killing bug: an EMPTY dict
+        # is falsy in Python, so ``{} or {}`` returns a brand-new dict and
+        # any writes the handler makes (e.g. ChatExtractHandler's sentinel
+        # ``__chat_extract_completed``) never reach main.py's local
+        # workflow_memory. Use a None-check instead so the caller's dict
+        # reference is preserved when it's an empty (but valid) dict.
+        # See run_log_20260518_151238 step 5/6: the sentinel was written
+        # to a phantom dict, main.py never saw it, and chat_extract ran
+        # twice before VLM finally emitted done on its own.
+        if workflow_memory is None:
+            workflow_memory = {}
         ctx = ActionContext(
             action=action_model,
             browser=self,
-            workflow_memory=workflow_memory or {},
+            workflow_memory=workflow_memory,
             page=page,
             rpa_required_keys=rpa_required_keys,
             rpa_template_value=rpa_template_value,
         )
-        handler_result = await handler.execute(ctx)
+        try:
+            handler_result = await handler.execute(ctx)
+        except Exception as exc:
+            _record_action_result(
+                success=False,
+                error=str(exc),
+                active=page,
+                metadata={"exception_type": type(exc).__name__},
+            )
+            raise
 
         # ── Handler 显式返回 Page（switch_tab / done）→ 跳过 Tab Guard ──
         if handler_result is not None:
@@ -3085,10 +3716,26 @@ Object.defineProperty(navigator, 'languages', {
             if self._last_action_error is not None:
                 _err = self._last_action_error
                 self._last_action_error = None
+                _record_action_result(
+                    success=False,
+                    error=(
+                        f"action={action_model.action} "
+                        f"target_id={action_model.target_id}: {_err}"
+                    ),
+                    active=handler_result,
+                    metadata={"exception_type": type(_err).__name__},
+                )
                 raise ActionExecutionError(
                     f"action={action_model.action} "
                     f"target_id={action_model.target_id}: {_err}"
                 ) from _err
+            _record_action_result(
+                success=True,
+                message="handler returned page",
+                active=handler_result,
+            )
+            # Surface tab open/close/focus drift to the next VLM step.
+            _maybe_set_tab_delta_notice()
             return handler_result
 
         # ══════════════════════════════════════════════════════
@@ -3098,7 +3745,9 @@ Object.defineProperty(navigator, 'languages', {
         #   - 当前页关闭（Fallback）
         #   - 全部页面消失（Emergency）
         # ══════════════════════════════════════════════════════
-        active_page = await ensure_active_page(self._context, page)
+        active_page = await ensure_active_page(
+            self._context, page, known_pages=_known_page_ids
+        )
 
         if active_page is not page:
             # 新页面尚未挂载事件处理器（XHR 拦截、下载监听等），补充注册
@@ -3116,7 +3765,10 @@ Object.defineProperty(navigator, 'languages', {
             _prev_action = action_model.action
             _prev_tid = action_model.target_id
             if _prev_action in ("click", "click_new_tab"):
-                self._tab_switch_notice = (
+                # J: tab guard observed a switch caused by user's click —
+                # fresh notice clobbers any earlier handler notice (the
+                # tab switch is the dominant event for the next VLM step).
+                self.set_tab_notice(
                     f"✅ 你上一步 {_prev_action}(元素 #{_prev_tid}) 已成功触发页面切换/新标签：\n"
                     f"  旧页面: {old_url[:120]}\n"
                     f"  当前页面: {new_url[:120]}\n"
@@ -3127,17 +3779,25 @@ Object.defineProperty(navigator, 'languages', {
                     f"若整个任务已达成，直接 action=done 结束。\n"
                     f"  • 目标要求在新页面继续填表/提取 → 留在当前页继续操作。\n"
                     f"  • 当前页明显是广告/验证墙/无关页（URL 含 sem/ad/promo、Cloudflare 验证） "
-                    f"→ close_tab 并在原页选**另一个** target_id 重试。"
+                    f"→ close_tab 并在原页选**另一个** target_id 重试。",
+                    severity="info",
+                    coalesce=False,
                 )
             else:
-                self._tab_switch_notice = (
+                # J: non-click action triggered a tab switch — surface as
+                # info notice; VLM still needs to decide whether to follow.
+                self.set_tab_notice(
                     f"ℹ️ 标签页切换（上一步动作: {_prev_action}）：\n"
                     f"  旧页面: {old_url[:120]}\n"
                     f"  当前页面: {new_url[:120]}\n"
-                    f"请对照用户目标判断这是预期切换还是异常，再决定下一步。"
+                    f"请对照用户目标判断这是预期切换还是异常，再决定下一步。",
+                    severity="info",
+                    coalesce=False,
                 )
         else:
-            self._tab_switch_notice = None
+            # J: no tab switch — drop any stale notice from earlier in
+            # this round; clear_tab_notice resets severity in lock-step.
+            self.clear_tab_notice()
         # 更新实例持有的活跃页引用，确保下一轮截图使用正确页面
         self._page = active_page
 
@@ -3145,11 +3805,26 @@ Object.defineProperty(navigator, 'languages', {
         if self._last_action_error is not None:
             _err = self._last_action_error
             self._last_action_error = None
+            _record_action_result(
+                success=False,
+                error=(
+                    f"action={action_model.action} "
+                    f"target_id={action_model.target_id}: {_err}"
+                ),
+                active=active_page,
+                metadata={"exception_type": type(_err).__name__},
+            )
             raise ActionExecutionError(
                 f"action={action_model.action} "
                 f"target_id={action_model.target_id}: {_err}"
             ) from _err
 
+        _record_action_result(success=True, message="ok", active=active_page)
+        # Surface tab open/close/focus drift to the next VLM step (this path
+        # already sets _tab_switch_notice for active-page changes; the helper
+        # is a no-op when that happened, but covers structural changes that
+        # didn't shift focus — e.g. background popups closing).
+        _maybe_set_tab_delta_notice()
         return active_page
 
     async def _wait_after_action(
@@ -3382,6 +4057,8 @@ Object.defineProperty(navigator, 'languages', {
             # 拼接最终路径并静默保存
             final_path = self._download_dir / download.suggested_filename
             await download.save_as(str(final_path.resolve()))
+            self.last_download_path = str(final_path.resolve())
+            self.last_download_name = str(download.suggested_filename or final_path.name)
             
             print(f"\n✅ [底层拦截] 成功拦截文件下载并静默保存至: \033[36m{final_path.resolve()}\033[0m\n")
             logger.info(f"[DOWNLOAD INTERCEPT] Saved native file: {final_path.resolve()}")
@@ -3773,12 +4450,27 @@ Object.defineProperty(navigator, 'languages', {
         except Exception:
             return ""
 
+    def get_active_tab_index(self) -> int:
+        """当前 self._page 在 context.pages 中的序号；无法确定时返回 -1。"""
+        if not self._context or not self._page:
+            return -1
+        open_pages = [p for p in self._context.pages if not p.is_closed()]
+        try:
+            return open_pages.index(self._page)
+        except ValueError:
+            return -1
+
     async def get_tabs_state(self) -> str:
         """
         返回当前所有标签页的状态摘要字符串，供注入 VLM 提示使用。
 
-        格式示例：
+        基本格式：
           [0] 百度一下 (活跃) | [1] 淘宝 | [2] 京东
+
+        若 Tab Visit Stack 非空，会在末尾追加返回路径提示：
+          ... ↩ close_tab 将回到 [N] <parent title>
+
+        让 VLM 知道"现在关掉当前 tab 会落到哪儿"，避免拍脑袋猜父子关系。
 
         若浏览器尚未启动或无任何页面，返回空字符串。
         """
@@ -3788,18 +4480,35 @@ Object.defineProperty(navigator, 'languages', {
         if not open_pages:
             return ""
         parts: list[str] = []
+        active_idx = -1
         for idx, p in enumerate(open_pages):
             try:
                 title = (await p.title()) or p.url or "about:blank"
-                # 截断过长标题，避免撑爆提示词
                 if len(title) > 30:
                     title = title[:27] + "..."
             except Exception:
                 title = p.url or "about:blank"
             is_active = (p == self._page)
+            if is_active:
+                active_idx = idx
             label = f"[{idx}] {title}" + (" (活跃)" if is_active else "")
             parts.append(label)
-        return " | ".join(parts)
+        base = " | ".join(parts)
+
+        # ── Tab Visit Stack 返回路径提示 ────────────────────────────────
+        parent = self.peek_tab_visit()
+        if parent is not None and parent in open_pages:
+            try:
+                parent_title = (await parent.title()) or parent.url or "about:blank"
+                if len(parent_title) > 24:
+                    parent_title = parent_title[:21] + "..."
+            except Exception:
+                parent_title = parent.url or "about:blank"
+            parent_idx = open_pages.index(parent)
+            # 只在父 != 当前活跃 tab 时提示（否则提示无意义）
+            if parent_idx != active_idx:
+                base += f"   ↩ close_tab 将回到 [{parent_idx}] {parent_title}"
+        return base
 
     async def get_active_page_summary(self) -> str:
         """返回当前激活页面的标题和 URL，供提示词注入与调试使用。"""
@@ -3862,6 +4571,7 @@ Object.defineProperty(navigator, 'languages', {
 
     async def close(self) -> None:
         """关闭持久化上下文和 Playwright 实例，释放资源。"""
+        self._closed = True
         if self._intercept_count > 0:
             logger.info(
                 f"Session summary: intercepted {self._intercept_count} total records"

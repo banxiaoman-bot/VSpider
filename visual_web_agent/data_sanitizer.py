@@ -426,19 +426,29 @@ def _has_source_evidence(
     source_compact = _compact_stable_text(source_norm)
 
     if not numeric_dense:
+        short_text_evidence = 0
+        numeric_evidence = 0
         for key, value in clean.items():
             value_norm = _normalise_for_match(value)
-            if not value_norm or _looks_numeric_or_time(value_norm):
+            if not value_norm:
+                continue
+            if _looks_numeric_or_time(value_norm):
+                if value_norm in source_norm:
+                    numeric_evidence += 1
                 continue
             compact = _compact_stable_text(value_norm)
             exact_match = value_norm in source_norm
             compact_match = len(compact) >= 8 and compact in source_compact
+            if exact_match and len(compact) >= 2 and not _is_volatile_evidence_key(key):
+                short_text_evidence += 1
             if not (exact_match or compact_match):
                 continue
             if _is_identity_key(key) and len(compact) >= 4:
                 return True
             if not _is_volatile_evidence_key(key) and len(compact) >= 4:
                 return True
+        if len(clean) >= 4 and short_text_evidence >= 2 and numeric_evidence >= 1:
+            return True
         return False
 
     evidence = 0

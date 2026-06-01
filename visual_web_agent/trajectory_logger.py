@@ -122,10 +122,15 @@ main{{max-width:1500px;margin:24px auto;padding:0 24px 48px;display:flex;flex-di
 class HtmlLogger:
     """Append-only HTML trajectory logger."""
 
-    def __init__(self, goal: str = "", log_dir: str | Path = "logs") -> None:
+    def __init__(
+        self,
+        goal: str = "",
+        log_dir: str | Path = "logs",
+        run_id: str = "",
+    ) -> None:
         log_path = Path(log_dir)
         log_path.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = str(run_id or "").strip() or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = log_path / f"run_log_{ts}.html"
         header = _build_header(goal=goal, start_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         with open(self.path, "w", encoding="utf-8", newline="\n") as f:

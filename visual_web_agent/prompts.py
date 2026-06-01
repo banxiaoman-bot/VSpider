@@ -12,6 +12,11 @@ try:
 except ImportError:
     from prompt_skills import SKILL_PROMPTS, STATIC_PROMPT_PARTS
 
+try:
+    from .extraction_engine.strategies import infer_goal_output_contract
+except ImportError:
+    from extraction_engine.strategies import infer_goal_output_contract
+
 SYSTEM_PROMPT = """你是一个顶级的高级网页自动化智能体 (Visual Web Agent)。你的任务是根据用户的自然语言指令，结合网页截图和无障碍语义树 (AX Tree)，精确地下发网页控制动作。
 
 ## 输入上下文（每轮固定收到三部分）
@@ -115,10 +120,10 @@ If the current page is already the main/dashboard/business page, execute the use
         {
             "thought": "在决定动作前，你必须先翻译用户的口语意图，并结合当前截图和 AX Tree 描述你的推理过程（参考下方「语义对齐映射表」和「思考与决策范例」）",
             "current_state": "当前屏幕状态的客观描述（例如：处于首页搜索框前、弹出了错误提示、数据仍显示为空Loading中）",
-            "action": "click | click_new_tab | type | hover | scroll | smooth_scroll | find_text | form_set | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | click_point | remove_element | drag_and_drop",
-            "target_id": 数字序号（click/click_new_tab/type/hover/extract_link/download_image/upload/save_to_memory/switch_tab/remove_element 时必填真实序号；scroll/smooth_scroll/wait/extract/done/press_key/goto/close_tab/click_point 填 0）,
-            "type_value": "如果 action 是 type，填写要输入的文本内容（支持 {{变量名}} 引用记忆库中的值）；如果是 scroll 或 smooth_scroll，填写方向（down/up/bottom/top）；如果是 wait，填写等待秒数（1-5）；如果是 upload，填写文件路径；否则留空",
-            "memory_key": "仅当 action 为 save_to_memory 时必填，填写存储该值所用的变量名（如 'order_id'、'user_name'）；其他 action 填空字符串",
+            "action": "click | click_new_tab | fetch_link_content | fetch_links_batch | chat_extract | type | hover | hover_and_click | row_action | scroll | smooth_scroll | find_text | form_set | wait | select | press_key | goto | extract | extract_link | download_image | upload | close_tab | switch_tab | save_to_memory | done | click_point | remove_element | drag_and_drop",
+            "target_id": 数字序号（click/click_new_tab/type/hover/extract_link/download_image/upload/save_to_memory/switch_tab/remove_element/fetch_link_content 时必填真实序号；scroll/smooth_scroll/wait/extract/chat_extract/done/press_key/goto/close_tab/click_point/fetch_links_batch 填 0；fetch_link_content 若 type_value 直接传 URL 则 target_id=0）,
+            "type_value": "如果 action 是 type，填写要输入的文本内容（支持 {{变量名}} 引用记忆库中的值）；如果是 fetch_links_batch，填写 JSON，如 {\"target_ids\":[16,32],\"mode\":\"dom|ax\",\"selectors\":[\"article\",\"main\"]}；如果是 fetch_link_content，可直接 URL 或 JSON {\"url\":\"...\",\"selectors\":[\"main\"],\"mode\":\"ax\"}；如果是 scroll 或 smooth_scroll，填写方向（down/up/bottom/top）；如果是 wait，填写等待秒数（1-5）；如果是 upload，填写文件路径；否则留空",
+            "memory_key": "当 action 为 save_to_memory/fetch_link_content/fetch_links_batch/chat_extract 时必填，填写存储该值所用的变量名（如 'order_id'、'article_1'、'top_results'、'ai_answer'）；其他 action 填空字符串",
             "extracted_data": null 或 结构化数据（仅当 action 为 extract 时必填，其他情况填 null）,
             "point": null 或 [x, y]（仅当 action 为 click_point 时必填，填写目标元素的千分制归一化坐标，范围 0-1000，左上角[0,0]右下角[1000,1000]；其他情况填 null）,
             "status": "success | captcha_detected | error"
@@ -172,12 +177,14 @@ If the current page is already the main/dashboard/business page, execute the use
 - **scroll**：滚动页面。`target_id` 填 0；在 `type_value` 中指定方向：`"down"`（向下一屏，默认）、`"up"`（向上一屏）、`"bottom"`（直接滚到页面最底部）、`"top"`（直接回到顶部）。**注意**：底层会检测滚动前后的位置；如果页面位置没有变化（已到边缘），会自动抛出错误并触发自愈，请不要无意义地重复向同一方向滚动
 - **smooth_scroll**：**人类仿真平滑滚动**（优先于 scroll 使用）。底层使用 `behavior:'smooth'` 模拟人类鼠标滚轮，滚动幅度约 80% 屏高。适用场景：① 瀑布流/无限加载页面（需要触发 Intersection Observer 懒加载）；② Hacker News / 微博等对瞬间跳转敏感的页面；③ 任何用普通 `scroll` 触发死循环熔断的场景。`target_id` 填 0；`type_value` 填 `"down"` 或 `"up"`。
 - **find_text**：滚动定位指定文字或字段标签。`target_id` 填 0；`type_value` 填要找的可见文字（如 `"Activity type"`、`"Resources"`、`"Create"`）。长文档/长表单里找特定字段或按钮时优先用它，不要上下盲滚。
+- **targeted_probe**：局部元素探针。`target_id` 填 0；`type_value` 可留空使用当前任务目标，也可写 `"input,button | 搜索框"`、`"link | View profile"` 这类格式。它不会改变页面状态，只返回与目标相关的 input/button/link/table/dialog 候选、selector、bbox 和证据。适用场景：你知道要找输入框/按钮/链接/表格/弹窗，但全页 SoM 太吵、目标没有红框、或需要先局部确认再操作。
 - **form_set**：按字段标签设置表单控件。`target_id` 填 0；`type_value` 填 `"字段标签=目标值"`，如 `"Activity name=VSpider 测试"`、`"Activity zone=Zone one"`、`"Instant delivery=开启"`。组件库表单、下拉、开关、复选框、单选框优先使用它，不要猜测红框 ID。
 - **wait**：**显式主动等待**。当你执行了搜索提交、翻页跳转、上传触发等操作后，**预判页面需要较长加载动画时**，可使用此动作主动暂停，避免截取到正在 Loading 的中间态页面。`target_id` 填 0；`type_value` 填整数秒数（**范围 1-5**，底层会限制最大 10 秒）。**注意**：轻度等待已由系统自动处理，仅在明显需要额外缓冲时使用，不要滥用。
 - **remove_element**：**物理铲除 DOM 节点**（终极反遮挡手段）。当页面被悬浮广告、Cookie 横幅、登录遮罩、全屏 Modal 等节点挡住，导致 `click` / `press_key Escape` 均无法关闭时，使用此动作直接从 DOM 树中删除该节点。节点一旦删除即永久消失（本次会话内），后续截图将不再看到它。`target_id` 填被遮挡元素（如广告层）的红框 ID；不需要 `type_value`。
 - **drag_and_drop**：**拖拽操作**。将 `target_id` 指定的源元素拖放到 `type_value` 指定 ID 的目标元素上。`target_id` 填拖拽起点的红框 ID；`type_value` 填拖拽终点的红框 ID（字符串形式）。适用场景：文件拖放、列表排序、看板卡片移动等。
 - **upload**：静默上传文件，完全绕过系统弹窗。当你观察到"上传文件"、"导入"、"选择文件"等按钮或虚线拖拽框时，**绝对不要执行 click**（点击会弹出系统文件选择器，VLM 无法操控）。请直接对该元素执行 upload 动作。底层会自动定位 `<input type="file">` 并通过 `set_input_files` 静默注入文件，不会产生任何系统弹窗。如果 goal 中明确指定了文件路径，请将其填入 `type_value`；否则留空（系统会使用预配置文件）。
 - **extract**：从当前页面截图中提取数据。仔细阅读页面上的文字、表格、数值，**严格按照用户目标中的筛选条件过滤**，将符合条件的数据整理为结构化 JSON 存入 extracted_data 字段。用于"获取、提取、统计、读取"类目标。`target_id` 填 0 表示全页视觉提取（最常用）。**⚠️ 绝对铁律：执行 extract 动作时，你输出的 JSON 结构中【必须包含】`extracted_data` 字段，且内容必须是提取出的真实 JSON 对象或列表，绝对禁止输出 null 或漏掉该字段！违反此规则系统会拒绝执行并强制你重试。** **📌 跨页提取规则：你每次只需要提取【当前屏幕可见】的数据。如果任务需要跨页提取（如"提取前两页数据"），请放心翻页后再次执行 extract，底层系统会自动将新数据追加合并到同一个文件中。不要在本次提取中重复包含上一页已提取过的历史数据！**
+- **chat_extract**：**AI 聊天回答专用提取**（聊天/AI 助手页必须用它，不要用通用 extract）。在你向 ChatGPT / Claude / 文心 / 通义 / 豆包 / Kimi / 智谱 / 元宝 / DeepSeek 等聊天页提交问题之后，调用此动作即可一站式完成"主动滚动到底部触发流式渲染 + 等待 is-streaming/typing 指示器消失 + 智能选回答块 + 排除搜索结果干扰 + 全页 innerText 兜底"。`target_id` 填 0；`type_value` 留空（高级用法可填 JSON `{"timeout":25,"min_length":80}`，回答很长时把 timeout 调到 35）；`memory_key` 必填（如 `"ai_answer"`）。**特别针对百度文心**（chat.baidu.com/search/?q=...）这种搜索+AI 混排页设计，会主动滚整页到底、绕开搜索结果块直击 AI 回答容器，并在选择器都失效时返回剔除导航/搜索区后的全页正文。完成后通常下一步 `done`。**不要在 chat_extract 之前手动 scroll**——它内部已经滚了。
 - **extract_link**：提取目标元素的链接属性（如通过图片获取下载地址，或某个 A 标签的直达链接）。如果你需要获取图片的下载地址或某个跳转链接，请输出 action: 'extract_link'，并指定目标的 target_id。底层程序会自动提取该元素的属性并将链接保存或输出。
 - **download_image**：免登录下载图片。当你观察到需要下载的图片时，请输出 action: 'download_image'，并提供该图片的 target_id。底层将自动继承浏览器鉴权态把该图片直接下载到本地。
 - **select**：选择下拉框中的选项。当你看到原生的 `<select>` 下拉框时，使用 select 动作，在 type_value 中填写要选择的选项文本。
@@ -650,6 +657,8 @@ _CREDENTIAL_KEYWORDS = (
 _MULTI_TAB_KEYWORDS = (
     "当前标签页列表", "标签页", "新标签", "新窗口", "后台打开", "switch_tab",
     "close_tab", "click_new_tab", "new tab", "tab",
+    # 批量取链接内容也归入多 tab 范畴 — 走 fetch_links_batch 更快
+    "每个链接", "每条结果", "依次抓取", "依次提取", "批量抓取",
 )
 _HITL_KEYWORDS = ("captcha", "验证码", "风控", "扫码", "短信", "二次鉴权", "ask_human")
 
@@ -776,6 +785,62 @@ def _text_has_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(k in text for k in keywords)
 
 
+def _resolver_matches(goal: str) -> bool:
+    """Return True iff ``visual_web_agent.relative_date`` could resolve a
+    relative-date phrase in ``goal``.
+
+    Wrapped in try/except for two reasons:
+      * Test fixtures may import this module before sys.path resolves the
+        relative_date module — fall back to keyword-only triggering.
+      * relative_date itself is pure / synchronous / no-side-effect, but
+        we still defensively isolate any future regex regression so it
+        can never crash the system-prompt build.
+    """
+    if not goal:
+        return False
+    try:
+        try:
+            from .relative_date import resolve_relative_date
+        except ImportError:  # pragma: no cover - direct script import
+            from relative_date import resolve_relative_date
+        return resolve_relative_date(goal) is not None
+    except Exception:
+        return False
+
+
+# Cheap URL extractor — pulls http(s) URLs out of the browser_state blob so
+# the data_export registry can be tested without needing the live page.
+_URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+", re.I)
+
+
+def _url_matches_data_export_registry(browser_state: str) -> bool:
+    """Return True iff ``browser_state`` contains a URL recognised by any
+    transformer registered in :mod:`visual_web_agent.data_export`.
+
+    This is the authoritative trigger for ``DATA_EXPORT_SKILL``: keyword
+    fallback (``_DATA_EXPORT_TRIGGERS``) catches text mentions, this catches
+    actual URLs in the page snapshot. Adding a new ``ExportTransform``
+    auto-wires it through both signals.
+
+    Defensive try/except so a registry import failure can't break prompt
+    building (the keyword fallback still fires).
+    """
+    if not browser_state:
+        return False
+    try:
+        try:
+            from .data_export import find_data_export_url
+        except ImportError:  # pragma: no cover - direct script import
+            from data_export import find_data_export_url
+        for match in _URL_RE.finditer(browser_state[:8000]):
+            name, export = find_data_export_url(match.group(0))
+            if name and export:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 _FORM_TRIGGERS = (
     "表单", "填写", "填入", "输入", "提交", "筛选", "过滤", "查询", "搜索",
     "日期", "下拉", "树形", "上传", "导入",
@@ -801,8 +866,13 @@ _CREDENTIAL_TRIGGERS = (
     "密码", "手机号", "手机", "邮箱", "账号", "用户名", "凭证", "密钥",
 )
 _MULTI_TAB_TRIGGERS = (
+    # 原有：用户显式描述多 tab 操作
     "标签页", "新标签", "新窗口", "后台打开", "switch_tab", "close_tab",
     "click_new_tab", "new tab", "tab",
+    # 新增：批量取链接内容的语义，触发 fetch_links_batch / fetch_link_content 的指引
+    "每个链接", "每条结果", "前几条", "前 3 条", "前3条", "前 5 条", "前5条",
+    "每篇", "每个搜索结果", "依次抓取", "依次提取", "批量抓取", "批量提取",
+    "fetch", "fetch_link", "fetch_links_batch", "extract content from",
 )
 _HOVER_MENU_TRIGGERS = (
     "hover", "悬浮", "悬停", "鼠标悬停", "下拉菜单", "菜单项", "弹出菜单",
@@ -812,6 +882,109 @@ _HOVER_MENU_TRIGGERS = (
 _CASCADER_TRIGGERS = (
     "cascader", "级联", "级联选择器", "多级菜单", "多级下拉", "多级选择",
     "树形级联", "选择路径", "->", "→",
+)
+# Row-action: VLM should use the system's row_action handler when goal asks
+# for "delete/edit/view/approve/retry the row where X". Critically narrow —
+# pure list-extract goals must NOT pull this in, or VLM will start hunting
+# for buttons in extraction tasks.
+_ROW_ACTION_TRIGGERS = (
+    # CN: "<动词> + 那一行/那条/这条/这行"
+    "那一行", "这一行", "那行", "这行", "那条", "这条",
+    "行内", "行操作", "行的删除", "行的编辑", "row action",
+    # CN explicit row-anchored verbs
+    "删除张", "删除李", "删除王", "删除赵",  # 张三/李四等姓氏开头
+    "删除该行", "编辑该行", "查看该行", "审批该行", "批准该行", "重试该行",
+    "删除这条", "删除该条", "编辑这条", "审批这条", "重试这条",
+    "把状态", "状态是",
+    "订单号", "订单 #", "order #", "order id",
+    # EN: "delete/edit/view/approve/retry the row where ..."
+    "the row where", "delete the row", "edit the row",
+    "view the row", "approve the row", "retry the row",
+    "row with status", "row where status",
+)
+# Confirm dialog: triggered by destructive verbs OR explicit dialog mentions.
+# Co-pulled with ROW_ACTION (most row deletes spawn a confirm modal).
+_CONFIRM_DIALOG_TRIGGERS = (
+    "确认弹窗", "确认对话框", "确认框", "二次确认", "二次确定",
+    "确定按钮", "弹出确认", "弹窗确认", "messagebox", "message box",
+    "el-message-box", "ant-modal-confirm", "popconfirm",
+    "confirm dialog", "confirmation modal", "confirmation dialog",
+    # Destructive verbs that almost always spawn confirm modals
+    "删除", "清空", "重置全部", "取消订阅", "退订",
+    "delete ", "clear all", "reset all", "unsubscribe",
+)
+_TREE_TRIGGERS = (
+    "树形", "树结构", "树控件", "文件树", "目录树", "组织架构", "组织架构树",
+    "分类树", "el-tree", "ant-tree", "ant tree", "<tree>", "node tree",
+    "tree view", "tree control", "treeview",
+    "expand the node", "expand the folder", "collapse the node",
+    "展开节点", "展开目录", "展开父节点", "折叠节点",
+)
+_STEPPER_TRIGGERS = (
+    "stepper", "wizard", "向导", "多步表单", "分步表单", "分步注册",
+    "step 1", "step 2", "step 3", "第一步", "第二步", "第三步",
+    "next step", "下一步", "上一步", "previous step",
+    "el-steps", "ant-steps", "步骤条",
+)
+# Loaded when the goal references a relative date that the resolver
+# (visual_web_agent.relative_date) can pin to an absolute date. The trigger
+# is a fast keyword fallback (used by tests + when the resolver isn't
+# available); the authoritative test in select_skills calls
+# resolve_relative_date() directly so the skill follows the SAME generic
+# capability that augments the goal — no per-phrase / per-site patches.
+_RELATIVE_DATE_TRIGGERS = (
+    # System-injected hint marker (highest signal — 100% reliable)
+    "【相对日期解析】",
+    # Day offsets
+    "今天", "今日", "明天", "明日", "后天", "大后天",
+    "昨天", "昨日", "前天", "大前天",
+    "today", "tomorrow", "yesterday",
+    # Month offsets — both directions, including multi-level "下下月"
+    "下个月", "下月", "下下月", "下下个月", "下下下月", "次月",
+    "上个月", "上月", "上上月", "上上个月", "上上上月",
+    "本月", "这个月", "当月",
+    "next month", "last month", "previous month", "this month",
+    "following month", "coming month",
+    # Year offsets
+    "明年", "去年", "今年", "后年", "前年", "大后年", "大前年",
+    "next year", "last year", "previous year",
+    # Week offsets — also the relative weekday triggers
+    "下周", "上周", "本周", "下星期", "上星期",
+    "next week", "last week", "this week",
+    # Boundaries
+    "月底", "月初", "月中", "月末", "本月最后", "本月最后一天",
+    "end of month", "start of month", "beginning of month",
+    # N-day arithmetic (catch by suffix tokens)
+    "天后", "天前", "天之后", "天之前",
+    "days ago", "days from now", "days later",
+    # In/Ago English
+    "in 1 day", "in 2 day", "in 3 day", "in 4 day", "in 5 day",
+    "in 6 day", "in 7 day", "in 10 day", "in 14 day", "in 30 day",
+)
+# Generic data-export trigger keywords. These are a *fallback* — the
+# authoritative test is ``_url_matches_data_export_registry`` which calls
+# the actual data_export registry. New data sources auto-trigger when
+# someone adds an ``ExportTransform`` — no need to update this list.
+_DATA_EXPORT_TRIGGERS = (
+    # URL signals — caught via browser_state too
+    "docs.google.com/spreadsheets",
+    "onedrive.live.com", "1drv.ms", ".sharepoint.com",
+    # Goal-text signals
+    "google sheets", "google sheet", "google 表格", "google表格",
+    "google spreadsheet",
+    "onedrive", "sharepoint", "office 365", "office365",
+    ".xlsx", ".xlsm", ".csv", ".tsv",
+    "导出 csv", "导出csv", "下载 csv", "下载csv",
+    "导出 excel", "导出excel", "下载 excel", "下载excel",
+    "export csv", "export excel", "download csv", "download xlsx",
+)
+_FEED_AD_FILTER_TRIGGERS = (
+    "跳过广告", "跳过推广", "排除广告", "排除推广", "过滤广告", "过滤推广",
+    "不要广告", "不计广告", "去除广告", "屏蔽广告",
+    "skip ad", "skip ads", "skip sponsored", "exclude ad", "exclude sponsored",
+    "filter out ad", "no ads", "without ads",
+    # Strong implicit signals: "真实/技术 文章" + "广告/推广" co-occurring
+    "真实的技术", "只提取真实", "真实文章",
 )
 _TOOLTIP_TRIGGERS = (
     "tooltip", "tool tip", "popover", "提示框", "提示气泡", "黑色提示",
@@ -824,6 +997,18 @@ _HITL_TRIGGERS = (
 _MEMORY_TRIGGERS = ("save_to_memory", "{{", "记忆", "跨页面", "变量", "memory")
 _SEMANTIC_TRIGGERS = (
     "语义", "意图", "模糊", "hover", "拖拽", "drag", "广告", "遮挡", "弹窗", "关闭",
+)
+# Loaded when the user is asking the agent to use a chat / assistant /
+# Q&A service. The pattern "find X assistant + type a question + read
+# answer" is the highest-volume failure mode for entry-page confusion
+# (run_log_20260514_183718: 20 wasted steps after VLM submitted to the
+# Baidu search box thinking it was Wenxin chat input).
+_CHAT_ENTRY_TRIGGERS = (
+    "助手", "对话", "聊天", "提问", "问 AI", "让 AI", "问问",
+    "文心", "通义", "豆包", "kimi", "hunyuan", "腾讯元宝", "智谱", "ChatGLM",
+    "chatgpt", "chat gpt", "claude", "gemini", "copilot",
+    "ai 回答", "ai回答", "ai 回复", "ai回复",
+    "介绍一下", "回答一下", "解释一下",  # common chat-style asks
 )
 
 
@@ -902,10 +1087,45 @@ def build_system_prompt(
         skills.append("hover_menu")
     if _text_has_any(haystack, _CASCADER_TRIGGERS):
         skills.append("cascader")
+    # Row action: the system-injected `row_action` handler needs FORM_SKILL's
+    # verification rules ("read row.value to confirm") + CONFIRM_DIALOG_SKILL
+    # to handle the post-click modal. Inject all three together so the prompt
+    # is self-contained.
+    if _text_has_any(haystack, _ROW_ACTION_TRIGGERS):
+        if "form" not in skills:
+            skills.append("form")
+        skills.append("row_action")
+        if "confirm_dialog" not in skills:
+            skills.append("confirm_dialog")
+    if _text_has_any(haystack, _CONFIRM_DIALOG_TRIGGERS):
+        if "confirm_dialog" not in skills:
+            skills.append("confirm_dialog")
+    if _text_has_any(haystack, _TREE_TRIGGERS):
+        skills.append("tree")
+    if _text_has_any(haystack, _STEPPER_TRIGGERS):
+        # Stepper goals are by definition form goals, pull FORM too.
+        if "form" not in skills:
+            skills.append("form")
+        skills.append("stepper")
+    if _text_has_any(haystack, _RELATIVE_DATE_TRIGGERS) or _resolver_matches(goal):
+        # Pull in FORM first if it wasn't already, so the date-picker block
+        # has the broader "calendar value verification" rules to lean on.
+        if "form" not in skills:
+            skills.append("form")
+        skills.append("relative_date")
+    if _text_has_any(haystack, _FEED_AD_FILTER_TRIGGERS):
+        skills.append("feed_ad_filter")
+    if (
+        _text_has_any(haystack, _DATA_EXPORT_TRIGGERS)
+        or _url_matches_data_export_registry(browser_state)
+    ):
+        skills.append("data_export")
     if _text_has_any(haystack, _TOOLTIP_TRIGGERS):
         skills.append("tooltip")
     if _text_has_any(haystack, _SEMANTIC_TRIGGERS):
         skills.append("semantic")
+    if _text_has_any(haystack, _CHAT_ENTRY_TRIGGERS):
+        skills.append("chat_entry")
     if _text_has_any(haystack, ("示例", "范例", "few-shot", "few shot")):
         skills.append("few_shot")
 
@@ -924,6 +1144,7 @@ def build_user_message(
     input_descriptions: str = "",
     workflow_memory: dict | None = None,
     task_plan: "object | None" = None,
+    capability_route: dict | None = None,
 ) -> str:
     """
     构建发送给 VLM 的用户消息文本部分。
@@ -944,6 +1165,31 @@ def build_user_message(
         f"🎯 ## 你的终极目标（Task）\n{goal}\n",
         f"## 进度\n当前是第 {step} 步，最多执行 {max_steps} 步。\n",
     ]
+    try:
+        _output_contract = infer_goal_output_contract(goal)
+    except Exception:
+        _output_contract = {}
+    _output_mode = str(_output_contract.get("mode") or "default")
+    if _output_mode == "answer":
+        parts.append(
+            "## Output intent\n"
+            "The user is asking for a concise answer, not a dataset export. "
+            "When the visible page already contains the answer, finish with action=done. "
+            "If you must use extract, extract only the target answer facts; do not save "
+            "generic search-result lists, recommendation chips, navigation text, or unrelated rows.\n"
+        )
+    elif _output_mode == "artifact":
+        parts.append(
+            "## Output intent\n"
+            "The user is asking for structured data or a saved artifact. Use extract/download/export "
+            "when the target rows or file are visible, and keep rows aligned to the requested fields.\n"
+        )
+    elif _output_mode == "mixed":
+        parts.append(
+            "## Output intent\n"
+            "The user wants both an answer and a saved/structured result. Capture the requested facts "
+            "cleanly and avoid unrelated page lists or search-result noise.\n"
+        )
     # ── 历史骑脸前置：把"已完成的操作 + 结果"紧贴在终极目标下方 ─────────────
     # 旧位置（AX Tree 之后）被长文本稀释，VLM 容易忽略；
     # 新位置 + 双层 ===== 分隔符用版式权重压制后续所有视觉描述，
@@ -955,6 +1201,9 @@ def build_user_message(
             f"{history}\n"
             "=========================================================\n"
         )
+    route_section = _format_capability_route_guidance(capability_route)
+    if route_section:
+        parts.append(route_section)
     # ── Wave 2：任务计划骑脸注入（紧贴历史之下）──────────────────────────
     # 让 VLM 每步都看到"整体计划 + 当前子目标 + 退出标准"，治跨步战略盲视。
     if task_plan is not None and getattr(task_plan, "sub_goals", None):
@@ -1007,6 +1256,57 @@ def build_user_message(
     return "\n".join(parts)
 
 
+def _format_capability_route_guidance(capability_route: dict | None) -> str:
+    if not isinstance(capability_route, dict) or not capability_route:
+        return ""
+    intent = capability_route.get("intent") or {}
+    backend_plan = capability_route.get("backend_plan") or []
+    fallback_chain = capability_route.get("fallback_chain") or []
+    selected_tools = capability_route.get("selected_agent_tools") or []
+    model_roles = capability_route.get("model_roles") or {}
+    task_type = str(intent.get("task_type") or "").strip()
+    output_mode = str(intent.get("output_mode") or "").strip()
+    plan_names = [
+        str(item.get("name") or "").strip()
+        for item in backend_plan
+        if isinstance(item, dict) and item.get("name")
+    ][:8]
+    fallback_names = [
+        str(item.get("capability") or "").strip()
+        for item in fallback_chain
+        if isinstance(item, dict) and item.get("capability")
+    ][:8]
+    tool_names = [
+        str(item.get("name") or "").strip()
+        for item in selected_tools
+        if isinstance(item, dict) and item.get("name")
+    ][:8]
+    vision_role = model_roles.get("vision_model") or {}
+    semantic_role = model_roles.get("semantic_model") or {}
+    lines = ["## Capability Route Guidance（系统路由建议，决策前必读）"]
+    if task_type or output_mode:
+        lines.append(f"- 任务类型: {task_type or 'unknown'}；输出模式: {output_mode or 'default'}")
+    if plan_names:
+        lines.append("- 推荐优先能力: " + " → ".join(plan_names))
+    if fallback_names:
+        lines.append("- 兜底顺序: " + " → ".join(fallback_names))
+    if tool_names:
+        lines.append("- 可用确定性 Agent 工具: " + ", ".join(tool_names))
+    lines.append(
+        "- 约束: 优先使用已注册的确定性动作/宏/抽取能力；不要凭空发明新 action；"
+        "当推荐能力与当前页面状态冲突时，以当前截图和 AX Tree 为准。"
+    )
+    if semantic_role:
+        lines.append("- 语义模型职责: 理解目标、拆解计划、审计卡住原因；不要替代运行时校验。")
+    if vision_role:
+        recommended = str(vision_role.get("recommended_use") or "fallback_or_verification")
+        lines.append(
+            "- 视觉模型职责: 只负责当前截图+AX 的可视化定位与歧义消解；"
+            f"本任务视觉使用建议: {recommended}。"
+        )
+    return "\n".join(lines) + "\n"
+
+
 # ════════════════════════════════════════════════════════════════
 #  Wave 2 — Planner / Reflector prompt builders
 # ════════════════════════════════════════════════════════════════
@@ -1039,12 +1339,28 @@ def build_plan_prompts(
         "   禁止把「让整个表单完整出现在同一屏」作为子目标或退出标准。长表单应拆成按字段顺序填写的子目标，"
         "   exit_criteria 使用「某字段已显示指定值 / 某选项已选中 / 最终 Create 或 Submit 已点击」这类可观察状态。"
         "   如果首屏已看见目标字段（如 Activity name），第一个子目标必须是填写当前可见字段，而不是继续向下滚动。\n"
-        "6. 🔒 登录墙识别：若完成 goal 显然需要登录态（访问私有内容、发贴、下单等），"
-        "   且 goal 文本中**未**明确给出凭证（如 {{phone}} / {{password}} 占位符、"
-        "   或直接写出账号密码），则第一个子目标必须设为登录墙探测，其 exit_criteria 写："
-        "   「若起始 URL 或首屏出现登录/验证页（URL 含 login/signin/passport/sso，"
-        "   或有手机号/密码/验证码输入框），立即 abort；否则视为已登录，推进下一子目标」。"
-        "   禁止把「完成登录」作为独立子目标 —— 无凭证就别尝试，直接 abort。\n\n"
+        "6. 🔒 **登录处理原则：被动响应，不主动探测**（CRITICAL — 适用于所有任务类型）\n"
+        "   核心理念：**能用就用，不能用才喊人**。绝大多数站点（包括聊天页、电商、"
+        "   工具页）在未登录态都有大量功能可用；主循环的运行时 guard（PRELOGIN 检测、"
+        "   CHAT DRIFT GUARD、ask_human 兜底）会在真正撞到登录墙时介入。在 Planner "
+        "   层凭空塞「探测登录」子目标，只会让 VLM 把第一步浪费在点登录按钮上。\n"
+        "   规则：\n"
+        "   (a) **只有当 goal 文本里明确出现**「登录」「先登录」「帮我登录」「log in」"
+        "       「sign in」等祈使动词，**或**给出了凭证占位符（如 `{{phone}}` / "
+        "       `{{password}}` / `{{verify_code}}`），才把「完成登录」列为第一个子目标，"
+        "       其 exit_criteria 写「URL 已离开 /login，页面进入业务态」。\n"
+        "   (b) goal **没明说**登录、也没给凭证 → **绝对不要**添加「探测登录 / "
+        "       检查登录态 / 打开登录页」类子目标，哪怕你觉得"
+        "       「这站点似乎需要登录才能用」。直接按 goal 字面动作拆分，第一个子目标"
+        "       就是 goal 要做的第一件事（输入框输入 / 搜索 / 点击列表项 / 提取数据 等）。\n"
+        "   (c) 即使没有凭证、运行时却撞上了登录墙，主循环会自动 `ask_human` 让"
+        "       用户人工介入；Planner 不需要在计划层重复防御。\n"
+        "6b. 📝 **goal 已经把要做的事描述完整时**（例如「打开页面，在输入框中输入 X，"
+        "    回车后获取回答」「提取列表前 10 条」「点击下一页直到末页」），子目标必须"
+        "    严格贴合 goal 字面动作，不要凭空插入『检查登录』『关闭弹窗』『确认页面加载』"
+        "    『验证元素可见』等 goal 没要求的探测步骤 —— 主循环的运行时 guard 会处理"
+        "    这些非业务态。Planner 的职责是「翻译用户意图为有序步骤」，不是「写一份"
+        "    防御性 SOP」。\n\n"
         "输出要求：\n"
         "- 只输出 JSON，不要任何 markdown、不要解释文字\n"
         "- JSON 结构：{\"goal\": str, \"sub_goals\": [{id, description, exit_criteria, status}], "

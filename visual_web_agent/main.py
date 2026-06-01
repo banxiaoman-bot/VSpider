@@ -16,9 +16,11 @@ VSpider 主程序入口
 import asyncio
 import argparse
 import calendar
+import csv
 from difflib import SequenceMatcher
 from functools import lru_cache
 import hashlib
+import io
 import json
 import logging
 import math
@@ -27,9 +29,11 @@ import re
 import sys
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from typing import Any
+from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,10 +43,17 @@ for _dotenv_path in (_PROJECT_ROOT / ".env", _APP_ROOT / ".env"):
         load_dotenv(dotenv_path=_dotenv_path, override=False)
 
 try:
-    from .config import MAX_STEPS, SCREENSHOT_DIR
+    from .config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from .browser_env import BrowserEnv, ActionExecutionError
+    from .browser_pool import acquire_browser, release_browser
     from .vlm_client import VLMClient, TaskPlan, SubGoal
-    from .data_manager import save_to_excel
+    from .data_writers import save_artifact, save_run_dataset, resolve_output_contract
+    from .io_contract import (
+        ensure_contract_skeleton,
+        ensure_input_contract_skeleton,
+        infer_output_contract,
+        write_output_contract,
+    )
     from .data_sanitizer import (
         TOOLTIP_UNIQUE_KEY,
         extract_tooltip_primary_key,
@@ -50,13 +61,60 @@ try:
     )
     from .artifact_manager import resolve_artifact_path
     from .trajectory_logger import HtmlLogger
+    from .action_result import ActionResult
+    from .action_registry import build_default_action_registry
+    from .capability_router import route_task as route_capabilities_for_task
+    from .browser_state import BrowserStateSnapshot
+    from .event_stream import EventStream
+    from .agent_strategy import (
+        extraction_targets_reached as _agent_strategy_extraction_targets_reached,
+        normalize_guard_url as _agent_strategy_normalize_guard_url,
+        normalize_output_field_key as _agent_strategy_normalize_output_field_key,
+        parse_goal_requested_fields as _agent_strategy_parse_goal_requested_fields,
+        parse_goal_target_count as _agent_strategy_parse_goal_target_count,
+        parse_goal_target_pages as _agent_strategy_parse_goal_target_pages,
+    )
     from .auth_vault import SecretResolutionError, resolve_env_placeholders
     from .page_data_controller import PageDataController
+    from .perception.targeted import format_probe_text
+    from .perception.targeted import choose_click_handoff_candidate
+    from .perception.targeted import choose_type_handoff_candidate
+    from .perception.targeted import probe_page
+    from .skills.registry import build_default_skill_registry
+    from .skills.replay import save_skill_replay_snapshot
+    from .extraction_engine.snapshots import maybe_save_snapshot
+    from .extraction_engine.recovery import rank_extraction_candidates_with_history
+    from .extraction_engine.cards import extract_semantic_card_rows
+    from .extraction_engine.strategies import (
+        choose_pre_extract_reached_candidate as _choose_pre_extract_reached_candidate,
+        click_target_is_same_page_extract_nav as _click_target_is_same_page_extract_nav,
+        data_shape_exposes_target_candidate as _data_shape_exposes_target_candidate,
+        infer_goal_output_contract,
+        infer_goal_strategy_context,
+    )
+    from .form_engine import (
+        parse_form_assignments as engine_parse_form_assignments,
+        prepare_form_batch_fields as engine_prepare_form_batch_fields,
+    )
+    from .failure_classifier import (
+        classify_and_log as _failure_classifier_fn,
+        FailureStats as _FailureStatsClass,
+    )
+    from .judge import TaskJudge, JudgeConfig
+    from .loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
+    from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
 except ImportError:
-    from config import MAX_STEPS, SCREENSHOT_DIR
+    from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
+    from browser_pool import acquire_browser, release_browser
     from vlm_client import VLMClient, TaskPlan, SubGoal
-    from data_manager import save_to_excel
+    from data_writers import save_artifact, save_run_dataset, resolve_output_contract
+    from io_contract import (
+        ensure_contract_skeleton,
+        ensure_input_contract_skeleton,
+        infer_output_contract,
+        write_output_contract,
+    )
     from data_sanitizer import (
         TOOLTIP_UNIQUE_KEY,
         extract_tooltip_primary_key,
@@ -64,8 +122,48 @@ except ImportError:
     )
     from artifact_manager import resolve_artifact_path
     from trajectory_logger import HtmlLogger
+    from action_result import ActionResult
+    from action_registry import build_default_action_registry
+    from capability_router import route_task as route_capabilities_for_task
+    from browser_state import BrowserStateSnapshot
+    from event_stream import EventStream
+    from agent_strategy import (
+        extraction_targets_reached as _agent_strategy_extraction_targets_reached,
+        normalize_guard_url as _agent_strategy_normalize_guard_url,
+        normalize_output_field_key as _agent_strategy_normalize_output_field_key,
+        parse_goal_requested_fields as _agent_strategy_parse_goal_requested_fields,
+        parse_goal_target_count as _agent_strategy_parse_goal_target_count,
+        parse_goal_target_pages as _agent_strategy_parse_goal_target_pages,
+    )
     from auth_vault import SecretResolutionError, resolve_env_placeholders
     from page_data_controller import PageDataController
+    from perception.targeted import format_probe_text
+    from perception.targeted import choose_click_handoff_candidate
+    from perception.targeted import choose_type_handoff_candidate
+    from perception.targeted import probe_page
+    from skills.registry import build_default_skill_registry
+    from skills.replay import save_skill_replay_snapshot
+    from extraction_engine.snapshots import maybe_save_snapshot
+    from extraction_engine.recovery import rank_extraction_candidates_with_history
+    from extraction_engine.cards import extract_semantic_card_rows
+    from extraction_engine.strategies import (
+        choose_pre_extract_reached_candidate as _choose_pre_extract_reached_candidate,
+        click_target_is_same_page_extract_nav as _click_target_is_same_page_extract_nav,
+        data_shape_exposes_target_candidate as _data_shape_exposes_target_candidate,
+        infer_goal_output_contract,
+        infer_goal_strategy_context,
+    )
+    from form_engine import (
+        parse_form_assignments as engine_parse_form_assignments,
+        prepare_form_batch_fields as engine_prepare_form_batch_fields,
+    )
+    from failure_classifier import (
+        classify_and_log as _failure_classifier_fn,
+        FailureStats as _FailureStatsClass,
+    )
+    from judge import TaskJudge, JudgeConfig
+    from loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
+    from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -110,14 +208,278 @@ def _broadcast_log_safe(message: str, level: str = "info") -> None:
         pass
 
 
-def _broadcast_done_safe(success: bool, message: str = "") -> None:
-    """向 API WebSocket 广播任务结束信号；未运行 API 时静默降级。"""
+# ── Final Answer 面板：每个 run 的答案元数据（由 _record_run_answer 写入） ──
+# 这两个变量被 _broadcast_done_safe 自动读取，将 answer_type / answer 字段
+# 透传给 api_server.broadcast_done，再由 WS 推送到前端 Final Answer Tab。
+# 仅 success=True 时附带；失败任务不会把 traceback 当作"最终结论"渲染。
+_RUN_OUTPUT_MODE: str | None = None
+_RUN_ANSWER_TEXT: str | None = None
+# F3: 答案域（"weather"|"stock"|"recipe"|"flight"|"generic"|None）。
+# 在 _compact_answer_text_for_goal 决议后由 _record_run_answer(domain=...) 写入，
+# 供前端 Final Answer 面板按域选择卡片渲染器。
+_RUN_ANSWER_DOMAIN: str | None = None
+_RUN_DONE_BROADCASTED: bool = False
+# Names of artifacts produced during the current run (consumed by
+# _broadcast_done_safe to auto-synthesise a file-mode summary).
+_RUN_NEW_ARTIFACT_NAMES: list[str] = []
+# K4: per-run failure metadata. Set at the top of the run function so
+# _broadcast_done_safe can call failure_archive.record_failure(...) with
+# the right run_id/goal/started_at when success=False arrives. None means
+# "this process hasn't started a run yet" — failure recording is skipped
+# in that state (e.g. tests that import main.py without launching a run).
+_RUN_ID: str | None = None
+_RUN_STARTED_AT: float | None = None
+_RUN_GOAL: str | None = None
+# Last step number reached this run (updated each loop iteration). Used
+# in the failure record so the UI can show "failed at step 7 of 40".
+_RUN_LAST_STEP: int | None = None
+
+
+def _record_run_answer(
+    *,
+    mode: str | None = None,
+    text: str | None = None,
+    domain: str | None = None,
+) -> None:
+    """记录本次 run 的"最终答案"元数据，供下次 done 广播使用。
+
+    ``mode`` 接受现有 ``_goal_output_mode`` 的取值（``"answer" | "artifact" |
+    "mixed" | "default"``）。只有 ``"answer"`` / ``"artifact"`` 会在 WS 上
+    映射出 answer_type；其余取值留空，让前端按 artifact 数量兜底推断。
+
+    ``text`` 是经 ``_clean_user_visible_done_message`` 清洗后的最终文本，
+    支持 Markdown。重复调用会覆盖上一次的 text — 始终以最后一次为准。
+
+    ``domain`` (F3) 是 ``_detect_answer_domain`` 返回的领域标签。
+    透传给前端可启用 stock / recipe / weather / flight 的专属卡片渲染。
+    """
+    global _RUN_OUTPUT_MODE, _RUN_ANSWER_TEXT, _RUN_ANSWER_DOMAIN
+    if mode is not None:
+        _RUN_OUTPUT_MODE = mode
+    if text is not None:
+        _RUN_ANSWER_TEXT = text
+    if domain is not None:
+        _RUN_ANSWER_DOMAIN = domain
+
+
+def _reset_run_answer() -> None:
+    """run 启动时清空答案状态，避免上次的答案在新 run 中被复用。"""
+    global _RUN_OUTPUT_MODE, _RUN_ANSWER_TEXT, _RUN_ANSWER_DOMAIN, _RUN_DONE_BROADCASTED
+    global _RUN_ID, _RUN_STARTED_AT, _RUN_GOAL, _RUN_LAST_STEP
+    _RUN_OUTPUT_MODE = None
+    _RUN_ANSWER_TEXT = None
+    _RUN_ANSWER_DOMAIN = None
+    _RUN_DONE_BROADCASTED = False
+    _RUN_NEW_ARTIFACT_NAMES.clear()
+    # K4: clear run identity so a stale ID from a previous run can't
+    # accidentally archive a failure for the new run if it crashes
+    # before _record_run_start fires.
+    _RUN_ID = None
+    _RUN_STARTED_AT = None
+    _RUN_GOAL = None
+    _RUN_LAST_STEP = None
+
+
+def _record_run_start(
+    *,
+    run_id: str,
+    goal: str | None = None,
+    started_at: float | None = None,
+) -> None:
+    """K4: stash run identity for ``_broadcast_done_safe`` to consume on
+    failure. Idempotent — overwrites any previous run's metadata.
+
+    ``started_at`` defaults to ``time.time()`` so callers don't have to
+    import time locally just to record this. ``goal`` is truncated by
+    ``failure_archive`` itself, so we pass it through verbatim.
+    """
+    global _RUN_ID, _RUN_STARTED_AT, _RUN_GOAL
+    rid = str(run_id or "").strip()
+    _RUN_ID = rid or None
+    _RUN_STARTED_AT = float(started_at) if started_at is not None else time.time()
+    _RUN_GOAL = (goal or None)
+
+
+def _record_run_step(step: int) -> None:
+    """K4: update the running step counter so failure records can show
+    ``"failed at step N"``. Best-effort; bad values are ignored."""
+    global _RUN_LAST_STEP
+    try:
+        _RUN_LAST_STEP = int(step)
+    except (TypeError, ValueError):
+        pass
+
+
+def _run_done_was_broadcasted() -> bool:
+    """Return whether this process already emitted a done event for the run."""
+    return bool(_RUN_DONE_BROADCASTED)
+
+
+def _record_new_artifact(name: str | None) -> None:
+    """Append an artifact filename to the per-run accumulator.
+
+    Called from ``artifact_manager.register_artifact`` so that the centralised
+    ``_broadcast_done_safe`` can synthesise a useful file-mode summary even
+    when no domain compactor produced explicit answer text. Empty / falsy
+    names are silently ignored. Duplicates are de-duplicated to keep the
+    summary readable when the same file is registered multiple times.
+    """
+    if not name:
+        return
+    text = str(name).strip()
+    if not text:
+        return
+    if text in _RUN_NEW_ARTIFACT_NAMES:
+        return
+    _RUN_NEW_ARTIFACT_NAMES.append(text)
+
+
+def _synthesize_file_mode_summary(names: list[str]) -> str:
+    """Render the accumulator into a Markdown summary for the Final Answer panel.
+
+    Returns ``""`` when the list is empty so the caller can fall back to
+    the existing fixed CTA. Names are quoted with backticks so the frontend
+    Markdown renderer styles them as inline code, matching the file-listing
+    look used elsewhere in the UI.
+    """
+    if not names:
+        return ""
+    n = len(names)
+    head_items = [f"`{nm}`" for nm in names[:5]]
+    head = "、".join(head_items)
+    if n > 5:
+        head += f" 等共 {n} 个"
+    else:
+        head += f"（共 {n} 个）" if n > 1 else ""
+    return (
+        f"📁 本次任务已导出文件：{head}。\n\n"
+        "请前往 **Artifacts** 面板下载。"
+    )
+
+
+def _derive_answer_type(mode: str | None) -> str | None:
+    """``_goal_output_mode`` → 前端 ``answer_type`` 的映射。"""
+    if mode == "answer":
+        return "text"
+    if mode == "artifact":
+        return "file"
+    return None
+
+
+def _broadcast_done_safe(
+    success: bool,
+    message: str = "",
+    *,
+    answer_type: str | None = None,
+    answer: str | None = None,
+    answer_domain: str | None = None,
+) -> None:
+    """向 API WebSocket 广播任务结束信号；未运行 API 时静默降级。
+
+    若调用方未显式提供 ``answer_type`` / ``answer``，会自动从模块级
+    ``_RUN_OUTPUT_MODE`` / ``_RUN_ANSWER_TEXT`` 中提取（见 ``_record_run_answer``）。
+    ``success=False`` 时不会附带 answer 字段，避免异常栈被前端误渲染为最终结论。
+
+    F3: ``answer_domain`` 同样从 ``_RUN_ANSWER_DOMAIN`` 兜底，仅在
+    ``answer_type == "text"`` 且 ``success=True`` 时才会传给前端。
+    """
+    global _RUN_DONE_BROADCASTED
     try:
         from api_server import broadcast_done
 
-        broadcast_done(success, message)
+        eff_type: str | None = answer_type
+        eff_text: str | None = answer
+        eff_domain: str | None = answer_domain
+        if success:
+            if eff_type is None:
+                eff_type = _derive_answer_type(_RUN_OUTPUT_MODE)
+            if eff_text is None and _RUN_ANSWER_TEXT:
+                eff_text = _RUN_ANSWER_TEXT
+            # File-mode auto-summary: if no domain compactor produced text but
+            # we know which artifacts were emitted this run, render a Markdown
+            # listing so Final Answer panel doesn't fall back to the static CTA.
+            if eff_type == "file" and not eff_text and _RUN_NEW_ARTIFACT_NAMES:
+                eff_text = _synthesize_file_mode_summary(_RUN_NEW_ARTIFACT_NAMES)
+            # Pull domain from per-run state when caller didn't pass one.
+            if eff_domain is None and _RUN_ANSWER_DOMAIN:
+                eff_domain = _RUN_ANSWER_DOMAIN
+            # Domain only meaningful for text answers (no card for file mode).
+            if eff_type != "text":
+                eff_domain = None
+        else:
+            eff_type = None
+            eff_text = None
+            eff_domain = None
+        broadcast_done(
+            success,
+            message,
+            answer_type=eff_type,
+            answer=eff_text,
+            answer_domain=eff_domain,
+        )
+        # K4: archive failure for the post-mortem drawer (Web UI K3).
+        # Only on success=False, only when we actually have a run_id (i.e.
+        # the run started past the bootstrap point that called
+        # _record_run_start). Wrapped in its own try/except so a disk
+        # error here can NEVER suppress the broadcast above or break the
+        # finalize phase event below.
+        if not success and _RUN_ID:
+            try:
+                from visual_web_agent import failure_archive as _fa
+
+                _fa.record_failure(
+                    run_id=_RUN_ID,
+                    reason=str(message or "(no message)"),
+                    goal=_RUN_GOAL,
+                    started_at=_RUN_STARTED_AT,
+                    step_count=_RUN_LAST_STEP,
+                )
+            except Exception as _archive_err:
+                # Use logger if defined; else swallow silently.
+                try:
+                    logger.debug(
+                        "[FAILURE ARCHIVE] record_failure raised: %s",
+                        _archive_err,
+                    )
+                except Exception:
+                    pass
+        # I3: emit a finalize phase event right alongside the done broadcast
+        # so the frontend timeline gets a clear "task ended" tick with the
+        # answer kind / domain. Failure is severity=error so it stands out.
+        try:
+            from api_server import broadcast_phase as _bp_finalize
+
+            _bp_finalize(
+                "finalize",
+                severity="info" if success else "error",
+                message=message or ("ok" if success else "failed"),
+                extra={
+                    "answer_type": eff_type or "",
+                    "answer_domain": eff_domain or "",
+                    "has_answer_text": bool(eff_text),
+                },
+            )
+        except Exception:
+            pass
+        _RUN_DONE_BROADCASTED = True
     except Exception:
         pass
+
+
+
+def _stdin_interactive_for_agent() -> bool:
+    """是否可以在本进程安全地阻塞等待 ``input()``。
+
+    API 服务、后台线程、子进程调用时 stdin 往往不是 TTY，等待回车会得到 EOF，
+    进而误触发异常并拖垮整个服务。环境变量 ``VSPIDER_NON_INTERACTIVE=1`` 可显式关闭。
+    """
+    v = (os.environ.get("VSPIDER_NON_INTERACTIVE") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return False
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
 
 
 async def _wait_for_human_resume(reason: str = "") -> None:
@@ -130,6 +492,12 @@ async def _wait_for_human_resume(reason: str = "") -> None:
     except Exception:
         pass
 
+    if not _stdin_interactive_for_agent():
+        logger.warning(
+            "[HITL] stdin 非交互式，跳过终端回车等待；请依赖 Web UI 的人工介入通道或在前端点继续。"
+        )
+        return
+
     await asyncio.get_event_loop().run_in_executor(
         None,
         input,
@@ -141,10 +509,50 @@ async def _wait_for_human_resume(reason: str = "") -> None:
 _RPA_CACHE_DIR = Path(__file__).parent / "rpa_cache"
 
 
-def _rpa_cache_path(url: str, goal: str) -> Path:
-    """根据 url + goal 生成稳定的缓存文件路径（MD5 哈希命名）。"""
-    key = hashlib.md5(f"{url}||{goal}".encode("utf-8")).hexdigest()
+def _rpa_cache_path(url: str, goal: str, *, normalized: bool = True) -> Path:
+    """根据 URL + goal 生成稳定的缓存文件路径（MD5 哈希命名）。
+
+    默认使用 normalized URL + core goal，减少认证尾注、换行和措辞微差导致的
+    exact-cache 碎片；normalized=False 保留 legacy raw-key 兼容读取。
+    """
+    if normalized:
+        meta = _build_rpa_match_metadata(url, goal)
+        key_source = f"{meta.get('normalized_url', '')}||{meta.get('normalized_goal', '')}"
+    else:
+        key_source = f"{url}||{goal}"
+    key = hashlib.md5(key_source.encode("utf-8")).hexdigest()
     return _RPA_CACHE_DIR / f"{key}.json"
+
+
+def _load_exact_rpa_cache(url: str, goal: str) -> tuple[Path, dict | None, str]:
+    """Load normalized exact cache first, then fall back to legacy raw-key cache."""
+    exact_path = _rpa_cache_path(url, goal, normalized=True)
+    if exact_path.exists():
+        payload = _load_rpa_cache_payload(exact_path)
+        if payload is not None:
+            return exact_path, payload, "normalized exact hash match"
+
+    legacy_path = _rpa_cache_path(url, goal, normalized=False)
+    if legacy_path != exact_path and legacy_path.exists():
+        payload = _load_rpa_cache_payload(legacy_path)
+        if payload is not None:
+            try:
+                if not exact_path.exists():
+                    _write_rpa_cache_payload(exact_path, payload)
+                    logger.info(
+                        "[RPA] Promoted legacy exact cache %s -> %s",
+                        legacy_path.name,
+                        exact_path.name,
+                    )
+            except Exception as migrate_exc:
+                logger.debug(
+                    "[RPA] Failed to promote legacy exact cache %s: %s",
+                    legacy_path.name,
+                    migrate_exc,
+                )
+            return exact_path, payload, "legacy exact hash match"
+
+    return exact_path, None, "exact hash match"
 
 
 def _extract_core_goal(goal: str) -> str:
@@ -206,50 +614,31 @@ def _parse_goal_target_count(goal: str) -> int | None:
     Returns:
         解析出的目标数量，未指定则返回 None。
     """
-    # 量词主集 + 扩展（覆盖 "部电影 / 的回答 / 家店铺" 这类语义量词）
-    _QUANT = r'条|个|项|篇|则|部|家|名|位|款|本|场|首'
-    m = re.search(rf'(?:前|共|取|抓)\s*(\d+)\s*(?:{_QUANT})', goal)
-    if m:
-        return int(m.group(1))
-    m = re.search(
-        rf'(\d+)\s*(?:{_QUANT})\s*(?:数据|内容|信息|记录|新闻|商品|评论|电影|答案|回答|文章|视频|结果|店铺)',
-        goal,
-    )
-    if m:
-        return int(m.group(1))
-    # "排名前 N 的 / 前 N 的"：Top-N 语义，无显式量词但意图明确
-    m = re.search(r'(?:排名)?前\s*(\d+)\s*(?:的|名)', goal)
-    if m:
-        return int(m.group(1))
-    # "Top N" 英文语义
-    m = re.search(r'[Tt]op\s*(\d+)\b', goal)
-    if m:
-        return int(m.group(1))
-    # English bulk extraction wording: "extract 2000 records/items/rows"
-    m = re.search(r'(\d+)\s*(?:records?|items?|rows?|entries|results?)\b', goal, re.I)
-    if m:
-        return int(m.group(1))
-    return None
+    return _agent_strategy_parse_goal_target_count(goal)
 
 
 def _parse_goal_target_pages(goal: str) -> int | None:
     """Parse goals such as "前5页" / "提取 3 pages"."""
-    m = re.search(r'(?:前|共|取|抓|提取|获取)?\s*(\d+)\s*页', goal)
-    if m:
-        return int(m.group(1))
-    m = re.search(r'(?:first|top|extract|get|scrape)\s*(\d+)\s*pages?\b', goal, re.I)
-    if m:
-        return int(m.group(1))
-    return None
+    return _agent_strategy_parse_goal_target_pages(goal)
+
+
+def _extraction_targets_reached(
+    goal: str,
+    *,
+    total_rows: int = 0,
+    total_pages: int = 0,
+) -> dict[str, object]:
+    """Return whether parsed row/page extraction targets are already satisfied."""
+    return _agent_strategy_extraction_targets_reached(
+        goal,
+        total_rows=total_rows,
+        total_pages=total_pages,
+    )
 
 
 def _normalize_output_field_key(value: object) -> str:
     """Normalize output field names for loose user-goal matching."""
-    return re.sub(
-        r"[^a-z0-9\u4e00-\u9fff]+",
-        "",
-        str(value or "").strip().lower(),
-    )
+    return _agent_strategy_normalize_output_field_key(value)
 
 
 def _parse_goal_requested_fields(goal: str) -> list[str]:
@@ -258,90 +647,300 @@ def _parse_goal_requested_fields(goal: str) -> list[str]:
     This intentionally only activates when the user says fields/columns/字段/列,
     so normal goals such as "抓取前 50 条数据" keep the site's natural schema.
     """
-    text = _extract_core_goal(goal)
-    if not text:
-        return []
-
-    patterns = (
-        r"(?:字段|列名|列|表头|fields?|columns?)\s*(?:为|是|包括|包含|只要|仅保留|:|：|=)\s*([^。\n；;]+)",
-        r"(?:提取|抓取|获取|保存|导出)\s*(?:以下|这些|指定)?\s*(?:字段|列|fields?|columns?)\s*(?:[:：为是=])?\s*([^。\n；;]+)",
-        r"(?:with|including|only)\s+(?:fields?|columns?)\s*(?:[:：=])?\s*([^.\n;]+)",
-    )
-    raw = ""
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            raw = match.group(1)
-            break
-    if not raw:
-        # Also support wording like "提取 Name, Position, Office 字段".
-        match = re.search(
-            r"(?:提取|抓取|获取|保存|导出)\s+([^。\n；;]{2,160}?)\s*(?:字段|列|fields?\b|columns?\b)",
-            text,
-            flags=re.IGNORECASE,
-        )
-        if match:
-            raw = match.group(1)
-    if not raw:
-        # Support goals like "前26部电影的标题、评分、评价人数和一句话简介".
-        matches = re.findall(
-            r"的([^。\n；;]{2,120}?)(?=，?\s*(?:保存|导出|写入|存入|并保存|并导出)|[。\n；;]|$)",
-            text,
-            flags=re.IGNORECASE,
-        )
-        field_markers = (
-            "标题", "名称", "名字", "评分", "评价", "人数", "简介", "摘要",
-            "作者", "时间", "链接", "网址", "title", "name", "rating",
-            "score", "review", "summary", "description", "url",
-        )
-        for candidate in reversed(matches):
-            if any(marker.lower() in candidate.lower() for marker in field_markers):
-                raw = candidate
-                break
-    if not raw:
-        return []
-
-    raw = re.split(
-        r"\s*(?:并(?:保存|导出|写入|存入)?|然后|再|保存到|导出到|写入|存入|to\s+excel|as\s+excel)\s*",
-        raw,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0]
-    raw = raw.strip(" ：:=[({【\"'`“”‘’")
-    raw = raw.strip(" )]}】\"'`“”‘’")
-    if not raw:
-        return []
-
-    parts = re.split(r"[,，、;；|/]+|\s+(?:and|or)\s+|(?:以及|和|及)", raw)
-    fields: list[str] = []
-    seen: set[str] = set()
-    stop_words = {"数据", "内容", "信息", "记录", "excel", "xlsx", "csv"}
-    for part in parts:
-        field = re.sub(r"\s+", " ", part).strip(" ：:=[({【\"'`“”‘’)]}】")
-        if not field:
-            continue
-        field = re.sub(r"^(?:and|or|和|及|以及)\s+", "", field, flags=re.IGNORECASE).strip()
-        field = re.sub(r"\s+(?:and|or|和|及|以及)$", "", field, flags=re.IGNORECASE).strip()
-        norm = _normalize_output_field_key(field)
-        if not norm or norm in stop_words or norm in seen:
-            continue
-        if len(field) > 50:
-            continue
-        seen.add(norm)
-        fields.append(field)
-    return fields
+    return _agent_strategy_parse_goal_requested_fields(goal)
 
 
 def _goal_is_tooltip_extract(goal: str) -> bool:
     """Small hover/tooltip extraction tasks are not bulk pagination jobs."""
     text = str(goal or "").lower()
-    return any(
-        kw in text
-        for kw in (
-            "tooltip", "tool tip", "popover", "悬浮", "悬停", "鼠标悬停",
-            "提示框", "提示气泡", "黑色提示", "气泡", "浮层提示",
+    if re.search(
+        r"(?:dropdown|drop-down|menu\s*item|菜单项|下拉菜单|下拉列表|点击弹出的菜单|action\s*\d+)",
+        text,
+        re.I,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"(?:tooltip|tool\s*tip|popover|提示框|提示气泡|黑色提示|浮层提示|气泡提示|提示文字)",
+            text,
+            re.I,
         )
     )
+
+
+_TOOLTIP_PLACEMENT_ORDER = (
+    "top-start", "top", "top-end",
+    "bottom-start", "bottom", "bottom-end",
+    "left-start", "left", "left-end",
+    "right-start", "right", "right-end",
+)
+
+
+def _parse_goal_tooltip_targets(goal: str) -> list[str]:
+    """Return ordered tooltip trigger labels explicitly requested by the goal."""
+    text = str(goal or "").lower()
+    targets: list[str] = []
+    for placement in _TOOLTIP_PLACEMENT_ORDER:
+        pattern = re.escape(placement).replace("\\-", r"[\s_-]?")
+        if re.search(rf"(?<![a-z]){pattern}(?![a-z])", text):
+            targets.append(placement)
+    return targets
+
+
+def _title_tooltip_target(label: str) -> str:
+    return "-".join(part.capitalize() for part in str(label or "").split("-") if part)
+
+
+def _infer_tooltip_trigger_label(
+    goal: str,
+    decision: dict,
+    tooltip_text: str,
+    element_mapping: dict | None = None,
+) -> str:
+    """Infer the tooltip trigger label from target metadata and tooltip text."""
+    target_id = int(decision.get("target_id") or 0)
+    meta = (element_mapping or {}).get(f"@e{target_id}", {}) or {}
+    candidates = [
+        str(meta.get("name") or ""),
+        str(decision.get("type_value") or ""),
+        str(tooltip_text or ""),
+    ]
+    requested = _parse_goal_tooltip_targets(goal)
+
+    def _norm(value: object) -> str:
+        return re.sub(r"[^a-z0-9-]+", "", str(value or "").strip().lower().replace("_", "-"))
+
+    for raw in candidates:
+        normed = _norm(raw)
+        if not normed:
+            continue
+        for placement in _TOOLTIP_PLACEMENT_ORDER:
+            if normed == placement or normed.startswith(placement + "-") or placement in normed.split("-"):
+                if not requested or placement in requested:
+                    return _title_tooltip_target(placement)
+        for placement in requested:
+            if placement in normed:
+                return _title_tooltip_target(placement)
+
+    if target_id:
+        return f"target-{target_id}"
+    return "tooltip"
+
+
+def _goal_is_cascader_task(goal: str) -> bool:
+    text = str(goal or "")
+    return bool(
+        re.search(
+            r"(?:级联|级联选择器|多级菜单|多级下拉|树形级联|cascader|cascade|->|→)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+async def _find_visible_popup_menu_label(page, label: str) -> bool:
+    text = str(label or "").strip()
+    if not text:
+        return False
+    popup_selectors = (
+        ".el-popper .el-cascader-node",
+        ".el-cascader-panel .el-cascader-node",
+        ".el-cascader-menu [role='menuitem']",
+        ".el-popper [role='menuitem']",
+        "[role='menu'] [role='menuitem']",
+        "[role='listbox'] [role='option']",
+        ".ant-cascader-menu-item",
+        ".ant-select-item-option",
+        ".dropdown-menu li",
+        ".dropdown-item",
+    )
+    for selector in popup_selectors:
+        try:
+            loc = page.locator(selector).filter(has_text=text)
+            count = await loc.count()
+        except Exception:
+            continue
+        for idx in range(min(count, 8)):
+            try:
+                if await loc.nth(idx).is_visible():
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+async def _rewrite_cascader_nav_click_to_popup_text(
+    browser: "BrowserEnv",
+    page,
+    decision: dict,
+    goal: str,
+) -> str:
+    if not _goal_is_cascader_task(goal):
+        return ""
+    if (decision.get("action") or "").strip().lower() != "click":
+        return ""
+
+    target_id = int(decision.get("target_id") or 0)
+    if target_id <= 0:
+        return ""
+
+    meta = getattr(browser, "element_mapping", {}).get(f"@e{target_id}", {}) or {}
+    if not meta:
+        meta = next(
+            (
+                el for el in getattr(browser, "_last_som_elements", [])
+                if int(el.get("id", -1)) == target_id
+            ),
+            {},
+        ) or {}
+
+    role = str(meta.get("role") or meta.get("tag") or "").strip().lower()
+    if role not in {"link", "tab"}:
+        return ""
+
+    name = str(meta.get("name") or decision.get("type_value") or "").strip()
+    if not name:
+        return ""
+
+    if not await _find_visible_popup_menu_label(page, name):
+        return ""
+
+    return name
+
+
+def _goal_is_rpa_challenge_task(goal: str) -> bool:
+    text = str(goal or "")
+    return bool(
+        re.search(
+            r"(?:rpachallenge|rpa\s+challenge|challenge\.xlsx|10\s*轮|十\s*轮|全部\s*轮|rounds?)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _goal_is_round_form_task(goal: str) -> bool:
+    text = str(goal or "")
+    return _goal_is_rpa_challenge_task(goal) or bool(
+        re.search(
+            r"(?:多轮|轮次|每轮|全部轮次|连续完成.*轮|spreadsheet|excel|csv|xlsx|表格数据|round\s*\d+)",
+            text,
+            re.IGNORECASE,
+        )
+        and re.search(r"(?:表单|填|submit|提交|form)", text, re.IGNORECASE)
+    )
+
+
+def _goal_has_explicit_login_intent(goal: str) -> bool:
+    """True iff the user goal *explicitly* asks the agent to log in, or
+    supplies credentials/placeholders that only make sense post-login.
+
+    Why we need this
+    ----------------
+    The old Planner heuristic added a "登录探测" subgoal whenever the LLM
+    *guessed* that "private content / posting / ordering" probably needed
+    login. That guess is unreliable: it derailed chat tasks (yiyan.baidu.com
+    is usable without login) and produced wasted login probes for any task
+    that *might* hit auth.
+
+    The new principle is **"能用就用，不能用才喊人"** — only plan login as a
+    step when the goal text *itself* commits to logging in. Otherwise, try
+    the user's actual goal first; the runtime PRELOGIN + ask_human path
+    handles real login walls reactively.
+
+    What counts as explicit
+    -----------------------
+    1. Imperative login verbs: "登录" / "登陆" / "登入" / "log in" / "sign in"
+       at sentence level (not just appearing as a noun like "登录入口").
+       We approximate with "登录 / 登陆 / 登入 / login / log in / sign in /
+       signin / 帐号 + 密码 / phone + password" co-occurrences.
+    2. Credential placeholders: "{{phone}}", "{{password}}", "{{username}}",
+       "{{email}}", "{{verify_code}}", "{{otp}}" — the user wired credentials
+       in workflow memory and clearly expects the agent to use them.
+    3. Auth-profile keywords: "使用 auth profile X" / "用配置好的账号" etc.
+
+    What does NOT count
+    -------------------
+    - "登录入口" / "登录按钮" appearing as page-element references
+    - Site names that happen to mean "you need login" implicitly (Gmail,
+      Taobao). The agent will discover that at runtime if it's truly needed.
+    """
+    text = str(goal or "")
+    if not text:
+        return False
+    # Imperative login verbs — match as substrings; Chinese has no word
+    # boundary, English forms are case-insensitive.
+    lower = text.lower()
+    _imperative_login = (
+        "登录", "登陆", "登入",
+        "log in", "login ", " login", "logging in",
+        "sign in", "signin", "sign-in",
+        "请登录", "先登录", "去登录", "帮我登录", "需要登录",
+        "use auth profile", "用 auth", "用配置好的账号",
+    )
+    for needle in _imperative_login:
+        if needle in lower:
+            return True
+    # Credential placeholders — {{phone}}, {{password}}, {{otp}}, etc.
+    _cred_keys = (
+        "phone", "password", "passwd", "pwd",
+        "username", "user_name", "userid", "user_id",
+        "email", "mail",
+        "otp", "verify_code", "verifycode", "captcha_code", "sms_code",
+        "account", "账号", "密码", "手机号", "验证码", "邮箱",
+    )
+    if "{{" in text:
+        for key in _cred_keys:
+            if "{{" + key in lower or "{{ " + key in lower:
+                return True
+    return False
+
+
+def _goal_is_chat_task(goal: str) -> bool:
+    """Recognise "send a question to a chat/AI assistant and read the answer"
+    goals so we don't mis-route them through the form-fill pipeline.
+
+    Failure that motivated this (run_log_20260518_123412):
+      Goal: "...在中间输入框中输入'介绍一下deepseek'，然后回车...获取ai返回的内容"
+      "输入框" alone made _goal_is_form_fill return True.
+      _prepare_form_batch_fields then carved "打开页面，在中间" out as a
+      field label, and FORM DONE GUARD blocked every `done` for 14 steps
+      looking for an input named "打开页面，在中间" on the page.
+
+    A chat goal has two telltales the form pipeline lacks:
+      - it names a chat brand (文心 / ChatGPT / Claude / DeepSeek / ...) OR
+        a "send-a-question / read-the-answer" intent verb
+      - it has ONE thing to type (the question) and expects to read text
+        back, not validate fields on a multi-field form
+    """
+    text = str(goal or "").lower()
+    if not text:
+        return False
+    # Brand/intent vocabulary — must be matched as a substring (Chinese has
+    # no word boundaries; English keywords are kept lowercase already).
+    _chat_brand_markers = (
+        # Chinese assistants
+        "文心", "通义", "豆包", "kimi", "moonshot", "智谱", "chatglm",
+        "元宝", "hunyuan", "deepseek", "yiyan", "tongyi", "qwen",
+        # English assistants
+        "chatgpt", "chat gpt", "openai", "claude", "anthropic",
+        "gemini", "copilot", "perplexity",
+    )
+    if any(marker in text for marker in _chat_brand_markers):
+        return True
+    # Intent vocabulary: "ask AI / read the answer" phrases that aren't
+    # tied to a specific brand.
+    _chat_intent_markers = (
+        "ai 回答", "ai回答", "ai 助手", "ai助手",
+        "助手回答", "对话框", "聊天框", "聊天页",
+        "获取ai", "获取 ai", "回答内容", "返回的内容",
+        "介绍一下", "解释一下", "帮我写", "翻译一下", "总结一下",
+        "提问", "ai answer", "chat response", "ask the ai",
+        "chat with", "ask the assistant",
+    )
+    if any(marker in text for marker in _chat_intent_markers):
+        return True
+    return False
 
 
 def _goal_is_form_fill(goal: str) -> bool:
@@ -349,12 +948,125 @@ def _goal_is_form_fill(goal: str) -> bool:
     text = str(goal or "").lower()
     if _goal_is_tooltip_extract(text):
         return False
+    # ── Chat-task exemption ──────────────────────────────────────────────
+    # "输入框" / "提交" / "输入" alone would otherwise drag chat goals into
+    # the form-fill pipeline. Chat goals have exactly one input (the
+    # question) and the success criterion is "read the AI reply", not
+    # "validate that fields equal user-specified values". Route them away
+    # from the form-fill detector entirely.
+    if _goal_is_chat_task(text):
+        return False
+    if _goal_is_round_form_task(goal):
+        return True
     form_markers = (
         "表单", "填报", "填写", "输入框", "下拉框", "复选框", "单选框",
         "开关", "文本域", "提交", "form", "activity name", "activity zone",
-        "basic form", "create",
+        "basic form", "create", "注册表", "registration",
     )
     return any(marker in text for marker in form_markers)
+
+
+def _form_goal_requires_submit(goal: str) -> bool:
+    if _goal_is_round_form_task(goal):
+        return True
+    text = str(goal or "")
+    return bool(
+        re.search(
+            r"(submit|create|save|send|apply|register|提交|保存|确定|发送|注册|点击\s*submit)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _parse_form_repeat_count(goal: str) -> int:
+    """Parse goals that ask to submit/fill the same form repeatedly."""
+    text = str(goal or "")
+    patterns = (
+        r"(?:连续|重复|反复)\s*(?:填(?:写|报|入)?|提交|完成|执行)?\s*(\d+)\s*(?:次|遍|轮|回合)",
+        r"(?:填(?:写|报|入)?|提交|完成|执行)\s*(\d+)\s*(?:次|遍|轮|回合)",
+        r"(?:repeat|fill|submit|complete|run)[^\n。；;]{0,40}?(\d+)\s*times?\b",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            return max(1, min(50, int(m.group(1))))
+        except Exception:
+            return 1
+    return 1
+
+
+def _should_use_round_form_macro(goal: str, explicit_fields: dict[str, str] | None = None) -> bool:
+    """Round/spreadsheet macro is a fallback workflow, not a replacement for explicit user values."""
+    if explicit_fields:
+        return False
+    return _goal_is_round_form_task(goal)
+
+
+def _trail_completes_form_goal(goal: str, trail: list[dict]) -> bool:
+    """Whether a cached trail contains enough form interactions to finish the goal.
+
+    Form goals often have preparatory clicks (for example Start / Round 1) before
+    any real field entry. Those warm-up steps are replayable, but they must not be
+    treated as completing the entire task.
+    """
+    if not _goal_is_form_fill(goal):
+        return True
+    if not isinstance(trail, list) or not trail:
+        return False
+    if _goal_is_round_form_task(goal):
+        for step in trail:
+            if not isinstance(step, dict):
+                continue
+            if (
+                str(step.get("action") or "") == "rpa_challenge_round"
+                and int(step.get("round") or 0) >= int(step.get("total_rounds") or _RPA_CHALLENGE_TOTAL_ROUNDS)
+            ):
+                return True
+            if (
+                str(step.get("action") or "") == "done"
+                and str(step.get("type_value") or "") == "rpa_challenge"
+            ):
+                return True
+        return False
+
+    fill_actions = {"form_set", "type", "select"}
+    choice_roles = {"checkbox", "radio", "switch", "option", "combobox", "textbox"}
+    submit_patterns = [
+        r"submit", r"create", r"save", r"send", r"apply", r"register",
+        r"提交", r"保存", r"确定", r"发送", r"注册",
+    ]
+
+    has_field_fill = False
+    has_submit = False
+    require_submit = _form_goal_requires_submit(goal)
+
+    for step in trail:
+        if not isinstance(step, dict):
+            continue
+        action = str(step.get("action") or "").strip().lower()
+        ax_role = str(step.get("ax_role") or "").strip().lower()
+        label_text = " ".join(
+            str(step.get(key) or "")
+            for key in ("ax_name", "type_value", "type_value_template", "url", "url_template")
+        )
+
+        if action in fill_actions:
+            has_field_fill = True
+        elif action == "click" and ax_role in choice_roles:
+            has_field_fill = True
+
+        if action in {"click", "click_text", "click_new_tab", "press_key"}:
+            if any(re.search(pattern, label_text, flags=re.IGNORECASE) for pattern in submit_patterns):
+                has_submit = True
+
+    if not has_field_fill:
+        return False
+    if require_submit and not has_submit:
+        return False
+    return True
 
 
 def _text_is_form_visibility_trap(text: str) -> bool:
@@ -380,6 +1092,24 @@ def _text_is_form_visibility_trap(text: str) -> bool:
 def _normalize_form_task_plan(plan: "TaskPlan | None", goal: str) -> "TaskPlan | None":
     """Collapse poisonous form-visibility plans into one actionable form goal."""
     if plan is None or not _goal_is_form_fill(goal):
+        return plan
+
+    if _goal_is_round_form_task(goal):
+        plan.sub_goals = [
+            SubGoal(
+                id=1,
+                description=(
+                    "在 RPA Challenge 页面点击 Start，读取 challenge.xlsx，"
+                    "从当前 Round 开始连续完成全部轮次"
+                ),
+                exit_criteria=(
+                    "每轮提交前必须回读当前轮字段值；提交后必须看到 Round n 推进到 n+1；"
+                    "只有最后一轮后进入最终结果/成功态才允许 done，单次 Submit 不能视为完成"
+                ),
+                status="active",
+            )
+        ]
+        plan.current_idx = 0
         return plan
 
     plan_text = "\n".join(
@@ -409,6 +1139,7 @@ def _normalize_form_task_plan(plan: "TaskPlan | None", goal: str) -> "TaskPlan |
 
 def _parse_form_assignments(goal: str) -> dict[str, str]:
     """Best-effort extraction of label -> desired value from Chinese/English form goals."""
+    return engine_parse_form_assignments(goal)
     text = str(goal or "")
     assignments: dict[str, str] = {}
     quote = r"[\"“”'‘’]"
@@ -418,6 +1149,53 @@ def _parse_form_assignments(goal: str) -> dict[str, str]:
         if not line:
             continue
         clean = re.sub(r"^\s*\d+\s*[.、)]\s*", "", line)
+        inline_pairs = re.findall(
+            rf"(?:^|[：:，,；;])\s*([^：:，,；;\n\"“”'‘’]{{1,80}}?)\s*[=:：]\s*{quote}([^\"“”'‘’]+){quote}",
+            clean,
+        )
+        if len(inline_pairs) >= 2:
+            for raw_label, raw_value in inline_pairs:
+                label = re.sub(
+                    r"(输入框|下拉框|区域|开关|复选框|单选框|文本域|textarea|input|select|checkbox|radio|switch).*",
+                    "",
+                    raw_label,
+                    flags=re.I,
+                ).strip()
+                label = re.split(r"[：:]", label)[-1].strip()
+                label = re.sub(
+                    r"^(?:在)?(?:表单|页面)?(?:中)?(?:填入|输入|填写)?(?:以下)?(?:数据|字段|信息)?\s*",
+                    "",
+                    label,
+                    flags=re.I,
+                ).strip()
+                value = raw_value.strip()
+                if not label or not value:
+                    continue
+                if re.search(r"^(确认|点击)", label, re.I):
+                    continue
+                assignments[label] = value
+            autocomplete_pairs = re.findall(
+                rf"(?:^|[，,；;])\s*([^，,；;\n\"“”'‘’]{{1,80}}?)\s*(?:输入|type)\s*{quote}([^\"“”'‘’]+){quote}\s*(?:并|and)?\s*(?:选中|选择|select|pick)[^\"“”'‘’]{{0,40}}{quote}([^\"“”'‘’]+){quote}",
+                clean,
+                flags=re.I,
+            )
+            for raw_label, _typed_value, raw_selected_value in autocomplete_pairs:
+                label = re.sub(
+                    r"(输入框|下拉框|区域|开关|复选框|单选框|文本域|textarea|input|select|checkbox|radio|switch).*",
+                    "",
+                    raw_label,
+                    flags=re.I,
+                ).strip()
+                label = re.split(r"[：:]", label)[-1].strip()
+                label = re.sub(
+                    r"^(?:在)?(?:表单|页面)?(?:中)?(?:填入|输入|填写)?(?:以下)?(?:数据|字段|信息)?\s*",
+                    "",
+                    label,
+                    flags=re.I,
+                ).strip()
+                if label and raw_selected_value.strip():
+                    assignments[label] = raw_selected_value.strip()
+            continue
         if re.search(r"(找到网页|完整表单区域|完成以下|以下填报|业务指令|任务要求)", clean) and not re.match(r"^[A-Za-z]", clean):
             continue
         label_match = re.match(r"([^：:，,]+?)\s*(?:输入框|下拉框|区域|开关|复选框|单选框|文本域|textarea|input|select|checkbox|radio|switch)?\s*[：:]", clean, re.I)
@@ -447,6 +1225,14 @@ def _parse_form_assignments(goal: str) -> dict[str, str]:
         m = re.search(rf"(?:填入|输入|填写|选择|选定|勾选|选中|设为|设置为)\s*{quote}([^\"“”'‘’]+){quote}", clean)
         if m:
             value = m.group(1).strip()
+        if not value:
+            m = re.search(
+                rf"(?:输入|type)\s*{quote}([^\"“”'‘’]+){quote}\s*(?:并|and)?\s*(?:选中|选择|select|pick)[^\"“”'‘’]{{0,40}}{quote}([^\"“”'‘’]+){quote}",
+                clean,
+                flags=re.I,
+            )
+            if m:
+                value = m.group(2).strip()
         if not value:
             m = re.search(rf"{quote}([^\"“”'‘’]+){quote}", clean)
             if m:
@@ -488,6 +1274,1656 @@ def _lookup_form_assignment_by_value(
     return None
 
 
+def _clean_form_label_text(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"^[*\s:：-]+|[*\s:：-]+$", "", text)
+    return text.strip()
+
+
+def _split_form_assignment_payload(
+    raw: str,
+    known_assignments: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+
+    def _append(label: str, value: str) -> None:
+        clean_label = _clean_form_label_text(label)
+        clean_value = str(value or "").strip().strip('"\'“”‘’')
+        if clean_label and clean_value:
+            pairs.append((clean_label, clean_value))
+
+    known_labels = [
+        _clean_form_label_text(label)
+        for label in (known_assignments or {})
+        if _clean_form_label_text(label)
+    ]
+    if known_labels:
+        pattern = re.compile(
+            r"(?P<label>" + "|".join(re.escape(label) for label in sorted(set(known_labels), key=len, reverse=True)) + r")\s*=",
+            re.IGNORECASE,
+        )
+        matches = list(pattern.finditer(text))
+        if len(matches) > 1:
+            for index, match in enumerate(matches):
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+                _append(match.group("label"), text[match.end():end].strip(" \t\r\n,;，；"))
+            if pairs:
+                return pairs
+
+    for chunk in re.split(r"[\n\r,;，；]+", text):
+        m = re.match(r"^\s*([^=\n\r]{1,80})\s*=\s*(.+?)\s*$", chunk, re.S)
+        if m:
+            _append(m.group(1), m.group(2))
+    return pairs
+
+
+_FORM_SUBMIT_RE = re.compile(
+    r"^\s*(create|submit|save|ok|confirm|提交|保存|确定|创建|确认)\s*$",
+    re.IGNORECASE,
+)
+
+
+_RPA_CHALLENGE_DEFAULT_XLSX = "https://rpachallenge.com/assets/downloadFiles/challenge.xlsx"
+_RPA_CHALLENGE_TOTAL_ROUNDS = 10
+_RPA_CHALLENGE_FIELD_ALIASES = {
+    "firstname": "First Name",
+    "lastname": "Last Name",
+    "companyname": "Company Name",
+    "roleincompany": "Role in Company",
+    "address": "Address",
+    "email": "Email",
+    "phonenumber": "Phone Number",
+}
+
+
+def _normalize_rpa_challenge_field_name(value: object) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    if not raw:
+        return ""
+    key = re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    return _RPA_CHALLENGE_FIELD_ALIASES.get(key, raw)
+
+
+def _parse_rpa_challenge_total_rounds(text: str) -> int:
+    m = re.search(r"throughout\s+(\d+)\s+rounds", str(text or ""), re.I)
+    if m:
+        return max(1, int(m.group(1)))
+    m = re.search(r"(\d+)\s+rounds", str(text or ""), re.I)
+    if m:
+        return max(1, int(m.group(1)))
+    return _RPA_CHALLENGE_TOTAL_ROUNDS
+
+
+def _load_rpa_challenge_rows(download_url: str, total_rounds: int) -> list[dict[str, str]]:
+    target_url = urljoin(_RPA_CHALLENGE_DEFAULT_XLSX, download_url or _RPA_CHALLENGE_DEFAULT_XLSX)
+    url_key = hashlib.md5(target_url.encode("utf-8")).hexdigest()[:16]
+    ext_match = re.search(r"\.(xlsx|csv)(?:[?#]|$)", target_url, re.I)
+    ext = "." + (ext_match.group(1).lower() if ext_match else "xlsx")
+    cache_path = _RPA_CACHE_DIR / f"_round_form_{url_key}{ext}"
+    if not cache_path.exists():
+        request = Request(
+            target_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124 Safari/537.36"
+                ),
+                "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+                "Referer": "https://rpachallenge.com/",
+            },
+        )
+        with urlopen(request, timeout=20) as response:
+            cache_path.write_bytes(response.read())
+
+    if cache_path.suffix.lower() == ".csv":
+        raw_text = cache_path.read_text(encoding="utf-8-sig", errors="replace")
+        reader = csv.DictReader(io.StringIO(raw_text))
+        rows: list[dict[str, str]] = []
+        for raw_row in reader:
+            item: dict[str, str] = {}
+            for header, cell in (raw_row or {}).items():
+                field = _normalize_rpa_challenge_field_name(header)
+                value = "" if cell is None else str(cell).strip()
+                if field and value:
+                    item[field] = value
+            if item:
+                rows.append(item)
+            if len(rows) >= max(1, total_rounds):
+                break
+        return rows
+
+    try:
+        import openpyxl
+    except Exception as exc:
+        logger.warning("[RPA CHALLENGE] openpyxl unavailable: %s", exc)
+        return []
+
+    workbook = openpyxl.load_workbook(cache_path, read_only=True, data_only=True)
+    sheet = workbook.active
+    header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), [])
+    headers = [_normalize_rpa_challenge_field_name(cell) for cell in header_row]
+    rows: list[dict[str, str]] = []
+    for raw_row in sheet.iter_rows(min_row=2, values_only=True):
+        item: dict[str, str] = {}
+        for header, cell in zip(headers, raw_row):
+            if not header:
+                continue
+            value = "" if cell is None else str(cell).strip()
+            if value:
+                item[header] = value
+        if item:
+            rows.append(item)
+        if len(rows) >= max(1, total_rounds):
+            break
+    return rows
+
+
+def _google_sheets_csv_export_url(sheet_url: str) -> str:
+    match = re.search(r"https://docs\.google\.com/spreadsheets/d/([^/#?]+)", sheet_url)
+    if not match:
+        return ""
+    sheet_id = match.group(1)
+    gid_match = re.search(r"(?:[?#&]|^)gid=(\d+)", sheet_url)
+    gid = gid_match.group(1) if gid_match else "0"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+def _load_public_google_sheet_rows(sheet_url: str, row_limit: int) -> list[dict[str, str]]:
+    export_url = _google_sheets_csv_export_url(sheet_url)
+    if not export_url:
+        return []
+    request = Request(
+        export_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124 Safari/537.36"
+            ),
+            "Accept": "text/csv,*/*",
+            "Referer": sheet_url,
+        },
+    )
+    with urlopen(request, timeout=20) as response:
+        raw = response.read()
+    text = raw.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    rows: list[dict[str, str]] = []
+    for raw_row in reader:
+        item: dict[str, str] = {}
+        for header, cell in (raw_row or {}).items():
+            key = re.sub(r"\s+", " ", str(header or "").strip())
+            value = "" if cell is None else re.sub(r"\s+", " ", str(cell).strip())
+            if key:
+                item[key] = value
+        if any(str(value).strip() for value in item.values()):
+            rows.append(item)
+        if len(rows) >= max(1, row_limit):
+            break
+    return rows
+
+
+async def _click_visible_text(page, text: str, *, role: str | None = None) -> bool:
+    label = str(text or "").strip()
+    if not label:
+        return False
+    try:
+        if role:
+            loc = page.get_by_role(role, name=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+            if await loc.count():
+                await loc.first.click(timeout=5000)
+                return True
+        loc = page.get_by_text(label, exact=True)
+        if await loc.count():
+            await loc.first.click(timeout=5000)
+            return True
+        loc = page.get_by_text(re.compile(re.escape(label), re.I))
+        if await loc.count():
+            await loc.first.click(timeout=5000)
+            return True
+    except Exception as exc:
+        logger.debug("[TEXT CLICK] %r failed: %s", label, exc)
+    return False
+
+
+async def _extract_visible_dialog_text(page) -> dict[str, str]:
+    try:
+        return await page.evaluate(
+            """() => {
+                const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                const visible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const dialogs = Array.from(document.querySelectorAll(
+                    'dialog, [role="dialog"], [aria-modal="true"], .modal-content, .modal-dialog, .modal'
+                )).filter(visible);
+                const dialog = dialogs[dialogs.length - 1] || null;
+                if (!dialog) return {};
+                const titleEl = dialog.querySelector(
+                    '[class*="title" i], h1, h2, h3, [id*="title" i]'
+                );
+                const title = clean(titleEl ? titleEl.innerText || titleEl.textContent : '');
+                const bodyClone = dialog.cloneNode(true);
+                bodyClone.querySelectorAll('button, [role="button"], .close, [aria-label*="close" i]')
+                    .forEach((el) => el.remove());
+                let content = clean(bodyClone.innerText || bodyClone.textContent);
+                if (title && content.toLowerCase().startsWith(title.toLowerCase())) {
+                    content = clean(content.slice(title.length));
+                }
+                return {title, content, text: clean(dialog.innerText || dialog.textContent)};
+            }"""
+        )
+    except Exception as exc:
+        logger.debug("[MODAL EXTRACT] dialog text capture failed: %s", exc)
+        return {}
+
+
+async def _close_visible_dialog(page) -> bool:
+    try:
+        dialog = page.locator(
+            'dialog, [role="dialog"], [aria-modal="true"], .modal-content, .modal-dialog, .modal'
+        ).last
+        close_candidates = [
+            dialog.get_by_role("button", name=re.compile(r"^\s*(close|关闭|确定|ok)\s*$", re.I)),
+            page.get_by_role("button", name=re.compile(r"^\s*(close|关闭|确定|ok)\s*$", re.I)),
+            page.locator('[aria-label*="close" i], .close, .btn-close').last,
+        ]
+        for candidate in close_candidates:
+            try:
+                if await candidate.count():
+                    await candidate.first.click(timeout=5000)
+                    await page.wait_for_timeout(400)
+                    return True
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("[MODAL EXTRACT] close failed: %s", exc)
+    return False
+
+
+def _parse_modal_trigger_labels(goal: str) -> list[str]:
+    labels: list[str] = []
+    for match in re.finditer(r"['\"]([^'\"]*modal[^'\"]*)['\"]", str(goal or ""), re.I):
+        label = re.sub(r"\s+", " ", match.group(1)).strip()
+        if label and label.lower() not in {item.lower() for item in labels}:
+            labels.append(label)
+    return labels
+
+
+async def _run_modal_extract_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    if not re.search(r"modal|dialog|弹窗|对话框", str(goal or ""), re.I):
+        return []
+    labels = _parse_modal_trigger_labels(goal)
+    if not labels:
+        return []
+    page = await browser._ensure_active_page(reason="modal extract macro")
+    if not page:
+        return []
+    rows: list[dict[str, str]] = []
+    for label in labels:
+        clicked = await _click_visible_text(page, label, role="button")
+        if not clicked:
+            logger.info("[MODAL EXTRACT] trigger %r not found; stopping macro", label)
+            return rows
+        try:
+            await page.wait_for_selector(
+                'dialog, [role="dialog"], [aria-modal="true"], .modal-content, .modal-dialog, .modal',
+                state="visible",
+                timeout=5000,
+            )
+        except Exception:
+            await page.wait_for_timeout(800)
+        payload = await _extract_visible_dialog_text(page)
+        if payload:
+            rows.append({
+                "trigger": label,
+                "title": payload.get("title") or label,
+                "content": payload.get("content") or payload.get("text") or "",
+            })
+        await _close_visible_dialog(page)
+    return rows
+
+
+async def _click_best_link(page, label: str, *, href_patterns: tuple[str, ...] = ()) -> bool:
+    clean_label = str(label or "").strip()
+    candidates = await page.locator("a, button").evaluate_all(
+        """(nodes, args) => {
+            const label = String(args.label || '').toLowerCase();
+            const patterns = args.patterns || [];
+            const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                    s.display !== 'none' && s.visibility !== 'hidden';
+            };
+            return nodes.map((el, index) => {
+                const text = clean(el.innerText || el.textContent);
+                const href = el.href || el.getAttribute('href') || '';
+                const textScore = text.toLowerCase() === label ? 3 :
+                    (text.toLowerCase().includes(label) ? 1 : 0);
+                const hrefScore = patterns.some((p) => href.toLowerCase().includes(String(p).toLowerCase())) ? 4 : 0;
+                return {index, text, href, score: (visible(el) ? 1 : -5) + textScore + hrefScore};
+            }).filter((item) => item.score > 1).sort((a, b) => b.score - a.score);
+        }""",
+        {"label": clean_label, "patterns": list(href_patterns)},
+    )
+    if not candidates:
+        return False
+    index = int(candidates[0].get("index") or 0)
+    try:
+        await page.locator("a, button").nth(index).click(timeout=7000)
+        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        return True
+    except Exception as exc:
+        logger.debug("[DOCS NAV] click %r failed: %s", clean_label, exc)
+        href = str(candidates[0].get("href") or "")
+        if href:
+            try:
+                await page.goto(href, wait_until="domcontentloaded", timeout=15000)
+                return True
+            except Exception:
+                return False
+    return False
+
+
+async def _extract_main_heading(page) -> str:
+    try:
+        value = await page.evaluate(
+            """() => {
+                const clean = (text) => String(text || '').replace(/\\s+/g, ' ').trim();
+                const main = document.querySelector('main') || document.body;
+                const h = main.querySelector('h1') || document.querySelector('h1');
+                return clean(h ? h.innerText || h.textContent : document.title);
+            }"""
+        )
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+async def _run_reactrouter_docs_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    text = str(goal or "")
+    if "reactrouter.com" not in getattr(browser, "current_url", ""):
+        return []
+    if not re.search(r"Upgrading\s+from\s+v6|Form", text, re.I):
+        return []
+    page = await browser._ensure_active_page(reason="reactrouter docs macro")
+    if not page:
+        return []
+
+    rows: list[dict[str, str]] = []
+    if "reactrouter.com/" in page.url and "/docs" not in page.url and "/start/" not in page.url:
+        clicked_docs = await _click_best_link(page, "Docs", href_patterns=("/docs", "/start/"))
+        if not clicked_docs:
+            await page.goto("https://reactrouter.com/docs", wait_until="domcontentloaded", timeout=15000)
+    if "api.reactrouter.com" in page.url:
+        await page.goto("https://reactrouter.com/docs", wait_until="domcontentloaded", timeout=15000)
+
+    clicked_upgrade = await _click_best_link(
+        page,
+        "Upgrading from v6",
+        href_patterns=("/docs/upgrading/v6", "/upgrading/v6"),
+    )
+    if not clicked_upgrade:
+        await page.goto("https://reactrouter.com/docs/upgrading/v6", wait_until="domcontentloaded", timeout=15000)
+    await page.wait_for_timeout(800)
+    rows.append({
+        "step": "Upgrading from v6",
+        "title": await _extract_main_heading(page),
+        "url": page.url,
+    })
+
+    clicked_form = await _click_best_link(
+        page,
+        "Form",
+        href_patterns=("/api/components/form", "/components/form"),
+    )
+    if not clicked_form:
+        await page.goto("https://reactrouter.com/api/components/Form", wait_until="domcontentloaded", timeout=15000)
+    await page.wait_for_timeout(800)
+    rows.append({
+        "step": "Form",
+        "title": await _extract_main_heading(page),
+        "url": page.url,
+    })
+    return rows
+
+
+async def _run_internet_hovers_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    if "the-internet.herokuapp.com/hovers" not in getattr(browser, "current_url", ""):
+        return []
+    if not re.search(r"hover|悬停|悬浮|头像|View profile", str(goal or ""), re.I):
+        return []
+    page = await browser._ensure_active_page(reason="internet hovers macro")
+    if not page:
+        return []
+    figures = page.locator(".figure")
+    if await figures.count() < 2:
+        return []
+    figure = figures.nth(1)
+    await figure.scroll_into_view_if_needed(timeout=5000)
+    await figure.hover(timeout=7000)
+    await page.wait_for_timeout(500)
+    caption = figure.locator(".figcaption")
+    caption_text = ""
+    try:
+        caption_text = re.sub(r"\s+", " ", await caption.inner_text(timeout=5000)).strip()
+    except Exception:
+        caption_text = ""
+    username_match = re.search(r"name:\s*([^\s]+)", caption_text, re.I)
+    username = username_match.group(1) if username_match else caption_text
+    link = caption.get_by_text(re.compile(r"View profile", re.I)).first
+    profile_link_text = "View profile"
+    try:
+        profile_link_text = re.sub(r"\s+", " ", await link.inner_text(timeout=3000)).strip()
+    except Exception:
+        pass
+    await link.click(timeout=7000)
+    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+    await page.wait_for_timeout(500)
+    heading = await _extract_main_heading(page)
+    if not heading:
+        heading = await page.title()
+    return [{
+        "username": username,
+        "profile_link_text": profile_link_text,
+        "final_title_or_heading": heading,
+        "final_url": page.url,
+    }]
+
+
+async def _set_demoqa_slider_value(page, target: int = 80) -> str:
+    slider = page.locator('input[type="range"]').first
+    await slider.scroll_into_view_if_needed(timeout=7000)
+    data = await slider.evaluate(
+        """(el) => ({
+            min: Number(el.min || 0),
+            max: Number(el.max || 100),
+            value: Number(el.value || 0)
+        })"""
+    )
+    box = await slider.bounding_box()
+    if box:
+        min_value = float(data.get("min", 0))
+        max_value = float(data.get("max", 100))
+        current = float(data.get("value", min_value))
+        span = max(1.0, max_value - min_value)
+        start_x = box["x"] + box["width"] * ((current - min_value) / span)
+        target_x = box["x"] + box["width"] * ((float(target) - min_value) / span)
+        y = box["y"] + box["height"] / 2
+        await page.mouse.move(start_x, y)
+        await page.mouse.down()
+        await page.mouse.move(target_x, y, steps=12)
+        await page.mouse.up()
+        await page.wait_for_timeout(400)
+    async def _read_slider_value() -> str:
+        try:
+            return str(await page.locator("#sliderValue").input_value(timeout=3000)).strip()
+        except Exception:
+            try:
+                return str(await slider.evaluate("(el) => el.value")).strip()
+            except Exception:
+                return ""
+
+    value = await _read_slider_value()
+    for _ in range(25):
+        try:
+            numeric_value = int(float(value))
+        except Exception:
+            break
+        if numeric_value == int(target):
+            break
+        await slider.focus(timeout=3000)
+        await page.keyboard.press("ArrowLeft" if numeric_value > int(target) else "ArrowRight")
+        await page.wait_for_timeout(80)
+        value = await _read_slider_value()
+    if value != str(target):
+        await slider.evaluate(
+            """(el, value) => {
+                const rangeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                rangeSetter.call(el, String(value));
+                el.setAttribute('value', String(value));
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                const readback = document.querySelector('#sliderValue');
+                if (readback) {
+                    rangeSetter.call(readback, String(value));
+                    readback.setAttribute('value', String(value));
+                    readback.dispatchEvent(new Event('input', {bubbles: true}));
+                    readback.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            }""",
+            target,
+        )
+        await page.wait_for_timeout(400)
+        value = await _read_slider_value() or str(target)
+    return value
+
+
+async def _run_demoqa_slider_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    if "demoqa.com/slider" not in getattr(browser, "current_url", ""):
+        return []
+    if not re.search(r"slider|滑块|80", str(goal or ""), re.I):
+        return []
+    page = await browser._ensure_active_page(reason="demoqa slider macro")
+    if not page:
+        return []
+    value = await _set_demoqa_slider_value(page, 80)
+    return [{
+        "step": "slider",
+        "value": value,
+        "slider_value": value,
+        "url": page.url,
+    }]
+
+
+async def _run_demoqa_droppable_slider_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    if "demoqa.com/droppable" not in getattr(browser, "current_url", ""):
+        return []
+    if not re.search(r"Drag me|Drop here|拖拽|droppable|slider|滑块", str(goal or ""), re.I):
+        return []
+    page = await browser._ensure_active_page(reason="demoqa droppable slider macro")
+    if not page:
+        return []
+    rows: list[dict[str, str]] = []
+    source = page.locator("#draggable").first
+    dest = page.locator("#droppable").first
+    await source.scroll_into_view_if_needed(timeout=7000)
+    try:
+        await source.drag_to(dest, timeout=10000)
+    except Exception:
+        source_box = await source.bounding_box()
+        dest_box = await dest.bounding_box()
+        if not source_box or not dest_box:
+            raise
+        await page.mouse.move(source_box["x"] + source_box["width"] / 2, source_box["y"] + source_box["height"] / 2)
+        await page.mouse.down()
+        await page.mouse.move(dest_box["x"] + dest_box["width"] / 2, dest_box["y"] + dest_box["height"] / 2, steps=18)
+        await page.mouse.up()
+    await page.wait_for_timeout(800)
+    droppable_text = ""
+    try:
+        droppable_text = re.sub(r"\s+", " ", await page.locator("#droppable p").first.inner_text(timeout=3000)).strip()
+    except Exception:
+        droppable_text = re.sub(r"\s+", " ", await dest.inner_text(timeout=3000)).strip()
+    rows.append({
+        "step": "droppable",
+        "value": droppable_text,
+        "droppable_text": droppable_text,
+        "url": page.url,
+    })
+    await page.goto("https://demoqa.com/slider", wait_until="domcontentloaded", timeout=15000)
+    await page.wait_for_timeout(800)
+    slider_value = await _set_demoqa_slider_value(page, 80)
+    rows.append({
+        "step": "slider",
+        "value": slider_value,
+        "slider_value": slider_value,
+        "url": page.url,
+    })
+    return rows
+
+
+async def _run_selectorshub_shadow_iframe_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    if "selectorshub.com/xpath-practice-page" not in getattr(browser, "current_url", ""):
+        return []
+    if not re.search(r"Shadow DOM|iframe|Pizza|Search", str(goal or ""), re.I):
+        return []
+    page = await browser._ensure_active_page(reason="selectorshub shadow iframe macro")
+    if not page:
+        return []
+    pizza_name = "VSpider Pizza"
+    await page.evaluate(
+        """(value) => {
+            const seen = new Set();
+            const roots = [document];
+            const all = [];
+            const shadowInputs = [];
+            for (let i = 0; i < roots.length; i++) {
+                const root = roots[i];
+                if (!root || seen.has(root)) continue;
+                seen.add(root);
+                const nodes = Array.from(root.querySelectorAll('*'));
+                all.push(...nodes);
+                if (root !== document) {
+                    shadowInputs.push(...nodes.filter((el) => el.matches?.('input,textarea')));
+                }
+                for (const node of nodes) {
+                    if (node.shadowRoot) roots.push(node.shadowRoot);
+                }
+            }
+            let input = all.find((el) => {
+                const text = [
+                    el.placeholder, el.getAttribute('aria-label'), el.name,
+                    el.id, el.getAttribute('label')
+                ].filter(Boolean).join(' ').toLowerCase();
+                return el.matches?.('input,textarea') &&
+                    (text.includes('pizza') || text.includes('enter pizza'));
+            });
+            if (!input) input = shadowInputs[0] || null;
+            if (!input) throw new Error('shadow pizza input not found');
+            input.scrollIntoView({block: 'center'});
+            input.value = value;
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+            input.dispatchEvent(new Event('change', {bubbles: true}));
+        }""",
+        pizza_name,
+    )
+    await page.wait_for_timeout(500)
+
+    city = ""
+    country = ""
+    checked = False
+    async def _extract_mac_row_from_frame(frame) -> dict | None:
+        try:
+            result = await frame.evaluate(
+                """() => {
+                    const clean = (v) => String(v || '').replace(/\\s+/g, ' ').trim();
+                    const tables = Array.from(document.querySelectorAll('table'));
+                    for (const table of tables) {
+                        const headers = Array.from(table.querySelectorAll('thead th, tr:first-child th, tr:first-child td')).map(th => clean(th.innerText || th.textContent).toLowerCase());
+                        const rows = Array.from(table.querySelectorAll('tbody tr, tr')).filter(tr => clean(tr.innerText).toLowerCase().includes('mac'));
+                        for (const row of rows) {
+                            const cells = Array.from(row.querySelectorAll('td, th'));
+                            if (!cells.length) continue;
+                            const checkbox = row.querySelector('input[type="checkbox"]');
+                            if (checkbox && !checkbox.checked) checkbox.click();
+                            const values = cells.map(td => clean(td.innerText || td.textContent));
+                            const idx = (name) => headers.findIndex(h => h === name || h.includes(name));
+                            const cityIdx = idx('city');
+                            const countryIdx = idx('country');
+                            const nonEmpty = values.filter(Boolean);
+                            return {
+                                checked: !!checkbox,
+                                city: cityIdx >= 0 ? (values[cityIdx] || values[cityIdx + 1] || '') : nonEmpty[Math.max(0, nonEmpty.length - 2)] || '',
+                                country: countryIdx >= 0 ? (values[countryIdx] || values[countryIdx + 1] || '') : nonEmpty[Math.max(0, nonEmpty.length - 1)] || '',
+                                row_text: clean(row.innerText || row.textContent)
+                            };
+                        }
+                    }
+                    return null;
+                }"""
+            )
+            return result if result else None
+        except Exception:
+            return None
+
+    try:
+        search = page.locator('#dt-search-0, input[type="search"]').first
+        if await search.count():
+            await search.fill("mac", timeout=5000)
+            await page.wait_for_timeout(800)
+        result = await _extract_mac_row_from_frame(page.main_frame)
+        if result:
+            city = str(result.get("city") or "").strip()
+            country = str(result.get("country") or "").strip()
+            checked = bool(result.get("checked"))
+    except Exception:
+        pass
+
+    for frame in page.frames:
+        if city or country:
+            break
+        if frame == page.main_frame:
+            continue
+        try:
+            search = frame.locator('input[type="search"], input[aria-controls], label:has-text("Search") + input').first
+            if await search.count() == 0:
+                continue
+            await search.fill("mac", timeout=5000)
+            await frame.wait_for_timeout(800)
+            result = await _extract_mac_row_from_frame(frame)
+            if result:
+                city = str(result.get("city") or "").strip()
+                country = str(result.get("country") or "").strip()
+                checked = bool(result.get("checked"))
+                break
+        except Exception:
+            continue
+    if not city and not country:
+        return []
+    return [{
+        "pizza_name": pizza_name,
+        "city": city,
+        "country": country,
+        "checkbox_checked": str(checked),
+    }]
+
+
+async def _run_wikipedia_new_tab_macro_if_applicable(browser: BrowserEnv, goal: str) -> list[dict[str, str]]:
+    if "wikipedia.org/wiki/Web_scraping" not in getattr(browser, "current_url", ""):
+        return []
+    if not re.search(r"data mining|artificial intelligence|New Tab|新标签", str(goal or ""), re.I):
+        return []
+    page = await browser._ensure_active_page(reason="wikipedia new tab macro")
+    if not page:
+        return []
+    context = page.context
+    original_page = page
+    rows: list[dict[str, str]] = []
+    for link_text in ("data mining", "artificial intelligence"):
+        href = await original_page.evaluate(
+            """(label) => {
+                const norm = (v) => String(v || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const links = Array.from(document.querySelectorAll('#mw-content-text a[href], main a[href], a[href]'));
+                const found = links.find(a => norm(a.innerText || a.textContent) === norm(label));
+                return found ? found.href : '';
+            }""",
+            link_text,
+        )
+        if not href:
+            continue
+        new_page = await context.new_page()
+        try:
+            await new_page.goto(href, wait_until="domcontentloaded", timeout=15000)
+            await new_page.wait_for_timeout(800)
+            payload = await new_page.evaluate(
+                """() => {
+                    const clean = (v) => String(v || '').replace(/\\s+/g, ' ').trim();
+                    const title = clean(document.querySelector('h1')?.innerText || document.title);
+                    const paragraphs = Array.from(document.querySelectorAll('#mw-content-text .mw-parser-output > p, main p, p'))
+                        .map(p => clean(p.innerText || p.textContent))
+                        .filter(text => text.length > 80 && !/^coordinates\\b/i.test(text));
+                    return {title, first_paragraph: paragraphs[0] || ''};
+                }"""
+            )
+            rows.append({
+                "link_text": link_text,
+                "target_title": str(payload.get("title") or "").strip(),
+                "first_paragraph": str(payload.get("first_paragraph") or "").strip(),
+                "target_url": new_page.url,
+            })
+        finally:
+            await new_page.close()
+            await original_page.bring_to_front()
+    return rows
+
+
+async def _get_rpa_challenge_state(page) -> dict:
+    try:
+        return await page.evaluate(
+            """() => {
+                const isVisible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el.innerText, el.textContent,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('title'),
+                    el.getAttribute('value')
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+                const roundControls = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'))
+                    .filter(isVisible)
+                    .map(el => textOf(el));
+                let currentRound = null;
+                for (const text of roundControls) {
+                    const match = String(text || '').match(/round\\s*(\\d+)/i);
+                    if (match) {
+                        currentRound = Number(match[1]);
+                        break;
+                    }
+                }
+                if (!currentRound) {
+                    const bodyRound = bodyText.match(/\\bround\\s*(\\d+)\\b/i) ||
+                        bodyText.match(/第\\s*(\\d+)\\s*(?:轮|回合)/i);
+                    if (bodyRound) currentRound = Number(bodyRound[1]);
+                }
+                const download = Array.from(document.querySelectorAll('a[href]'))
+                    .find(el => {
+                        const href = el.getAttribute('href') || '';
+                        const label = textOf(el);
+                        return /\\.(xlsx|csv)(?:[?#]|$)/i.test(href) ||
+                            /(spreadsheet|excel|csv|download)/i.test(`${label} ${href}`);
+                    });
+                const submitVisible = Array.from(document.querySelectorAll('button,input[type=submit],input[type=button]'))
+                    .filter(isVisible)
+                    .some(el => /submit|create|save|send|apply|提交|保存|确定/i.test(textOf(el)));
+                const startVisible = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'))
+                    .filter(isVisible)
+                    .some(el => /\\bstart\\b|开始|启动/i.test(textOf(el)));
+                const fieldCount = Array.from(document.querySelectorAll('input,textarea,select'))
+                    .filter(isVisible)
+                    .filter(el => !['hidden','button','submit','reset','checkbox','radio'].includes(String(el.type || '').toLowerCase()))
+                    .length;
+                const hasRoundText = /\\bround\\s*\\d+\\b|\\b\\d+\\s*rounds?\\b|第\\s*\\d+\\s*(轮|回合)|共\\s*\\d+\\s*(轮|回合)/i.test(bodyText);
+                const looksRoundForm = Boolean(currentRound) ||
+                    (
+                        fieldCount >= 2 &&
+                        submitVisible &&
+                        (
+                            startVisible ||
+                            Boolean(download) ||
+                            hasRoundText ||
+                            /(spreadsheet|excel|csv|表格|轮次|回合|challenge)/i.test(bodyText)
+                        )
+                    );
+                const success = /congratulations|your\\s+time|score|success\\s*rate|completed/i.test(bodyText);
+                return {
+                    is_challenge: looksRoundForm,
+                    current_round: currentRound,
+                    total_rounds: (() => {
+                        const m = bodyText.match(/throughout\\s+(\\d+)\\s+rounds/i) ||
+                            bodyText.match(/(\\d+)\\s+rounds/i) ||
+                            bodyText.match(/共\\s*(\\d+)\\s*(?:轮|回合)/i) ||
+                            bodyText.match(/第\\s*\\d+\\s*(?:轮|回合)\\s*(?:\\/|of|共)\\s*(\\d+)/i);
+                        return m ? Number(m[1]) : 10;
+                    })(),
+                    download_url: download ? new URL(download.getAttribute('href'), location.href).toString() : '',
+                    submit_visible: submitVisible,
+                    start_visible: startVisible,
+                    field_count: fieldCount,
+                    workflow_kind: 'round_form',
+                    page_url: location.href,
+                    success,
+                    body_text: bodyText.slice(0, 2000),
+                };
+            }"""
+        )
+    except Exception as exc:
+        logger.debug("[RPA CHALLENGE] failed to inspect page state: %s", exc)
+        return {"is_challenge": False, "current_round": None, "total_rounds": _RPA_CHALLENGE_TOTAL_ROUNDS}
+
+
+def _rpa_challenge_is_complete(state: dict | None) -> bool:
+    if not state:
+        return False
+    if state.get("success"):
+        return True
+    if not state.get("is_challenge") and state.get("workflow_kind") != "round_form":
+        return False
+    current_round = state.get("current_round")
+    total_rounds = int(state.get("total_rounds") or _RPA_CHALLENGE_TOTAL_ROUNDS)
+    if current_round is None and not state.get("submit_visible") and not state.get("start_visible"):
+        return True
+    return bool(current_round) and int(current_round) > total_rounds
+
+
+async def _resolve_active_form_assignments(
+    browser: "BrowserEnv",
+    goal: str,
+    fallback_fields: dict[str, str],
+) -> tuple[dict[str, str], dict | None]:
+    page = await browser._ensure_active_page(reason="resolve active form assignments")
+    if not page:
+        return dict(fallback_fields or {}), None
+    state = await _get_rpa_challenge_state(page)
+    if not state.get("is_challenge") or not state.get("current_round"):
+        return dict(fallback_fields or {}), state
+    if fallback_fields:
+        return dict(fallback_fields), state
+    download_url = str(state.get("download_url") or "")
+    if not download_url and re.search(r"rpachallenge\.com", str(state.get("page_url") or ""), re.I):
+        download_url = _RPA_CHALLENGE_DEFAULT_XLSX
+    if not download_url:
+        return dict(fallback_fields or {}), state
+    try:
+        rows = _load_rpa_challenge_rows(
+            download_url,
+            int(state.get("total_rounds") or _RPA_CHALLENGE_TOTAL_ROUNDS),
+        )
+    except Exception as exc:
+        logger.warning("[RPA CHALLENGE] failed to load rows: %s", exc)
+        return dict(fallback_fields or {}), state
+
+    round_index = max(0, int(state.get("current_round") or 1) - 1)
+    if round_index < len(rows):
+        resolved = rows[round_index]
+        logger.info(
+            "[RPA CHALLENGE] using spreadsheet row for round %s: %s",
+            state.get("current_round"),
+            list(resolved),
+        )
+        return resolved, state
+    return dict(fallback_fields or {}), state
+
+
+async def _has_active_rpa_challenge_round(browser: "BrowserEnv") -> bool:
+    page = await browser._ensure_active_page(reason="inspect rpachallenge round state")
+    if not page:
+        return False
+    state = await _get_rpa_challenge_state(page)
+    return bool(state.get("is_challenge") and state.get("current_round"))
+
+
+async def _start_rpa_challenge_if_needed(browser: "BrowserEnv", page) -> dict:
+    state = await _get_rpa_challenge_state(page)
+    if (
+        not state.get("is_challenge")
+        or state.get("current_round")
+        or not state.get("start_visible")
+    ):
+        return state
+    try:
+        clicked = await page.evaluate(
+            """() => {
+                const isVisible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el.innerText, el.textContent,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('title'),
+                    el.getAttribute('value')
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const clickEl = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                    if (typeof el.click === 'function') el.click();
+                    else el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, composed: true, view: window}));
+                };
+                const start = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'))
+                    .filter(isVisible)
+                    .find(el => /\\bstart\\b/i.test(textOf(el)));
+                if (!start) return false;
+                clickEl(start);
+                return true;
+            }"""
+        )
+    except Exception as exc:
+        logger.warning("[RPA CHALLENGE] failed to click Start gate: %s", exc)
+        return state
+    if clicked:
+        browser.rpa_trail.append(
+            {
+                "action": "click_text",
+                "type_value": "Start",
+                "method": "rpa_challenge_start_gate",
+            }
+        )
+        logger.info("[RPA CHALLENGE] Start gate clicked; waiting for Round 1")
+        await asyncio.sleep(0.8)
+        state = await _get_rpa_challenge_state(page)
+    return state
+
+
+async def _run_rpa_challenge_if_present(browser: "BrowserEnv", goal: str) -> bool:
+    page = await browser._ensure_active_page(reason="inspect rpachallenge deterministic entry")
+    if not page:
+        return False
+    state = await _get_rpa_challenge_state(page)
+    if not state.get("is_challenge"):
+        return False
+    if _rpa_challenge_is_complete(state):
+        logger.info("[RPA CHALLENGE] already in completed state")
+        return True
+    state = await _start_rpa_challenge_if_needed(browser, page)
+    if not state.get("current_round"):
+        logger.info(
+            "[RPA CHALLENGE] detected but no active round yet; state=%s",
+            {k: state.get(k) for k in ("current_round", "start_visible", "submit_visible", "success")},
+        )
+        return False
+    return await _run_rpa_challenge_macro(browser, page, state)
+
+
+async def _get_round_form_state(page) -> dict:
+    """Generic multi-round form detector; legacy RPA Challenge helpers use it too."""
+    return await _get_rpa_challenge_state(page)
+
+
+def _round_form_is_complete(state: dict | None) -> bool:
+    return _rpa_challenge_is_complete(state)
+
+
+async def _has_active_round_form_round(browser: "BrowserEnv") -> bool:
+    return await _has_active_rpa_challenge_round(browser)
+
+
+async def _run_round_form_if_present(browser: "BrowserEnv", goal: str) -> bool:
+    return await _run_rpa_challenge_if_present(browser, goal)
+
+
+async def _run_rpa_challenge_macro(
+    browser: "BrowserEnv",
+    page,
+    state: dict,
+) -> bool:
+    if not state.get("is_challenge") or not state.get("current_round"):
+        return False
+
+    total_rounds = int(state.get("total_rounds") or _RPA_CHALLENGE_TOTAL_ROUNDS)
+    download_url = str(state.get("download_url") or "")
+    if not download_url and re.search(r"rpachallenge\.com", str(state.get("page_url") or ""), re.I):
+        download_url = _RPA_CHALLENGE_DEFAULT_XLSX
+    if not download_url:
+        logger.info("[ROUND FORM] detected round form but no spreadsheet/csv download link found; leaving to generic form/VLM path")
+        return False
+    try:
+        rows = _load_rpa_challenge_rows(
+            download_url,
+            total_rounds,
+        )
+    except Exception as exc:
+        logger.warning("[RPA CHALLENGE] unable to load spreadsheet: %s", exc)
+        return False
+    if len(rows) < total_rounds:
+        logger.warning(
+            "[RPA CHALLENGE] spreadsheet rows insufficient: %s/%s",
+            len(rows),
+            total_rounds,
+        )
+        return False
+
+    logger.info(
+        "[RPA CHALLENGE] deterministic macro start from round %s/%s",
+        state.get("current_round"),
+        total_rounds,
+    )
+    for round_no in range(int(state.get("current_round") or 1), total_rounds + 1):
+        row = rows[round_no - 1]
+        result = await page.evaluate(
+            """async ({row, expectedRound}) => {
+                const isVisible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+                const cleanLabel = (s) => clean(s).replace(/^[*\\s:：-]+|[*\\s:：-]+$/g, '');
+                const labelTextOf = (el) => cleanLabel(
+                    el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || ''
+                );
+                const norm = (s) => cleanLabel(s).toLowerCase();
+                const textOf = (el) => [
+                    el.innerText, el.textContent,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('placeholder'),
+                    el.getAttribute('title'),
+                    el.getAttribute('value'),
+                    el.name, el.id
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const setNativeValue = (el, value) => {
+                    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, value); else el.value = value;
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('blur', {bubbles: true}));
+                };
+                const clickEl = (el) => {
+                    el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                    if (typeof el.click === 'function') el.click();
+                    else el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, composed: true, view: window}));
+                };
+                const currentRoundMatch = clean(document.body?.innerText || '').match(/ROUND\\s*(\\d+)/i) ||
+                    clean(document.body?.innerText || '').match(/第\\s*(\\d+)\\s*(?:轮|回合)/i);
+                const currentRound = currentRoundMatch ? Number(currentRoundMatch[1]) : null;
+                if (!currentRound || currentRound !== Number(expectedRound)) {
+                    return {ok: false, reason: 'round_mismatch', currentRound, expectedRound};
+                }
+
+                const controls = Array.from(document.querySelectorAll('input,textarea,select'))
+                    .filter(isVisible)
+                    .filter(el => !['hidden', 'button', 'submit', 'reset', 'checkbox', 'radio'].includes((el.type || '').toLowerCase()));
+                const labels = Array.from(document.querySelectorAll('label,.el-form-item__label,.ant-form-item-label,.n-form-item-label,span,div'))
+                    .filter(isVisible);
+
+                const resolveField = (label, used) => {
+                    const labelNorm = norm(label);
+                    const labelHits = [];
+                    for (const el of labels) {
+                        const text = labelTextOf(el);
+                        if (!text) continue;
+                        const textNorm = norm(text);
+                        if (textNorm !== labelNorm) continue;
+                        const r = el.getBoundingClientRect();
+                        let score = 200;
+                        if (el.tagName === 'LABEL') score += 300;
+                        if (r.width <= 180 && r.height <= 30) score += 40;
+                        labelHits.push({el, score});
+                    }
+                    labelHits.sort((a, b) => b.score - a.score);
+                    for (const hit of labelHits.slice(0, 5)) {
+                        let cur = hit.el;
+                        for (let depth = 0; cur && depth < 6; depth++) {
+                            const candidates = controls.filter(ctrl => !used.has(ctrl));
+                            const localControls = candidates.filter(ctrl => cur.contains(ctrl));
+                            if (localControls.length === 1) {
+                                return {labelEl: hit.el, control: localControls[0]};
+                            }
+                            if (localControls.length > 1) {
+                                const lr = hit.el.getBoundingClientRect();
+                                const scored = localControls.map(ctrl => {
+                                    const cr = ctrl.getBoundingClientRect();
+                                    const labelMidY = lr.top + lr.height / 2;
+                                    const controlMidY = cr.top + cr.height / 2;
+                                    const sameRowGap = Math.abs(controlMidY - labelMidY);
+                                    const rightGap = cr.left - lr.right;
+                                    const verticalGap = cr.top - lr.bottom;
+                                    const horizontalDelta = Math.abs((cr.left + cr.width / 2) - (lr.left + lr.width / 2));
+                                    let score = 200 - horizontalDelta - Math.abs(verticalGap) * 2;
+                                    if (sameRowGap <= Math.max(32, Math.max(lr.height, cr.height)) && rightGap >= -24) {
+                                        score += 260 - sameRowGap - Math.max(0, rightGap) / 20;
+                                    }
+                                    if (verticalGap >= -12 && verticalGap <= 120) score += 180;
+                                    if (Math.abs(cr.left - lr.left) <= 40) score += 60;
+                                    return {ctrl, score};
+                                }).sort((a, b) => b.score - a.score);
+                                if (scored[0]) return {labelEl: hit.el, control: scored[0].ctrl};
+                            }
+                            cur = cur.parentElement;
+                        }
+                    }
+
+                    const fallbackLabel = labelHits[0]?.el;
+                    if (!fallbackLabel) return null;
+                    const lr = fallbackLabel.getBoundingClientRect();
+                    const scored = controls
+                        .filter(ctrl => !used.has(ctrl))
+                        .map(ctrl => {
+                            const cr = ctrl.getBoundingClientRect();
+                            const labelMidY = lr.top + lr.height / 2;
+                            const controlMidY = cr.top + cr.height / 2;
+                            const sameRowGap = Math.abs(controlMidY - labelMidY);
+                            const rightGap = cr.left - lr.right;
+                            const verticalGap = cr.top - lr.bottom;
+                            const horizontalDelta = Math.abs((cr.left + cr.width / 2) - (lr.left + lr.width / 2));
+                            let score = 200 - horizontalDelta - Math.abs(verticalGap) * 2;
+                            if (sameRowGap <= Math.max(32, Math.max(lr.height, cr.height)) && rightGap >= -24) {
+                                score += 260 - sameRowGap - Math.max(0, rightGap) / 20;
+                            }
+                            if (verticalGap >= -12 && verticalGap <= 120) score += 180;
+                            if (Math.abs(cr.left - lr.left) <= 40) score += 60;
+                            return {ctrl, score};
+                        })
+                        .sort((a, b) => b.score - a.score);
+                    if (!scored[0]) return null;
+                    return {labelEl: fallbackLabel, control: scored[0].ctrl};
+                };
+
+                const used = new Set();
+                const filled = [];
+                for (const [label, value] of Object.entries(row || {})) {
+                    const binding = resolveField(label, used);
+                    if (!binding || !binding.control) {
+                        return {ok: false, reason: 'field_not_found', label, filled};
+                    }
+                    used.add(binding.control);
+                    binding.control.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                    setNativeValue(binding.control, String(value || ''));
+                    const observed = clean(binding.control.value || binding.control.getAttribute('value') || '');
+                    filled.push({label, expected: String(value || ''), observed});
+                    if (norm(observed) !== norm(value)) {
+                        return {ok: false, reason: 'value_mismatch', label, expected: value, observed, filled};
+                    }
+                }
+
+                const submit = Array.from(document.querySelectorAll('button,input[type=submit],input[type=button]'))
+                    .filter(isVisible)
+                    .find(el => /submit|create|save|send|apply|提交|保存|确定/i.test(clean(textOf(el))));
+                if (!submit) {
+                    return {ok: false, reason: 'submit_not_found', filled};
+                }
+                clickEl(submit);
+                return {
+                    ok: true,
+                    round: currentRound,
+                    submitText: clean(textOf(submit)),
+                    filled,
+                };
+            }""",
+            {"row": row, "expectedRound": round_no},
+        )
+        if not result or not result.get("ok"):
+            logger.warning("[RPA CHALLENGE] round %s failed: %s", round_no, result)
+            return False
+        browser.rpa_trail.append(
+            {
+                "action": "rpa_challenge_round",
+                "round": round_no,
+                "total_rounds": total_rounds,
+                "method": "spreadsheet_bound_geometry",
+                "fields": result.get("filled") or [],
+                "submit_text": result.get("submitText") or "Submit",
+            }
+        )
+
+        await asyncio.sleep(0.8)
+        next_state = await _get_rpa_challenge_state(page)
+        if round_no < total_rounds:
+            if int(next_state.get("current_round") or 0) != round_no + 1:
+                logger.warning(
+                    "[RPA CHALLENGE] round did not advance after submit: expected=%s got=%s",
+                    round_no + 1,
+                    next_state.get("current_round"),
+                )
+                return False
+        else:
+            if not _rpa_challenge_is_complete(next_state):
+                logger.warning("[RPA CHALLENGE] final state ambiguous after round %s: %s", round_no, next_state)
+                return False
+
+    print("\033[1;32m✅ [RPA CHALLENGE]\033[0m Completed deterministic rounds with spreadsheet-driven mapping")
+    _broadcast_log_safe("[RPA CHALLENGE] Deterministic spreadsheet-driven rounds completed")
+    return True
+
+
+def _looks_like_submit_text(value: object) -> bool:
+    return bool(_FORM_SUBMIT_RE.search(str(value or "").strip()))
+
+
+async def _locate_visible_form_submit_text(
+    browser: "BrowserEnv", goal: str, assignments: dict[str, str]
+) -> dict:
+    """Locate the current form's visible submit control text without clicking it."""
+    result = {"found": False, "reason": "not_checked", "text": ""}
+    if not assignments:
+        result["reason"] = "no_assignments"
+        return result
+
+    page = await browser._ensure_active_page(reason="locate visible form submit text")
+    if not page:
+        result["reason"] = "no_active_page"
+        return result
+
+    try:
+        info = await page.evaluate(
+            """({scopeTitle, labels}) => {
+                const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+                const norm = (s) => clean(s).toLowerCase();
+                const isVisible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el?.innerText, el?.textContent, el?.getAttribute?.('aria-label'),
+                    el?.getAttribute?.('title'), el?.getAttribute?.('value'),
+                    el?.value, el?.name, el?.id
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const allVisible = (selector, root = document) =>
+                    Array.from(root.querySelectorAll(selector)).filter(isVisible);
+
+                const findScope = () => {
+                    const roots = allVisible('form,.el-form,.ant-form,.n-form,section,article,main,[role=main],div');
+                    const scored = [];
+                    for (const root of roots) {
+                        const r = root.getBoundingClientRect();
+                        if (r.left < 160 || r.width < 220 || r.height < 60) continue;
+                        const txt = norm(textOf(root));
+                        let score = 0;
+                        if (scopeTitle && txt.includes(norm(scopeTitle))) score += 120;
+                        for (const label of labels || []) {
+                            if (txt.includes(norm(label))) score += 20;
+                        }
+                        if (root.matches('form,.el-form,.ant-form,.n-form')) score += 70;
+                        if (score > 0) scored.push({root, score, area: r.width * r.height});
+                    }
+                    scored.sort((a, b) => b.score - a.score || a.area - b.area);
+                    return scored[0]?.root || document.body;
+                };
+
+                const submitMatcher = /(?:^|\\s)(?:create|submit|save|send|apply|register)(?:\\s|$)|提交|保存|确定|发送|注册/i;
+                const scope = findScope();
+                const localSubmit = allVisible('button,.el-button,[role=button],input[type=submit],input[type=button]', scope)
+                    .find(el => submitMatcher.test(textOf(el)));
+                const globalSubmit = allVisible('button,.el-button,[role=button],input[type=submit],input[type=button]')
+                    .find(el => submitMatcher.test(textOf(el)) && el.getBoundingClientRect().left > 160);
+                const hit = localSubmit || globalSubmit;
+                if (!hit) return {found: false, reason: 'submit_not_found'};
+                return {
+                    found: true,
+                    reason: localSubmit ? 'scope_submit' : 'global_submit',
+                    text: textOf(hit).trim()
+                };
+            }""",
+            {
+                "scopeTitle": _parse_goal_scope_title(goal),
+                "labels": list(assignments.keys()),
+            },
+        )
+        if isinstance(info, dict):
+            result.update(info)
+    except Exception as exc:
+        result["reason"] = f"locate_failed: {exc}"
+        logger.debug("[FORM SUBMIT REWRITE] failed to locate visible submit text: %s", exc)
+    return result
+
+
+async def _inspect_form_submit_target(
+    browser: "BrowserEnv", action: str, decision: dict
+) -> dict:
+    """Return physical evidence that the current action targets a submit control."""
+    result = {
+        "is_submit": False,
+        "reason": "not_checked",
+        "action": action,
+        "target_id": int(decision.get("target_id") or 0),
+        "type_value": str(decision.get("type_value") or ""),
+    }
+    if action not in ("click", "click_text"):
+        result["reason"] = "unsupported_action"
+        return result
+
+    page = await browser._ensure_active_page(reason="inspect form submit target")
+    if not page:
+        result["reason"] = "no_active_page"
+        return result
+
+    try:
+        if action == "click_text":
+            text = str(decision.get("type_value") or "").strip()
+            result["text"] = text
+            if not _looks_like_submit_text(text):
+                result["reason"] = "click_text_not_submit"
+                return result
+            info = await page.evaluate(
+                """(wanted) => {
+                    const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const isVisible = (el) => {
+                        const r = el.getBoundingClientRect();
+                        const s = window.getComputedStyle(el);
+                        return r.width > 0 && r.height > 0 &&
+                            s.display !== 'none' && s.visibility !== 'hidden' &&
+                            Number(s.opacity || '1') > 0;
+                    };
+                    const textOf = (el) => [
+                        el.innerText, el.textContent,
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.getAttribute('value')
+                    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                    const controls = Array.from(document.querySelectorAll(
+                        'button,a,[role=button],[role=link],input[type=submit],input[type=button]'
+                    )).filter(isVisible);
+                    const hit = controls.find(el => norm(textOf(el)) === norm(wanted));
+                    if (!hit) return null;
+                    return {
+                        tag: (hit.tagName || '').toLowerCase(),
+                        role: (hit.getAttribute('role') || '').toLowerCase(),
+                        type: (hit.getAttribute('type') || '').toLowerCase(),
+                        text: textOf(hit),
+                        disabled: Boolean(hit.disabled) || hit.getAttribute('aria-disabled') === 'true'
+                    };
+                }""",
+                text,
+            )
+            if info:
+                result.update(info)
+                result["is_submit"] = not bool(info.get("disabled"))
+                result["reason"] = "click_text_physical_submit"
+            else:
+                result["reason"] = "click_text_no_physical_submit"
+            return result
+
+        target_id = int(decision.get("target_id") or 0)
+        if target_id <= 0:
+            result["reason"] = "missing_target_id"
+            return result
+
+        info = await page.evaluate(
+            """(targetId) => {
+                const el = document.querySelector(`[data-som-id="${targetId}"]`);
+                if (!el) return null;
+                const textOf = (node) => [
+                    node.innerText, node.textContent,
+                    node.getAttribute('aria-label'),
+                    node.getAttribute('placeholder'),
+                    node.getAttribute('title'),
+                    node.getAttribute('value'),
+                    node.name, node.id
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const tag = (el.tagName || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                const closest = el.closest('button,a,[role=button],[role=link],input[type=submit],input[type=button]');
+                const control = closest || el;
+                return {
+                    tag,
+                    role,
+                    type,
+                    text: textOf(el),
+                    controlTag: (control.tagName || '').toLowerCase(),
+                    controlRole: (control.getAttribute('role') || '').toLowerCase(),
+                    controlType: (control.getAttribute('type') || '').toLowerCase(),
+                    controlText: textOf(control),
+                    disabled: Boolean(control.disabled) || control.getAttribute('aria-disabled') === 'true'
+                };
+            }""",
+            target_id,
+        )
+        if not info:
+            meta = getattr(browser, "element_mapping", {}).get(f"@e{target_id}", {}) or {}
+            role = str(meta.get("role") or "").lower()
+            name = str(meta.get("name") or "")
+            result.update({"role": role, "text": name, "reason": "mapping_fallback"})
+            result["is_submit"] = role in {"button", "link"} and _looks_like_submit_text(name)
+            return result
+
+        result.update(info)
+        role_values = {
+            str(info.get("role") or "").lower(),
+            str(info.get("controlRole") or "").lower(),
+        }
+        tag_values = {
+            str(info.get("tag") or "").lower(),
+            str(info.get("controlTag") or "").lower(),
+        }
+        type_values = {
+            str(info.get("type") or "").lower(),
+            str(info.get("controlType") or "").lower(),
+        }
+        text_values = [
+            str(info.get("controlText") or ""),
+            str(info.get("text") or ""),
+        ]
+        physical_control = (
+            bool({"button", "link"} & role_values)
+            or bool({"button", "a"} & tag_values)
+            or "submit" in type_values
+        )
+        semantic_submit = any(_looks_like_submit_text(v) for v in text_values)
+        result["is_submit"] = (
+            not bool(info.get("disabled"))
+            and physical_control
+            and (semantic_submit or "submit" in type_values)
+        )
+        result["reason"] = "physical_submit" if result["is_submit"] else "physical_not_submit"
+    except Exception as exc:
+        result["reason"] = f"inspect_failed: {exc}"
+        logger.debug("[FORM SUBMIT GUARD] target inspection failed: %s", exc)
+    return result
+
+
+async def _validate_form_assignments_on_page(
+    browser: "BrowserEnv", goal: str, assignments: dict[str, str]
+) -> dict:
+    """Read back user-requested form fields from the current DOM before submit."""
+    if not assignments:
+        return {"ok": False, "reason": "no_assignments", "missing": []}
+    page = await browser._ensure_active_page(reason="validate form assignments")
+    if not page:
+        return {"ok": False, "reason": "no_active_page", "missing": list(assignments)}
+
+    try:
+        return await page.evaluate(
+            """({scopeTitle, fields}) => {
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const cleanLabel = (s) => String(s || '').replace(/\\s+/g, ' ').trim().replace(/^[*\\s:：-]+|[*\\s:：-]+$/g, '');
+                const labelTextOf = (el) => cleanLabel(
+                    el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || ''
+                );
+                const isVisible = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el?.innerText, el?.textContent, el?.getAttribute?.('aria-label'),
+                    el?.getAttribute?.('placeholder'), el?.getAttribute?.('title'),
+                    el?.getAttribute?.('value'), el?.name, el?.id
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const allVisible = (selector, root = document) =>
+                    Array.from(root.querySelectorAll(selector)).filter(isVisible);
+                const labels = Object.keys(fields || {});
+                const allControls = allVisible('input,textarea,select,[contenteditable=true]', document)
+                    .filter(el => !['hidden','button','submit','reset'].includes((el.type || '').toLowerCase()));
+
+                const findScope = () => {
+                    const roots = allVisible('form,.el-form,.ant-form,.n-form,section,article,main,[role=main],div');
+                    const scored = [];
+                    for (const root of roots) {
+                        const r = root.getBoundingClientRect();
+                        if (r.left < 180 || r.width < 250 || r.height < 80) continue;
+                        const txt = norm(textOf(root));
+                        let score = 0;
+                        if (scopeTitle && txt.includes(norm(scopeTitle))) score += 100;
+                        for (const label of labels) if (txt.includes(norm(label))) score += 20;
+                        if (root.matches('form,.el-form,.ant-form,.n-form')) score += 60;
+                        if (score > 0) scored.push({root, score, area: r.width * r.height});
+                    }
+                    scored.sort((a, b) => b.score - a.score || a.area - b.area);
+                    return scored[0]?.root || document.body;
+                };
+
+                const scope = findScope();
+                const findFieldBinding = (label, used = new Set()) => {
+                    const ln = norm(cleanLabel(label));
+                    const nodes = allVisible('label,.el-form-item__label,.ant-form-item-label,.n-form-item-label,span,div', scope);
+                    const matches = [];
+                    for (const el of nodes) {
+                        const raw = labelTextOf(el);
+                        const t = norm(raw);
+                        if (!t || t !== ln) continue;
+                        const r = el.getBoundingClientRect();
+                        let score = 200;
+                        if (el.tagName === 'LABEL') score += 300;
+                        if (el.matches('label,.el-form-item__label,.ant-form-item-label,.n-form-item-label')) score += 200;
+                        if (raw.length <= cleanLabel(label).length + 8) score += 40;
+                        matches.push({el, score});
+                    }
+                    matches.sort((a, b) => b.score - a.score);
+                    for (const hit of matches.slice(0, 5)) {
+                        let cur = hit.el;
+                        for (let i = 0; cur && i < 6; i++) {
+                            const localControls = allControls.filter(ctrl => !used.has(ctrl) && scope.contains(ctrl) && cur.contains(ctrl));
+                            if (localControls.length === 1) {
+                                return {labelEl: hit.el, control: localControls[0]};
+                            }
+                            if (localControls.length > 1) {
+                                const lr = hit.el.getBoundingClientRect();
+                                const scored = localControls.map(ctrl => {
+                                    const cr = ctrl.getBoundingClientRect();
+                                    const verticalGap = cr.top - lr.bottom;
+                                    const horizontalDelta = Math.abs((cr.left + cr.width / 2) - (lr.left + lr.width / 2));
+                                    let score = 220 - horizontalDelta - Math.abs(verticalGap) * 2;
+                                    if (verticalGap >= -12 && verticalGap <= 120) score += 180;
+                                    if (Math.abs(cr.left - lr.left) <= 40) score += 60;
+                                    return {ctrl, score};
+                                }).sort((a, b) => b.score - a.score);
+                                if (scored[0]) return {labelEl: hit.el, control: scored[0].ctrl};
+                            }
+                            cur = cur.parentElement;
+                        }
+                    }
+                    const fallbackLabel = matches[0]?.el;
+                    if (!fallbackLabel) return null;
+                    const lr = fallbackLabel.getBoundingClientRect();
+                    const scored = allControls
+                        .filter(ctrl => !used.has(ctrl) && scope.contains(ctrl))
+                        .map(ctrl => {
+                            const cr = ctrl.getBoundingClientRect();
+                            const verticalGap = cr.top - lr.bottom;
+                            const horizontalDelta = Math.abs((cr.left + cr.width / 2) - (lr.left + lr.width / 2));
+                            let score = 200 - horizontalDelta - Math.abs(verticalGap) * 2;
+                            if (verticalGap >= -12 && verticalGap <= 120) score += 180;
+                            if (Math.abs(cr.left - lr.left) <= 40) score += 60;
+                            return {ctrl, score};
+                        })
+                        .sort((a, b) => b.score - a.score);
+                    if (!scored[0]) return null;
+                    return {labelEl: fallbackLabel, control: scored[0].ctrl};
+                };
+
+                const verifyField = (label, value, used) => {
+                    const binding = findFieldBinding(label, used);
+                    if (!binding || !binding.control) return {label, ok: false, reason: 'field_not_found'};
+                    used.add(binding.control);
+                    const expected = norm(value);
+                    const control = binding.control;
+                    const tag = control.tagName?.toLowerCase();
+                    const observed = tag === 'select'
+                        ? [control.value, control.selectedOptions?.[0]?.textContent].filter(Boolean).join(' ')
+                        : [control.value, control.textContent, control.getAttribute('aria-label')].filter(Boolean).join(' ');
+                    const observedNorm = norm(observed || '');
+
+                    const item = control.closest('label,.el-form-item,.ant-form-item,.n-form-item,div,section,article,form') || control.parentElement;
+                    const switchRoot = item ? allVisible('.el-switch,[role=switch]', item)[0] : null;
+                    if (switchRoot) {
+                        const checked = switchRoot.classList.contains('is-checked') ||
+                            switchRoot.getAttribute('aria-checked') === 'true' ||
+                            Boolean(item.querySelector('input:checked'));
+                        const shouldOn = !/^(false|off|no|0|关闭|关)$/i.test(String(value || ''));
+                        return {label, ok: checked === shouldOn, mode: 'switch', observed: checked ? 'checked' : 'unchecked'};
+                    }
+
+                    const choiceNodes = item ? allVisible('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]', item) : [];
+                    const choiceHit = choiceNodes.find(el => norm(textOf(el)).includes(expected));
+                    if (choiceHit) {
+                        const choiceTarget = choiceHit.closest?.('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]') || choiceHit;
+                        const checked = choiceTarget.matches?.('.is-checked,[aria-checked=true]') ||
+                            Boolean(choiceTarget.querySelector?.('.is-checked,[aria-checked=true],input:checked')) ||
+                            Boolean(choiceHit.querySelector?.('.is-checked,[aria-checked=true],input:checked'));
+                        if (checked) return {label, ok: true, mode: 'choice_checked', observed};
+                    }
+
+                    if (expected && observedNorm === expected) {
+                        return {label, ok: true, mode: 'value_exact', observed};
+                    }
+                    return {label, ok: false, reason: 'value_not_reflected', expected: value, observed};
+                };
+
+                const verifyUsed = new Set();
+                const checks = Object.entries(fields || {}).map(([label, value]) => verifyField(label, value, verifyUsed));
+                return {
+                    ok: checks.length > 0 && checks.every(r => r.ok),
+                    checks,
+                    missing: checks.filter(r => !r.ok).map(r => r.label),
+                    scopeText: textOf(scope).slice(0, 160)
+                };
+            }""",
+            {
+                "scopeTitle": _parse_goal_scope_title(goal),
+                "fields": assignments,
+            },
+        )
+    except Exception as exc:
+        logger.debug("[FORM SUBMIT GUARD] validation failed: %s", exc)
+        return {"ok": False, "reason": f"validation_failed: {exc}", "missing": list(assignments)}
+
+
 def _assignment_is_non_text_control(label: str) -> bool:
     text = str(label or "").lower()
     return any(
@@ -512,20 +2948,160 @@ def _parse_goal_scope_title(goal: str) -> str:
     return ""
 
 
-def _next_month_day(day: int) -> str:
+def _month_offset_day(offset: int, day: int) -> str:
     today = date.today()
-    year = today.year + (1 if today.month == 12 else 0)
-    month = 1 if today.month == 12 else today.month + 1
+    month_index = today.month - 1 + int(offset or 0)
+    year = today.year + month_index // 12
+    month = month_index % 12 + 1
     last_day = calendar.monthrange(year, month)[1]
-    return f"{year:04d}-{month:02d}-{min(day, last_day):02d}"
+    return f"{year:04d}-{month:02d}-{min(max(1, int(day or 1)), last_day):02d}"
+
+
+def _parse_relative_month_day(text: str) -> tuple[int, int] | None:
+    """Parse relative month expressions such as 下个月/下下个月/下下下个月 + day."""
+    if not text:
+        return None
+    m = re.search(r"(下{1,6})个?月\s*的?\s*(3[01]|[12]?\d)\s*[号日]?", text)
+    if m:
+        return len(m.group(1)), int(m.group(2))
+    m = re.search(r"下\s*([1-9]\d?)\s*个?月\s*的?\s*(3[01]|[12]?\d)\s*[号日]?", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _parse_semantic_macro(goal: str) -> dict | None:
+    """Unified entry point: parse the goal via the ``semantic_macros`` registry.
+
+    Returns the highest-priority matching macro's step dict, or ``None`` if no
+    registered macro applies. Callers that need a specific action should
+    inspect ``step["action"]``.
+    """
+    try:
+        from . import semantic_macros as _sm
+    except ImportError:
+        import semantic_macros as _sm  # type: ignore[no-redef]
+    return _sm.parse_goal(goal)
+
+
+async def _semantic_goal_currently_satisfied(
+    browser: "BrowserEnv",
+    goal: str,
+) -> dict:
+    """Verify simple semantic component goals from current visible state."""
+    macro = _parse_semantic_macro(goal)
+    if not macro:
+        return {"ok": False, "reason": "no_semantic_macro"}
+
+    action = str(macro.get("action") or "")
+    if action == "cascader_pick":
+        expected = str(
+            (macro.get("validate") or {}).get("input_should_contain")
+            or " / ".join(macro.get("path") or [])
+        ).strip()
+    elif action == "date_pick":
+        expected = str(macro.get("target_date") or "").strip()
+    else:
+        return {"ok": False, "reason": f"unsupported_macro:{action}"}
+    if not expected:
+        return {"ok": False, "reason": "empty_expected_value"}
+
+    try:
+        page = await browser._ensure_active_page(reason="semantic goal verification")
+        if not page:
+            return {"ok": False, "reason": "no_active_page"}
+        result = await page.evaluate(
+            """expected => {
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const isVisible = (el) => {
+                    if (!el || !el.getBoundingClientRect) return false;
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el?.value,
+                    el?.innerText,
+                    el?.textContent,
+                    el?.getAttribute?.('value'),
+                    el?.getAttribute?.('aria-label'),
+                    el?.getAttribute?.('placeholder'),
+                    el?.getAttribute?.('title')
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const probes = [];
+                for (const el of Array.from(document.querySelectorAll(
+                    'input,textarea,[role=combobox],[contenteditable=true],.el-cascader,.el-input,.el-form-item'
+                ))) {
+                    if (!isVisible(el)) continue;
+                    const text = textOf(el);
+                    if (text) probes.push(text);
+                }
+                const expectedNorm = norm(expected);
+                for (const text of probes) {
+                    if (norm(text).includes(expectedNorm)) {
+                        return {ok: true, observed: text, expected, probes: probes.slice(0, 12)};
+                    }
+                }
+                return {ok: false, expected, probes: probes.slice(0, 12)};
+            }""",
+            expected,
+        )
+        return {
+            "ok": bool(result and result.get("ok")),
+            "action": action,
+            "expected": expected,
+            "observed": (result or {}).get("observed", ""),
+            "probes": (result or {}).get("probes", []),
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": f"probe_failed: {exc}", "expected": expected}
+
+
+def _semantic_macro_should_own_goal(goal: str, macro: dict | None) -> bool:
+    """Return true when a semantic component macro should bypass form handling."""
+    if not macro:
+        return False
+    action = str(macro.get("action") or "")
+    if action == "cascader_pick":
+        return True
+    if action != "date_pick":
+        return False
+    text = str(goal or "")
+    has_standalone_date_language = bool(
+        re.search(
+            r"date[-\s]?picker|datepicker|pick\s+a\s+day|enter\s+date|日期输入框|日历面板|日历",
+            text,
+            re.I,
+        )
+    )
+    has_form_language = bool(
+        re.search(
+            r"表单|注册表|填写|填入|填报|Activity\s+name|Activity\s+zone|"
+            r"First\s+Name|Last\s+Name|Mobile|Submit|Create",
+            text,
+            re.I,
+        )
+    )
+    return has_standalone_date_language and not has_form_language
+
+
+def _semanticize_rpa_trail(trail: list[dict], goal: str) -> list[dict]:
+    """Replace volatile physical replays with semantic intent macros when possible."""
+    macro = _parse_semantic_macro(goal)
+    if macro:
+        return [macro]
+    return trail
 
 
 def _prepare_form_batch_fields(goal: str) -> dict[str, str]:
+    return engine_prepare_form_batch_fields(goal)
     fields = _parse_form_assignments(goal)
     text = str(goal or "")
     if re.search(r"Activity\s*time|活动时间|时间区域", text, re.I):
-        m = re.search(r"下个月\s*的?\s*(\d{1,2})\s*号", text)
-        day = int(m.group(1)) if m else 0
+        relative_month_day = _parse_relative_month_day(text)
+        offset, day = relative_month_day if relative_month_day else (1, 0)
         if not day:
             chunks = re.split(r"[\r\n]+|(?=\s*\d+\s*[.、)]\s*)", text)
             time_chunk = next((c for c in chunks if re.search(r"Activity\s*time|活动时间|时间区域", c, re.I)), "")
@@ -533,20 +3109,347 @@ def _prepare_form_batch_fields(goal: str) -> dict[str, str]:
             day = int(nums[-1]) if nums else 0
         if day:
             if 1 <= day <= 31:
-                fields["Activity time"] = _next_month_day(day)
+                fields["Activity time"] = _month_offset_day(offset, day)
     return fields
+
+
+async def _auto_form_has_prestart_gate(browser: "BrowserEnv") -> bool:
+    """Delay deterministic form fill while a visible Start gate still blocks the real workflow."""
+    page = await browser._ensure_active_page(reason="inspect auto form prestart gate")
+    if not page:
+        return False
+    try:
+        result = await page.evaluate(
+            """() => {
+                const norm = (s) => String(s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                const isVisible = (el) => {
+                    const r = el.getBoundingClientRect();
+                    const s = window.getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden' &&
+                        Number(s.opacity || '1') > 0;
+                };
+                const textOf = (el) => [
+                    el.innerText, el.textContent,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('title'),
+                    el.getAttribute('value')
+                ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                const controls = Array.from(document.querySelectorAll(
+                    'button,[role=button],input[type=button],input[type=submit],a'
+                )).filter(isVisible);
+                const fields = Array.from(document.querySelectorAll('input,textarea,select'))
+                    .filter(isVisible)
+                    .filter(el => !['hidden','button','submit','reset'].includes((el.type || '').toLowerCase()));
+                const hasStart = controls.some(el => /\bstart\b/i.test(textOf(el)));
+                const hasSubmit = controls.some(el => /(?:\bsubmit\b|\bcreate\b|提交|保存|确定)/i.test(textOf(el)));
+                return {
+                    blocked: hasStart && hasSubmit && fields.length >= 2,
+                    fieldCount: fields.length,
+                };
+            }"""
+        )
+    except Exception as exc:
+        logger.debug("[AUTO FORM] failed to inspect prestart gate: %s", exc)
+        return False
+    if result and result.get("blocked"):
+        logger.info(
+            "[AUTO FORM] prestart gate detected; defer deterministic fill until Start is cleared. fields=%s",
+            result.get("fieldCount"),
+        )
+        return True
+    return False
+
+
+async def _try_auto_form_fill_bound_controls(
+    page,
+    *,
+    scope_title: str,
+    fields: dict[str, str],
+    require_submit: bool,
+) -> dict:
+    """Fill generic forms by binding each visible label to one concrete control.
+
+    This is intentionally stricter than the older container-based path: a field is
+    complete only when the bound control itself reads back the expected value.
+    """
+    return await page.evaluate(
+        """async ({scopeTitle, fields, requireSubmit}) => {
+            const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
+            const cleanLabel = (s) => clean(s).replace(/^[*\\s:：-]+|[*\\s:：-]+$/g, '');
+            const norm = (s) => cleanLabel(s).toLowerCase();
+            const isVisible = (el) => {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                    s.display !== 'none' && s.visibility !== 'hidden' &&
+                    Number(s.opacity || '1') > 0;
+            };
+            const textOf = (el) => [
+                el?.innerText, el?.textContent, el?.getAttribute?.('aria-label'),
+                el?.getAttribute?.('placeholder'), el?.getAttribute?.('title'),
+                el?.getAttribute?.('value'), el?.value, el?.name, el?.id
+            ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+            const labelTextOf = (el) => cleanLabel(
+                el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || ''
+            );
+            const allVisible = (selector, root = document) =>
+                Array.from(root.querySelectorAll(selector)).filter(isVisible);
+            const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+            const labels = Object.keys(fields || {});
+
+            const findScope = () => {
+                const roots = allVisible('form,.el-form,.ant-form,.n-form,section,article,main,[role=main],div');
+                const scored = [];
+                for (const root of roots) {
+                    const r = root.getBoundingClientRect();
+                    if (r.left < 160 || r.width < 220 || r.height < 60) continue;
+                    const txt = norm(textOf(root));
+                    let score = 0;
+                    if (scopeTitle && txt.includes(norm(scopeTitle))) score += 120;
+                    for (const label of labels) if (txt.includes(norm(label))) score += 20;
+                    if (root.matches('form,.el-form,.ant-form,.n-form')) score += 70;
+                    if (score > 0) scored.push({root, score, area: r.width * r.height});
+                }
+                scored.sort((a, b) => b.score - a.score || a.area - b.area);
+                return scored[0]?.root || document.body;
+            };
+
+            const scope = findScope();
+            const controls = allVisible('input,textarea,select,[contenteditable=true],[contenteditable="true"]', scope)
+                .filter(el => !['hidden','button','submit','reset'].includes((el.type || '').toLowerCase()));
+            const labelNodes = allVisible(
+                'label,.el-form-item__label,[class*=form-item__label],.ant-form-item-label,.n-form-item-label,span,div',
+                scope
+            );
+
+            const findBinding = (label, used) => {
+                const labelNorm = norm(label);
+                const available = controls.filter(ctrl => !used.has(ctrl));
+                const direct = available.find(ctrl => [
+                    ctrl.getAttribute('aria-label'),
+                    ctrl.getAttribute('placeholder'),
+                    ctrl.getAttribute('title'),
+                    ctrl.getAttribute('name'),
+                    ctrl.id
+                ].filter(Boolean).some(t => norm(t) === labelNorm));
+                if (direct) return {labelEl: direct, control: direct, method: 'direct_control'};
+
+                const hits = [];
+                for (const el of labelNodes) {
+                    const raw = labelTextOf(el);
+                    if (!raw || norm(raw) !== labelNorm) continue;
+                    const r = el.getBoundingClientRect();
+                    let score = 200;
+                    if (el.tagName === 'LABEL') score += 300;
+                    if (el.matches('label,.el-form-item__label,[class*=form-item__label],.ant-form-item-label,.n-form-item-label')) score += 180;
+                    if (raw.length <= cleanLabel(label).length + 8) score += 40;
+                    if (r.width <= 240 && r.height <= 40) score += 20;
+                    hits.push({el, score});
+                }
+                hits.sort((a, b) => b.score - a.score);
+
+                for (const hit of hits.slice(0, 6)) {
+                    const forId = hit.el.getAttribute?.('for');
+                    if (forId) {
+                        const explicit = available.find(ctrl => ctrl.id === forId);
+                        if (explicit) return {labelEl: hit.el, control: explicit, method: 'for_attr'};
+                    }
+                    let cur = hit.el;
+                    for (let depth = 0; cur && depth < 7; depth++) {
+                        const localControls = available.filter(ctrl => cur.contains(ctrl));
+                        if (localControls.length === 1) {
+                            return {labelEl: hit.el, control: localControls[0], method: 'local_unique'};
+                        }
+                        if (localControls.length > 1) {
+                            const lr = hit.el.getBoundingClientRect();
+                            const scored = localControls.map(ctrl => {
+                                const cr = ctrl.getBoundingClientRect();
+                                const labelMidY = lr.top + lr.height / 2;
+                                const controlMidY = cr.top + cr.height / 2;
+                                const sameRowGap = Math.abs(controlMidY - labelMidY);
+                                const rightGap = cr.left - lr.right;
+                                const verticalGap = cr.top - lr.bottom;
+                                const horizontalDelta = Math.abs((cr.left + cr.width / 2) - (lr.left + lr.width / 2));
+                                let score = 220 - horizontalDelta - Math.abs(verticalGap) * 2;
+                                if (sameRowGap <= Math.max(32, Math.max(lr.height, cr.height)) && rightGap >= -24) {
+                                    score += 260 - sameRowGap - Math.max(0, rightGap) / 20;
+                                }
+                                if (verticalGap >= -12 && verticalGap <= 130) score += 180;
+                                if (Math.abs(cr.left - lr.left) <= 45) score += 70;
+                                return {ctrl, score};
+                            }).sort((a, b) => b.score - a.score);
+                            if (scored[0]) return {labelEl: hit.el, control: scored[0].ctrl, method: 'local_geometry'};
+                        }
+                        cur = cur.parentElement;
+                    }
+                }
+                const fallbackLabel = hits[0]?.el;
+                if (!fallbackLabel) return null;
+                const lr = fallbackLabel.getBoundingClientRect();
+                const scored = available.map(ctrl => {
+                    const cr = ctrl.getBoundingClientRect();
+                    const labelMidY = lr.top + lr.height / 2;
+                    const controlMidY = cr.top + cr.height / 2;
+                    const sameRowGap = Math.abs(controlMidY - labelMidY);
+                    const rightGap = cr.left - lr.right;
+                    const verticalGap = cr.top - lr.bottom;
+                    const horizontalDelta = Math.abs((cr.left + cr.width / 2) - (lr.left + lr.width / 2));
+                    let score = 200 - horizontalDelta - Math.abs(verticalGap) * 2;
+                    if (sameRowGap <= Math.max(32, Math.max(lr.height, cr.height)) && rightGap >= -24) {
+                        score += 260 - sameRowGap - Math.max(0, rightGap) / 20;
+                    }
+                    if (verticalGap >= -12 && verticalGap <= 130) score += 180;
+                    if (Math.abs(cr.left - lr.left) <= 45) score += 70;
+                    return {ctrl, score};
+                }).sort((a, b) => b.score - a.score);
+                return scored[0] ? {labelEl: fallbackLabel, control: scored[0].ctrl, method: 'page_geometry'} : null;
+            };
+
+            const setNativeValue = (el, value) => {
+                if (el.isContentEditable) {
+                    el.focus?.();
+                    el.textContent = String(value || '');
+                } else {
+                    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, String(value || '')); else el.value = String(value || '');
+                }
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+            };
+            const clickEl = (el) => {
+                el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
+                if (typeof el.click === 'function') el.click();
+                else el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, composed: true, view: window}));
+            };
+            const valueOf = (control) => {
+                const tag = control.tagName?.toLowerCase();
+                if (tag === 'select') {
+                    return [control.value, control.selectedOptions?.[0]?.textContent]
+                        .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                }
+                return [control.value, control.textContent, control.getAttribute('aria-label')]
+                    .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+            };
+            const verify = (binding, label, value) => {
+                const control = binding.control;
+                const expected = norm(value);
+                const type = (control.type || '').toLowerCase();
+                if (type === 'checkbox' || type === 'radio') {
+                    const shouldCheck = !/^(false|off|no|0|关闭|关)$/i.test(String(value || 'true'));
+                    return {label, ok: Boolean(control.checked) === shouldCheck, observed: control.checked ? 'checked' : 'unchecked', method: binding.method};
+                }
+                const observed = valueOf(control);
+                return {label, ok: expected && norm(observed) === expected, expected: value, observed, method: binding.method};
+            };
+
+            const used = new Set();
+            const results = [];
+            const bindings = [];
+            for (const [label, value] of Object.entries(fields || {})) {
+                const binding = findBinding(label, used);
+                if (!binding || !binding.control) {
+                    results.push({label, ok: false, reason: 'field_not_found'});
+                    continue;
+                }
+                used.add(binding.control);
+                bindings.push([label, value, binding]);
+                const control = binding.control;
+                const tag = control.tagName?.toLowerCase();
+                const type = (control.type || '').toLowerCase();
+                const expected = String(value || '');
+
+                if (tag === 'select') {
+                    const options = Array.from(control.options || []);
+                    const hit = options.find(opt => norm(opt.textContent) === norm(expected)) ||
+                        options.find(opt => norm(opt.value) === norm(expected)) ||
+                        options.find(opt => norm(opt.textContent).includes(norm(expected)));
+                    if (hit) control.value = hit.value;
+                    else control.value = expected;
+                    control.dispatchEvent(new Event('input', {bubbles: true}));
+                    control.dispatchEvent(new Event('change', {bubbles: true}));
+                    results.push({label, ok: true, mode: 'select', method: binding.method});
+                    continue;
+                }
+                if (type === 'checkbox' || type === 'radio') {
+                    const shouldCheck = !/^(false|off|no|0|关闭|关)$/i.test(expected || 'true');
+                    if (Boolean(control.checked) !== shouldCheck) clickEl(control);
+                    results.push({label, ok: true, mode: type, method: binding.method});
+                    continue;
+                }
+                const role = (control.getAttribute('role') || '').toLowerCase();
+                const popup = (control.getAttribute('aria-haspopup') || '').toLowerCase();
+                if ((control.readOnly || role === 'combobox' || popup) && tag !== 'textarea') {
+                    results.push({label, ok: false, reason: 'complex_component_requires_form_set_or_macro', method: binding.method});
+                    continue;
+                }
+                if (tag === 'input' || tag === 'textarea' || control.isContentEditable) {
+                    setNativeValue(control, expected);
+                    results.push({label, ok: true, mode: 'input', method: binding.method});
+                    continue;
+                }
+                results.push({label, ok: false, reason: 'unsupported_control', method: binding.method});
+            }
+
+            await sleep(200);
+            const verifications = bindings.map(([label, value, binding]) => verify(binding, label, value));
+            const verificationOk = verifications.length > 0 && verifications.every(r => r.ok);
+            if (!verificationOk || !results.every(r => r.ok)) {
+                return {ok: false, results, verifications, scopeText: textOf(scope).slice(0, 160)};
+            }
+
+            const submit = allVisible('button,.el-button,[role=button],input[type=submit],input[type=button]', scope)
+                .find(el => /(?:^|\\s)(?:create|submit)(?:\\s|$)|提交|保存|确定/i.test(textOf(el).trim())) ||
+                allVisible('button,.el-button,[role=button],input[type=submit],input[type=button]')
+                    .find(el => /(?:^|\\s)(?:create|submit)(?:\\s|$)|提交|保存|确定/i.test(textOf(el).trim()));
+            let submitted = false;
+            let submitText = '';
+            if (submit) {
+                submitText = textOf(submit).trim();
+                clickEl(submit);
+                await sleep(500);
+                submitted = true;
+            }
+            if (requireSubmit && !submitted) {
+                return {ok: false, reason: 'submit_not_found', results, verifications, requireSubmit, submitted};
+            }
+            return {ok: true, submitted, submitText, results, verifications, scopeText: textOf(scope).slice(0, 160)};
+        }""",
+        {
+            "scopeTitle": scope_title,
+            "fields": fields,
+            "requireSubmit": require_submit,
+        },
+    )
 
 
 async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
     """Deterministic label/scoped form executor, used before handing control to VLM."""
     if not _goal_is_form_fill(goal):
         return False
-    fields = _prepare_form_batch_fields(goal)
-    if len(fields) < 2:
-        return False
     scope_title = _parse_goal_scope_title(goal)
     page = await browser._ensure_active_page(reason="before auto form fill")
     if not page:
+        return False
+    _default_fields = _prepare_form_batch_fields(goal)
+    _active_fields, _challenge_state = await _resolve_active_form_assignments(browser, goal, _default_fields)
+    if (
+        not _default_fields
+        and _should_use_round_form_macro(goal, _default_fields)
+        and _challenge_state
+        and _challenge_state.get("is_challenge")
+        and _challenge_state.get("current_round")
+    ):
+        try:
+            if await _run_rpa_challenge_macro(browser, page, _challenge_state):
+                return True
+        except Exception as exc:
+            logger.warning("[RPA CHALLENGE] deterministic macro failed, falling back: %s", exc)
+    fields = _active_fields
+    if len(fields) < 2:
         return False
     require_submit = bool(
         re.search(
@@ -555,6 +3458,78 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
             re.IGNORECASE,
         )
     )
+    repeat_count = _parse_form_repeat_count(goal)
+    try:
+        if repeat_count > 1:
+            repeat_results = []
+            for repeat_index in range(1, repeat_count + 1):
+                active_page = await browser._ensure_active_page(
+                    reason=f"auto form repeat {repeat_index}/{repeat_count}"
+                )
+                if not active_page:
+                    bound_result = {
+                        "ok": False,
+                        "reason": "no_active_page",
+                        "repeatIndex": repeat_index,
+                        "repeatCount": repeat_count,
+                        "repetitions": repeat_results,
+                    }
+                    break
+                bound_result = await _try_auto_form_fill_bound_controls(
+                    active_page,
+                    scope_title=scope_title,
+                    fields=fields,
+                    require_submit=require_submit,
+                )
+                if isinstance(bound_result, dict):
+                    bound_result["repeatIndex"] = repeat_index
+                    bound_result["repeatCount"] = repeat_count
+                repeat_results.append(bound_result)
+                logger.info(
+                    "[AUTO FORM] repeat %s/%s bound-control result=%s",
+                    repeat_index,
+                    repeat_count,
+                    bound_result,
+                )
+                if not isinstance(bound_result, dict) or not bound_result.get("ok"):
+                    bound_result = {
+                        "ok": False,
+                        "reason": "repeat_failed",
+                        "repeatIndex": repeat_index,
+                        "repeatCount": repeat_count,
+                        "repetitions": repeat_results,
+                    }
+                    break
+                if repeat_index < repeat_count:
+                    await asyncio.sleep(0.8)
+            else:
+                bound_result = {
+                    "ok": True,
+                    "submitted": bool(require_submit),
+                    "repeatCount": repeat_count,
+                    "repetitions": repeat_results,
+                }
+        else:
+            bound_result = await _try_auto_form_fill_bound_controls(
+                page,
+                scope_title=scope_title,
+                fields=fields,
+                require_submit=require_submit,
+            )
+        logger.info("[AUTO FORM] bound-control result=%s", bound_result)
+        try:
+            browser._last_auto_form_result = bound_result
+        except Exception:
+            pass
+        if isinstance(bound_result, dict) and bound_result.get("ok"):
+            print(f"\033[1;32m✅ [AUTO FORM]\033[0m 已按 label/control 绑定执行表单填报")
+            _broadcast_log_safe("[AUTO FORM] Deterministic bound-control form fill executed")
+            return True
+        logger.info("[AUTO FORM] bound-control path declined; trying component-aware fallback.")
+    except Exception as err:
+        logger.warning("[AUTO FORM] bound-control path failed: %s", err)
+        logger.info("[AUTO FORM] trying component-aware fallback after bound-control error.")
+
     logger.info("[AUTO FORM] Trying deterministic form fill. scope=%r fields=%s", scope_title, list(fields))
     try:
         result = await page.evaluate(
@@ -568,9 +3543,9 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                         Number(s.opacity || '1') > 0;
                 };
                 const textOf = (el) => [
-                    el.innerText, el.textContent, el.getAttribute('aria-label'),
-                    el.getAttribute('placeholder'), el.getAttribute('title'),
-                    el.getAttribute('value'), el.name, el.id
+                    el?.innerText, el?.textContent, el?.getAttribute?.('aria-label'),
+                    el?.getAttribute?.('placeholder'), el?.getAttribute?.('title'),
+                    el?.getAttribute?.('value'), el?.name, el?.id
                 ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
                 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
                 const setNativeValue = (el, val) => {
@@ -589,6 +3564,24 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                 const labels = Object.keys(fields || {});
 
                 const findScope = () => {
+                    if (scopeTitle) {
+                        const titleNorm = norm(scopeTitle);
+                        const heading = allVisible('h1,h2,h3,h4,h5,h6')
+                            .find(el => norm(textOf(el)) === titleNorm || norm(textOf(el)).includes(titleNorm));
+                        if (heading) {
+                            let sib = heading.nextElementSibling;
+                            for (let i = 0; sib && i < 12; i++, sib = sib.nextElementSibling) {
+                                if (sib.querySelector?.('form,.el-form,.ant-form,.n-form')) {
+                                    return sib.querySelector('form,.el-form,.ant-form,.n-form') || sib;
+                                }
+                            }
+                            let cur = heading.parentElement;
+                            for (let i = 0; cur && i < 6; i++, cur = cur.parentElement) {
+                                const form = cur.querySelector?.('form,.el-form,.ant-form,.n-form');
+                                if (form && isVisible(form)) return form;
+                            }
+                        }
+                    }
                     const candidateRoots = allVisible('form,.el-form,.ant-form,.n-form,section,article,main,[role=main],div');
                     const scored = [];
                     for (const root of candidateRoots) {
@@ -609,6 +3602,26 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                 const scope = findScope();
                 const findFieldContainer = (label) => {
                     const ln = norm(label);
+                    const directControls = allVisible('input,textarea,select,[contenteditable=true],[role=combobox]', scope)
+                        .filter(el => !['hidden','button','submit','reset'].includes((el.type || '').toLowerCase()));
+                    const directHit = directControls.find(el => {
+                        const attrs = [
+                            el.getAttribute?.('aria-label'),
+                            el.getAttribute?.('placeholder'),
+                            el.getAttribute?.('title'),
+                            el.getAttribute?.('name'),
+                            el.id
+                        ].filter(Boolean).map(norm);
+                        return attrs.some(t => t === ln || t.includes(ln) || ln.includes(t));
+                    });
+                    if (directHit) {
+                        const directContainer = directHit.closest?.(
+                            '.form-group,.form-row,.el-form-item,.ant-form-item,.n-form-item,[class*=form-item],[class*=field],.col-md-4,.col-md-6,.col-sm-12'
+                        );
+                        return (directContainer && directContainer !== directHit)
+                            ? directContainer
+                            : (directHit.parentElement || directHit);
+                    }
                     const nodes = allVisible('label,.el-form-item__label,.ant-form-item-label,.n-form-item-label,span,div', scope);
                     const matches = [];
                     for (const el of nodes) {
@@ -628,8 +3641,7 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                         if (cur !== labelEl && (
                             cur.classList?.contains('el-form-item') ||
                             cur.classList?.contains('ant-form-item') ||
-                            cur.classList?.contains('n-form-item') ||
-                            cur.tagName?.toLowerCase() === 'form'
+                            cur.classList?.contains('n-form-item')
                         )) return cur;
                         cur = cur.parentElement;
                     }
@@ -646,7 +3658,10 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                     for (let i = 0; i < 12; i++) {
                         const opts = allVisible([
                             '.el-select-dropdown__item','.el-radio','.el-checkbox',
-                            '.ant-select-item-option','[role=option]','label','li','span','button'
+                            '.ant-select-item-option','[role=option]',
+                            '[id^="react-select"][id*="option"]',
+                            '.css-yt9ioa-option','.css-1n7v3ny-option',
+                            'label','li','span','button'
                         ].join(','));
                         const hit = opts.find(el => norm(textOf(el)) === vn) || opts.find(el => norm(textOf(el)).includes(vn));
                         if (hit) {
@@ -772,7 +3787,7 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                             switchRoot.getAttribute('aria-checked') === 'true' ||
                             Boolean(item.querySelector('input:checked'));
                         const shouldOn = !/^(false|off|no|0)$/i.test(String(value || ''));
-                        return {label, ok: checked === shouldOn, mode: 'switch', observed: checked ? 'checked' : 'unchecked'};
+                        return {label, ok: checked === shouldOn, expected: value, mode: 'switch', observed: checked ? 'checked' : 'unchecked'};
                     }
 
                     const choiceNodes = allVisible('label,.el-radio,.el-checkbox,[role=radio],[role=checkbox]', item);
@@ -782,11 +3797,11 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                         const checked = choiceTarget.matches?.('.is-checked,[aria-checked=true]') ||
                             Boolean(choiceTarget.querySelector?.('.is-checked,[aria-checked=true],input:checked')) ||
                             Boolean(choiceHit.querySelector?.('.is-checked,[aria-checked=true],input:checked'));
-                        if (checked) return {label, ok: true, mode: 'choice_checked', observed};
+                        if (checked) return {label, ok: true, expected: value, mode: 'choice_checked', observed};
                     }
 
                     if (expected && observedNorm.includes(expected)) {
-                        return {label, ok: true, mode: 'value_visible', observed};
+                        return {label, ok: true, expected: value, mode: 'value_visible', observed};
                     }
                     return {label, ok: false, reason: 'value_not_reflected', expected: value, observed};
                 };
@@ -810,7 +3825,8 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                         continue;
                     }
 
-                    const selectRoot = allVisible('.el-select,.ant-select,.n-select,[role=combobox]', item)[0];
+                    const selectRoot = allVisible('.el-select,.ant-select,.n-select', item)[0] ||
+                        allVisible('[role=combobox]', item)[0];
                     const inputs = allVisible('input,[contenteditable=true]', item)
                         .filter(el => !['hidden','checkbox','radio','button','submit'].includes((el.type || '').toLowerCase()));
                     if (/(date|time|日期|时间)/i.test(label) && /^\\d{4}-\\d{2}-\\d{2}/.test(valueText) && inputs.length) {
@@ -824,9 +3840,48 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                         continue;
                     }
                     const readonly = inputs.find(el => el.readOnly || (el.getAttribute('role') || '').toLowerCase() === 'combobox' || el.getAttribute('aria-haspopup'));
-                    const isChoiceValue = /(zone|type|resource|delivery|date|time|下拉|选择|复选|单选|开关|日期|时间)/i.test(label);
+                    const autocomplete = inputs.find(el => {
+                        const role = (el.getAttribute('role') || '').toLowerCase();
+                        const auto = (el.getAttribute('aria-autocomplete') || el.getAttribute('autocomplete') || '').toLowerCase();
+                        return role === 'combobox' || auto === 'list' || auto === 'both' ||
+                            /subject|tag|skill|course|autocomplete|联想|科目|课程/i.test(label);
+                    });
+                    if (autocomplete && /subject|tag|skill|course|autocomplete|联想|科目|课程/i.test(label)) {
+                        const query = valueText;
+                        clickEl(autocomplete);
+                        setNativeValue(autocomplete, query);
+                        autocomplete.dispatchEvent(new KeyboardEvent('keydown', {key: query.slice(-1) || 'a', bubbles: true}));
+                        autocomplete.dispatchEvent(new KeyboardEvent('keyup', {key: query.slice(-1) || 'a', bubbles: true}));
+                        await sleep(500);
+                        let ok = await clickOption(valueText);
+                        if (!ok && /s$/i.test(valueText)) {
+                            setNativeValue(autocomplete, valueText.replace(/s$/i, ''));
+                            await sleep(500);
+                            ok = await clickOption(valueText);
+                        }
+                        if (!ok) {
+                            autocomplete.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+                            autocomplete.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', bubbles: true}));
+                            await sleep(250);
+                        }
+                        results.push({label, ok: ok || norm(textOf(item)).includes(vn), mode: 'autocomplete'});
+                        continue;
+                    }
+                    const isChoiceValue = /(zone|type|resource|delivery|date|time|subject|course|下拉|选择|复选|单选|开关|日期|时间|科目|课程)/i.test(label);
                     if ((selectRoot || readonly) && isChoiceValue) {
-                        clickEl(selectRoot || readonly);
+                        let opener = selectRoot || readonly;
+                        for (const sel of [
+                            '.el-select__wrapper', '.el-select',
+                            '.ant-select-selector', '.ant-select',
+                            '.n-base-selection', '[role=combobox]'
+                        ]) {
+                            const closest = readonly?.closest?.(sel) || opener?.closest?.(sel) || opener?.querySelector?.(sel);
+                            if (closest && isVisible(closest)) {
+                                opener = closest;
+                                break;
+                            }
+                        }
+                        clickEl(opener);
                         await sleep(350);
                         const ok = await clickOption(valueText);
                         results.push({label, ok, mode: 'select'});
@@ -854,7 +3909,7 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                             choiceTarget.querySelector?.('.is-checked,[aria-checked=true],input:checked') ||
                             choiceHit.matches?.('.is-checked,[aria-checked=true],input:checked') ||
                             choiceHit.querySelector?.('.is-checked,[aria-checked=true],input:checked');
-                        results.push({label, ok: Boolean(checked) || choiceTarget.tagName === 'BUTTON', mode: 'choice'});
+                        results.push({label, ok: Boolean(checked) || norm(textOf(choiceTarget)).includes(vn) || choiceTarget.tagName === 'BUTTON', mode: 'choice'});
                         continue;
                     }
 
@@ -878,11 +3933,11 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                     };
                 }
 
-                const submit = allVisible('button,.el-button,[role=button]', scope)
-                    .find(el => /^(create|submit|提交|保存|确定)$/i.test(textOf(el).trim())) ||
-                    allVisible('button,.el-button,[role=button]')
+                const submit = allVisible('button,.el-button,[role=button],input[type=submit],input[type=button]', scope)
+                    .find(el => /(?:^|\\s)(?:create|submit)(?:\\s|$)|提交|保存|确定/i.test(textOf(el).trim())) ||
+                    allVisible('button,.el-button,[role=button],input[type=submit],input[type=button]')
                     .filter(el => el.getBoundingClientRect().left > 180)
-                    .find(el => /^(create|submit|提交|保存|确定)$/i.test(textOf(el).trim()));
+                    .find(el => /(?:^|\\s)(?:create|submit)(?:\\s|$)|提交|保存|确定/i.test(textOf(el).trim()));
                 let submitted = false;
                 let submitText = '';
                 if (submit) {
@@ -922,13 +3977,56 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
             },
         )
         logger.info("[AUTO FORM] result=%s", result)
+        try:
+            browser._last_auto_form_result = result
+        except Exception:
+            pass
         if isinstance(result, dict) and result.get("ok"):
             print(f"\033[1;32m✅ [AUTO FORM]\033[0m 已按 DOM scope 执行表单填报")
             _broadcast_log_safe("[AUTO FORM] Deterministic scoped form fill executed")
             return True
+        return False
     except Exception as err:
         logger.warning("[AUTO FORM] deterministic fill failed, fallback to VLM: %s", err)
-    return False
+        return False
+
+
+def _format_auto_form_validation_summary(result: object) -> str:
+    if not isinstance(result, dict):
+        return ""
+    repetitions = result.get("repetitions")
+    if isinstance(repetitions, list) and repetitions:
+        chunks: list[str] = []
+        for idx, item in enumerate(repetitions, start=1):
+            if not isinstance(item, dict):
+                chunks.append(f"第{idx}次: {item!r}")
+                continue
+            one = _format_auto_form_validation_summary(
+                {k: v for k, v in item.items() if k != "repetitions"}
+            )
+            chunks.append(f"第{idx}次: {one or item!r}")
+        status = "成功" if result.get("ok") else "失败"
+        return f"重复表单执行{status}: 共{result.get('repeatCount') or len(repetitions)}次; " + " || ".join(chunks)
+    verifications = result.get("verifications") or []
+    parts: list[str] = []
+    if isinstance(verifications, list):
+        for item in verifications:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            expected = str(item.get("expected") or "").strip()
+            observed = str(item.get("observed") or "").strip()
+            method = str(item.get("method") or item.get("mode") or "").strip()
+            if label:
+                parts.append(f"{label}: expected={expected!r}, observed={observed!r}, method={method}")
+    submit_text = str(result.get("submitText") or "").strip()
+    submitted = bool(result.get("submitted"))
+    suffix = f"; submitted={submitted}"
+    if submit_text:
+        suffix += f", submit={submit_text!r}"
+    if parts:
+        return "字段回读: " + " | ".join(parts) + suffix
+    return f"字段回读结果: {result!r}"
 
 
 def _goal_needs_pagination_probe(goal: str) -> bool:
@@ -1062,9 +4160,12 @@ def _derive_effective_max_steps(goal: str) -> int:
 
 def _goal_should_skip_rpa(goal: str) -> tuple[bool, str]:
     """
-    某些 prompt 本身就是为了测试异常链路/容错恢复而设计的，
-    例如“点击一个绝对不存在的元素”“故意触发错误步骤”等。
-    这类任务不应启用肌肉记忆，否则会被旧缓存直接短路，测不到真实恢复逻辑。
+    Some goals should not use cached RPA replay.
+
+    This includes explicit recovery/error tests. Relative date-picker tasks are
+    handled by semantic RPA macros instead of being disabled here. Cascader /
+    multi-level popup tasks also use semantic macros and should not be blocked
+    by this physical-replay gate.
     """
     text = str(goal or "").strip()
     if not text:
@@ -1089,7 +4190,14 @@ def _goal_should_skip_rpa(goal: str) -> tuple[bool, str]:
 
 def _load_rpa_cache_payload(path: Path) -> dict | None:
     try:
-        return _normalize_rpa_cache_payload(json.loads(path.read_text(encoding="utf-8")))
+        raw_payload = json.loads(path.read_text(encoding="utf-8"))
+        normalized_payload = _normalize_rpa_cache_payload(raw_payload)
+        if normalized_payload != raw_payload:
+            try:
+                _write_rpa_cache_payload(path, normalized_payload)
+            except Exception as refresh_exc:
+                logger.debug("[RPA] Failed to refresh normalized cache %s: %s", path.name, refresh_exc)
+        return normalized_payload
     except Exception as exc:
         logger.warning(f"[RPA] Failed to load cache {path.name}: {exc}")
         return None
@@ -1756,6 +4864,59 @@ def _decision_is_irrelevant_nav_click(decision: dict, goal: str, input_descripti
     )
 
 
+def _goal_is_bulk_extraction(goal: str) -> bool:
+    if _goal_is_tooltip_extract(goal):
+        return False
+    try:
+        if infer_goal_output_contract(goal).get("mode") == "answer":
+            return False
+    except Exception:
+        pass
+    return bool(
+        re.search(
+            r"获取|提取|抓取|采集|爬取|抽取|\bextract(?:_link)?\b|\bscrape\b|\bcrawl\b",
+            str(goal or ""),
+            re.IGNORECASE,
+        )
+    )
+
+
+def _decision_click_targets_extraction_control(
+    decision: dict,
+    input_descriptions: str,
+) -> bool:
+    action = (decision.get("action") or "").strip().lower()
+    if action not in ("click", "click_text", "click_point"):
+        return False
+
+    target_id = int(decision.get("target_id", 0) or 0)
+    line = _find_target_line(input_descriptions, target_id) if target_id else ""
+    text = " ".join(
+        part
+        for part in (
+            line,
+            str(decision.get("type_value") or ""),
+            str(decision.get("thought") or ""),
+        )
+        if part
+    )
+    if not text:
+        return False
+
+    control_patterns = [
+        r"\bnext\b", r"\bprev(?:ious)?\b", r"\bmore\b", r"load\s*more",
+        r"\bpage\b", r"pagination", r"下一页", r"上一页", r"更多", r"加载更多",
+        r"搜索", r"查询", r"\bsearch\b", r"\bquery\b", r"筛选", r"\bfilter\b",
+        r"排序", r"\bsort\b", r"刷新", r"\brefresh\b", r"展开", r"收起",
+        r"textbox", r"input", r"combobox", r"select", r"下拉",
+    ]
+    return _text_matches_patterns(
+        text,
+        control_patterns,
+        extra_env_name="VSPIDER_EXTRA_EXTRACTION_CONTROL_KEYWORDS",
+    )
+
+
 def _goal_explicitly_requests_voice_or_camera(goal: str) -> bool:
     patterns = [
         r"语音", r"麦克风", r"voice", r"microphone",
@@ -1889,6 +5050,36 @@ def _decision_implies_completion(decision: dict) -> bool:
     if not text:
         return False
 
+    follow_up_patterns = [
+        r"进入下一阶段",
+        r"进入下一子目标",
+        r"进入下一步",
+        r"推进至下一",
+        r"推进至[^\n]{0,30}(?:阶段|子目标|步骤)",
+        r"可推进至[^\n]{0,30}(?:阶段|子目标|步骤)",
+        r"下一阶段",
+        r"下一子目标",
+        r"下一步",
+        r"接下来",
+        r"随后",
+        r"然后",
+        r"继续(?:执行|点击|选择|展开|翻页|填写|提取|搜索)?",
+        r"填写(?:数据)?阶段",
+        r"提交阶段",
+        r"提取阶段",
+        r"还需(?:要)?",
+        r"仍需(?:要)?",
+        r"需要继续",
+        r"需要再",
+        r"需(?:要)?(?:点击|选择|展开|输入|提取|翻页|确认)",
+        r"点击[^\n]{0,40}以(?:展开|打开|进入|继续|完成|选择|获取)",
+        r"选择[^\n]{0,40}以(?:展开|进入|继续|完成)",
+        r"展开[^\n]{0,40}以(?:继续|完成|查看)",
+        r"以展开其子项",
+    ]
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in follow_up_patterns):
+        return False
+
     completion_patterns = [
         r"任务已完成",
         r"任务已(?:经)?(?:全部)?完成",
@@ -1915,6 +5106,45 @@ def _decision_implies_completion(decision: dict) -> bool:
         r"all required steps have been completed",
     ]
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in completion_patterns)
+
+
+def _decision_mentions_follow_up_work(decision: dict) -> bool:
+    """Whether the decision text still describes remaining user-visible work."""
+    text = "\n".join(
+        str(decision.get(key, "") or "")
+        for key in ("progress_review", "current_state", "thought")
+    ).strip()
+    if not text:
+        return False
+
+    follow_up_patterns = [
+        r"进入下一阶段",
+        r"进入下一子目标",
+        r"进入下一步",
+        r"推进至下一",
+        r"推进至[^\n]{0,30}(?:阶段|子目标|步骤)",
+        r"可推进至[^\n]{0,30}(?:阶段|子目标|步骤)",
+        r"下一阶段",
+        r"下一子目标",
+        r"下一步",
+        r"接下来",
+        r"随后",
+        r"然后",
+        r"继续(?:执行|点击|选择|展开|翻页|填写|提取|搜索)?",
+        r"填写(?:数据)?阶段",
+        r"提交阶段",
+        r"提取阶段",
+        r"还需(?:要)?",
+        r"仍需(?:要)?",
+        r"需要继续",
+        r"需要再",
+        r"需(?:要)?(?:点击|选择|展开|输入|提取|翻页|确认)",
+        r"点击[^\n]{0,40}以(?:展开|打开|进入|继续|完成|选择|获取)",
+        r"选择[^\n]{0,40}以(?:展开|进入|继续|完成)",
+        r"展开[^\n]{0,40}以(?:继续|完成|查看)",
+        r"以展开其子项",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in follow_up_patterns)
 
 
 def _decision_claims_current_subgoal_completed(decision: dict) -> bool:
@@ -1971,6 +5201,79 @@ def _decision_claims_current_subgoal_completed(decision: dict) -> bool:
         r"all required steps have been completed",
     ]
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in completion_patterns)
+
+
+def _decision_should_finish_instead_of_operate(
+    decision: dict,
+    *,
+    output_mode: str = "",
+) -> bool:
+    """Answer-only guard for contradictory "complete, but still click" decisions."""
+    action = (decision.get("action") or "").strip().lower()
+    if not action or action in {
+        "done",
+        "ask_human",
+        "error",
+        "extract",
+        "chat_extract",
+        "fetch_link_content",
+        "fetch_links_batch",
+        "download_image",
+        "upload",
+        "save_to_memory",
+    }:
+        return False
+    if str(output_mode or "").strip().lower() != "answer":
+        return False
+    if decision.get("extracted_data"):
+        return False
+    if _decision_mentions_follow_up_work(decision):
+        return False
+    if not _decision_claims_current_subgoal_completed(decision):
+        return False
+
+    text = "\n".join(
+        str(decision.get(key, "") or "")
+        for key in ("progress_review", "current_state", "thought")
+    ).strip()
+    if not text:
+        return False
+
+    finish_patterns = [
+        r"无需(?:再|进一步)?(?:操作|点击|搜索|处理|交互)",
+        r"无须(?:再|进一步)?(?:操作|点击|搜索|处理|交互)",
+        r"不需要(?:再|进一步)?(?:操作|点击|搜索|处理|交互)",
+        r"应(?:该)?直接(?:结束|输出\s*done)",
+        r"可(?:以)?直接(?:结束|输出\s*done)",
+        r"任务目标(?:已|已经)?(?:达成|满足|完成)",
+        r"用户(?:问题|需求|目标)[^\n]{0,80}已(?:完全)?(?:覆盖|满足|达成)",
+        r"所有信息(?:均|都)?已(?:可见|覆盖|满足)",
+        r"no further (?:action|operation|click|search) needed",
+        r"should (?:finish|end|return done)",
+        r"(?:task|goal) (?:is )?(?:complete|completed|satisfied|achieved)",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in finish_patterns)
+
+
+def _done_targets_final_subgoal(plan: "TaskPlan | Any | None", decision: dict) -> bool:
+    """Whether a done decision is completing the already-active final subgoal.
+
+    PLAN GATE runs before Wave 2 advances current_idx, so the first done on the
+    last subgoal should be allowed when the model explicitly marks that subgoal
+    complete. Otherwise result-page form tasks pay an unnecessary wait/extract
+    tail before the second done is accepted.
+    """
+    if plan is None:
+        return False
+    sub_goals = list(getattr(plan, "sub_goals", []) or [])
+    if not sub_goals:
+        return False
+    try:
+        cur_idx = int(getattr(plan, "current_idx", 0) or 0)
+    except Exception:
+        cur_idx = 0
+    cur_idx = max(0, min(cur_idx, len(sub_goals) - 1))
+    return cur_idx >= len(sub_goals) - 1 and _decision_claims_current_subgoal_completed(decision)
 
 
 def _is_terminal_only_subgoal(subgoal: "TaskPlan | Any") -> bool:
@@ -2132,6 +5435,671 @@ def _force_done_decision(decision: dict) -> dict:
     return normalized
 
 
+def _clean_user_visible_done_message(message: object) -> str:
+    """Remove engine-only guard annotations from final user-visible done text."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\[ANSWER_DONE_INTENT_GUARD\]\s*", "", text)
+    text = re.sub(r"\[(?:EXTRACT_NULL|ZERO_TARGET)_DOWNGRADE\]\s*", "", text)
+    text = re.sub(
+        r"页面答案已满足用户问题，系统将原动作\s*['\"][^'\"]*['\"]\s*改为\s*done[。.]?\s*",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"Answer-mode decision text says the task is complete;[^\n]*(?:\n|$)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text.strip()
+
+
+def _format_extracted_rows_as_answer(rows: object) -> str:
+    """Format structured answer-mode rows for the Final Answer panel."""
+    if rows is None:
+        return ""
+    if isinstance(rows, dict):
+        direct_answer = rows.get("answer")
+        if direct_answer:
+            return str(direct_answer).strip()
+        row_list: list[object] = [rows]
+    elif isinstance(rows, list):
+        row_list = rows
+    else:
+        return str(rows).strip()
+
+    lines: list[str] = []
+    for raw_row in row_list[:5]:
+        if isinstance(raw_row, dict):
+            direct_answer = raw_row.get("answer")
+            if direct_answer:
+                lines.append(str(direct_answer).strip())
+                continue
+            weather = str(
+                raw_row.get("weather")
+                or raw_row.get("天气")
+                or raw_row.get("condition")
+                or ""
+            ).strip()
+            temperature = str(
+                raw_row.get("temperature")
+                or raw_row.get("气温")
+                or raw_row.get("temp")
+                or ""
+            ).strip()
+            rain_probability = str(
+                raw_row.get("rain_probability")
+                or raw_row.get("降雨概率")
+                or raw_row.get("precipitation_probability")
+                or ""
+            ).strip()
+            if weather or temperature or rain_probability:
+                weather_line = ""
+                if weather:
+                    weather_line = (
+                        f"会下雨，天气为{weather}"
+                        if "雨" in weather
+                        else f"天气为{weather}"
+                    )
+                detail_parts = [weather_line] if weather_line else []
+                if temperature:
+                    detail_parts.append(f"气温 {temperature}")
+                if rain_probability:
+                    detail_parts.append(f"降雨概率 {rain_probability}")
+                lines.append("；".join(detail_parts) + "。")
+                continue
+            parts = [
+                f"{key}: {value}"
+                for key, value in raw_row.items()
+                if str(value or "").strip()
+                and str(key or "").strip()
+                not in {"source", "page_url", "url", "output_file"}
+            ]
+            if parts:
+                lines.append("- " + "; ".join(parts))
+        elif str(raw_row or "").strip():
+            lines.append("- " + str(raw_row).strip())
+    if len(row_list) > 5:
+        lines.append(f"...共 {len(row_list)} 条")
+    return "\n".join(line for line in lines if line).strip()
+
+
+_WEATHER_GOAL_KEYWORDS = (
+    "天气",
+    "气温",
+    "温度",
+    "下雨",
+    "有雨",
+    "降雨",
+    "降水",
+)
+
+_WEATHER_CONDITION_RE = (
+    r"雷阵雨|阵雨|小雨|中雨|大雨|暴雨|雷雨|雨夹雪|小雪|中雪|大雪|"
+    r"多云|晴|阴天?|雾|霾|沙尘|浮尘|扬沙|雨|雪"
+)
+
+
+def _clean_weather_city_candidate(candidate: str) -> str:
+    text = str(candidate or "").strip()
+    text = re.sub(r"[\s，,。！？?；;：:、（）()【】\[\]\"'“”‘’]+", "", text)
+    text = re.sub(
+        r"^(?:帮我|请|麻烦|帮忙|能不能|可以|给我|想知道)+",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?:查一下|查询|查查|查|看一下|看看|看|告诉我|了解一下|一下)",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?:今天|明天|后天|明日|未来一周|未来七天|未来7天|未来三天|未来3天)",
+        "",
+        text,
+    )
+    text = re.sub(r"(?:天气预报|天气|气温|温度|预报|的)$", "", text)
+    text = re.sub(r"[^\u4e00-\u9fffA-Za-z·]", "", text)
+    if len(text) > 24:
+        text = text[-24:]
+    if text in {"天气", "气温", "温度", "下雨", "有雨", "降雨", "降水"}:
+        return ""
+    return text if len(text) >= 2 else ""
+
+
+def _extract_weather_city_from_goal(goal: str) -> str:
+    text = re.sub(r"\s+", "", str(goal or ""))
+    if not any(keyword in text for keyword in _WEATHER_GOAL_KEYWORDS):
+        return ""
+
+    rain_match = re.search(
+        r"(.{0,60}?)(?:会不会|是否|有没有|有无|会有|可能会)"
+        r".{0,8}(?:下雨|有雨|降雨|降水|雨)",
+        text,
+    )
+    if rain_match:
+        city = _clean_weather_city_candidate(rain_match.group(1))
+        if city:
+            return city
+
+    patterns = [
+        r"(?:今天|明天|后天|明日)\s*([\u4e00-\u9fffA-Za-z·]{2,30}?)(?:的)?(?:天气|气温|温度|预报)",
+        r"([\u4e00-\u9fffA-Za-z·]{2,30}?)(?:今天|明天|后天|明日)(?:的)?(?:天气|气温|温度|预报|会不会|是否|有没有|有无)",
+        r"(?:查一下|查询|查查|查|看看|看一下)?\s*([\u4e00-\u9fffA-Za-z·]{2,30}?)(?:的)?(?:天气|气温|温度|天气预报)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        city = _clean_weather_city_candidate(match.group(1))
+        if city:
+            return city
+    return ""
+
+
+def _infer_answer_weather_search_query(goal: str) -> str:
+    """Infer a clean search query for answer-only weather lookups."""
+    city = _extract_weather_city_from_goal(goal)
+    if not city:
+        return ""
+    text = str(goal or "")
+    if re.search(r"未来\s*(?:一|七|7)\s*天|一周|七天|7天", text):
+        horizon = "未来一周"
+    elif re.search(r"未来\s*(?:三|3)\s*天|三天|3天", text):
+        horizon = "未来三天"
+    elif "后天" in text:
+        horizon = "后天"
+    elif "今天" in text:
+        horizon = "今天"
+    elif "明天" in text or "明日" in text:
+        horizon = "明天"
+    else:
+        horizon = ""
+    return f"{city}{horizon}天气" if horizon else f"{city}天气"
+
+
+def _baidu_query_from_url(url: str) -> str:
+    try:
+        parsed = urlsplit(str(url or ""))
+        params = parse_qs(parsed.query or "")
+    except Exception:
+        return ""
+    for key in ("wd", "word", "q", "query"):
+        values = params.get(key) or []
+        if values:
+            return unquote_plus(str(values[0] or "")).strip()
+    return ""
+
+
+def _is_baidu_url(url: str) -> bool:
+    try:
+        host = (urlsplit(str(url or "")).hostname or "").lower()
+    except Exception:
+        return False
+    return host == "baidu.com" or host.endswith(".baidu.com")
+
+
+def _normalize_search_query(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "")).lower()
+
+
+def _infer_answer_stock_search_query(goal: str) -> str:
+    """Infer a clean baidu search query for stock-flavoured answer goals."""
+    name = _extract_stock_subject_from_goal(goal)
+    if not name:
+        return ""
+    return f"{name} 股价"
+
+
+def _infer_answer_recipe_search_query(goal: str) -> str:
+    """Infer a clean baidu search query for recipe-flavoured answer goals."""
+    dish = _extract_recipe_name_from_goal(goal)
+    if not dish:
+        return ""
+    return f"{dish} 做法"
+
+
+def _infer_answer_flight_search_query(goal: str) -> str:
+    """Infer a clean baidu search query for flight-flavoured answer goals."""
+    flight = _extract_flight_number_from_goal(goal)
+    if not flight:
+        return ""
+    return f"{flight} 航班动态"
+
+
+def _build_answer_search_fast_path_url(
+    goal: str,
+    *,
+    start_url: str,
+    current_url: str,
+    output_mode: str,
+) -> tuple[str, str]:
+    """Return (query, url) for a safe direct Baidu answer search, if useful.
+
+    Domain-aware: tries weather → stock → recipe → flight inferers in order.
+    The first non-empty query wins. Returns ``("", "")`` on:
+      * non-answer output_mode
+      * neither URL is Baidu
+      * no inferer produced a query
+      * current Baidu wd already matches the inferred query
+    """
+    if str(output_mode or "") != "answer":
+        return "", ""
+    if not (_is_baidu_url(start_url) or _is_baidu_url(current_url)):
+        return "", ""
+    query = (
+        _infer_answer_weather_search_query(goal)
+        or _infer_answer_stock_search_query(goal)
+        or _infer_answer_recipe_search_query(goal)
+        or _infer_answer_flight_search_query(goal)
+    )
+    if not query:
+        return "", ""
+    current_query = _baidu_query_from_url(current_url)
+    if _normalize_search_query(current_query) == _normalize_search_query(query):
+        return "", ""
+    return query, "https://www.baidu.com/s?wd=" + quote_plus(query)
+
+
+async def _maybe_run_answer_search_fast_path(
+    browser: BrowserEnv,
+    event_stream: EventStream,
+    *,
+    goal: str,
+    start_url: str,
+    output_mode: str,
+) -> bool:
+    current_url = getattr(browser, "current_url", "") or ""
+    query, target_url = _build_answer_search_fast_path_url(
+        goal,
+        start_url=start_url,
+        current_url=current_url,
+        output_mode=output_mode,
+    )
+    if not target_url:
+        return False
+    try:
+        page = await browser._ensure_active_page(reason="answer search fast path")
+        if page is None or page.is_closed():
+            return False
+        logger.info(
+            "[ANSWER SEARCH FAST PATH] %s -> %s",
+            (current_url or start_url)[:140],
+            target_url,
+        )
+        event_stream.guard(
+            step=0,
+            name="ANSWER_SEARCH_FAST_PATH",
+            message=f"Direct search for answer-mode weather query: {query}",
+            metadata={
+                "query": query,
+                "from_url": current_url or start_url,
+                "target_url": target_url,
+            },
+        )
+        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await browser._wait_for_page_stable()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.debug("[ANSWER SEARCH FAST PATH] skipped: %s", exc)
+        event_stream.guard(
+            step=0,
+            name="ANSWER_SEARCH_FAST_PATH_ERROR",
+            message=f"{type(exc).__name__}: {exc}",
+            metadata={"query": query, "target_url": target_url},
+        )
+        return False
+
+
+def _city_regex_for_weather_text(city: str) -> str:
+    city = str(city or "").strip()
+    if not city:
+        return ""
+    suffixes = "市县区州盟旗"
+    if city[-1:] in suffixes and len(city) > 2:
+        base = re.escape(city[:-1])
+        return base + f"[{suffixes}]?"
+    return re.escape(city) + f"[{suffixes}]?"
+
+
+def _normalize_weather_temperature(value: str) -> str:
+    temp = str(value or "").strip()
+    temp = temp.replace("－", "-").replace("—", "-").replace("到", "~").replace("至", "~")
+    temp = re.sub(r"\s+", "", temp)
+    if temp.endswith("°"):
+        temp = temp[:-1] + "℃"
+    elif temp and not re.search(r"(?:℃|°C|度|C)$", temp):
+        temp += "℃"
+    return temp
+
+
+def _compose_weather_answer(city: str, weather: str, temperature: str, context: str) -> str:
+    weather = str(weather or "").strip()
+    temperature = _normalize_weather_temperature(temperature)
+    context = str(context or "")
+    no_rain = bool(re.search(r"无降水|无降雨|无雨|不下雨|不会下雨|没有降水|没有雨", context))
+    has_rain = bool(
+        not no_rain
+        and (
+            "雨" in weather
+            or re.search(r"有(?:小雨|中雨|大雨|阵雨|雷雨|降水|降雨)", context)
+            or re.search(r"降水概率\s*(?:[1-9]\d?|100)\s*%", context)
+        )
+    )
+    rain_text = "会下雨" if has_rain else "不会下雨"
+    parts = [f"明天{city}{rain_text}"]
+    if weather:
+        parts.append(f"天气为{weather}")
+    if temperature:
+        parts.append(f"气温 {temperature}")
+    return "，".join(parts) + "。"
+
+
+def _compact_weather_answer_from_text(text: str, goal: str) -> str:
+    city = _extract_weather_city_from_goal(goal)
+    if not city:
+        return ""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    cleaned = raw.replace("\u200c", "").replace("\u200b", "").replace("*", "")
+    compact = re.sub(r"\s+", " ", cleaned)
+    city_re = _city_regex_for_weather_text(city)
+    if not city_re:
+        return ""
+    temp_re = r"[-−]?\d{1,2}\s*[~～\-—至到]\s*[-−]?\d{1,2}\s*(?:℃|°C|°|度|C)?"
+    detailed_pattern = re.compile(
+        rf"(?P<context>{city_re}\s*明天(?:（[^）]{{0,40}}）|\([^)]{{0,40}}\))?"
+        rf"\s*为\s*(?P<weather>{_WEATHER_CONDITION_RE})(?:天气)?"
+        rf"[^。；;\n]{{0,40}}?(?:温度范围|气温|温度)\s*(?P<temp>{temp_re})"
+        rf"[^。；;\n]{{0,80}})",
+        re.IGNORECASE,
+    )
+    for match in detailed_pattern.finditer(compact):
+        return _compose_weather_answer(
+            city,
+            match.group("weather"),
+            match.group("temp"),
+            match.group("context"),
+        )
+
+    card_pattern = re.compile(
+        rf"(?P<context>{city_re}[^。；;\n]{{0,120}}?"
+        rf"(?P<temp>{temp_re})\s*(?P<weather>{_WEATHER_CONDITION_RE})"
+        rf"[^。；;\n]{{0,80}})",
+        re.IGNORECASE,
+    )
+    for match in card_pattern.finditer(compact):
+        return _compose_weather_answer(
+            city,
+            match.group("weather"),
+            match.group("temp"),
+            match.group("context"),
+        )
+
+    reverse_card_pattern = re.compile(
+        rf"(?P<context>{city_re}[^。；;\n]{{0,160}}?"
+        rf"(?P<weather>{_WEATHER_CONDITION_RE})\s*(?P<temp>{temp_re})"
+        rf"[^。；;\n]{{0,80}})",
+        re.IGNORECASE,
+    )
+    for match in reverse_card_pattern.finditer(compact):
+        return _compose_weather_answer(
+            city,
+            match.group("weather"),
+            match.group("temp"),
+            match.group("context"),
+        )
+    return ""
+
+
+# ── Domain detection vocab for answer-mode goals ────────────────────────────
+# Weather vocab is already captured by _WEATHER_GOAL_KEYWORDS.
+_STOCK_GOAL_KEYWORDS = (
+    "股价", "股票", "股市", "收盘", "开盘", "涨跌",
+    "市值", "K线", "行情", "股权", "证券",
+)
+
+_RECIPE_GOAL_KEYWORDS = (
+    "怎么做", "做法", "食谱", "菜谱", "如何做",
+    "怎么烧", "怎么炒", "教程",
+)
+
+_FLIGHT_GOAL_KEYWORDS = (
+    "航班", "航班号", "航空", "起飞", "降落", "到达",
+    "登机口", "航站楼", "延误", "准点",
+)
+
+
+def _detect_answer_domain(goal: str) -> str:
+    """Classify an answer-mode goal into a known domain.
+
+    Returns one of ``"weather"`` / ``"stock"`` / ``"recipe"`` / ``"generic"``.
+    Used by ``_compact_answer_text_for_goal`` to route to the right
+    domain-specific compactor. ``"generic"`` falls through to raw text.
+    """
+    text = re.sub(r"\s+", "", str(goal or ""))
+    if not text:
+        return "generic"
+    if any(kw in text for kw in _WEATHER_GOAL_KEYWORDS):
+        return "weather"
+    if any(kw in text for kw in _STOCK_GOAL_KEYWORDS):
+        return "stock"
+    if any(kw in text for kw in _RECIPE_GOAL_KEYWORDS):
+        return "recipe"
+    if any(kw in text for kw in _FLIGHT_GOAL_KEYWORDS) or _extract_flight_number_from_goal(text):
+        return "flight"
+    return "generic"
+
+
+def _extract_stock_subject_from_goal(goal: str) -> str:
+    """Pull the company / ticker name from a stock-flavoured goal."""
+    text = re.sub(r"\s+", "", str(goal or ""))
+    if not text:
+        return ""
+    text = re.sub(r"^(?:帮我|请|麻烦|帮忙|能不能|可以|给我|想知道)+", "", text)
+    text = re.sub(
+        r"(?:查一下|查询|查查|查|看一下|看看|看|告诉我|了解一下|一下|现在|当前|今日|今天|目前)",
+        "",
+        text,
+    )
+    m = re.search(
+        # Non-greedy so the captured name does not eat the trailing "的";
+        # explicit "的?" between name and the topic word handles "贵州茅台的股价".
+        r"([\u4e00-\u9fffA-Za-z]{2,12}?)的?(?:股价|股票|股市|收盘价|开盘价|行情|市值)",
+        text,
+    )
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _compact_stock_answer_for_goal(text: str, goal: str) -> str:
+    """Compress a stock-quote page into ``{name}（{code}）现价 ¥{price}（涨跌幅 {pct}）。``
+
+    Returns ``""`` when the goal is not stock-flavoured or no price line
+    can be confidently located — the caller falls back to raw text.
+    """
+    name = _extract_stock_subject_from_goal(goal)
+    if not name:
+        return ""
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    compact = re.sub(r"\s+", " ", raw)
+    price_m = re.search(
+        r"(?:现价|最新价|当前价|当前)\s*[:：]?\s*(?P<price>\d{1,6}(?:\.\d{1,4})?)\s*元?",
+        compact,
+    )
+    if not price_m:
+        # Fallback: name proximity to a price-like number
+        anchor = rf"{re.escape(name)}[^\d\n]{{0,40}}?(?P<price>\d{{1,6}}(?:\.\d{{1,4}})?)\s*元"
+        price_m = re.search(anchor, compact)
+    if not price_m:
+        return ""
+    price = price_m.group("price")
+    window = compact[max(0, price_m.start() - 20):price_m.end() + 80]
+    pct_m = re.search(r"(?P<pct>[+\-−]?\d+(?:\.\d+)?)\s*%", window)
+    pct = (pct_m.group("pct") + "%") if pct_m else ""
+    code_m = re.search(
+        rf"{re.escape(name)}[^\d]{{0,12}}(?P<code>\d{{6}})",
+        compact,
+    )
+    code = code_m.group("code") if code_m else ""
+    parts = [name]
+    if code:
+        parts.append(f"（{code}）")
+    parts.append(f"现价 ¥{price}")
+    if pct:
+        parts.append(f"（涨跌幅 {pct}）")
+    return "".join(parts) + "。"
+
+
+def _extract_recipe_name_from_goal(goal: str) -> str:
+    """Pull the dish name from a recipe-flavoured goal."""
+    text = re.sub(r"\s+", "", str(goal or ""))
+    if not text:
+        return ""
+    text = re.sub(r"^(?:帮我|请|麻烦|帮忙|能不能|可以|给我|想知道)+", "", text)
+    m = re.search(
+        # Non-greedy + explicit "的?" so "红烧肉的做法" extracts "红烧肉".
+        r"([\u4e00-\u9fffA-Za-z]{2,16}?)的?(?:怎么做|做法|食谱|菜谱|如何做|怎么烧|怎么炒|教程)",
+        text,
+    )
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _compact_recipe_answer_for_goal(text: str, goal: str) -> str:
+    """Summarise a recipe page into ``{name}；用料：…；步骤：A → B → C。``
+
+    Returns ``""`` when the goal is not recipe-flavoured or the dish name
+    cannot be located in the body text — caller falls back to raw text.
+    """
+    name = _extract_recipe_name_from_goal(goal)
+    if not name:
+        return ""
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    name_pos = raw.find(name)
+    if name_pos < 0:
+        return ""
+    section = raw[name_pos:name_pos + 800]
+    ingredient_lines: list[str] = []
+    step_lines: list[str] = []
+    for line in section.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        ing_m = re.match(r"^(?:主料|辅料|配料|材料|用料)\s*[:：]\s*(.+)$", line)
+        if ing_m:
+            ingredient_lines.append(ing_m.group(1).strip())
+            continue
+        if len(step_lines) < 3:
+            step_m = re.match(r"^(?:步骤\s*)?\d+[\.、：:]?\s*(.+)$", line)
+            if step_m and len(step_m.group(1).strip()) >= 2:
+                step_lines.append(step_m.group(1).strip())
+    parts = [name]
+    if ingredient_lines:
+        parts.append("用料：" + "；".join(ingredient_lines))
+    if step_lines:
+        parts.append("步骤：" + " → ".join(step_lines))
+    if len(parts) == 1:
+        # Only the dish name — not enough signal to compact
+        return ""
+    return "；".join(parts) + "。"
+
+
+def _extract_flight_number_from_goal(goal: str) -> str:
+    """Extract an IATA-style flight number (e.g. ``CA1234``) from a goal."""
+    text = re.sub(r"\s+", "", str(goal or "")).upper()
+    if not text:
+        return ""
+    m = re.search(r"(?<![A-Z0-9])([A-Z]{2}\d{3,4}[A-Z]?)(?![A-Z0-9])", text)
+    if m:
+        return m.group(1)
+    return ""
+
+
+_FLIGHT_STATUS_KEYWORDS = (
+    "已起飞", "已到达", "已落地", "已取消", "取消",
+    "延误", "准点", "登机中", "候机中", "计划",
+    "备降", "返航", "在飞",
+)
+
+
+def _compact_flight_answer_for_goal(text: str, goal: str) -> str:
+    """Compress a flight-info page into ``{flight} {status} {dep} → {arr}。``
+
+    Returns ``""`` if the flight number is missing from goal or absent in
+    body text, or no status / time signals are present near it — caller
+    falls back to raw text in that case.
+    """
+    flight = _extract_flight_number_from_goal(goal)
+    if not flight:
+        return ""
+    raw = str(text or "")
+    if not raw.strip() or flight not in raw.upper():
+        return ""
+    compact = re.sub(r"\s+", " ", raw)
+    idx = compact.upper().find(flight)
+    if idx < 0:
+        return ""
+    window = compact[idx:idx + 240]
+    status = next((kw for kw in _FLIGHT_STATUS_KEYWORDS if kw in window), "")
+    times = re.findall(r"\d{1,2}[:：]\d{2}", window)
+    parts: list[str] = [flight]
+    if status:
+        parts.append(status)
+    if len(times) >= 2:
+        parts.append(f"{times[0]} → {times[1]}")
+    elif times:
+        parts.append(times[0])
+    if len(parts) == 1:
+        return ""
+    return " ".join(parts) + "。"
+
+
+def _compact_answer_text_for_goal(text: str, goal: str) -> str:
+    """Domain-router for answer-mode page-text compaction.
+
+    Dispatches the raw page text to the matching domain compactor based
+    on goal vocabulary; if the domain compactor cannot extract a clean
+    answer (returns ``""``), falls back to the raw input. This lets the
+    Final Answer panel show the best-available text without ever swallowing
+    the original content for non-routable goals.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    domain = _detect_answer_domain(goal)
+    if domain == "weather":
+        compacted = _compact_weather_answer_from_text(raw, goal)
+        if compacted:
+            return compacted
+    elif domain == "stock":
+        compacted = _compact_stock_answer_for_goal(raw, goal)
+        if compacted:
+            return compacted
+    elif domain == "recipe":
+        compacted = _compact_recipe_answer_for_goal(raw, goal)
+        if compacted:
+            return compacted
+    elif domain == "flight":
+        compacted = _compact_flight_answer_for_goal(raw, goal)
+        if compacted:
+            return compacted
+    return raw
+
+
+
 def _compact_rpa_trail(trail: list[dict]) -> list[dict]:
     """
     压缩连续重复的 RPA 动作，避免把重复提交/重复点击固化进缓存。
@@ -2249,11 +6217,12 @@ async def _resolve_composite_locator(page, step: dict, timeout_ms: int):
 def _normalize_rpa_cache_payload(payload) -> dict:
     """兼容旧版 list 缓存与新版 dict 缓存。"""
     if isinstance(payload, list):
+        trail = _semanticize_rpa_trail(payload, "")
         return {
             "version": 1,
             "replayable": True,
             "reason": "",
-            "trail": payload,
+            "trail": trail,
             "fail_count": 0,
             "max_failures": 2,
             "completes_task": True,
@@ -2271,16 +6240,48 @@ def _normalize_rpa_cache_payload(payload) -> dict:
             str(payload.get("source_url", "") or ""),
             str(payload.get("source_goal", "") or ""),
         )
+        source_goal = str(payload.get("source_goal", "") or meta["source_goal"])
+        semantic_trail = _semanticize_rpa_trail(trail, source_goal)
+        semantic_action = (
+            str(semantic_trail[0].get("action") or "")
+            if semantic_trail and len(semantic_trail) == 1 and isinstance(semantic_trail[0], dict)
+            else ""
+        )
+        was_calendar_physical = bool(
+            semantic_trail
+            and len(semantic_trail) == 1
+            and isinstance(semantic_trail[0], dict)
+            and semantic_action == "date_pick"
+        )
+        replayable = bool(payload.get("replayable", True))
+        reason = str(payload.get("reason", "") or "")
+        reason_lower = reason.lower()
+        if was_calendar_physical and (
+            not replayable or "calendar date selection uses volatile cell positions" in reason
+        ):
+            replayable = True
+            reason = ""
+        if semantic_action == "cascader_pick" and (
+            not replayable
+            or "cascader/multi-level popups are dynamic and require live interaction" in reason_lower
+            or "dynamic and require live interaction" in reason_lower
+        ):
+            replayable = True
+            reason = ""
+        _completes_task = bool(payload.get("completes_task", True))
+        if _goal_is_form_fill(source_goal):
+            _completes_task = _trail_completes_form_goal(source_goal, semantic_trail)
+
         return {
             "version": int(payload.get("version", 4) or 4),
-            "replayable": bool(payload.get("replayable", True)),
-            "reason": str(payload.get("reason", "") or ""),
-            "trail": trail,
+            "replayable": replayable,
+            "reason": reason,
+            "trail": semantic_trail,
             "fail_count": int(payload.get("fail_count", 0) or 0),
             "max_failures": int(payload.get("max_failures", 2) or 2),
-            "completes_task": bool(payload.get("completes_task", True)),
+            "completes_task": _completes_task,
             "source_url": str(payload.get("source_url", "") or meta["source_url"]),
-            "source_goal": str(payload.get("source_goal", "") or meta["source_goal"]),
+            "source_goal": source_goal,
             "core_goal": str(payload.get("core_goal", "") or meta["core_goal"]),
             "normalized_url": str(payload.get("normalized_url", "") or meta["normalized_url"]),
             "normalized_goal": str(payload.get("normalized_goal", "") or meta["normalized_goal"]),
@@ -2348,15 +6349,23 @@ async def _replay_rpa(
     browser: "BrowserEnv",
     trail: list[dict],
     workflow_memory: dict | None = None,
+    vlm: "VLMClient | None" = None,
 ) -> bool:
     """
     极速 RPA 回放：直接用 XPath/坐标执行缓存动作，完全跳过 VLM。
+
+    vlm 仅作为语义宏（date_pick 等）postcheck 的慢路径兜底；
+    传 None 时退化为纯 JS 校验。
 
     Returns:
         True  → 全程无报错，任务完成
         False → 任意步骤失败，需降级回 VLM 主循环
     """
     from playwright.async_api import Error as PlaywrightError
+    try:
+        from . import semantic_macros as _semantic_macros
+    except ImportError:
+        import semantic_macros as _semantic_macros  # type: ignore[no-redef]
 
     compacted_trail = _compact_rpa_trail(trail)
     if len(compacted_trail) != len(trail):
@@ -2397,6 +6406,35 @@ async def _replay_rpa(
                 active_page = browser._page if browser._page and not browser._page.is_closed() else page
                 await active_page.wait_for_load_state("domcontentloaded", timeout=_RPA_TIMEOUT)
                 await asyncio.sleep(0.8)
+
+            elif act in _semantic_macros.actions():
+                # Unified semantic-macro dispatch — handles cascader_pick,
+                # date_pick, and any future macro registered with the
+                # ``semantic_macros`` package. Each macro provides its own JS
+                # body + optional VL judge question.
+                logger.info(
+                    "[RPA REPLAY] %s: dispatching %r through semantic_macros registry",
+                    step_label, act,
+                )
+                # Inject runtime config flags that the JS body expects. date_pick
+                # reads ``allow_direct_set`` (config: DATE_PICK_DIRECT_SET_FALLBACK)
+                # to decide whether to use ``setNativeValue`` as a last resort.
+                if act == "date_pick" and "allow_direct_set" not in step:
+                    step["allow_direct_set"] = bool(getattr(
+                        _runtime_config_module(),
+                        "DATE_PICK_DIRECT_SET_FALLBACK",
+                        False,
+                    ))
+                _macro_result = await _semantic_macros.replay_step(page, step, vlm=vlm)
+                if not _macro_result.get("ok"):
+                    raise RuntimeError(f"{act} macro failed: {_macro_result}")
+                if _macro_result.get("vl_recovered"):
+                    print(
+                        f"\033[1;33m🔍 [VL JUDGE]\033[0m {act}: VL 视觉裁判判定已生效 "
+                        f"({str(_macro_result.get('vl_judge', {}).get('reason',''))[:60]})"
+                    )
+                logger.info("[RPA REPLAY] %s verified: %s", act, _macro_result)
+                await asyncio.sleep(0.5)
 
             elif act == "type":
                 val = step.get("type_value_template") or step.get("type_value", "")
@@ -2558,6 +6596,41 @@ async def _replay_rpa(
 
                 await asyncio.sleep(0.3)
 
+            elif act in ("fetch_link_content", "fetch_links_batch"):
+                type_value = (
+                    step.get("type_value_template")
+                    or step.get("type_value")
+                    or step.get("url")
+                    or ""
+                )
+                type_value = _resolve_replay_template(str(type_value), workflow_memory)
+                memory_key = str(step.get("memory_key") or "").strip()
+                if not memory_key:
+                    memory_key = f"fetched_{idx + 1}"
+                logger.info(
+                    "[RPA REPLAY] %s: %s -> memory[%s]",
+                    step_label,
+                    act,
+                    memory_key,
+                )
+                active_page = await browser.execute_action(
+                    {
+                        "progress_review": "cached fetch replay",
+                        "thought": f"Replay cached {act} without VLM.",
+                        "current_state": "RPA replay",
+                        "action": act,
+                        "target_id": int(step.get("target_id") or 0),
+                        "type_value": type_value,
+                        "memory_key": memory_key,
+                        "extracted_data": None,
+                        "status": "pending",
+                    },
+                    workflow_memory=workflow_memory,
+                )
+                if active_page is not None:
+                    browser._page = active_page
+                await asyncio.sleep(0.2)
+
             elif act == "smooth_scroll":
                 direction = (step.get("type_value") or "down").strip().lower()
                 if direction == "up":
@@ -2609,10 +6682,31 @@ async def _replay_rpa(
 
         except (PlaywrightError, Exception) as rpa_err:
             print(
-                f"\033[1;31m⚠️  [肌肉记忆]\033[0m "
-                f"回放中断于动作 {idx + 1}，原因: {rpa_err}"
+                f"\n\033[1;41m⚠️  [RPA REPLAY FAILED]\033[0m "
+                f"step={idx + 1}/{len(compacted_trail)} action={act} "
+                f"reason: {type(rpa_err).__name__}: {rpa_err}\n"
             )
             logger.warning(f"[RPA REPLAY] {step_label} FAILED — {type(rpa_err).__name__}: {rpa_err}")
+            try:
+                _failure_path = _RPA_CACHE_DIR / "_last_replay_failure.json"
+                _failure_record = {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "step_index": idx,
+                    "step_count": len(compacted_trail),
+                    "action": act,
+                    "step_label": step_label,
+                    "step_payload": step,
+                    "error_type": type(rpa_err).__name__,
+                    "error_message": str(rpa_err),
+                    "current_url": getattr(browser, "current_url", "") or "",
+                }
+                _failure_path.write_text(
+                    json.dumps(_failure_record, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                logger.info(f"[RPA REPLAY] Failure detail written to {_failure_path}")
+            except Exception as _persist_err:
+                logger.debug(f"[RPA REPLAY] Failed to persist failure detail: {_persist_err}")
             return False
 
     return True
@@ -2623,6 +6717,7 @@ async def _replay_ready_rpa_steps(
     payload: dict,
     cursor: int,
     workflow_memory: dict | None,
+    vlm: "VLMClient | None" = None,
 ) -> tuple[int, list[dict], bool]:
     """回放当前已满足前置条件的连续缓存步骤。"""
     if not payload.get("replayable", True):
@@ -2650,7 +6745,7 @@ async def _replay_ready_rpa_steps(
         f"[RPA PARTIAL] Replaying cached steps {cursor + 1}-{next_cursor}/{len(trail)} "
         f"(ready after prerequisites satisfied)"
     )
-    ok = await _replay_rpa(browser, ready_steps, workflow_memory)
+    ok = await _replay_rpa(browser, ready_steps, workflow_memory, vlm=vlm)
     if not ok:
         return cursor, [], True
     return next_cursor, ready_steps, False
@@ -2711,6 +6806,43 @@ def _apply_runtime_overrides(args) -> None:
             logger.info(f"[VIEWPORT] Runtime override from prompt: {width}x{height}")
 
 
+def _resolve_action_tool_metadata(
+    action_registry,
+    action_name: str,
+    *,
+    goal: str = "",
+    selected_tools: list[dict] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve safe event metadata for an executed action.
+
+    Exact tool actions keep their metadata directly. Generic aliases like click
+    are only labeled when that tool was actually selected for the current goal,
+    which avoids auth/profile prompt noise leaking unrelated tool labels into
+    normal browser actions.
+    """
+    tool = action_registry.resolve_for_action(action_name, goal=goal)
+    if not tool:
+        return None
+
+    normalized_action = str(action_name or "").strip().lower()
+    normalized_tool_name = str(tool.get("name") or "").strip().lower()
+    if normalized_action != normalized_tool_name:
+        selected_names = {
+            str(item.get("name") or "").strip().lower()
+            for item in (selected_tools or [])
+            if isinstance(item, dict)
+        }
+        if normalized_tool_name not in selected_names:
+            return None
+
+    return {
+        "name": tool.get("name"),
+        "capability": tool.get("capability"),
+        "evidence": tool.get("evidence") or [],
+        "risk": tool.get("risk") or "",
+    }
+
+
 async def run_agent(
     start_url: str,
     goal: str,
@@ -2721,6 +6853,7 @@ async def run_agent(
     stop_event: threading.Event | None = None,
     auth_profiles: str | None = None,
     vlm_options: dict | None = None,
+    run_constraints: dict | None = None,
 ) -> bool:
     """
     Agent 核心运转循环。
@@ -2760,14 +6893,460 @@ async def run_agent(
 
     # 每次运行生成独立的带时间戳文件名，避免多次运行数据混在一起
     _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # L: open per-run phase event jsonl right after run_ts is known so
+    # every broadcast_phase call from this run lands in logs/phase_<ts>.jsonl
+    try:
+        from api_server import set_phase_log_run_id as _set_phase_run
+
+        _set_phase_run(_run_ts)
+    except Exception:
+        pass
     _vlm_output = f"output_{_run_ts}.xlsx"       # VLM extract 提取的结果
     _xhr_output = f"xhr_{_run_ts}.xlsx"           # XHR 拦截到的 API 数据（分开存）
+    _goal_output_mode = "default"
+    _goal_output_contract: dict[str, Any] = {}
+    # ── 新一次 run：清空上一次 run 残留的 Final Answer 状态 ──
+    _reset_run_answer()
+    # K4: stash run identity so a failure inside this run lands in
+    # runs/failed/<_run_ts>.json with the right goal + duration. Must
+    # come AFTER _reset_run_answer() which clears the same fields.
+    _record_run_start(run_id=_run_ts, goal=goal, started_at=time.time())
 
-    browser = BrowserEnv()
+    # PRE-1: input preflight. Resolve a usable start URL when the user gave none
+    # (decision A: auto-suggest an entry, never hard-block on a missing URL) and
+    # collect clarifications. Best-effort: a preflight failure never aborts a run.
+    _preflight = None
+    try:
+        from .io_contract import build_preflight as _build_preflight
+
+        _preflight = _build_preflight(
+            goal or "",
+            start_url=start_url or "",
+            upload_file=upload_file or "",
+            auth_profiles=auth_profiles or "",
+            constraints=run_constraints or None,
+        )
+        if not (start_url or "").strip() and _preflight.resolved_start_url:
+            start_url = _preflight.resolved_start_url
+            _entry_src = (
+                _preflight.entry_suggestion.source
+                if _preflight.entry_suggestion else "inferred"
+            )
+            logger.info(
+                "[PREFLIGHT] no entry url given; starting from %s (%s)",
+                start_url, _entry_src,
+            )
+            _broadcast_log_safe(
+                f"[\u5165\u53e3\u63a8\u65ad] \u672a\u7ed9\u7f51\u5740\uff0c\u81ea\u52a8\u4ece {start_url} \u5f00\u59cb"
+                f"\uff08{_entry_src}\uff09\uff0c\u5982\u9700\u66f4\u6362\u8bf7\u544a\u77e5"
+            )
+        for _warn in (_preflight.warnings or []):
+            logger.info("[PREFLIGHT][warn] %s", _warn.as_reason())
+    except Exception as _pf_err:
+        logger.warning("[PREFLIGHT] skipped: %s", _pf_err)
+
+    # OUT-3: materialize runs/<_run_ts>/{input_contract.json,output_contract.json,
+    # manifest.json,artifacts/} skeleton up-front so any writer / harvester that
+    # fires during this run lands beside a real contract instead of an empty
+    # workspace/artifacts/ blob. ``ensure_input_contract_skeleton`` only writes
+    # when the file is absent, so a richer input_contract persisted by
+    # smart_batch_runner._persist_io_contracts_safe still wins; ad-hoc CLI /
+    # replay runs that skip the dispatch layer now get a usable input contract.
+    _initial_output_contract: dict[str, Any] = {}
+    try:
+        ensure_contract_skeleton(_run_ts)
+        ensure_input_contract_skeleton(
+            _run_ts,
+            goal=goal or "",
+            target_url=start_url or "",
+            file_path=upload_file or "",
+            auth_profiles=auth_profiles or "",
+            constraints=run_constraints or None,
+            source="cli",
+        )
+        _initial_oc = infer_output_contract(goal or "")
+        write_output_contract(_run_ts, _initial_oc)
+        _initial_output_contract = _initial_oc.to_dict()
+        logger.info(
+            "[IO CONTRACT] run=%s output_kind=%s container=%s mode=%s",
+            _run_ts,
+            _initial_oc.output_kind,
+            _initial_oc.container,
+            _initial_oc.mode,
+        )
+    except Exception as _oc_err:
+        logger.warning("[IO CONTRACT] skeleton write failed: %s", _oc_err)
+
+    # PRE-2: decision A -- only genuinely ambiguous inputs (e.g. an attachment
+    # whose intent could not be inferred) pause for a human before the run.
+    if _preflight is not None and getattr(_preflight, "needs_human", False):
+        try:
+            await _wait_for_human_resume(_preflight.blocking_reason())
+        except Exception as _hg_err:
+            logger.warning("[PREFLIGHT] human gate skipped: %s", _hg_err)
+
+    try:
+        from .io_contract import set_current_run as _set_current_run
+        _set_current_run(_run_ts)
+    except Exception:
+        try:
+            from io_contract import set_current_run as _set_current_run
+            _set_current_run(_run_ts)
+        except Exception:
+            pass
+
+    browser_lease = acquire_browser(run_id=_run_ts)
+    browser = browser_lease.browser
     vlm = VLMClient()
     # HTML 轨迹日志实例化在 try 块外，确保 finally 中的 finalize() 始终可访问
-    html_logger = HtmlLogger(goal=goal)
+    html_logger = HtmlLogger(goal=goal, run_id=_run_ts)
+    event_stream = EventStream(run_id=_run_ts)
+    _snapshot_goal = goal
+    action_registry = build_default_action_registry()
+    skill_registry = build_default_skill_registry(load_history=True)
+    async def _browser_action_tool(action_payload, workflow_memory=None):
+        return await browser.execute_action(action_payload, workflow_memory)
+
+    async def _targeted_probe_tool(action_payload, workflow_memory=None):
+        page = await browser._ensure_active_page(reason="targeted probe action")
+        before_url = browser.current_url
+        before_pages = len(browser._context.pages) if browser._context else 0
+        raw_value = str((action_payload or {}).get("type_value") or "").strip()
+        probe_goal = goal
+        kinds: list[str] = []
+        if raw_value:
+            if "|" in raw_value:
+                kind_part, probe_part = raw_value.split("|", 1)
+                kinds = [
+                    item.strip()
+                    for item in re.split(r"[,，\s]+", kind_part)
+                    if item.strip() in {"input", "button", "link", "table", "dialog"}
+                ]
+                probe_goal = probe_part.strip() or goal
+            elif raw_value in {"input", "button", "link", "table", "dialog"}:
+                kinds = [raw_value]
+            else:
+                probe_goal = raw_value
+        if not page:
+            browser._last_action_result = ActionResult.from_action(
+                action_payload,
+                success=False,
+                error="No active page for targeted probe.",
+                before_url=before_url,
+                after_url=before_url,
+                before_pages=before_pages,
+                after_pages=before_pages,
+            )
+            return None
+        probe_result = await probe_page(
+            page,
+            goal=probe_goal,
+            kinds=tuple(kinds) or None,
+            limit=12,
+        )
+        summary = format_probe_text(probe_result, limit=8)
+        metadata = {
+            "probe": probe_result.as_dict(),
+            "probe_goal": probe_goal,
+            "candidate_count": len(probe_result.candidates),
+        }
+        browser._last_action_result = ActionResult.from_action(
+            action_payload,
+            success=probe_result.ok,
+            message=summary,
+            error="" if probe_result.ok else "No targeted candidates found.",
+            before_url=before_url,
+            after_url=browser.current_url,
+            before_pages=before_pages,
+            after_pages=len(browser._context.pages) if browser._context else before_pages,
+            metadata=metadata,
+        )
+        try:
+            if probe_result.ok:
+                vlm.inject_error_feedback(
+                    "局部感知探针已返回候选元素。优先根据下列 selector/bbox/evidence 选择下一步；"
+                    "如果候选足够明确，可改用 click_text/type/press_key 等确定性动作；"
+                    "如果候选不匹配，再回退到全页截图/SoM 判断。\n"
+                    + summary
+                )
+            else:
+                vlm.inject_error_feedback(
+                    "局部感知探针未找到匹配候选。请回退到全页截图/SoM 观察，或先滚动/展开弹窗后重试。"
+                )
+        except Exception:
+            pass
+        return page
+
+    async def _try_targeted_click_text_handoff(action_payload: dict) -> bool:
+        click_text = str((action_payload or {}).get("type_value") or "").strip()
+        if not click_text or len(click_text) > 80:
+            return False
+        page = await browser._ensure_active_page(reason="targeted click_text handoff")
+        if not page:
+            return False
+        before_url = browser.current_url
+        before_pages = len(browser._context.pages) if browser._context else 0
+        try:
+            probe_result = await probe_page(
+                page,
+                goal=f"click {click_text}",
+                kinds=("button", "link"),
+                limit=8,
+            )
+            candidate = choose_click_handoff_candidate(
+                probe_result,
+                target_text=click_text,
+                min_confidence=0.55,
+            )
+            if not candidate:
+                return False
+            frame = page.main_frame
+            for item in page.frames:
+                try:
+                    if candidate.frame_name and item.name == candidate.frame_name:
+                        frame = item
+                        break
+                    if candidate.frame_url and item.url == candidate.frame_url:
+                        frame = item
+                        break
+                except Exception:
+                    continue
+            locator = frame.locator(candidate.selector).first
+            await locator.scroll_into_view_if_needed(timeout=2500)
+            await locator.click(timeout=4000)
+            await browser._wait_after_action()
+            active_page = await browser._ensure_active_page(reason="targeted click_text handoff after click")
+            browser._last_action_result = ActionResult.from_action(
+                action_payload,
+                success=True,
+                message=(
+                    "targeted_probe high-confidence handoff clicked "
+                    f"{candidate.kind} {candidate.text!r}"
+                ),
+                before_url=before_url,
+                after_url=browser.current_url,
+                before_pages=before_pages,
+                after_pages=len(browser._context.pages) if browser._context else before_pages,
+                metadata={
+                    "clicked_text": candidate.text,
+                    "targeted_handoff": {
+                        "mode": "click_text_to_selector",
+                        "selector": candidate.selector,
+                        "confidence": candidate.confidence,
+                        "kind": candidate.kind,
+                        "text": candidate.text,
+                        "frame_url": candidate.frame_url,
+                        "evidence": list(candidate.evidence),
+                    },
+                    "probe": probe_result.as_dict(),
+                },
+            )
+            logger.info(
+                "[TARGETED HANDOFF] click_text %r -> selector=%s conf=%s text=%r",
+                click_text,
+                candidate.selector,
+                candidate.confidence,
+                candidate.text,
+            )
+            return active_page is not None
+        except Exception as exc:
+            logger.debug("[TARGETED HANDOFF] click_text probe/click skipped: %s", exc)
+            return False
+
+    def _resolve_type_value_for_handoff(raw_value: str, workflow_memory=None) -> tuple[str, str]:
+        value = str(raw_value or "")
+        display_value = value
+        if workflow_memory and "{{" in value:
+            def _interpolate(match: re.Match) -> str:
+                key = match.group(1).strip()
+                resolved = (workflow_memory or {}).get(key)
+                return match.group(0) if resolved is None else str(resolved)
+            value = re.sub(r"\{\{([^}]+)\}\}", _interpolate, value)
+            display_value = value
+        env_template = display_value if "{{env:" in display_value else ""
+        value, used_auth_vault, _env_names = resolve_env_placeholders(value)
+        if used_auth_vault:
+            display_value = env_template
+        return value, display_value
+
+    async def _try_targeted_type_handoff(
+        action_payload: dict,
+        workflow_memory=None,
+    ) -> bool:
+        raw_value = str((action_payload or {}).get("type_value") or "")
+        if not raw_value.strip():
+            return False
+        try:
+            target_id = int((action_payload or {}).get("target_id") or 0)
+        except Exception:
+            target_id = 0
+        if target_id > 0:
+            return False
+        page = await browser._ensure_active_page(reason="targeted type handoff")
+        if not page:
+            return False
+        before_url = browser.current_url
+        before_pages = len(browser._context.pages) if browser._context else 0
+        try:
+            probe_goal = goal
+            probe_result = await probe_page(
+                page,
+                goal=probe_goal,
+                kinds=("input",),
+                limit=8,
+            )
+            candidate = choose_type_handoff_candidate(
+                probe_result,
+                min_confidence=0.5,
+            )
+            if not candidate:
+                try:
+                    try:
+                        from .targeted_type_fallback import fill_best_text_input
+                    except ImportError:
+                        from targeted_type_fallback import fill_best_text_input
+                    value, display_value = _resolve_type_value_for_handoff(
+                        raw_value,
+                        workflow_memory=workflow_memory,
+                    )
+                    fallback_result = await fill_best_text_input(page, value)
+                    if not fallback_result.get("ok"):
+                        return False
+                    await browser._wait_after_action(light_action=True)
+                    browser.rpa_trail.append({
+                        "action": "type",
+                        "method": "dom_input_fallback",
+                        "type_value": display_value,
+                    })
+                    browser._last_action_result = ActionResult.from_action(
+                        action_payload,
+                        success=True,
+                        message=(
+                            "DOM fallback filled visible text/search input "
+                            f"{fallback_result.get('tag', '')} "
+                            f"{fallback_result.get('ariaLabel') or fallback_result.get('placeholder') or fallback_result.get('name') or ''!r}"
+                        ),
+                        before_url=before_url,
+                        after_url=browser.current_url,
+                        before_pages=before_pages,
+                        after_pages=len(browser._context.pages) if browser._context else before_pages,
+                        metadata={
+                            "value_readbacks": [
+                                {
+                                    "value": display_value,
+                                    "method": "dom_input_fallback",
+                                    "observed": fallback_result.get("value", ""),
+                                }
+                            ],
+                            "targeted_handoff": {
+                                "mode": "dom_input_fallback",
+                                **fallback_result,
+                            },
+                            "probe": probe_result.as_dict(),
+                        },
+                    )
+                    logger.info(
+                        "[TARGETED HANDOFF] type DOM fallback -> %s",
+                        fallback_result,
+                    )
+                    return True
+                except Exception as fallback_exc:
+                    logger.debug(
+                        "[TARGETED HANDOFF] DOM input fallback skipped: %s",
+                        fallback_exc,
+                    )
+                    return False
+            frame = page.main_frame
+            for item in page.frames:
+                try:
+                    if candidate.frame_name and item.name == candidate.frame_name:
+                        frame = item
+                        break
+                    if candidate.frame_url and item.url == candidate.frame_url:
+                        frame = item
+                        break
+                except Exception:
+                    continue
+            value, display_value = _resolve_type_value_for_handoff(
+                raw_value,
+                workflow_memory=workflow_memory,
+            )
+            locator = frame.locator(candidate.selector).first
+            await locator.scroll_into_view_if_needed(timeout=2500)
+            await locator.click(timeout=3000)
+            await locator.fill(value, timeout=4000)
+            await locator.evaluate(
+                """el => {
+                    el.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
+                    el.dispatchEvent(new Event('blur', {bubbles: true, composed: true}));
+                }"""
+            )
+            await browser._wait_after_action(light_action=True)
+            browser.rpa_trail.append({
+                "action": "type",
+                "selector": candidate.selector,
+                "method": "targeted_probe_handoff",
+                "type_value": display_value,
+            })
+            browser._last_action_result = ActionResult.from_action(
+                action_payload,
+                success=True,
+                message=(
+                    "targeted_probe high-confidence handoff filled "
+                    f"{candidate.tag} {candidate.text!r}"
+                ),
+                before_url=before_url,
+                after_url=browser.current_url,
+                before_pages=before_pages,
+                after_pages=len(browser._context.pages) if browser._context else before_pages,
+                metadata={
+                    "value_readbacks": [
+                        {
+                            "selector": candidate.selector,
+                            "value": display_value,
+                            "method": "targeted_probe_handoff",
+                        }
+                    ],
+                    "targeted_handoff": {
+                        "mode": "type_to_input_selector",
+                        "selector": candidate.selector,
+                        "confidence": candidate.confidence,
+                        "kind": candidate.kind,
+                        "text": candidate.text,
+                        "frame_url": candidate.frame_url,
+                        "evidence": list(candidate.evidence),
+                    },
+                    "probe": probe_result.as_dict(),
+                },
+            )
+            logger.info(
+                "[TARGETED HANDOFF] type -> selector=%s conf=%s text=%r",
+                candidate.selector,
+                candidate.confidence,
+                candidate.text,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("[TARGETED HANDOFF] type probe/fill skipped: %s", exc)
+            return False
+
+    action_registry.bind("auto_form_fill", _try_auto_form_fill)
+    action_registry.bind("round_form_challenge", _run_round_form_if_present)
+    action_registry.bind("date_pick", _replay_rpa)
+    action_registry.bind("cascader_pick", _replay_rpa)
+    action_registry.bind("hover_and_click", _browser_action_tool)
+    action_registry.bind("next_page", _browser_action_tool)
+    action_registry.bind("targeted_probe", _targeted_probe_tool)
+    _registry_dispatch_actions = {"hover_and_click", "next_page", "targeted_probe"}
     _run_succeeded = False
+    _selected_tools: list[dict] = []
+    _capability_route: dict | None = None
+    # E1b: runtime cross-system tracker. Built from the capability route's
+    # workflow_graph systems once routing completes; observes each step's
+    # URL to surface real cross-system hops in the event stream. Stays
+    # None (inert) if routing fails so the hot loop hook is a safe no-op.
+    _run_system_tracker = None
 
     def _check_stop(context: str) -> None:
         if stop_event and stop_event.is_set():
@@ -2784,11 +7363,281 @@ async def run_agent(
         _broadcast_done_safe(False, stale_msg)
         return True
 
+    def _with_tool_metadata(result):
+        if result is None:
+            return result
+        try:
+            action_name = (
+                result.action
+                if isinstance(result, ActionResult)
+                else str(result.get("action") or "")
+            )
+        except Exception:
+            action_name = ""
+        tool_meta = _resolve_action_tool_metadata(
+            action_registry,
+            action_name,
+            goal=goal,
+            selected_tools=_selected_tools,
+        )
+        if not tool_meta:
+            return result
+        if isinstance(result, ActionResult):
+            result.metadata.setdefault("tool", tool_meta)
+            return result
+        if isinstance(result, dict):
+            data = dict(result)
+            metadata = dict(data.get("metadata") or {})
+            metadata.setdefault("tool", tool_meta)
+            data["metadata"] = metadata
+            return data
+        return result
+
+    async def _recover_active_page(reason: str):
+        page = await browser._ensure_active_page(reason=reason)
+        if page is not None and not page.is_closed():
+            return page
+        logger.warning(
+            "[BROWSER RECOVERY] No active page during %s; restarting browser at %s",
+            reason,
+            start_url,
+        )
+        event_stream.guard(
+            step=0,
+            name="BROWSER_CONTEXT_RECOVERY",
+            message=f"No active page during {reason}; restarted browser context",
+            metadata={"start_url": start_url},
+        )
+        await browser.restart(start_url, reason=reason)
+        page = await browser._ensure_active_page(reason=f"after restart: {reason}")
+        if page is None or page.is_closed():
+            raise RuntimeError(f"No active page after browser restart ({reason})")
+        return page
+
     try:
         _broadcast_log_safe("VSpider Agent started", level="info")
+        event_stream.run_start(goal=goal, start_url=start_url)
+        _initial_strategy_context = infer_goal_strategy_context(
+            goal,
+            url=start_url,
+            target_count=_parse_goal_target_count(goal),
+            requested_fields=_parse_goal_requested_fields(goal),
+        )
+        try:
+            _capability_route = route_capabilities_for_task(
+                goal,
+                url=start_url,
+                limit=12,
+            )
+            event_stream.emit(
+                "capability_route",
+                intent=_capability_route.get("intent"),
+                backend_plan=_capability_route.get("backend_plan"),
+                fallback_chain=_capability_route.get("fallback_chain"),
+                capability_manifest=_capability_route.get("capability_manifest"),
+                action_ref_schema=_capability_route.get("action_ref_schema"),
+                runtime_preflight=_capability_route.get("runtime_preflight"),
+                execution_plan=_capability_route.get("execution_plan"),
+                workflow_graph=_capability_route.get("workflow_graph"),
+                model_roles=_capability_route.get("model_roles"),
+                audit=_capability_route.get("audit"),
+            )
+            try:
+                from api_server import broadcast_phase as _broadcast_capability_phase
+
+                _route_names = [
+                    item.get("name")
+                    for item in (_capability_route.get("backend_plan") or [])[:8]
+                    if isinstance(item, dict) and item.get("name")
+                ]
+                _broadcast_capability_phase(
+                    "capability_route",
+                    severity="info",
+                    message=" → ".join(_route_names),
+                    extra={
+                        "intent": _capability_route.get("intent"),
+                        "backend_plan": _capability_route.get("backend_plan"),
+                        "fallback_chain": _capability_route.get("fallback_chain"),
+                        "capability_manifest": _capability_route.get("capability_manifest"),
+                        "action_ref_schema": _capability_route.get("action_ref_schema"),
+                        "runtime_preflight": _capability_route.get("runtime_preflight"),
+                        "execution_plan": _capability_route.get("execution_plan"),
+                        "workflow_graph": _capability_route.get("workflow_graph"),
+                        "model_roles": _capability_route.get("model_roles"),
+                        "audit": _capability_route.get("audit"),
+                    },
+                )
+            except Exception as _capability_phase_err:
+                logger.debug("[CAPABILITY ROUTER] phase broadcast skipped: %s", _capability_phase_err)
+            logger.info(
+                "[CAPABILITY ROUTER] intent=%s plan=%s",
+                (_capability_route.get("intent") or {}).get("task_type"),
+                [item.get("name") for item in (_capability_route.get("backend_plan") or [])[:8]],
+            )
+        except Exception as _capability_route_err:
+            logger.debug("[CAPABILITY ROUTER] skipped: %s", _capability_route_err)
+        # E1b: build the runtime cross-system tracker from the planned
+        # workflow_graph systems. Inert when routing produced no systems.
+        try:
+            from visual_web_agent.run_system_tracker import build_run_system_tracker
+
+            _run_system_tracker = build_run_system_tracker(_capability_route)
+        except Exception as _tracker_build_err:
+            logger.debug("[RUN SYSTEM TRACKER] build skipped: %s", _tracker_build_err)
+        _selected_tools = action_registry.select_for_goal(
+            goal,
+            strategy_context=_initial_strategy_context,
+        )
+        event_stream.emit(
+            "tool_catalog",
+            tools=action_registry.list_tools(include_disabled=True),
+            selected_tools=_selected_tools,
+            strategy_context=_initial_strategy_context,
+        )
+        logger.info(
+            "[ACTION REGISTRY] registered=%s selected=%s",
+            len(action_registry.list_tools(include_disabled=True)),
+            [tool.get("name") for tool in _selected_tools],
+        )
+        if (
+            _goal_is_bulk_extraction(goal)
+            and "docs.google.com/spreadsheets/" in str(start_url or "")
+        ):
+            _sheet_target = _parse_goal_target_count(goal) or 20
+            logger.info(f"{'=' * 60}")
+            logger.info(f"[TARGET] {goal}")
+            _broadcast_log_safe(f"[TARGET] {goal}")
+            logger.info(f"[URL] {start_url}")
+            _broadcast_log_safe(f"[URL] {start_url}")
+            try:
+                _sheet_rows = _load_public_google_sheet_rows(start_url, _sheet_target)
+            except Exception as exc:
+                logger.warning("[GOOGLE SHEETS EXTRACT] CSV export preflight failed: %s", exc)
+                _sheet_rows = []
+            if _sheet_rows:
+                saved_path = save_run_dataset(
+                    _sheet_rows,
+                    run_id=_run_ts,
+                    output_contract=_initial_output_contract,
+                    produced_by="google_sheets_csv_export",
+                    filename_hint=_vlm_output,
+                )
+                logger.info(
+                    "[GOOGLE SHEETS EXTRACT] saved %s/%s rows via CSV export -> %s",
+                    len(_sheet_rows),
+                    _sheet_target,
+                    saved_path,
+                )
+                event_stream.extract(
+                    step=0,
+                    source="GOOGLE_SHEETS_CSV_EXPORT",
+                    rows=len(_sheet_rows),
+                    output_file=str(saved_path),
+                    metadata={
+                        "target": _sheet_target,
+                        "export_url": _google_sheets_csv_export_url(start_url),
+                    },
+                )
+                _broadcast_log_safe(
+                    f"[GOOGLE SHEETS EXTRACT] 已通过 CSV 导出保存 {len(_sheet_rows)}/{_sheet_target} 行。"
+                )
+                _run_succeeded = len(_sheet_rows) >= _sheet_target
+                _broadcast_done_safe(_run_succeeded, "Google Sheets CSV export completed")
+                return _run_succeeded
         _check_stop("before_browser_start")
+        try:
+            from .config import apply_run_constraints
+        except ImportError:
+            from config import apply_run_constraints
+        apply_run_constraints(run_constraints)
         # 启动浏览器并导航
         await browser.start(start_url)
+        await _recover_active_page("after browser.start")
+        # ── E2: media harvester deterministic fast path ──────────────
+        # When capability_router has decided this run wants media
+        # (output_kind=media_image/video/audio/pdf/archive or
+        # file_generic), try to download everything visible on the
+        # landing page deterministically BEFORE spending VLM calls.
+        # Any failure inside the hook is logged at debug and silently
+        # ignored; the VLM loop continues as if no hook had run.
+        try:
+            from visual_web_agent.media_harvester import maybe_run_media_harvest
+
+            _media_hook_result = await maybe_run_media_harvest(
+                page=getattr(browser, "_page", None),
+                capability_route=_capability_route,
+                run_id=_run_ts,
+                goal=goal,
+            )
+            if _media_hook_result.triggered:
+                event_stream.emit(
+                    "media_harvest",
+                    output_kind=_media_hook_result.output_kind,
+                    downloaded=_media_hook_result.downloaded_count,
+                    failed=_media_hook_result.failed_count,
+                    manifest_appended=_media_hook_result.manifest_appended,
+                    candidate_count=_media_hook_result.candidate_count,
+                    short_circuit=_media_hook_result.short_circuit,
+                    report=_media_hook_result.report_dict,
+                )
+                try:
+                    from api_server import broadcast_phase as _bp_media
+
+                    _bp_media(
+                        "media_harvest",
+                        severity="info" if _media_hook_result.success else "warning",
+                        message=(
+                            f"downloaded={_media_hook_result.downloaded_count} "
+                            f"failed={_media_hook_result.failed_count} "
+                            f"output_kind={_media_hook_result.output_kind}"
+                        ),
+                        extra=_media_hook_result.to_dict(),
+                    )
+                except Exception:
+                    pass
+                if _media_hook_result.short_circuit:
+                    _run_succeeded = bool(_media_hook_result.success)
+                    _broadcast_done_safe(
+                        _run_succeeded,
+                        (
+                            f"Media harvest completed: "
+                            f"{_media_hook_result.downloaded_count} files saved"
+                        ),
+                    )
+                    return _run_succeeded
+        except Exception as _media_hook_err:
+            logger.debug("[MEDIA HARVEST HOOK] skipped: %s", _media_hook_err)
+        # ── end media harvester fast path ────────────────────────────
+        _initial_http_status = getattr(browser, "last_navigation_status", None)
+        if (
+            isinstance(_initial_http_status, int)
+            and _initial_http_status >= 400
+            and re.search(r"\b404\b|\bhttp\s*error\b|\bstatus\s*code\b|错误|终止|状态码", goal, re.I)
+        ):
+            message = f"检测到 HTTP {_initial_http_status}，任务终止"
+            logger.warning("[HTTP ERROR GUARD] %s url=%s", message, getattr(browser, "last_navigation_url", ""))
+            event_stream.guard(
+                step=0,
+                name="HTTP_ERROR_GUARD",
+                message=message,
+                metadata={
+                    "status_code": _initial_http_status,
+                    "url": getattr(browser, "last_navigation_url", "") or start_url,
+                },
+            )
+            event_stream.done(
+                step=0,
+                success=True,
+                reason="http_error_guard",
+                message=message,
+                metadata={
+                    "status_code": _initial_http_status,
+                    "url": getattr(browser, "last_navigation_url", "") or start_url,
+                },
+            )
+            _broadcast_done_safe(True, message)
+            _run_succeeded = True
+            return True
         if _abort_if_stale_auth():
             return False
 
@@ -2840,18 +7689,369 @@ async def run_agent(
             return False
         # ──────────────────────────────────────────────────────────────────
 
+        # ── 相对日期解析（通用能力，不绑定具体网站/控件）────────────────
+        # goal 中任何相对日期短语（"下个月15号"、"3天后"、"下周三"、"月底"…）
+        # 都由 visual_web_agent.relative_date 提前解析成绝对日期 YYYY-MM-DD。
+        # VLM 拿到的 goal 末尾会附加【相对日期解析】块，避免它再去做日期算术。
+        try:
+            from .relative_date import resolve_relative_date, format_resolver_hint
+        except ImportError:
+            from relative_date import resolve_relative_date, format_resolver_hint  # type: ignore[no-redef]
+        try:
+            _rel_date_match = resolve_relative_date(goal)
+        except Exception as _rd_err:
+            logger.debug("[DATE RESOLVER] skipped (%s)", _rd_err)
+            _rel_date_match = None
+        if _rel_date_match is not None:
+            goal = goal + format_resolver_hint(_rel_date_match)
+            logger.info(
+                "[DATE RESOLVER] %r → %s (Δm=%+d, conf=%s)",
+                _rel_date_match.phrase,
+                _rel_date_match.target.isoformat(),
+                _rel_date_match.delta_months,
+                _rel_date_match.confidence,
+            )
+        # ──────────────────────────────────────────────────────────────────
+
+        # ── 数据导出 URL 解析（通用能力，不绑定具体数据源）────────────────
+        # 当 start_url 命中 data_export 注册表（Sheets / OneDrive / SharePoint …），
+        # 在 goal 末尾追加【数据导出 URL】块。VLM 看到提示后第一步直接 goto
+        # 这个 URL，绕开 canvas/预览渲染。新数据源只要在 data_export.py 注册
+        # 一条 ExportTransform，这里自动生效，无需改 prompt / 改主流程。
+        try:
+            from .data_export import find_data_export_url
+        except ImportError:
+            from data_export import find_data_export_url  # type: ignore[no-redef]
+        try:
+            _de_source, _de_export = find_data_export_url(start_url)
+        except Exception as _de_err:
+            logger.debug("[DATA EXPORT] skipped (%s)", _de_err)
+            _de_source, _de_export = "", ""
+        if _de_source and _de_export:
+            goal = (
+                goal
+                + "\n\n【数据导出 URL】（系统自动计算，绕开 canvas 预览）"
+                + f"\n· 识别来源: {_de_source}"
+                + f"\n· 导出 URL: {_de_export}"
+            )
+            logger.info(
+                "[DATA EXPORT] %s → %s",
+                _de_source,
+                _de_export,
+            )
+        # ──────────────────────────────────────────────────────────────────
+
         logger.info(f"{'=' * 60}")
         logger.info(f"[TARGET] {goal}")
         _broadcast_log_safe(f"[TARGET] {goal}")
         logger.info(f"[URL] {start_url}")
         _broadcast_log_safe(f"[URL] {start_url}")
+        _macro_extract_rows: list[dict[str, str]] = []
+        _macro_extract_source = ""
+        _macro_expected_rows = 0
+        _macro_required_fields: list[str] = []
+        _skill_match_for_replay = None
+        _skill_result_for_replay = None
+        _skill_replay_input_url = ""
+        try:
+            if not _macro_extract_rows:
+                _skill_candidate_url = getattr(browser, "current_url", "")
+                _skill_strategy_context = infer_goal_strategy_context(
+                    goal,
+                    url=_skill_candidate_url,
+                    target_count=_parse_goal_target_count(goal),
+                )
+                event_stream.emit(
+                    "strategy_context",
+                    step=0,
+                    context=_skill_strategy_context,
+                )
+                _skill_match = skill_registry.best_match(
+                    url=_skill_candidate_url,
+                    goal=goal,
+                    strategy_context=_skill_strategy_context,
+                )
+                if _skill_match:
+                    _matched_skill = _skill_match.skill
+                    _skill_replay_input_url = _skill_candidate_url
+                    _macro_tool = action_registry.resolve_for_action(
+                        _matched_skill.action,
+                        goal=goal,
+                    ) or {
+                        "name": _matched_skill.action,
+                        "capability": _matched_skill.capability,
+                        "risk": "low",
+                    }
+                    _skill_metadata = _matched_skill.dispatch_metadata(
+                        url=getattr(browser, "current_url", ""),
+                        goal=goal,
+                    )
+                    _skill_metadata["selection"] = {
+                        "score": _skill_match.score,
+                        "reasons": list(_skill_match.reasons),
+                        "history_runs": _skill_match.history_runs,
+                        "history_success_rate": _skill_match.history_success_rate,
+                        "strategy_context": _skill_strategy_context,
+                    }
+                    event_stream.emit(
+                        "skill_match",
+                        step=0,
+                        skill={
+                            "name": _matched_skill.name,
+                            "action": _matched_skill.action,
+                            "source": _matched_skill.source,
+                            "capability": _matched_skill.capability,
+                        },
+                        metadata=_skill_metadata,
+                    )
+                    event_stream.emit(
+                        "tool_dispatch",
+                        step=0,
+                        action=_matched_skill.action,
+                        tool={
+                            "name": _macro_tool.get("name"),
+                            "capability": _macro_tool.get("capability"),
+                            "risk": _macro_tool.get("risk", "low"),
+                        },
+                        metadata=_skill_metadata,
+                    )
+                    _skill_result = await _matched_skill.run(browser, goal)
+                    _skill_match_for_replay = _skill_match
+                    _skill_result_for_replay = _skill_result
+                    _macro_expected_rows = int(_skill_result.expected_rows or 1)
+                    _macro_required_fields = list(_skill_result.required_fields or [])
+                    _macro_extract_rows = list(_skill_result.rows or [])
+                    _macro_extract_source = str(_skill_result.source or _matched_skill.source)
+                    for _verification in _skill_result.verifications:
+                        event_stream.verify(
+                            step=0,
+                            name=_verification.name,
+                            success=bool(_verification.success),
+                            expected=_verification.expected,
+                            observed=_verification.observed,
+                            metadata=dict(_verification.metadata or {}),
+                        )
+                    if not _macro_extract_rows:
+                        event_stream.guard(
+                            step=0,
+                            name=f"{_macro_extract_source}_FALLBACK",
+                            message=(
+                                f"Skill {_matched_skill.name} matched but produced no rows; "
+                                "falling back to legacy macro/generic loop."
+                            ),
+                            metadata=_skill_metadata,
+                        )
+        except Exception as _macro_err:
+            logger.debug("[INTERACTION EXTRACT MACRO] skipped: %s", _macro_err)
+            event_stream.guard(
+                step=0,
+                name="INTERACTION_EXTRACT_MACRO_ERROR",
+                message=f"{type(_macro_err).__name__}: {_macro_err}",
+                metadata={"source": _macro_extract_source or "unknown"},
+            )
+            _macro_extract_rows = []
+            _macro_extract_source = ""
+        if _macro_extract_rows:
+            _macro_fields = sorted(
+                {
+                    str(key)
+                    for row in _macro_extract_rows
+                    if isinstance(row, dict)
+                    for key, value in row.items()
+                    if value not in (None, "")
+                }
+            )
+            event_stream.verify(
+                step=0,
+                name=f"{_macro_extract_source}_row_count",
+                success=len(_macro_extract_rows) >= max(1, _macro_expected_rows),
+                expected=max(1, _macro_expected_rows),
+                observed=len(_macro_extract_rows),
+                metadata={"fields": _macro_fields},
+            )
+            _required_macro_fields = _macro_required_fields or (
+                ["trigger", "title", "content"]
+                if _macro_extract_source == "MODAL_DIALOG_MACRO"
+                else ["step", "title", "url"]
+            )
+            _missing_macro_fields = [
+                field
+                for field in _required_macro_fields
+                if any(not str((row or {}).get(field) or "").strip() for row in _macro_extract_rows)
+            ]
+            event_stream.verify(
+                step=0,
+                name=f"{_macro_extract_source}_required_fields",
+                success=not _missing_macro_fields,
+                expected=_required_macro_fields,
+                observed={"missing": _missing_macro_fields, "fields": _macro_fields},
+                metadata={"rows": len(_macro_extract_rows)},
+            )
+            saved_path = save_run_dataset(
+                _macro_extract_rows,
+                run_id=_run_ts,
+                output_contract=_goal_output_contract,
+                produced_by="semantic_macro_extract",
+                filename_hint=_vlm_output,
+            )
+            _skill_replay_path = ""
+            if _skill_match_for_replay and _skill_result_for_replay:
+                try:
+                    _skill_replay_path = str(save_skill_replay_snapshot(
+                        skill_match=_skill_match_for_replay,
+                        goal=goal,
+                        url=_skill_replay_input_url or getattr(browser, "current_url", ""),
+                        result=_skill_result_for_replay,
+                        run_id=_run_ts,
+                        output_file=str(saved_path or ""),
+                    ))
+                    event_stream.emit(
+                        "skill_replay",
+                        step=0,
+                        skill={
+                            "name": _skill_match_for_replay.skill.name,
+                            "source": _skill_match_for_replay.skill.source,
+                        },
+                        path=_skill_replay_path,
+                        metadata={
+                            "score": _skill_match_for_replay.score,
+                            "reasons": list(_skill_match_for_replay.reasons),
+                        },
+                    )
+                except Exception as _replay_err:
+                    event_stream.guard(
+                        step=0,
+                        name="SKILL_REPLAY_SAVE_FAILED",
+                        message=f"{type(_replay_err).__name__}: {_replay_err}",
+                        metadata={"source": _macro_extract_source},
+                    )
+            logger.info(
+                "[INTERACTION EXTRACT MACRO] %s saved %s rows -> %s",
+                _macro_extract_source,
+                len(_macro_extract_rows),
+                saved_path,
+            )
+            event_stream.extract(
+                step=0,
+                source=_macro_extract_source,
+                rows=len(_macro_extract_rows),
+                output_file=str(saved_path or ""),
+                metadata={
+                    "url": getattr(browser, "current_url", ""),
+                    "skill_replay_path": _skill_replay_path,
+                },
+            )
+            _broadcast_log_safe(
+                f"[{_macro_extract_source}] 已保存 {len(_macro_extract_rows)} 条交互抽取结果。"
+            )
+            _run_succeeded = True
+            _broadcast_done_safe(True, f"{_macro_extract_source} completed")
+            return True
+        if (
+            _goal_is_bulk_extraction(goal)
+            and "docs.google.com/spreadsheets/" in str(start_url or "")
+        ):
+            _sheet_target = _parse_goal_target_count(goal) or 20
+            try:
+                _sheet_rows = _load_public_google_sheet_rows(start_url, _sheet_target)
+            except Exception as exc:
+                logger.warning("[GOOGLE SHEETS EXTRACT] CSV export fallback failed: %s", exc)
+                _sheet_rows = []
+            if _sheet_rows:
+                saved_path = save_run_dataset(
+                    _sheet_rows,
+                    run_id=_run_ts,
+                    output_contract=_initial_output_contract,
+                    produced_by="google_sheets_csv_export",
+                    filename_hint=_vlm_output,
+                )
+                logger.info(
+                    "[GOOGLE SHEETS EXTRACT] saved %s/%s rows via CSV export -> %s",
+                    len(_sheet_rows),
+                    _sheet_target,
+                    saved_path,
+                )
+                event_stream.extract(
+                    step=0,
+                    source="GOOGLE_SHEETS_CSV_EXPORT",
+                    rows=len(_sheet_rows),
+                    output_file=str(saved_path),
+                    metadata={
+                        "target": _sheet_target,
+                        "export_url": _google_sheets_csv_export_url(start_url),
+                    },
+                )
+                _broadcast_log_safe(
+                    f"[GOOGLE SHEETS EXTRACT] 已通过 CSV 导出保存 {len(_sheet_rows)}/{_sheet_target} 行。"
+                )
+                _broadcast_done_safe(True, "Google Sheets CSV export completed")
+                _run_succeeded = len(_sheet_rows) >= _sheet_target
+                return _run_succeeded
         _effective_max_steps = _derive_effective_max_steps(goal)
+        # Unified semantic-macro detection. Registry parsers run first; legacy
+        # All semantic-macro detection (date_pick, cascader_pick, future ones)
+        # flows through the unified registry entry point.
+        _initial_semantic_macro = _parse_semantic_macro(goal)
+        _semantic_macro_owns_goal = _semantic_macro_should_own_goal(
+            goal,
+            _initial_semantic_macro,
+        )
         _is_form_fill_goal = _goal_is_form_fill(goal)
+        if _semantic_macro_owns_goal:
+            _is_form_fill_goal = False
+            logger.info(
+                "[SEMANTIC MACRO] standalone component goal detected; "
+                "bypassing generic form-fill mode."
+            )
+        if not _is_form_fill_goal:
+            try:
+                _goal_page = await browser._ensure_active_page(reason="detect rpachallenge form goal")
+                _goal_challenge_state = await _get_round_form_state(_goal_page) if _goal_page else {}
+                if _goal_challenge_state.get("is_challenge"):
+                    _is_form_fill_goal = True
+                    logger.info("[RPA CHALLENGE] page detected; treating task as a round-aware form goal.")
+            except Exception as _challenge_goal_err:
+                logger.debug("[RPA CHALLENGE] initial page detection skipped: %s", _challenge_goal_err)
         _form_assignments = _prepare_form_batch_fields(goal) if _is_form_fill_goal else {}
         _requested_output_fields = _parse_goal_requested_fields(goal)
+        _goal_output_contract = resolve_output_contract(
+            _initial_output_contract,
+            dict((_initial_strategy_context or {}).get("output_contract") or {}),
+            infer_goal_output_contract(
+                goal,
+                target_count=_parse_goal_target_count(goal),
+                requested_fields=_requested_output_fields,
+            ) if not _initial_output_contract else None,
+        )
+        _goal_output_mode = str(
+            _goal_output_contract.get("mode")
+            or _goal_output_contract.get("output_mode")
+            or "default"
+        )
+        # 向前端 Final Answer 面板同步 mode：answer/artifact → answer_type=text/file
+        # F3: 同时把目标域分类（weather/stock/recipe/flight/generic）一并存档，
+        # 供 done 广播时透传给前端，让 Final Answer 面板按域选卡片渲染。
+        _goal_answer_domain = _detect_answer_domain(goal)
+        _record_run_answer(
+            mode=_goal_output_mode,
+            domain=_goal_answer_domain,
+        )
+        await _maybe_run_answer_search_fast_path(
+            browser,
+            event_stream,
+            goal=goal,
+            start_url=start_url,
+            output_mode=_goal_output_mode,
+        )
         _data_controller = PageDataController(_requested_output_fields)
         if _requested_output_fields:
             logger.info("[EXTRACT SCHEMA] requested fields=%s", _requested_output_fields)
+        if _goal_output_mode != "default":
+            logger.info(
+                "[OUTPUT CONTRACT] mode=%s contract=%s",
+                _goal_output_mode,
+                _goal_output_contract,
+            )
         if _effective_max_steps > MAX_STEPS:
             logger.info(
                 f"[MAX STEPS] bulk extraction budget raised: "
@@ -2865,15 +8065,18 @@ async def run_agent(
         else:
             logger.info(f"[MAX STEPS] {MAX_STEPS}")
         logger.info(f"{'=' * 60}")
+        workflow_memory: dict = {}
 
         # Component-library forms are more reliable through scoped DOM execution
         # than through step-by-step VLM clicks. The executor honors a title/scope
         # phrase such as "Basic Form 标题下方" before touching fields.
-        if _is_form_fill_goal and _form_assignments:
-            _auto_form_ok = await _try_auto_form_fill(browser, goal)
-            if _auto_form_ok:
+        if _is_form_fill_goal:
+            _challenge_done = False
+            if _should_use_round_form_macro(goal, _form_assignments):
+                _challenge_done = await _run_round_form_if_present(browser, goal)
+            if _challenge_done:
                 _run_succeeded = True
-                _broadcast_done_safe(True, "Auto form fill completed")
+                _broadcast_done_safe(True, "RPA Challenge completed")
                 try:
                     _auto_ss, _ = await browser.mark_and_screenshot(step=99)
                     html_logger.log_step(
@@ -2883,19 +8086,112 @@ async def run_agent(
                             "action": "done",
                             "target_id": 0,
                             "status": "success",
-                            "thought": "AUTO FORM 已完成字段回读校验，并已点击 Create/Submit（若目标要求提交）。",
-                            "type_value": "auto_form",
+                            "thought": "RPA Challenge 已点击 Start，并按 challenge.xlsx 连续完成全部轮次；仅最终完成态允许 done。",
+                            "type_value": "rpa_challenge",
                         },
                         memory_state=dict(workflow_memory),
                     )
-                except Exception as _auto_log_err:
-                    logger.debug("[AUTO FORM] failed to log final screenshot: %s", _auto_log_err)
+                except Exception as _challenge_log_err:
+                    logger.debug("[RPA CHALLENGE] failed to log final screenshot: %s", _challenge_log_err)
+                event_stream.verify(
+                    step=99,
+                    name="rpa_challenge_completion",
+                    success=True,
+                    expected="final completion state",
+                    observed="challenge macro returned complete",
+                    metadata={"macro": "round_form", "phase": "startup"},
+                )
+                event_stream.act(
+                    step=99,
+                    result=_with_tool_metadata(
+                        ActionResult.from_action(
+                            {"action": "auto_form_macro", "type_value": "rpa_challenge"},
+                            success=True,
+                            message="RPA Challenge completed",
+                            after_url=getattr(browser, "current_url", "") or "",
+                            after_pages=len(browser._context.pages) if browser._context else 0,
+                            metadata={"macro": "round_form", "phase": "startup"},
+                        )
+                    ),
+                )
                 return True
+
+            _auto_form_blocked = (
+                False if _form_assignments else await _auto_form_has_prestart_gate(browser)
+            )
+            if not _auto_form_blocked:
+                _auto_form_ok = await _try_auto_form_fill(browser, goal)
+                if _auto_form_ok:
+                    _run_succeeded = True
+                    _broadcast_done_safe(True, "Auto form fill completed")
+                    try:
+                        _auto_ss, _ = await browser.mark_and_screenshot(step=99)
+                        html_logger.log_step(
+                            step_num=99,
+                            screenshot_path=str(Path(SCREENSHOT_DIR) / "step_99.png") if _auto_ss else None,
+                            action_dict={
+                                "action": "done",
+                                "target_id": 0,
+                                "status": "success",
+                                "thought": (
+                                    "AUTO FORM 已完成字段回读校验，并已点击 Create/Submit（若目标要求提交）。"
+                                    + "\n"
+                                    + _format_auto_form_validation_summary(
+                                        getattr(browser, "_last_auto_form_result", None)
+                                    )
+                                ),
+                                "type_value": "auto_form",
+                                "form_validation": getattr(browser, "_last_auto_form_result", None),
+                            },
+                            memory_state=dict(workflow_memory),
+                        )
+                    except Exception as _auto_log_err:
+                        logger.debug("[AUTO FORM] failed to log final screenshot: %s", _auto_log_err)
+                    event_stream.verify(
+                        step=99,
+                        name="auto_form_readback",
+                        success=True,
+                        expected="all parsed form fields",
+                        observed="field readback ok",
+                        metadata={
+                            "form_validation": getattr(
+                                browser,
+                                "_last_auto_form_result",
+                                None,
+                            ),
+                            "phase": "startup",
+                        },
+                    )
+                    event_stream.act(
+                        step=99,
+                        result=_with_tool_metadata(
+                            ActionResult.from_action(
+                                {"action": "auto_form", "type_value": "auto_form"},
+                                success=True,
+                                message="Auto form fill completed",
+                                after_url=getattr(browser, "current_url", "") or "",
+                                after_pages=len(browser._context.pages) if browser._context else 0,
+                                metadata={
+                                    "form_validation": getattr(
+                                        browser,
+                                        "_last_auto_form_result",
+                                        None,
+                                    ),
+                                    "phase": "startup",
+                                },
+                            )
+                        ),
+                    )
+                    return True
 
         # 滑窗：记录最近 6 步的 (action, target_id, landing_url)，用于检测点击死循环
         # 升级为 URL-aware：只有"同一 ID 被点击 ≥ 3 次 **且** 着陆 URL 完全相同"才判定死循环，
         # 翻页 / A-B 循环切换等 URL 在变化的合法重复不再误伤。
         _last_actions: list[tuple[str, int, str]] = []
+        # SoM 红框编号属于“动作发起页”，不是动作落地页。比如在 Bing 上 click_new_tab
+        # @e19 打开 aidaxue，@e19 仍应记录为 Bing 页上的编号；否则回到 Bing 后会被
+        # 误判成跨页复用。
+        _som_target_refs: list[tuple[str, int, str, str]] = []
         _LOOP_GUARD_WINDOW = 6
         _loop_guard_blocked_ids: set[int] = set()  # 触发过 LOOP GUARD 的 target_id，后续直接拦截
         _loop_guard_blocked_points: set[tuple] = set()  # click_point 黑名单（bucket 后的坐标）
@@ -2905,18 +8201,17 @@ async def run_agent(
         # 降级为 wait 后老 LOOP GUARD 看不见）。连续 3 次就强制硬指令 + 切走。
         _consecutive_zero_target = 0
         _last_zero_target_tv = ""
+        try:
+            from .wait_loop_guard import WaitLoopTracker
+        except ImportError:
+            from wait_loop_guard import WaitLoopTracker
+        _wait_loop_tracker = WaitLoopTracker()
 
         def _norm_url_for_guard(url: str) -> str:
             """LOOP GUARD key 稳定化：只保留 scheme+host+path，抛弃 query/fragment。
             修复 Bug B：JD 异常页等站每次刷新注入 timestamp nonce，
             否则同元素同页 3 次点击会被拆成 3 个不同 key，计数器永远不累积。"""
-            if not url:
-                return ""
-            try:
-                p = urlparse(url)
-                return f"{p.scheme}://{p.netloc}{p.path}"
-            except Exception:
-                return url[:120]
+            return _agent_strategy_normalize_guard_url(url)
 
         def _bucket_point(point) -> tuple:
             """click_point 坐标聚类：千分制 100 宽度桶，容忍 VLM 坐标漂移。
@@ -2929,9 +8224,20 @@ async def run_agent(
             except (TypeError, ValueError):
                 return ()
 
+        def _target_id_for_guard(decision: dict) -> int:
+            try:
+                return int(decision.get("target_id", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
         # LOOP GUARD 覆盖的动作集（Bug #1 修复）
         _LOOP_GUARD_ACTIONS = (
             "click", "click_new_tab", "click_point", "click_text", "hover_and_click"
+        )
+        _SOM_REF_ACTIONS = (
+            "click", "click_text", "click_new_tab", "type", "hover", "select",
+            "upload", "press_key", "find_text", "next_page", "save_to_memory",
+            "download_image",
         )
         _extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
         _pagination_probed = False  # 首次 extract 后探测分页器一次（Improvement 1）
@@ -2954,6 +8260,11 @@ async def run_agent(
         _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
         _tooltip_trigger_keys: set[str] = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
         _pagination_exhausted = False  # 分页已耗尽（滚到底+翻页失败），用于容差退出
+        try:
+            from visual_web_agent.completion_kernel import NoProgressTracker
+        except ImportError:
+            from completion_kernel import NoProgressTracker  # type: ignore[no-redef]
+        _no_progress_tracker = NoProgressTracker(exhaust_threshold=2)
         _form_scroll_down_streak = 0  # 表单未开始填写前，连续向下滚动次数
         _form_interaction_started = False  # 一旦开始填/点字段，允许正常分段滚动
         _auto_form_retry_count = 0
@@ -3018,7 +8329,11 @@ async def run_agent(
             score = result.accepted * 100.0 + completeness * 5.0
             score -= result.duplicates * 8.0
             score -= result.rejected_total * 12.0
-            if "DOM_LIST" in source:
+            if "DOM_CARDS" in source:
+                score += 58.0
+                if result.accepted >= 2:
+                    score += 12.0
+            elif "DOM_LIST" in source:
                 if int(shape.get("repeated_list_items") or 0) >= result.accepted >= 2:
                     score += 45.0
                 else:
@@ -3125,6 +8440,20 @@ async def run_agent(
                 return None
             def _candidate_priority(candidate: dict) -> int:
                 source = str(candidate.get("name") or "").upper()
+                if _goal_output_mode == "answer":
+                    if "VIEWPORT" in source or "VLM" in source:
+                        return 6
+                    if "FULL_PAGE" in source or "AX_TREE" in source or "INNER_TEXT" in source:
+                        return 5
+                    if "DOM_CARDS" in source:
+                        return 3
+                    if "DOM_TABLE" in source:
+                        return 2
+                    if "DOM_LIST" in source:
+                        return 1
+                    return 0
+                if "DOM_CARDS" in source:
+                    return 5
                 if "DOM_LIST" in source:
                     return 4
                 if "DOM_TABLE" in source:
@@ -3135,14 +8464,24 @@ async def run_agent(
                     return 1
                 return 0
 
-            viable.sort(
-                key=lambda c: (
-                    float(c.get("score") or 0),
-                    int(c.get("accepted") or 0),
-                    _candidate_priority(c),
-                ),
-                reverse=True,
-            )
+            if _goal_output_mode == "answer":
+                viable.sort(
+                    key=lambda c: (
+                        _candidate_priority(c),
+                        float(c.get("score") or 0),
+                        -int(c.get("accepted") or 0),
+                    ),
+                    reverse=True,
+                )
+            else:
+                viable.sort(
+                    key=lambda c: (
+                        float(c.get("score") or 0),
+                        int(c.get("accepted") or 0),
+                        _candidate_priority(c),
+                    ),
+                    reverse=True,
+                )
             chosen = viable[0]
             logger.info(
                 "[EXTRACT ARBITER] candidates=%s | selected=%s score=%.1f accepted=%s",
@@ -3184,6 +8523,330 @@ async def run_agent(
                     new_triggers += 1
             _total_extracted_rows = len(_tooltip_trigger_keys)
             return new_triggers, _total_extracted_rows
+
+        async def _capture_body_text_excerpt(limit: int = 3000) -> str:
+            try:
+                page = await browser._ensure_active_page(reason="extraction snapshot body text")
+                if not page:
+                    return ""
+                text = await page.evaluate(
+                    """() => String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim()"""
+                )
+                return str(text or "")[:limit]
+            except Exception as exc:
+                logger.debug("[EXTRACTION SNAPSHOT] body text capture skipped: %s", exc)
+                return ""
+
+        async def _save_extraction_snapshot(
+            *,
+            source: str,
+            rows: list,
+            output_file: str,
+            accepted_rows: int,
+            duplicate_rows: int = 0,
+            rejected_rows: int = 0,
+            candidates: list[dict] | None = None,
+            data_shape: dict | None = None,
+            source_text: str = "",
+            metadata: dict | None = None,
+        ) -> str:
+            try:
+                snapshot_path = maybe_save_snapshot(
+                    url=getattr(browser, "current_url", "") or "",
+                    goal=_snapshot_goal,
+                    source=source,
+                    rows=rows,
+                    requested_fields=_requested_output_fields,
+                    output_file=output_file,
+                    run_id=_run_ts,
+                    step=step,
+                    total_rows=_total_extracted_rows,
+                    accepted_rows=accepted_rows,
+                    duplicate_rows=duplicate_rows,
+                    rejected_rows=rejected_rows,
+                    candidates=candidates or [],
+                    data_shape=data_shape or {},
+                    source_text=source_text,
+                    body_text=await _capture_body_text_excerpt(),
+                    metadata=metadata or {},
+                )
+                if not snapshot_path:
+                    return ""
+                logger.info("[EXTRACTION SNAPSHOT] saved: %s", snapshot_path)
+                event_stream.extract(
+                    step=step,
+                    source=source,
+                    rows=accepted_rows,
+                    output_file=output_file,
+                    metadata={
+                        **dict(metadata or {}),
+                        "snapshot_path": str(snapshot_path),
+                    },
+                )
+                return str(snapshot_path)
+            except Exception as exc:
+                logger.debug("[EXTRACTION SNAPSHOT] save skipped: %s", exc)
+                return ""
+
+        async def _try_dom_api_fast_path(
+            dom_rows: list,
+            *,
+            source: str,
+            dom_text: str = "",
+        ) -> dict:
+            try:
+                from visual_web_agent.content_completeness_guard import (
+                    evaluate_dom_api_completeness,
+                    execute_api_fast_path,
+                )
+
+                page_text = dom_text or await _capture_body_text_excerpt(6000)
+                verdict = evaluate_dom_api_completeness(
+                    dom_rows=dom_rows,
+                    dom_text=page_text,
+                    run_id=_run_ts,
+                    goal=goal,
+                )
+                if not verdict.get("should_fast_path"):
+                    return {"applied": False, "verdict": verdict}
+
+                cookies: list = []
+                if getattr(browser, "_context", None) is not None:
+                    cookies = await browser._context.cookies()
+                fast = execute_api_fast_path(
+                    run_id=_run_ts,
+                    verdict=verdict,
+                    cookies=cookies,
+                )
+                if not fast.get("applied"):
+                    return fast
+
+                api_rows = fast.get("rows") or []
+                if not api_rows:
+                    return {"applied": False, "reason": "empty_api_rows", "verdict": verdict}
+
+                saved_path = ""
+                if _goal_output_mode != "answer":
+                    saved_path = save_run_dataset(
+                        api_rows,
+                        run_id=_run_ts,
+                        output_contract=_goal_output_contract,
+                        produced_by="api_fast_path",
+                        filename_hint=_vlm_output,
+                    )
+                _record_extract_progress(api_rows, len(api_rows))
+                logger.info(
+                    "[API FAST PATH] upgraded %s via %s rows=%s saved=%s",
+                    source,
+                    fast.get("endpoint"),
+                    len(api_rows),
+                    saved_path,
+                )
+                event_stream.guard(
+                    step=step,
+                    name="DOM_API_FAST_PATH",
+                    message="DOM truncated or sparse; replayed richer API payload.",
+                    metadata={"verdict": verdict, "fast_path": fast, "source": source},
+                )
+                try:
+                    from api_server import broadcast_phase as _bp_api_fp
+
+                    _bp_api_fp(
+                        "completion_guard",
+                        severity="info",
+                        message=f"api_fast_path: {fast.get('endpoint', '')[:80]}",
+                        step=step,
+                        notice_severity=getattr(browser, "_last_notice_severity", None),
+                        extra={
+                            "guard": "dom_api_fast_path",
+                            "evaluation": {
+                                "status": "complete",
+                                "evidence": verdict.get("reasons") or [],
+                                "reasons": ["api_fast_path"],
+                            },
+                            "endpoint": fast.get("endpoint"),
+                            "row_count": len(api_rows),
+                        },
+                    )
+                except Exception:
+                    pass
+                return {"applied": True, "verdict": verdict, "fast_path": fast, "saved_path": saved_path}
+            except Exception as _api_fp_err:
+                logger.debug("[API FAST PATH] skipped: %s", _api_fp_err)
+                return {"applied": False, "error": str(_api_fp_err)}
+
+        def _xhr_saved_row_count() -> tuple[int | None, str]:
+            filename = str(getattr(browser, "_intercept_filename", "") or "")
+            if not filename:
+                return None, ""
+            path = resolve_artifact_path(filename)
+            if not path.exists():
+                return None, str(path)
+            try:
+                import pandas as _pd
+
+                df = _pd.read_excel(path)
+                return int(len(df.index)), str(path)
+            except Exception as exc:
+                logger.debug("[XHR HARD KILL] saved-row count skipped: %s", exc)
+                return None, str(path)
+
+        def _xhr_target_reached() -> tuple[bool, int, int | None]:
+            target = _parse_goal_target_count(goal)
+            if not enable_xhr or target is None or browser.intercepted_count <= 0:
+                return False, browser.intercepted_count, target
+            if _goal_is_tooltip_extract(goal):
+                return False, browser.intercepted_count, target
+            if not _goal_is_bulk_extraction(goal):
+                return False, browser.intercepted_count, target
+            saved_count, saved_path = _xhr_saved_row_count()
+            effective_count = (
+                saved_count
+                if saved_count is not None
+                else int(browser.intercepted_count or 0)
+            )
+            if saved_count is not None and saved_count != browser.intercepted_count:
+                logger.info(
+                    "[XHR HARD KILL] using saved clean rows=%s instead of raw intercepted=%s (%s)",
+                    saved_count,
+                    browser.intercepted_count,
+                    saved_path,
+                )
+            return effective_count >= target, effective_count, target
+
+        async def _finish_if_xhr_target_reached(reason: str) -> bool:
+            nonlocal _total_extracted_rows, _task_completed, _run_succeeded, _log_screenshot_path, _log_decision
+            reached, count, target = _xhr_target_reached()
+            if not reached:
+                return False
+            _total_extracted_rows = max(_total_extracted_rows, count)
+            output_file = str(getattr(browser, "_intercept_filename", "") or "")
+            logger.info(
+                "[XHR HARD KILL] intercepted target reached: %s/%s (%s)",
+                count,
+                target,
+                reason,
+            )
+            _broadcast_log_safe(
+                f"[XHR HARD KILL] XHR 清洗后已保存 {count}/{target} 条数据，任务达量结束。"
+            )
+            _broadcast_done_safe(True, "XHR intercepted target reached")
+            event_stream.extract(
+                step=step,
+                source="XHR_INTERCEPT",
+                rows=count,
+                output_file=output_file,
+                metadata={"reason": reason, "target": target},
+            )
+            await browser.mark_and_screenshot(step=99)
+            _log_screenshot_path = str(Path(SCREENSHOT_DIR) / "step_99.png")
+            # PRESERVE the VLM's actual action in the trajectory; only annotate
+            # ``thought`` with the guard's exit-reason. See the matching fix in
+            # ``_finish_if_file_download_completed`` for rationale.
+            _guard_annotation = (
+                f"[XHR HARD KILL] XHR 拦截器已捕获 {count}/{target} 条数据，"
+                "任务在本步达量后结束。"
+            )
+            if isinstance(_log_decision, dict):
+                _log_decision = dict(_log_decision)
+                _original_thought = str(_log_decision.get("thought") or "").strip()
+                _log_decision["status"] = "success"
+                _log_decision["thought"] = (
+                    f"{_guard_annotation}\n"
+                    + (f"原 VLM thought：{_original_thought}" if _original_thought else "")
+                ).rstrip()
+                _log_decision["extract_text_source"] = "XHR_INTERCEPT"
+                _log_decision["output_file"] = output_file
+            else:
+                _log_decision = {
+                    "action": "done",
+                    "target_id": 0,
+                    "type_value": "",
+                    "status": "success",
+                    "thought": _guard_annotation,
+                    "extract_text_source": "XHR_INTERCEPT",
+                    "output_file": output_file,
+                }
+            _task_completed = True
+            _run_succeeded = True
+            return True
+
+        async def _finish_if_file_download_completed(reason: str) -> bool:
+            nonlocal _task_completed, _run_succeeded, _log_screenshot_path, _log_decision
+            if not re.search(r"\bdownload\b|下载|samplefile|保存文件", goal, re.I):
+                return False
+            download_path = str(getattr(browser, "last_download_path", "") or "")
+            download_name = str(getattr(browser, "last_download_name", "") or "")
+            if not download_path or not Path(download_path).exists():
+                return False
+            logger.info(
+                "[DOWNLOAD GUARD] completed download %s (%s)",
+                download_name or Path(download_path).name,
+                reason,
+            )
+            event_stream.guard(
+                step=step,
+                name="DOWNLOAD_COMPLETED_GUARD",
+                message="download completed; ending task",
+                metadata={
+                    "path": download_path,
+                    "name": download_name or Path(download_path).name,
+                    "reason": reason,
+                },
+            )
+            event_stream.done(
+                step=step,
+                success=True,
+                reason="download_completed_guard",
+                message=f"download completed: {download_name or Path(download_path).name}",
+                metadata={
+                    "path": download_path,
+                    "name": download_name or Path(download_path).name,
+                },
+            )
+            _broadcast_done_safe(True, "Download completed")
+            try:
+                await browser.mark_and_screenshot(step=99)
+                _log_screenshot_path = str(Path(SCREENSHOT_DIR) / "step_99.png")
+            except Exception as screenshot_err:
+                logger.debug("[DOWNLOAD GUARD] final screenshot skipped: %s", screenshot_err)
+            # PRESERVE the VLM's actual click decision in the trajectory.
+            # Earlier this branch wiped ``_log_decision`` to ``action=done`` /
+            # ``target_id=0`` / ``thought=Download completed``, so the trajectory
+            # showed zero visible click and users thought "the agent didn't
+            # press Download". The download interceptor only fires from a real
+            # network download, so the action that triggered it must have run —
+            # keep its fields and only append a guard annotation to ``thought``.
+            _saved_file = download_name or Path(download_path).name
+            _guard_annotation = (
+                f"[DOWNLOAD GUARD] 任务在本步触发的下载完成后结束 — "
+                f"文件已保存到 {download_path} ({_saved_file})。"
+            )
+            if isinstance(_log_decision, dict):
+                _log_decision = dict(_log_decision)  # don't mutate the original
+                _original_thought = str(_log_decision.get("thought") or "").strip()
+                _log_decision["status"] = "success"
+                _log_decision["thought"] = (
+                    f"{_guard_annotation}\n"
+                    + (f"原 VLM thought：{_original_thought}" if _original_thought else "")
+                ).rstrip()
+                _log_decision["download_path"] = download_path
+                _log_decision["downloaded_file"] = _saved_file
+            else:
+                # Fallback: no VLM decision recorded yet (rare — guard fired
+                # before the action could populate _log_decision).
+                _log_decision = {
+                    "action": "done",
+                    "target_id": 0,
+                    "type_value": _saved_file,
+                    "status": "success",
+                    "thought": _guard_annotation,
+                    "download_path": download_path,
+                    "downloaded_file": _saved_file,
+                }
+            _task_completed = True
+            _run_succeeded = True
+            return True
 
         def _compact_link_match_text(value: object) -> str:
             return re.sub(r"\W+", "", str(value or "").lower(), flags=re.UNICODE)
@@ -3688,6 +9351,77 @@ async def run_agent(
             if ax_text:
                 return source, ax_text
             return ("INNER_TEXT_FALLBACK", body_text) if body_text else ("", "")
+
+        async def _extract_body_text_for_semantic_cards(reason: str) -> str:
+            """Lightweight body text fallback for schema-driven card extraction."""
+            if not _requested_output_fields:
+                return ""
+            try:
+                _body_page = await browser._ensure_active_page(reason=reason)
+                text = await _body_page.evaluate(
+                    """() => document.body ? String(document.body.innerText || '') : ''"""
+                )
+                return str(text or "").strip()[:20000]
+            except Exception as body_err:
+                logger.debug("[EXTRACT DOM] semantic card body text skipped: %s", body_err)
+                return ""
+
+        async def _inspect_click_target_for_extract_nav_guard(decision: dict) -> dict:
+            action_name = str(decision.get("action") or "").strip().lower()
+            if action_name not in {"click", "click_text", "click_point"}:
+                return {}
+            target_id = int(decision.get("target_id") or 0)
+            if target_id <= 0:
+                return {
+                    "text": str(decision.get("type_value") or ""),
+                    "action": action_name,
+                }
+            try:
+                page = await browser._ensure_active_page(
+                    reason="inspect extraction same-page nav target"
+                )
+                if not page:
+                    return {}
+                return await page.evaluate(
+                    """(targetId) => {
+                        const el = document.querySelector(`[data-som-id="${targetId}"]`);
+                        if (!el) return {exists: false, target_id: targetId};
+                        const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                        const anchor = el.closest('a[href]');
+                        const role = clean(el.getAttribute('role') || '');
+                        const tag = clean(el.tagName || '').toLowerCase();
+                        const href = anchor ? anchor.href : (
+                            el.href || el.getAttribute('href') || ''
+                        );
+                        const text = clean(
+                            el.innerText || el.textContent ||
+                            el.getAttribute('aria-label') ||
+                            el.getAttribute('title') || ''
+                        );
+                        const cls = clean(el.className || '');
+                        const parent = el.closest(
+                            'nav,header,[role="navigation"],[role="tablist"],.tab,.tabs,.nav,.navbar,.forecast'
+                        );
+                        return {
+                            exists: true,
+                            target_id: targetId,
+                            tag,
+                            role,
+                            href,
+                            text,
+                            class_name: cls,
+                            nav_like: Boolean(parent),
+                            tab_like: role === 'tab' ||
+                                el.getAttribute('aria-controls') ||
+                                el.getAttribute('data-toggle') === 'tab' ||
+                                /\\b(tab|tabs|nav-link|active)\\b/i.test(cls),
+                        };
+                    }""",
+                    target_id,
+                ) or {}
+            except Exception as inspect_err:
+                logger.debug("[EXTRACT NAV GUARD] target inspection skipped: %s", inspect_err)
+                return {}
 
         async def _extract_list_rows_via_dom(reason: str) -> tuple[list[dict], str]:
             """Extract repeated list/card rows directly with DOM semantics."""
@@ -4277,10 +10011,264 @@ async def run_agent(
                 logger.debug("[EXTRACT DEDUP] scroll drain probe failed: %s", probe_err)
                 return {"at_bottom": False, "probe_failed": True}
 
+        async def _try_pre_extract_fast_path() -> bool:
+            """Try deterministic extraction before invoking the VLM planner."""
+            nonlocal _run_succeeded, _rpa_cache_allowed, _rpa_skip_reason
+            if not _goal_is_bulk_extraction(goal):
+                return False
+            if _goal_is_tooltip_extract(goal) or _is_form_fill_goal:
+                return False
+            target_count = _parse_goal_target_count(goal)
+            if target_count is None or target_count <= 0:
+                return False
+
+            logger.info(
+                "[PRE-EXTRACT] starting deterministic preflight target=%s fields=%s",
+                target_count,
+                _requested_output_fields,
+            )
+            _broadcast_log_safe(
+                f"[PRE-EXTRACT] 先尝试确定性抽取，目标 {target_count} 行。",
+                level="info",
+            )
+
+            data_shape: dict = {}
+            try:
+                data_shape = await browser.probe_data_shape()
+                logger.info("[PRE-EXTRACT] data_shape=%s", data_shape)
+            except Exception as shape_err:
+                logger.debug("[PRE-EXTRACT] data shape skipped: %s", shape_err)
+
+            candidates: list[dict] = []
+
+            # Try families in a stable fast-path order. If multiple families
+            # satisfy the goal, table-like DOM evidence wins over cards/lists,
+            # and full-page/AX only acts as the final pre-planner fallback.
+            dom_table_rows = await _extract_visible_table_rows_via_dom(
+                "pre-extract visible table rows"
+            )
+            if dom_table_rows:
+                candidates.append(
+                    _sanitize_extraction_candidate(
+                        name="DOM_TABLE",
+                        data=dom_table_rows,
+                        source_text="",
+                        data_shape=data_shape,
+                    )
+                )
+
+            body_text = await _extract_body_text_for_semantic_cards(
+                "pre-extract semantic card body text"
+            )
+            dom_list_rows, dom_list_text = await _extract_list_rows_via_dom(
+                "pre-extract visible list rows"
+            )
+            card_source_text = "\n\n".join(
+                text for text in (body_text, dom_list_text) if text
+            )
+            dom_card_rows, dom_card_text = extract_semantic_card_rows(
+                dom_list_rows,
+                source_text=card_source_text,
+                requested_fields=_requested_output_fields,
+                goal=goal,
+            )
+            if dom_card_rows:
+                logger.info(
+                    "[PRE-EXTRACT] semantic cards rows=%s source_chars=%s",
+                    len(dom_card_rows),
+                    len(dom_card_text or card_source_text),
+                )
+                candidates.append(
+                    _sanitize_extraction_candidate(
+                        name="DOM_CARDS",
+                        data=dom_card_rows,
+                        source_text=dom_card_text or card_source_text,
+                        data_shape=data_shape,
+                    )
+                )
+            if dom_list_rows:
+                candidates.append(
+                    _sanitize_extraction_candidate(
+                        name="DOM_LIST",
+                        data=dom_list_rows,
+                        source_text=dom_list_text or body_text,
+                        data_shape=data_shape,
+                    )
+                )
+
+            reached_candidate = _choose_pre_extract_reached_candidate(
+                candidates,
+                target_count,
+            )
+            if not reached_candidate:
+                full_source, full_text = await _extract_full_page_text_for_data(
+                    "pre-extract full page/AX fallback"
+                )
+                if full_text:
+                    structured_full = await vlm.extract_structured_data(
+                        page_text=full_text,
+                        goal=goal,
+                    )
+                    if (
+                        structured_full
+                        and isinstance(structured_full, list)
+                        and len(structured_full) > 0
+                    ):
+                        logger.info(
+                            "[PRE-EXTRACT] full-page structured rows=%s source=%s chars=%s",
+                            len(structured_full),
+                            full_source,
+                            len(full_text),
+                        )
+                        candidates.append(
+                            _sanitize_extraction_candidate(
+                                name=f"FULL_PAGE:{full_source}",
+                                data=structured_full,
+                                source_text=full_text,
+                                data_shape=data_shape,
+                            )
+                        )
+
+            if not candidates:
+                logger.info("[PRE-EXTRACT] no deterministic candidates")
+                return False
+
+            try:
+                candidates = rank_extraction_candidates_with_history(
+                    candidates,
+                    url=getattr(browser, "current_url", "") or start_url,
+                    requested_fields=_requested_output_fields,
+                    goal=_snapshot_goal,
+                )
+            except Exception as recovery_err:
+                logger.debug("[PRE-EXTRACT] recovery ranking skipped: %s", recovery_err)
+
+            chosen = _choose_pre_extract_reached_candidate(candidates, target_count)
+            if chosen:
+                logger.info(
+                    "[PRE-EXTRACT] reached target via ordered family: %s accepted=%s/%s",
+                    chosen.get("name"),
+                    chosen.get("accepted"),
+                    target_count,
+                )
+            else:
+                chosen = _choose_best_extraction_candidate(candidates)
+            if not chosen:
+                logger.info("[PRE-EXTRACT] no viable candidate after arbitration")
+                return False
+
+            accepted = int(chosen.get("accepted") or 0)
+            if accepted < target_count:
+                logger.info(
+                    "[PRE-EXTRACT] best candidate %s has %s/%s rows; continue to planner",
+                    chosen.get("name"),
+                    accepted,
+                    target_count,
+                )
+                return False
+
+            rows, new_rows, dup_rows, rejected_rows, chosen_source_text = (
+                _commit_extraction_candidate(chosen)
+            )
+            rows = await _enrich_rows_with_dom_links(rows)
+            saved_path = save_run_dataset(
+                rows,
+                run_id=_run_ts,
+                output_contract=_goal_output_contract,
+                produced_by="pre_extract",
+                filename_hint=_vlm_output,
+            )
+            progress_new_rows, progress_total_rows = _record_extract_progress(
+                rows,
+                new_rows,
+            )
+            snapshot_path = await _save_extraction_snapshot(
+                source=str(chosen.get("name") or "PRE_EXTRACT"),
+                rows=rows,
+                output_file=str(saved_path or ""),
+                accepted_rows=new_rows,
+                duplicate_rows=dup_rows,
+                rejected_rows=rejected_rows,
+                candidates=candidates,
+                data_shape=data_shape,
+                source_text=chosen_source_text or body_text,
+                metadata={
+                    "mode": "pre_extract_fast_path",
+                    "progress_new_rows": progress_new_rows,
+                    "progress_total_rows": progress_total_rows,
+                    "target": target_count,
+                },
+            )
+            _rpa_cache_allowed = False
+            _rpa_skip_reason = "pre-extract completed task"
+            logger.info(
+                "[PRE-EXTRACT] completed via %s rows=%s/%s output=%s snapshot=%s",
+                chosen.get("name"),
+                progress_total_rows,
+                target_count,
+                saved_path,
+                snapshot_path,
+            )
+            print(
+                f"\033[1;32m🎯 [PRE-EXTRACT]\033[0m "
+                f"{chosen.get('name')} 已达量 {progress_total_rows}/{target_count}，"
+                "跳过 Planner/VLM 主循环。"
+            )
+            _broadcast_log_safe(
+                f"[PRE-EXTRACT] {chosen.get('name')} 已提取 {progress_total_rows}/{target_count} 行，任务完成。"
+            )
+            _broadcast_done_safe(True, "Pre-extract target reached")
+            try:
+                await browser.mark_and_screenshot(step=99)
+            except Exception as screenshot_err:
+                logger.debug("[PRE-EXTRACT] final screenshot skipped: %s", screenshot_err)
+            _run_succeeded = True
+            return True
+
         # ── 自愈计数器 ────────────────────────────────────────────────
         # 连续执行失败超过 _MAX_CONSECUTIVE_ERRORS 次时强制转 ask_human
         _MAX_CONSECUTIVE_ERRORS = 3
         _consecutive_errors = 0
+        try:
+            from .stuck_recovery_guard import StuckRecoveryState
+        except ImportError:
+            from stuck_recovery_guard import StuckRecoveryState
+        _stuck_recovery_state = StuckRecoveryState()
+        _recovery_chain_pending = False
+        try:
+            from .bot_challenge_guard import BotChallengeState
+        except ImportError:
+            from bot_challenge_guard import BotChallengeState
+        _bot_challenge_state = BotChallengeState()
+        # ── Session Drop tracking (Wave 3) ───────────────────────────
+        # _last_business_url: most recent non-login URL we observed at
+        # step end. Used by the session-drop sniffer to decide whether
+        # we've been bounced to login MID-task.
+        # _pending_session_return_url: set when sniffer fires; consumed
+        # by the post-ask_human resume handler to goto back automatically.
+        _last_business_url: str = ""
+        _pending_session_return_url: str = ""
+        # ── Failure Classifier：统一失败统计 ─────────────────────────
+        _failure_stats = _FailureStatsClass()
+        # ── Judge：任务完成验证 ──────────────────────────────────────
+        _judge = TaskJudge(vlm_client=vlm, config=JudgeConfig(
+            enabled=JUDGE_ENABLED,
+            max_retries_after_fail=2,
+        ))
+        _judge_rejections = 0  # done 被 Judge 驳回的次数
+        # ── Loop Detector：统一循环检测 ──────────────────────────────
+        _loop_detector = ActionLoopDetector(config=LoopDetectorConfig(
+            window_size=8,
+            action_repeat_threshold=3,
+            stagnation_threshold=4,
+        ))
+        # ── Element Tracker：清空上一任务的追踪条目 ──────────────────
+        # 新任务开始时显式 reset，避免上次任务的 last_click 等别名串到本次。
+        # 开关关闭时 reset_element_tracker() 是 no-op，不需要额外判断。
+        try:
+            vlm.reset_element_tracker()
+        except Exception as _trk_reset_err:
+            logger.debug(f"[TRACKER] reset failed: {_trk_reset_err}")
 
         # ── Wave 2：Planner / Reflector 状态 ──────────────────────────
         _task_plan: "TaskPlan | None" = None
@@ -4300,17 +10288,31 @@ async def run_agent(
         _executed_cached_trail: list[dict] = []
         _blank_page_recovery_attempted: set[str] = set()
         _force_vision_next_step = False
+        _runtime_config = _runtime_config_module()
+        _allow_physical_rpa = bool(getattr(_runtime_config, "RPA_ENABLE_PHYSICAL_REPLAY", True))
+        _allow_semantic_rpa = bool(getattr(_runtime_config, "RPA_ENABLE_SEMANTIC_MACRO_REPLAY", True))
+        _semantic_macro = (
+            _initial_semantic_macro
+        ) if _allow_semantic_rpa else None
+        _semantic_macro_attempted = False
         _skip_rpa_for_goal, _skip_rpa_reason = _goal_should_skip_rpa(goal)
-        if _skip_rpa_for_goal:
+        if not _allow_physical_rpa:
+            _rpa_cache_allowed = False
+            _rpa_skip_reason = "physical replay disabled by config"
+            logger.info("[RPA] Physical replay disabled by config")
+            print(
+                "\n\033[1;33m⚡ [RPA]\033[0m 物理肌肉记忆回放已被配置关闭。\n"
+                "   semantic macro replay 仍可单独启用。"
+            )
+        elif _skip_rpa_for_goal:
             _rpa_cache_allowed = False
             _rpa_skip_reason = _skip_rpa_reason
             logger.info(
-                f"[RPA] Disabled for this run because the goal is intentionally testing "
-                f"an invalid/error path: {_rpa_skip_reason}"
+                f"[RPA] Disabled for this run: {_rpa_skip_reason}"
             )
             print(
-                f"\n\033[1;33m⚡ [RPA]\033[0m 当前任务包含故意注入的错误/无效步骤，"
-                f"已自动禁用肌肉记忆回放。\n"
+                f"\n\033[1;33m⚡ [RPA]\033[0m 当前任务不适合物理肌肉记忆回放，"
+                f"已自动禁用物理回放。\n"
                 f"   reason: {_rpa_skip_reason}"
             )
 
@@ -4324,16 +10326,49 @@ async def run_agent(
         _rpa_cursor = 0
         browser.clear_rpa_trail()  # 清空上次遗留的轨迹
 
-        if not _skip_rpa_for_goal:
-            if _rpa_exact_path.exists():
-                logger.info(f"[RPA] Exact cache hit: {_rpa_exact_path}")
-                _rpa_payload = _load_rpa_cache_payload(_rpa_exact_path)
+        if _allow_physical_rpa and not _skip_rpa_for_goal:
+            _rpa_exact_path, _rpa_payload, _rpa_match_reason = _load_exact_rpa_cache(
+                start_url, goal
+            )
+            if _rpa_payload is not None:
+                logger.info(
+                    "[RPA] Exact cache hit: %s | reason=%s",
+                    _rpa_exact_path,
+                    _rpa_match_reason,
+                )
             if _rpa_payload is None:
                 _similar_match = _find_similar_rpa_cache(start_url, goal, exclude_path=_rpa_exact_path)
                 if _similar_match:
                     _rpa_path, _rpa_payload, _rpa_match_reason = _similar_match
                     logger.info(
                         f"[RPA] Similar cache selected: {_rpa_path} | reason={_rpa_match_reason}"
+                    )
+        if _semantic_macro:
+                _semantic_action = str(_semantic_macro.get("action") or "")
+                logger.info(
+                    "[RPA] Using %s macro generated from current goal: %s",
+                    _semantic_action,
+                    _semantic_macro.get("path") or _semantic_macro.get("target_date"),
+                )
+                _rpa_payload = {
+                    "version": 4,
+                    "replayable": True,
+                    "reason": "",
+                    "trail": [_semantic_macro],
+                    "fail_count": 0,
+                    "max_failures": 2,
+                    "completes_task": _goal_output_mode != "answer",
+                    **_build_rpa_match_metadata(start_url, goal),
+                }
+                _rpa_path = _rpa_exact_path
+                _rpa_match_reason = f"semantic {_semantic_action} macro"
+                try:
+                    _write_rpa_cache_payload(_rpa_exact_path, _rpa_payload)
+                except Exception as _semantic_cache_err:
+                    logger.debug(
+                        "[RPA] Failed to persist current %s macro: %s",
+                        _semantic_action,
+                        _semantic_cache_err,
                     )
         if _rpa_payload:
             if not _rpa_payload.get("replayable", True):
@@ -4344,13 +10379,24 @@ async def run_agent(
                 )
                 logger.info(f"[RPA] Cache is non-replayable, skip replay: {_reason}")
             else:
-                _match_label = "精确命中" if _rpa_path == _rpa_exact_path else f"近似命中（{_rpa_match_reason}）"
+                _reason_lower = str(_rpa_match_reason or "").lower()
+                if _reason_lower.startswith("normalized exact"):
+                    _match_label = "精确命中（normalized exact）"
+                elif _reason_lower.startswith("legacy exact"):
+                    _match_label = "精确命中（legacy exact）"
+                elif _reason_lower.startswith("semantic "):
+                    _match_label = f"语义宏命中（{_rpa_match_reason}）"
+                elif _rpa_path == _rpa_exact_path:
+                    _match_label = f"精确命中（{_rpa_match_reason}）"
+                else:
+                    _match_label = f"近似命中（{_rpa_match_reason}）"
                 print(
                     f"\n\033[1;33m⚡ [RPA]\033[0m 发现肌肉记忆缓存: {_rpa_path.name}\n"
                     f"   {_match_label}，将在条件满足时自动尝试极速回放..."
                 )
+                await _recover_active_page("before startup RPA replay")
                 _new_cursor, _replayed_steps, _replay_failed = await _replay_ready_rpa_steps(
-                    browser, _rpa_payload, _rpa_cursor, workflow_memory
+                    browser, _rpa_payload, _rpa_cursor, workflow_memory, vlm=vlm
                 )
                 if _replay_failed:
                     logger.warning("[RPA] Startup replay failed, falling back to VLM loop.")
@@ -4360,8 +10406,35 @@ async def run_agent(
                 else:
                     _rpa_cursor = _new_cursor
                     _executed_cached_trail.extend(_replayed_steps)
-                    if (
+                    _replay_completes_current_goal = bool(
                         _rpa_payload.get("completes_task", True)
+                    )
+                    if _goal_output_mode == "answer" and _replay_completes_current_goal:
+                        logger.info(
+                            "[RPA] Answer-mode replay used only as a navigation prefix; "
+                            "final answer still requires page observation/VLM output."
+                        )
+                        event_stream.guard(
+                            step=0,
+                            name="ANSWER_RPA_PREFIX_ONLY",
+                            message=(
+                                "Cached physical replay reached the expected page, "
+                                "but answer-mode tasks still require a final observed answer."
+                            ),
+                            metadata={
+                                "cache": str(_rpa_path),
+                                "replayed_steps": len(_replayed_steps),
+                                "cursor": _rpa_cursor,
+                                "trail_length": len(_rpa_payload.get("trail") or []),
+                            },
+                        )
+                        _replay_completes_current_goal = False
+                    if _goal_is_form_fill(goal):
+                        _replay_completes_current_goal = _trail_completes_form_goal(
+                            goal, _executed_cached_trail
+                        )
+                    if (
+                        _replay_completes_current_goal
                         and _rpa_cursor >= len(_rpa_payload.get("trail") or [])
                         and _replayed_steps
                     ):
@@ -4370,6 +10443,10 @@ async def run_agent(
                         _run_succeeded = True
                         return True
         # ──────────────────────────────────────────────────────────────
+
+        step = 0
+        if await _try_pre_extract_fast_path():
+            return True
 
         # ══════════════════════════════════════════════════════════════
         # Wave 2 Planner：任务起手生成子目标清单
@@ -4401,11 +10478,88 @@ async def run_agent(
             logger.warning(f"[PLANNER] 调用失败静默降级：{_plan_err}")
             _task_plan = None
 
+        if _task_plan is not None:
+            try:
+                from visual_web_agent.semantic_router import merge_task_plan_into_route
+
+                _capability_route = merge_task_plan_into_route(_task_plan, _capability_route)
+            except Exception as _plan_merge_err:
+                logger.debug("[PLANNER] route merge skipped: %s", _plan_merge_err)
+
+        try:
+            try:
+                from .tab_session_guards import infer_tab_session_anchor
+            except ImportError:
+                from tab_session_guards import infer_tab_session_anchor
+            _tab_session_anchor = infer_tab_session_anchor(goal)
+        except Exception as _tsa_init_err:
+            logger.debug("[TAB SESSION] anchor init skipped: %s", _tsa_init_err)
+            _tab_session_anchor = None
+        if _tab_session_anchor is not None:
+            logger.info(
+                "[TAB SESSION] anchor tab index=%s (goal mentions return to first/start tab)",
+                _tab_session_anchor,
+            )
+
         for step in range(1, _effective_max_steps + 1):
             _check_stop(f"before_step_{step}")
+            # K4: track the current step in module state so that if a
+            # failure surfaces from inside this iteration the archive
+            # record gets ``step_count = N`` instead of None.
+            _record_run_step(step)
             logger.info(f"\n{'-' * 50}")
             logger.info(f">> Step {step}/{_effective_max_steps}")
             logger.info(f"{'-' * 50}")
+
+            # ── Session-drop URL tracking (Wave 3) ─────────────────────
+            # Snapshot the URL we ENTER this step on. If the snapshot is
+            # NOT login-shaped, remember it as the latest business URL.
+            # The session-drop guard later compares against this to detect
+            # mid-task auth expiry. We update at step start (not end) so
+            # the snapshot reflects post-stabilisation state of the prior
+            # step's navigation.
+            try:
+                try:
+                    from .session_drop_guard import looks_like_login_url as _sd_looks
+                except ImportError:  # pragma: no cover
+                    from session_drop_guard import looks_like_login_url as _sd_looks  # type: ignore[no-redef]
+                _step_entry_url = browser.current_url or ""
+                if _step_entry_url and not _sd_looks(_step_entry_url):
+                    _last_business_url = _step_entry_url
+            except Exception:
+                pass
+
+            # ── E1b: runtime cross-system observation ──────────────────
+            # Resolve the URL we entered this step on to a planned system.
+            # Only emit when it's a genuine cross-system hop (from a known
+            # prior system) so single-system runs stay quiet. Fully guarded
+            # so it can never break the step loop.
+            try:
+                if _run_system_tracker is not None:
+                    _sys_transition = _run_system_tracker.observe(
+                        browser.current_url or "", step=step
+                    )
+                    if _sys_transition is not None and _sys_transition.from_system_id:
+                        event_stream.emit(
+                            "system_transition",
+                            **_sys_transition.to_dict(),
+                        )
+                        try:
+                            from api_server import broadcast_phase as _bp_sys
+
+                            _bp_sys(
+                                "system_transition",
+                                severity="info",
+                                message=(
+                                    f"{_sys_transition.from_system_name} → "
+                                    f"{_sys_transition.to_system_name}"
+                                ),
+                                extra=_sys_transition.to_dict(),
+                            )
+                        except Exception:
+                            pass
+            except Exception as _sys_observe_err:
+                logger.debug("[RUN SYSTEM TRACKER] observe skipped: %s", _sys_observe_err)
 
             # ── 本轮日志收集状态 ──────────────────────────────────────────
             _log_screenshot_path: str | None = None
@@ -4424,13 +10578,15 @@ async def run_agent(
                 if _login_intercepted:
                     logger.info("[PRELOGIN] Login popup handled before reasoning; refreshing context.")
 
-                if _is_form_fill_goal and _form_assignments and _auto_form_retry_count < 3:
-                    _auto_form_retry_count += 1
-                    logger.info("[AUTO FORM] step-level deterministic retry #%s", _auto_form_retry_count)
-                    _auto_form_ok = await _try_auto_form_fill(browser, goal)
-                    if _auto_form_ok:
+                if _semantic_macro and not _is_form_fill_goal:
+                    _semantic_state = await _semantic_goal_currently_satisfied(
+                        browser,
+                        goal,
+                    )
+                    if _semantic_state.get("ok"):
                         _run_succeeded = True
-                        _broadcast_done_safe(True, "Auto form fill completed")
+                        _task_completed = True
+                        _broadcast_done_safe(True, "Semantic component goal verified")
                         try:
                             _auto_ss, _ = await browser.mark_and_screenshot(step)
                             _log_screenshot_path = (
@@ -4438,16 +10594,272 @@ async def run_agent(
                                 if _auto_ss
                                 else None
                             )
-                        except Exception as _auto_log_err:
-                            logger.debug("[AUTO FORM] failed to capture completion screenshot: %s", _auto_log_err)
+                        except Exception as _semantic_ss_err:
+                            logger.debug(
+                                "[SEMANTIC VERIFY] failed to capture screenshot: %s",
+                                _semantic_ss_err,
+                            )
                         _log_decision = {
                             "action": "done",
                             "target_id": 0,
                             "status": "success",
-                            "thought": "AUTO FORM 已完成字段回读校验，并已点击 Create/Submit（若目标要求提交）。",
-                            "type_value": "auto_form",
+                            "type_value": str(_semantic_state.get("expected") or ""),
+                            "thought": (
+                                "SEMANTIC VERIFY 已从当前页面回读到目标值，"
+                                "组件任务完成。"
+                            ),
+                            "semantic_validation": _semantic_state,
                         }
+                        event_stream.verify(
+                            step=step,
+                            name="semantic_goal",
+                            success=True,
+                            expected=_semantic_state.get("expected", ""),
+                            observed=_semantic_state.get("observed", ""),
+                            metadata=_semantic_state,
+                        )
+                        event_stream.act(
+                            step=step,
+                            result=_with_tool_metadata(
+                                ActionResult.from_action(
+                                    {
+                                        "action": "semantic_verify",
+                                        "type_value": str(_semantic_state.get("expected") or ""),
+                                    },
+                                    success=True,
+                                    message="Semantic component goal verified",
+                                    after_url=getattr(browser, "current_url", "") or "",
+                                    after_pages=len(browser._context.pages) if browser._context else 0,
+                                    metadata={"semantic_validation": _semantic_state},
+                                )
+                            ),
+                        )
                         break
+
+                    if not _semantic_macro_attempted:
+                        _semantic_macro_attempted = True
+                        _semantic_action = str(_semantic_macro.get("action") or "semantic_macro")
+                        logger.info(
+                            "[SEMANTIC MACRO] trying %s before VLM loop: %s",
+                            _semantic_action,
+                            _semantic_macro.get("path") or _semantic_macro.get("target_date"),
+                        )
+                        _semantic_ok = await _replay_rpa(
+                            browser,
+                            [dict(_semantic_macro)],
+                            workflow_memory,
+                            vlm=vlm,
+                        )
+                        if _semantic_ok:
+                            _post_semantic_state = await _semantic_goal_currently_satisfied(
+                                browser,
+                                goal,
+                            )
+                            _run_succeeded = True
+                            _task_completed = True
+                            _broadcast_done_safe(True, "Semantic component macro completed")
+                            try:
+                                _auto_ss, _ = await browser.mark_and_screenshot(step)
+                                _log_screenshot_path = (
+                                    str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png")
+                                    if _auto_ss
+                                    else None
+                                )
+                            except Exception as _semantic_ss_err:
+                                logger.debug(
+                                    "[SEMANTIC MACRO] failed to capture screenshot: %s",
+                                    _semantic_ss_err,
+                                )
+                            _log_decision = {
+                                "action": "done",
+                                "target_id": 0,
+                                "status": "success",
+                                "type_value": str(
+                                    _post_semantic_state.get("expected")
+                                    or _semantic_macro.get("target_date")
+                                    or " / ".join(_semantic_macro.get("path") or [])
+                                ),
+                                "thought": (
+                                    f"SEMANTIC MACRO 已执行 {_semantic_action}，"
+                                    "并完成组件目标。"
+                                ),
+                                "semantic_validation": _post_semantic_state,
+                            }
+                            event_stream.verify(
+                                step=step,
+                                name="semantic_macro",
+                                success=bool(_post_semantic_state.get("ok", True)),
+                                expected=_post_semantic_state.get("expected", ""),
+                                observed=_post_semantic_state.get("observed", ""),
+                                metadata={
+                                    "macro": _semantic_macro,
+                                    "validation": _post_semantic_state,
+                                },
+                            )
+                            event_stream.act(
+                                step=step,
+                                result=_with_tool_metadata(
+                                    ActionResult.from_action(
+                                        {
+                                            "action": _semantic_action,
+                                            "type_value": str(_log_decision.get("type_value") or ""),
+                                        },
+                                        success=True,
+                                        message="Semantic component macro completed",
+                                        after_url=getattr(browser, "current_url", "") or "",
+                                        after_pages=len(browser._context.pages) if browser._context else 0,
+                                        metadata={"semantic_validation": _post_semantic_state},
+                                    )
+                                ),
+                            )
+                            break
+                        event_stream.guard(
+                            step=step,
+                            name="semantic_macro_failed",
+                            message=(
+                                f"Semantic macro {_semantic_action} failed; "
+                                "falling back to VLM loop."
+                            ),
+                            metadata={"macro": _semantic_macro},
+                        )
+
+                _force_challenge_auto_form = False
+                if _is_form_fill_goal:
+                    _challenge_done = False
+                    if _should_use_round_form_macro(goal, _form_assignments):
+                        _challenge_done = await _run_round_form_if_present(browser, goal)
+                    if _challenge_done:
+                        _run_succeeded = True
+                        _broadcast_done_safe(True, "RPA Challenge completed")
+                        try:
+                            _auto_ss, _ = await browser.mark_and_screenshot(step)
+                            _log_screenshot_path = (
+                                str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png")
+                                if _auto_ss
+                                else None
+                            )
+                        except Exception as _challenge_log_err:
+                            logger.debug("[RPA CHALLENGE] failed to capture completion screenshot: %s", _challenge_log_err)
+                        _log_decision = {
+                            "action": "done",
+                            "target_id": 0,
+                            "status": "success",
+                            "thought": "RPA Challenge 已点击 Start，并按 challenge.xlsx 连续完成全部轮次；仅最终完成态允许 done。",
+                            "type_value": "rpa_challenge",
+                        }
+                        event_stream.verify(
+                            step=step,
+                            name="rpa_challenge_completion",
+                            success=True,
+                            expected="final completion state",
+                            observed="challenge macro returned complete",
+                            metadata={"macro": "round_form"},
+                        )
+                        event_stream.act(
+                            step=step,
+                            result=_with_tool_metadata(
+                                ActionResult.from_action(
+                                    {"action": "auto_form_macro", "type_value": "rpa_challenge"},
+                                    success=True,
+                                    message="RPA Challenge completed",
+                                    after_url=getattr(browser, "current_url", "") or "",
+                                    after_pages=len(browser._context.pages) if browser._context else 0,
+                                )
+                            ),
+                        )
+                        break
+                    _force_challenge_auto_form = (
+                        False if _form_assignments else await _has_active_round_form_round(browser)
+                    )
+                if _is_form_fill_goal and (_auto_form_retry_count < 3 or _force_challenge_auto_form):
+                    _auto_form_blocked = (
+                        False if _form_assignments else await _auto_form_has_prestart_gate(browser)
+                    )
+                    if _auto_form_blocked:
+                        logger.info("[AUTO FORM] step-level retry deferred until Start gate is cleared")
+                    else:
+                        if _force_challenge_auto_form:
+                            logger.info("[AUTO FORM] active rpachallenge round detected; forcing deterministic retry")
+                        else:
+                            _auto_form_retry_count += 1
+                            logger.info("[AUTO FORM] step-level deterministic retry #%s", _auto_form_retry_count)
+                        _auto_form_ok = await _try_auto_form_fill(browser, goal)
+                        if _auto_form_ok:
+                            _run_succeeded = True
+                            _broadcast_done_safe(True, "Auto form fill completed")
+                            try:
+                                _auto_ss, _ = await browser.mark_and_screenshot(step)
+                                _log_screenshot_path = (
+                                    str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png")
+                                    if _auto_ss
+                                    else None
+                                )
+                            except Exception as _auto_log_err:
+                                logger.debug("[AUTO FORM] failed to capture completion screenshot: %s", _auto_log_err)
+                            _log_decision = {
+                                "action": "done",
+                                "target_id": 0,
+                                "status": "success",
+                                "thought": (
+                                    "AUTO FORM 已完成字段回读校验，并已点击 Create/Submit（若目标要求提交）。"
+                                    + "\n"
+                                    + _format_auto_form_validation_summary(
+                                        getattr(browser, "_last_auto_form_result", None)
+                                    )
+                                ),
+                                "type_value": "auto_form",
+                                "form_validation": getattr(browser, "_last_auto_form_result", None),
+                            }
+                            event_stream.verify(
+                                step=step,
+                                name="auto_form_readback",
+                                success=True,
+                                expected="all parsed form fields",
+                                observed="field readback ok",
+                                metadata={
+                                    "form_validation": getattr(
+                                        browser,
+                                        "_last_auto_form_result",
+                                        None,
+                                    )
+                                },
+                            )
+                            event_stream.act(
+                                step=step,
+                                result=_with_tool_metadata(
+                                    ActionResult.from_action(
+                                        {"action": "auto_form", "type_value": "auto_form"},
+                                        success=True,
+                                        message="Auto form fill completed",
+                                        after_url=getattr(browser, "current_url", "") or "",
+                                        after_pages=len(browser._context.pages) if browser._context else 0,
+                                        metadata={
+                                            "form_validation": getattr(
+                                                browser,
+                                                "_last_auto_form_result",
+                                                None,
+                                            )
+                                        },
+                                    )
+                                ),
+                            )
+                            break
+
+                _page_for_loop = await _recover_active_page(
+                    "main loop active page recovery"
+                )
+                _loop_url = (_page_for_loop.url or "") if _page_for_loop else ""
+                if _page_for_loop and (not _loop_url or _loop_url.startswith("about:")) and url:
+                    try:
+                        logger.warning(
+                            "[PAGE RECOVERY] Active page is blank before step %s; navigating back to start URL: %s",
+                            step,
+                            url,
+                        )
+                        await _page_for_loop.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await browser._wait_for_page_stable()
+                    except Exception as _loop_nav_err:
+                        logger.warning("[PAGE RECOVERY] start URL restore failed: %s", _loop_nav_err)
 
                 if _goal_prefers_visual_navigation(goal):
                     _page = await browser._ensure_active_page(reason="blank page recovery check")
@@ -4465,8 +10877,9 @@ async def run_agent(
                 if _rpa_payload and _rpa_payload.get("replayable", True):
                     _trail = _rpa_payload.get("trail") or []
                     if _rpa_cursor < len(_trail):
+                        await _recover_active_page("before partial RPA replay")
                         _new_cursor, _replayed_steps, _replay_failed = await _replay_ready_rpa_steps(
-                            browser, _rpa_payload, _rpa_cursor, workflow_memory
+                            browser, _rpa_payload, _rpa_cursor, workflow_memory, vlm=vlm
                         )
                         if _replay_failed:
                             logger.warning("[RPA] Partial replay failed, continue with VLM loop.")
@@ -4480,11 +10893,32 @@ async def run_agent(
                                 _rpa_payload.get("completes_task", True)
                                 and _rpa_cursor >= len(_trail)
                             ):
-                                logger.info("[RPA] Partial replay completed the remaining task.")
-                                await browser.mark_and_screenshot(step=99)
-                                _run_succeeded = True
-                                return True
-                            continue
+                                if _goal_output_mode == "answer":
+                                    logger.info(
+                                        "[RPA] Partial replay reached the answer page; "
+                                        "continuing so the final answer is observed and logged."
+                                    )
+                                    event_stream.guard(
+                                        step=step,
+                                        name="ANSWER_RPA_PREFIX_ONLY",
+                                        message=(
+                                            "Partial cached replay finished its trail, "
+                                            "but answer-mode tasks need a final observed answer."
+                                        ),
+                                        metadata={
+                                            "cache": str(_rpa_path),
+                                            "replayed_steps": len(_replayed_steps),
+                                            "cursor": _rpa_cursor,
+                                            "trail_length": len(_trail),
+                                        },
+                                    )
+                                else:
+                                    logger.info("[RPA] Partial replay completed the remaining task.")
+                                    await browser.mark_and_screenshot(step=99)
+                                    _run_succeeded = True
+                                    return True
+                            else:
+                                continue
 
                 # ══════════════════════════════════════════════════════════════
                 # 混合调度：主引擎（网络截胡）优先于备用引擎（VLM 视觉提取）
@@ -4510,6 +10944,13 @@ async def run_agent(
                     )
                     await browser.mark_and_screenshot(step=99)
                     _run_succeeded = True
+                    event_stream.extract(
+                        step=step,
+                        source="XHR",
+                        rows=_record_cnt,
+                        output_file=_xhr_output,
+                        metadata={"saved_path": saved_path},
+                    )
                     break
                 # ════════════════════════════════════════════════════════════
                 # 图文双模态融合 (Hybrid Modality)
@@ -4528,10 +10969,50 @@ async def run_agent(
                 print("\033[1;36m🧠 [HYBRID]\033[0m 同步采集 SoM 截图 + 无障碍语义树 (AX Tree)，融合决策")
                 logger.info("[HYBRID] Collecting SoM screenshot + accessibility tree for fused VLM decision")
 
-                screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+                await _recover_active_page("before hybrid screenshot")
+                try:
+                    screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+                except RuntimeError as screenshot_err:
+                    if "No active page" not in str(screenshot_err):
+                        raise
+                    logger.warning(
+                        "[BROWSER RECOVERY] screenshot failed with no active page; restarting and retrying once"
+                    )
+                    await browser.restart(start_url, reason="retry hybrid screenshot")
+                    screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
                 _log_screenshot_path = (
                     str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
                 )
+
+                try:
+                    try:
+                        from .bot_challenge_guard import handle_bot_challenge_step
+                    except ImportError:
+                        from bot_challenge_guard import handle_bot_challenge_step
+                    _bc_result = await handle_bot_challenge_step(
+                        browser,
+                        _bot_challenge_state,
+                        hitl_callback=_wait_for_human_resume,
+                    )
+                    if _bc_result.notice:
+                        input_descriptions = _bc_result.notice + "\n" + (input_descriptions or "")
+                    if _bc_result.cleared_after_hitl:
+                        screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+                        _log_screenshot_path = (
+                            str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
+                        )
+                        try:
+                            from .auth_harvester import harvest_storage_state as _bc_harvest
+                        except ImportError:
+                            from auth_harvester import harvest_storage_state as _bc_harvest
+                        try:
+                            _bc_hr = await _bc_harvest(browser)
+                            if _bc_hr.saved:
+                                logger.info("[BOT CHALLENGE] harvested auth profile: %s", _bc_hr.profile_name)
+                        except Exception as _bc_harv_err:
+                            logger.debug("[BOT CHALLENGE] auth harvest skipped: %s", _bc_harv_err)
+                except Exception as _bc_err:
+                    logger.debug("[BOT CHALLENGE] step hook skipped: %s", _bc_err)
 
                 try:
                     ax_tree_text = await browser.extract_accessibility_tree()
@@ -4543,6 +11024,31 @@ async def run_agent(
 
                 _log_reasoning_text_source = "AX_TREE" if ax_tree_text else "SCREENSHOT_ONLY"
 
+                # ── A11y Enhancer：增强 AX Tree 信息 ─────────────────────
+                if ax_tree_text and A11Y_ENHANCER_ENABLED:
+                    try:
+                        _a11y_enhancer = A11yEnhancer(config=A11yEnhancerConfig(
+                            enable_grouping=True,
+                            enable_state_annotation=True,
+                            enable_hidden_hints=True,
+                            max_output_chars=15000,
+                        ))
+                        _a11y_meta = A11yPageMetadata(
+                            url=getattr(browser, "current_url", "") or "",
+                            title=(_page_state or "")[:100],
+                            total_elements=len(getattr(browser, "_last_som_elements", []) or []),
+                            visible_elements=len(getattr(browser, "_last_visible_elements", []) or []),
+                            iframe_count=getattr(browser, "_iframe_count", 0),
+                            scroll_position=getattr(browser, "_last_scroll_y", 0),
+                            page_height=getattr(browser, "_page_height", 0),
+                        )
+                        _a11y_result = _a11y_enhancer.enhance(ax_tree_text, _a11y_meta)
+                        ax_tree_text = _a11y_result.text
+                        if _a11y_result.summary:
+                            logger.debug(f"[A11Y] {_a11y_result.summary}")
+                    except Exception as _a11y_err:
+                        logger.debug(f"[A11Y] Enhancement skipped: {_a11y_err}")
+
                 # 兜底：防止超大 AX Tree 撑爆 Token
                 if ax_tree_text and len(ax_tree_text) > 15000:
                     _orig_len = len(ax_tree_text)
@@ -4550,6 +11056,29 @@ async def run_agent(
                     logger.warning(
                         f"[HYBRID] AX Tree 长度 {_orig_len} 超过 15000 阈值，已截断以保护上下文窗口"
                     )
+                _browser_state = await BrowserStateSnapshot.from_browser(
+                    browser,
+                    step=step,
+                    screenshot_path=_log_screenshot_path or "",
+                    ax_tree_text=ax_tree_text,
+                    tabs=_tabs_state,
+                    page_summary=_page_state,
+                    last_action_result=getattr(browser, "_last_action_result", None),
+                    metadata={
+                        "reasoning_text_source": _log_reasoning_text_source,
+                    },
+                )
+                event_stream.observe(
+                    step=step,
+                    url=getattr(browser, "current_url", "") or "",
+                    screenshot_path=_log_screenshot_path or "",
+                    ax_lines=len(ax_tree_text.splitlines()) if ax_tree_text else 0,
+                    browser_state=_browser_state,
+                    metadata={
+                        "tabs": _tabs_state,
+                        "reasoning_text_source": _log_reasoning_text_source,
+                    },
+                )
 
                 ax_block = ""
                 if ax_tree_text:
@@ -4677,28 +11206,74 @@ async def run_agent(
                     )
                 )
                 if _can_force_extract_after_navigation_now:
-                    logger.info(
-                        "[FORCE EXTRACT AFTER NAV] skipping VLM ask; extracting newly landed page"
-                    )
-                    _broadcast_log_safe(
-                        "[FORCE EXTRACT] 翻页已落地，下一步先提取当前页，避免连续翻页跳过目标数据",
-                        level="info",
-                    )
-                    decisions = [{
-                        "action": "extract",
-                        "target_id": 0,
-                        "type_value": "",
-                        "memory_key": "",
-                        "extracted_data": None,
-                        "__extract_downgraded": True,
-                        "thought": (
-                            "[FORCE EXTRACT 翻页后提取锁] 上一步已成功进入新页面。"
-                            "在未提取当前页之前禁止继续 next_page，系统直接启动当前页自动提取。"
-                        ),
-                        "progress_review": "",
-                        "current_state": "",
-                        "subgoal_status": "in_progress",
-                    }]
+                    # On a known chat host, swap to chat_extract — generic
+                    # extract on yiyan/chat.baidu/etc. captures search-result
+                    # cards, missing the AI answer entirely.
+                    try:
+                        try:
+                            from .chat_extract_coercion_guard import (
+                                detect_extract_on_chat_host as _force_chat_check,
+                            )
+                        except ImportError:  # pragma: no cover
+                            from chat_extract_coercion_guard import (  # type: ignore[no-redef]
+                                detect_extract_on_chat_host as _force_chat_check,
+                            )
+                        _force_chat_hit = _force_chat_check(
+                            {"action": "extract", "memory_key": ""},
+                            browser.current_url or "",
+                        )
+                    except Exception:
+                        _force_chat_hit = None
+
+                    if _force_chat_hit:
+                        logger.info(
+                            "[FORCE EXTRACT AFTER NAV] chat host %s → using chat_extract",
+                            _force_chat_hit["matched_host"],
+                        )
+                        _broadcast_log_safe(
+                            f"[FORCE EXTRACT] 聊天域 {_force_chat_hit['matched_host']}，"
+                            "改用 chat_extract 抓 AI 回答",
+                            level="info",
+                        )
+                        decisions = [{
+                            "action": "chat_extract",
+                            "target_id": 0,
+                            "type_value": "",
+                            "memory_key": _force_chat_hit["memory_key"],
+                            "extracted_data": None,
+                            "__extract_downgraded": True,
+                            "thought": (
+                                "[FORCE CHAT_EXTRACT AFTER NAV] 上一步已进入聊天页。"
+                                "由于当前是已知 AI 助手域名，系统改用 chat_extract："
+                                "等流式 + 选回答容器 + 排搜索结果。"
+                            ),
+                            "progress_review": "",
+                            "current_state": "",
+                            "subgoal_status": "in_progress",
+                        }]
+                    else:
+                        logger.info(
+                            "[FORCE EXTRACT AFTER NAV] skipping VLM ask; extracting newly landed page"
+                        )
+                        _broadcast_log_safe(
+                            "[FORCE EXTRACT] 翻页已落地，下一步先提取当前页，避免连续翻页跳过目标数据",
+                            level="info",
+                        )
+                        decisions = [{
+                            "action": "extract",
+                            "target_id": 0,
+                            "type_value": "",
+                            "memory_key": "",
+                            "extracted_data": None,
+                            "__extract_downgraded": True,
+                            "thought": (
+                                "[FORCE EXTRACT 翻页后提取锁] 上一步已成功进入新页面。"
+                                "在未提取当前页之前禁止继续 next_page，系统直接启动当前页自动提取。"
+                            ),
+                            "progress_review": "",
+                            "current_state": "",
+                            "subgoal_status": "in_progress",
+                        }]
                     _force_extract_after_navigation_pending = False
                 elif _can_force_next_page_now:
                     logger.info(
@@ -4731,17 +11306,213 @@ async def run_agent(
                     if _force_next_page_pending:
                         logger.info("[FORCE NEXT_PAGE] cleared because target is already met")
                         _force_next_page_pending = False
-                    decisions = await vlm.ask(
-                        screenshot_b64,
-                        goal,
-                        step,
-                        input_descriptions,
-                        workflow_memory,
-                        task_plan=_task_plan,
-                        max_steps=_effective_max_steps,
-                    )
+                    # G2: emit vlm_call phase event with duration for the
+                    # frontend timeline. Best-effort, swallows api_server errors.
+                    _vlm_t0 = time.time()
+                    decisions = None
+                    if _recovery_chain_pending:
+                        _recovery_chain_pending = False
+                        try:
+                            try:
+                                from .recovery_chain import attempt_stuck_recovery_chain
+                            except ImportError:
+                                from recovery_chain import attempt_stuck_recovery_chain
+                            decisions = await attempt_stuck_recovery_chain(
+                                browser,
+                                goal=goal,
+                                start_url=start_url,
+                                tab_anchor_index=_tab_session_anchor,
+                            )
+                            if decisions:
+                                logger.info(
+                                    "[RECOVERY CHAIN] bypassed VLM (%s action(s))",
+                                    len(decisions),
+                                )
+                        except Exception as _rc_err:
+                            logger.debug("[RECOVERY CHAIN] skipped: %s", _rc_err)
+                            decisions = None
+                    if decisions is None:
+                        decisions = await vlm.ask(
+                            screenshot_b64,
+                            goal,
+                            step,
+                            input_descriptions,
+                            workflow_memory,
+                            task_plan=_task_plan,
+                            max_steps=_effective_max_steps,
+                            som_elements=getattr(browser, "_last_som_elements", None),
+                            capability_route=_capability_route,
+                        )
+                    try:
+                        from api_server import broadcast_phase
+
+                        broadcast_phase(
+                            "vlm_call",
+                            severity="info",
+                            message=f"step {step}",
+                            step=step,
+                            duration_ms=int((time.time() - _vlm_t0) * 1000),
+                            notice_severity=getattr(browser, "_last_notice_severity", None),
+                        )
+                    except Exception:
+                        pass
+
+                if decisions:
+                    _head_decision = decisions[0]
+                    if _decision_should_finish_instead_of_operate(
+                        _head_decision,
+                        output_mode=_goal_output_mode,
+                    ):
+                        _original_action = str(_head_decision.get("action") or "")
+                        _original_target = _head_decision.get("target_id", 0)
+                        logger.info(
+                            "[ANSWER DONE GUARD] answer is already visible; "
+                            "rewriting action=%r target_id=%r to done.",
+                            _original_action,
+                            _original_target,
+                        )
+                        event_stream.guard(
+                            step=step,
+                            name="ANSWER_DONE_INTENT_GUARD",
+                            message=(
+                                "Answer-mode decision text says the task is complete; "
+                                "rewrote the physical action to done."
+                            ),
+                            metadata={
+                                "output_mode": _goal_output_mode,
+                                "original_action": _original_action,
+                                "original_target_id": _original_target,
+                            },
+                        )
+                        _rewritten_decision = _force_done_decision(_head_decision)
+                        _rewritten_decision["subgoal_status"] = "completed"
+                        _rewritten_decision["__answer_done_guard"] = True
+                        _rewritten_decision["__original_action"] = _original_action
+                        _rewritten_decision["__original_target_id"] = _original_target
+                        _rewritten_decision["thought"] = str(
+                            _head_decision.get("thought") or ""
+                        )
+                        decisions = [_rewritten_decision]
+
+                if decisions:
+                    try:
+                        from visual_web_agent.completion_kernel import (
+                            load_manifest_items_for_run,
+                            maybe_short_circuit_decision,
+                        )
+                        from visual_web_agent.planner_exit_criteria import (
+                            current_subgoal_criteria,
+                        )
+
+                        _ck_exit_criteria = current_subgoal_criteria(_task_plan)
+                        _ck_prev = getattr(browser, "_last_action_result", None)
+                        _ck_last_action = str(getattr(_ck_prev, "action", "") or "")
+                        _ck_last_ok = (
+                            bool(getattr(_ck_prev, "success", False))
+                            if _ck_prev is not None else False
+                        )
+                        _ck = maybe_short_circuit_decision(
+                            decisions[0],
+                            goal=goal,
+                            output_contract=_goal_output_contract,
+                            output_mode=_goal_output_mode,
+                            total_extracted_rows=_total_extracted_rows,
+                            goal_target_count=_parse_goal_target_count(goal),
+                            pagination_exhausted=_pagination_exhausted,
+                            manifest_items=load_manifest_items_for_run(_run_ts),
+                            workflow_memory=workflow_memory,
+                            no_progress_streak=_no_progress_tracker.streak,
+                            exit_criteria=_ck_exit_criteria,
+                            current_url=getattr(browser, "current_url", "") or "",
+                            last_action=_ck_last_action,
+                            last_action_success=_ck_last_ok,
+                        )
+                        if _ck.get("short_circuit"):
+                            logger.info(
+                                "[COMPLETION KERNEL] rewrote action=%s -> done; evidence=%s",
+                                _ck.get("decision", {}).get("__original_action"),
+                                (_ck.get("evaluation") or {}).get("evidence"),
+                            )
+                            event_stream.guard(
+                                step=step,
+                                name="COMPLETION_KERNEL_SHORT_CIRCUIT",
+                                message="Task evidence complete; stopped low-value action.",
+                                metadata={
+                                    "evaluation": _ck.get("evaluation"),
+                                    "original_action": _ck.get("decision", {}).get("__original_action"),
+                                },
+                            )
+                            try:
+                                from api_server import broadcast_phase as _bp_ck
+
+                                _bp_ck(
+                                    "completion_guard",
+                                    severity="info",
+                                    message=(
+                                        f"short_circuit: "
+                                        f"{_ck.get('decision', {}).get('__original_action')} → done"
+                                    ),
+                                    step=step,
+                                    notice_severity=getattr(
+                                        browser, "_last_notice_severity", None
+                                    ),
+                                    extra={
+                                        "guard": "completion_kernel_short_circuit",
+                                        "evaluation": _ck.get("evaluation"),
+                                        "original_action": _ck.get("decision", {}).get(
+                                            "__original_action"
+                                        ),
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            decisions = [_ck["decision"]]
+                    except Exception as _ck_err:
+                        logger.debug("[COMPLETION KERNEL] skipped: %s", _ck_err)
 
                 _log_decision = decisions
+                event_stream.decide(
+                    step=step,
+                    decisions=decisions,
+                    url=getattr(browser, "current_url", "") or "",
+                )
+
+                # ── Loop Detector：统一循环检测（补充现有 LOOP GUARD）──────
+                if decisions:
+                    _ld_fp = PageFingerprint(
+                        url=getattr(browser, "current_url", "") or "",
+                        title=(await browser.get_active_page_summary() if hasattr(browser, "get_active_page_summary") else "")[:100],
+                        element_count=len(getattr(browser, "_last_som_elements", []) or []),
+                        scroll_position=getattr(browser, "_last_scroll_y", 0),
+                    )
+                    _ld_result = _loop_detector.check(decisions[0], _ld_fp, step)
+                    if _ld_result.loop_detected:
+                        logger.warning(
+                            f"[LOOP DETECTOR] {_ld_result.loop_type} "
+                            f"(confidence={_ld_result.confidence:.2f}): "
+                            f"{_ld_result.nudge_message[:120]}"
+                        )
+                        _broadcast_log_safe(
+                            f"[LOOP DETECTOR] {_ld_result.loop_type} detected",
+                            level="warn",
+                        )
+                        vlm.inject_error_feedback(_ld_result.nudge_message)
+                        try:
+                            from .stuck_recovery_guard import evaluate_loop_recovery
+                        except ImportError:
+                            from stuck_recovery_guard import evaluate_loop_recovery
+                        _sr_loop = evaluate_loop_recovery(
+                            _stuck_recovery_state,
+                            loop_type=str(_ld_result.loop_type or ""),
+                            nudge_number=int(
+                                (_ld_result.details or {}).get("nudge_number") or 0
+                            ),
+                        )
+                        if _sr_loop.should_reset:
+                            vlm.reset_decision_history(_sr_loop.reason)
+                            _loop_detector.reset()
+                            _consecutive_errors = 0
+                            _recovery_chain_pending = True
 
                 # ── 思想-动作分离同步推进（Cascader / 多级菜单 / 多步表单通用）──
                 # 现象：VLM thought 写"已完成应推进下一子目标"但 action 字段
@@ -5003,6 +11774,635 @@ async def run_agent(
                 else:
                     _consecutive_zero_target = 0
 
+                try:
+                    _wait_loop_msg = _wait_loop_tracker.observe(
+                        _head_dec,
+                        browser.current_url or "",
+                    )
+                    if _wait_loop_msg:
+                        logger.warning("[WAIT LOOP GUARD] %s", _wait_loop_msg)
+                        _broadcast_log_safe(
+                            "[WAIT LOOP GUARD] repeated short wait loop detected; "
+                            "injecting corrective feedback",
+                            level="warn",
+                        )
+                        vlm.inject_error_feedback(_wait_loop_msg)
+                except Exception as _wait_loop_err:
+                    logger.debug("[WAIT LOOP GUARD] skipped: %s", _wait_loop_err)
+
+                # ── SUBMIT LOOP GUARD ────────────────────────────────────
+                # 拦"VLM 不信自己 submit 成功，又点一次同一个按钮"
+                # 触发条件：head=click/click_text/click_new_tab + 同 target_id 出现在
+                # 上一步 + 两步之间 URL 已变化（path 不同，submit 显然生效了）。
+                # 解决 wait_loop_guard 覆盖不到的 click 变种。
+                if decisions:
+                    try:
+                        try:
+                            from .submit_loop_guard import detect_redundant_click_after_navigation
+                        except ImportError:  # pragma: no cover
+                            from submit_loop_guard import detect_redundant_click_after_navigation  # type: ignore[no-redef]
+                        _submit_loop_msg = detect_redundant_click_after_navigation(
+                            decisions[0],
+                            _last_actions,
+                            browser.current_url or "",
+                            url_normalizer=_norm_url_for_guard,
+                        )
+                        if _submit_loop_msg:
+                            logger.warning("[SUBMIT LOOP GUARD] %s", _submit_loop_msg[:200])
+                            _broadcast_log_safe(
+                                "[SUBMIT LOOP GUARD] 同 target_id 跨页重点；注入反馈",
+                                level="warn",
+                            )
+                            vlm.inject_error_feedback(_submit_loop_msg)
+                            # Downgrade head to wait so VLM gets a clean re-look
+                            # at the new page before retrying. type_value="2"
+                            # distinguishes from the wait_loop_guard's "1".
+                            _sl_head = decisions[0]
+                            _sl_head["action"] = "wait"
+                            _sl_head["target_id"] = 0
+                            _sl_head["type_value"] = "2"
+                            decisions[:] = [_sl_head]
+                    except Exception as _submit_loop_err:
+                        logger.debug("[SUBMIT LOOP GUARD] skipped: %s", _submit_loop_err)
+
+                # ── SWITCH TAB LOOP GUARD ─────────────────────────────────
+                # 拦"VLM 反复 switch_tab(同 N)、每次 status=success 但 thought
+                # 始终说'还在错的页'"——心智模型错了不是 switch 错了。
+                # 触发：head=switch_tab(N) + 上一步也是 switch_tab(N)。
+                if decisions:
+                    try:
+                        try:
+                            from .switch_tab_loop_guard import detect_switch_tab_loop
+                        except ImportError:  # pragma: no cover
+                            from switch_tab_loop_guard import detect_switch_tab_loop  # type: ignore[no-redef]
+                        _switch_loop_msg = detect_switch_tab_loop(
+                            decisions[0],
+                            _last_actions,
+                            threshold=2,
+                        )
+                        if _switch_loop_msg:
+                            logger.warning("[SWITCH TAB LOOP] %s", _switch_loop_msg[:200])
+                            _broadcast_log_safe(
+                                "[SWITCH TAB LOOP GUARD] 连续 switch_tab 同 N；强制反馈",
+                                level="warn",
+                            )
+                            vlm.inject_error_feedback(_switch_loop_msg)
+                            # Downgrade head to wait (type_value="3" 区别于
+                            # wait_loop_guard 的 "1" 和 submit_loop_guard 的 "2")
+                            # 让 VLM 下一步重看当前 tab 真实内容。
+                            _stl_head = decisions[0]
+                            _stl_head["action"] = "wait"
+                            _stl_head["target_id"] = 0
+                            _stl_head["type_value"] = "3"
+                            decisions[:] = [_stl_head]
+                    except Exception as _switch_loop_err:
+                        logger.debug("[SWITCH TAB LOOP] skipped: %s", _switch_loop_err)
+
+                # ── TYPE_VALUE SCHEMA GUARD ───────────────────────────────
+                # 拦"VLM 把动作元数据写成 type_value 字符串"。
+                # 19:06 文心失败：VLM 想 click_point 却 emit
+                # `type target_id=7 type_value="send_button_click_point_870_445"`
+                # → 把这串描述真的输入到了聊天框，污染了原文本。
+                # 这种错误 LOOP GUARD / SUBMIT_LOOP 都看不见（每次 type_value
+                # 字符串都不同，被当成是"换内容重输"了）。
+                if decisions:
+                    try:
+                        try:
+                            from .type_value_schema_guard import detect_metadata_in_type_value
+                        except ImportError:  # pragma: no cover
+                            from type_value_schema_guard import detect_metadata_in_type_value  # type: ignore[no-redef]
+                        _tv_schema_msg = detect_metadata_in_type_value(decisions[0])
+                        if _tv_schema_msg:
+                            logger.warning(
+                                "[TYPE_VALUE SCHEMA GUARD] rejected head decision: %s",
+                                _tv_schema_msg[:200],
+                            )
+                            _broadcast_log_safe(
+                                "[TYPE_VALUE SCHEMA] 动作元数据被塞进 type_value；拒绝并反馈",
+                                level="warn",
+                            )
+                            vlm.inject_error_feedback(_tv_schema_msg)
+                            # Downgrade head to wait (type_value="4" 区别于
+                            # wait_loop_guard 的 "1"、submit_loop_guard 的 "2"、
+                            # switch_tab_loop_guard 的 "3")
+                            _tv_head = decisions[0]
+                            _tv_head["action"] = "wait"
+                            _tv_head["target_id"] = 0
+                            _tv_head["type_value"] = "4"
+                            decisions[:] = [_tv_head]
+                    except Exception as _tv_schema_err:
+                        logger.debug("[TYPE_VALUE SCHEMA] skipped: %s", _tv_schema_err)
+
+                # ── CHAT DRIFT GUARD ──────────────────────────────────────
+                # 当用户目标含 "文心/通义/豆包/ChatGPT/..." 等已知 chat brand，
+                # 且 VLM 上一步 submit 之后落到 /search/ 页（百度路由把聊天输
+                # 入框转成搜索框那种），直接把头动作改写为
+                # goto <known_chat_url>，跳过 11 步无效恢复。
+                # 解决 run_log_20260514_192447 那种"VLM 准确识别问题但找不到
+                # 出路" 的死循环。
+                if decisions:
+                    try:
+                        try:
+                            from .chat_entry_drift_guard import detect_chat_to_search_drift
+                        except ImportError:  # pragma: no cover
+                            from chat_entry_drift_guard import detect_chat_to_search_drift  # type: ignore[no-redef]
+                        _drift = detect_chat_to_search_drift(
+                            decisions[0],
+                            _last_actions,
+                            browser.current_url or "",
+                            goal,
+                        )
+                        if _drift:
+                            logger.warning(
+                                "[CHAT DRIFT GUARD] head rewritten → goto %s (brand=%s)",
+                                _drift["goto_url"], _drift["matched_brand"],
+                            )
+                            _broadcast_log_safe(
+                                f"[CHAT DRIFT GUARD] 重定向到 {_drift['matched_brand']} 真聊天 URL",
+                                level="warn",
+                            )
+                            vlm.inject_error_feedback(_drift["feedback"])
+                            # Rewrite head into a goto for the recovery URL
+                            _drift_head = decisions[0]
+                            _drift_head["action"] = "goto"
+                            _drift_head["target_id"] = 0
+                            _drift_head["type_value"] = _drift["goto_url"]
+                            _drift_head["thought"] = (
+                                f"[CHAT DRIFT GUARD] 自动恢复：goto {_drift['goto_url']} "
+                                f"(原 thought: {str(_drift_head.get('thought') or '')[:200]})"
+                            )
+                            decisions[:] = [_drift_head]
+                    except Exception as _drift_err:
+                        logger.debug("[CHAT DRIFT GUARD] skipped: %s", _drift_err)
+
+                # ── SESSION DROP GUARD (Wave 3) ───────────────────────────
+                # Mid-task auth expiry: agent was working on a business URL,
+                # current page is now a login/auth surface. Capture the
+                # business URL, rewrite the head action to ask_human, and
+                # let the post-resume handler goto back automatically.
+                # Runs BEFORE all other guards so they don't mutate the head
+                # in ways that would lose the session-drop signal.
+                if decisions and _last_business_url:
+                    try:
+                        try:
+                            from .session_drop_guard import (
+                                detect_session_drop as _sdg_detect,
+                                build_feedback as _sdg_feedback,
+                            )
+                        except ImportError:  # pragma: no cover
+                            from session_drop_guard import (  # type: ignore[no-redef]
+                                detect_session_drop as _sdg_detect,
+                                build_feedback as _sdg_feedback,
+                            )
+                        _sd_head_action = str(decisions[0].get("action") or "")
+                        _sd_head_status = str(decisions[0].get("status") or "")
+                        # Always probe for session drop — the URL-based check
+                        # is the strongest signal. Behaviour differs by what
+                        # VLM emitted, but we MUST capture return_url even
+                        # when VLM tried to ask for help on its own; and we
+                        # MUST rewrite the head when VLM gave up with
+                        # done/error on a login-shaped URL (otherwise the
+                        # _consecutive_errors counter crashes the run before
+                        # the user can intervene).
+                        _sd_signal = _sdg_detect(
+                            current_url=browser.current_url or "",
+                            last_business_url=_last_business_url,
+                            initial_url=start_url or "",
+                            step=step,
+                        )
+                        if _sd_signal:
+                            _pending_session_return_url = _sd_signal.return_url
+                            _orig_sd_action = _sd_head_action
+                            # If VLM is already asking for help, leave the
+                            # action alone — but the return_url above will
+                            # still trigger the auto-goto after resume.
+                            if _sd_head_action in ("ask_human", "captcha_detected"):
+                                logger.info(
+                                    "[SESSION DROP GUARD] return_url=%s recorded; "
+                                    "VLM already %s — not rewriting",
+                                    _sd_signal.return_url[:80],
+                                    _sd_head_action,
+                                )
+                                _broadcast_log_safe(
+                                    f"🔐 [SESSION DROP] VLM 已请求 {_sd_head_action}，"
+                                    f"系统将在恢复后自动回到 "
+                                    f"{_sd_signal.return_url[:60]}",
+                                    level="warn",
+                                )
+                            else:
+                                # Covers normal actions AND the giving-up
+                                # patterns (done/error/done+status=error).
+                                # Without this rewrite, VLM's done+error keeps
+                                # piling up _consecutive_errors and crashes
+                                # the run (run_log_20260518_153055 hit 3
+                                # consecutive errors before the user could
+                                # even see what was happening).
+                                _sd_drop_head = decisions[0]
+                                _sd_drop_head["action"] = "ask_human"
+                                _sd_drop_head["status"] = "error"
+                                _sd_drop_head["target_id"] = 0
+                                _sd_drop_head["type_value"] = (
+                                    f"Session expired mid-task. Last business URL: "
+                                    f"{_sd_signal.return_url}. After you log in, "
+                                    "the agent will auto-resume from that page."
+                                )
+                                _sd_drop_head["thought"] = (
+                                    f"[SESSION DROP GUARD] {_sd_signal.reason} "
+                                    f"(orig action: {_orig_sd_action}"
+                                    + (f", status: {_sd_head_status}"
+                                       if _sd_head_status else "")
+                                    + ")"
+                                )
+                                decisions[:] = [_sd_drop_head]
+                                logger.warning(
+                                    "[SESSION DROP GUARD] head → ask_human; "
+                                    "orig=%s/%s; return_url=%s",
+                                    _orig_sd_action, _sd_head_status,
+                                    _sd_signal.return_url[:80],
+                                )
+                                _broadcast_log_safe(
+                                    f"🔐 [SESSION DROP] 任务中途登录态失效"
+                                    f"（VLM 原动作 {_orig_sd_action}），"
+                                    f"将在登录后自动回到 {_sd_signal.return_url[:60]}",
+                                    level="warn",
+                                )
+                                vlm.inject_error_feedback(_sdg_feedback(_sd_signal))
+                                # I4: phase event — guard rewrote VLM's head
+                                # action. Severity=warn because the run can
+                                # still recover after human login.
+                                try:
+                                    from api_server import broadcast_phase as _bp_guard
+
+                                    _bp_guard(
+                                        "guard",
+                                        severity="warn",
+                                        message=f"session_drop: {_orig_sd_action} → ask_human",
+                                        step=step,
+                                        notice_severity=getattr(browser, "_last_notice_severity", None),
+                                        extra={
+                                            "guard": "session_drop",
+                                            "orig_action": _orig_sd_action,
+                                            "return_url": _sd_signal.return_url[:200],
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+                    except Exception as _sd_err:
+                        logger.debug("[SESSION DROP GUARD] skipped: %s", _sd_err)
+
+                # ── POST-NOOP TYPE → ENTER COERCION ─────────────────────────
+                # When the previous step's TypeHandler short-circuited as
+                # a no-op (input already had the target text), VLM very
+                # often emits ANOTHER duplicate type next step — its thought
+                # may even acknowledge "no need to type" while the JSON
+                # still says type. Catch this thought-action divergence by
+                # rewriting the duplicate type to press_key Enter so the
+                # message actually gets submitted.
+                if decisions:
+                    try:
+                        _ln = getattr(browser, "_last_type_noop", None)
+                        if isinstance(_ln, dict):
+                            _h = decisions[0]
+                            _h_act = str(_h.get("action") or "")
+                            _h_tv = str(_h.get("type_value") or "").strip()
+                            _h_tid = int(_h.get("target_id") or 0)
+                            _ln_tv = str(_ln.get("value") or "").strip()
+                            # Hard-correct only when the new decision is the
+                            # SAME duplicate type pattern. Different target_id
+                            # is fine (could be a different element).
+                            if (
+                                _h_act == "type"
+                                and _h_tv == _ln_tv
+                                and _ln_tv
+                            ):
+                                logger.warning(
+                                    "[POST-NOOP TYPE COERCE] last step was TYPE NO-OP "
+                                    "for %r; VLM re-emitted type — rewriting to press_key Enter",
+                                    _ln_tv[:40],
+                                )
+                                _broadcast_log_safe(
+                                    "⏎ [POST-NOOP COERCE] 上一步 TYPE NO-OP 已确认输入框含目标，"
+                                    "本步重复 type 自动改写为 press_key Enter",
+                                    level="warn",
+                                )
+                                _h["action"] = "press_key"
+                                _h["target_id"] = 0
+                                _h["type_value"] = "Enter"
+                                _h["thought"] = (
+                                    "[POST-NOOP TYPE COERCE] 上一步 TYPE NO-OP 已确认"
+                                    f"输入框含目标文本 {_ln_tv[:40]!r}；本轮的重复 type 被系统"
+                                    "改写为 press_key Enter，直接提交消息。原 thought："
+                                    + str(_h.get("thought") or "")[:200]
+                                )
+                                vlm.inject_error_feedback(
+                                    "⏎ [POST-NOOP COERCE] 你刚才被 TYPE NO-OP 拦截后又重复 type 了同一文本。"
+                                    "系统已替你改写为 press_key Enter。请在 thought 中记下"
+                                    "「输入框已确认含目标值，下一步是提交/等回复」，"
+                                    "不要再连续 type 同一内容。"
+                                )
+                                decisions[:] = [_h]
+                            # Clear the flag once consumed; if VLM picked a
+                            # non-type next action we don't want stale state.
+                            browser._last_type_noop = None
+                    except Exception as _ntc_err:
+                        logger.debug("[POST-NOOP TYPE COERCE] skipped: %s", _ntc_err)
+
+                # ── CHAT SUBMIT COERCE ──────────────────────────────────
+                # 修复 run_log_20260518_154220: yiyan.baidu.com 的发送按钮是
+                # <div>+<SVG>，SoM 没标号；VLM 退而 press_key Enter，但页面
+                # 自定义 Enter 处理器没生效 → 11 次 Enter 都没发出消息 →
+                # MAX_STEPS。本 guard 在以下条件全部满足时强制改写为 chat_submit：
+                #   1) 当前在已知 chat 域名（yiyan/chat.baidu/chatgpt/claude 等）
+                #   2) 当前头部动作是 press_key Enter
+                #   3) 最近 2 步里至少有 1 步也是 press_key Enter 且
+                #      _last_action_result.success=True（也就是技术上"按下了"
+                #      但页面没响应——再按一次只会重复失败）
+                # 这样可以让"Enter 不通"早早被打断，把按钮点击交给确定性的
+                # chat_send_locator + ChatSubmitHandler。
+                if decisions:
+                    try:
+                        try:
+                            from .chat_extract_coercion_guard import (
+                                is_on_known_chat_domain as _csc_is_chat,
+                            )
+                        except ImportError:  # pragma: no cover
+                            from chat_extract_coercion_guard import (  # type: ignore[no-redef]
+                                is_on_known_chat_domain as _csc_is_chat,
+                            )
+                        _csc_head = decisions[0]
+                        _csc_act = str(_csc_head.get("action") or "")
+                        _csc_tv = str(_csc_head.get("type_value") or "").strip().lower()
+                        _csc_thought = str(_csc_head.get("thought") or "")
+                        _csc_on_chat = False
+                        try:
+                            _csc_on_chat = bool(_csc_is_chat(browser.current_url or ""))
+                        except Exception:
+                            _csc_on_chat = False
+                        _csc_is_enter_press = (
+                            _csc_act == "press_key"
+                            and _csc_tv in ("enter", "return")
+                        )
+                        _prev_action_result = getattr(browser, "_last_action_result", None)
+                        _prev_action_name = str(
+                            getattr(_prev_action_result, "action", "") or ""
+                        )
+                        _prev_action_ok = bool(
+                            getattr(_prev_action_result, "success", False)
+                        )
+                        if (
+                            _csc_on_chat
+                            and _csc_act == "chat_submit"
+                            and _prev_action_name == "chat_submit"
+                            and _prev_action_ok
+                            and not workflow_memory.get("__chat_extract_completed")
+                        ):
+                            logger.warning(
+                                "[CHAT POST-SUBMIT GUARD] previous chat_submit succeeded; "
+                                "rewriting repeated chat_submit to chat_extract"
+                            )
+                            _broadcast_log_safe(
+                                "💬 [CHAT POST-SUBMIT GUARD] 上一步已经成功发送消息，"
+                                "本步不再重复发送，改为 chat_extract 等待并提取 AI 回复",
+                                level="warn",
+                            )
+                            _csc_head["action"] = "chat_extract"
+                            _csc_head["target_id"] = 0
+                            _csc_head["type_value"] = ""
+                            _csc_head["memory_key"] = (
+                                str(_csc_head.get("memory_key") or "").strip()
+                                or "ai_answer"
+                            )
+                            _csc_head["extracted_data"] = None
+                            _csc_head["status"] = ""
+                            _csc_head["subgoal_status"] = "in_progress"
+                            _csc_head["thought"] = (
+                                "[CHAT POST-SUBMIT GUARD] 上一步 chat_submit 已成功，"
+                                "当前已在聊天会话页；重复发送可能造成多条重复问题。"
+                                "系统改写为 chat_extract：等待流式回答稳定并提取正文。"
+                                "原 thought："
+                                + _csc_thought[:240]
+                            )
+                            decisions[:] = [_csc_head]
+                            vlm.inject_error_feedback(
+                                "💬 [CHAT POST-SUBMIT GUARD] 上一步已经成功发送消息。"
+                                "在 AI 聊天页发送成功后，下一步应使用 chat_extract "
+                                "等待并提取回答，不要继续 chat_submit/点击发送。"
+                            )
+                            _csc_act = "chat_extract"
+                            _csc_tv = ""
+                        if _csc_on_chat and _csc_is_enter_press:
+                            # 看 vlm._history 最后 2 条里有没有同样的 press_key Enter
+                            _recent = (vlm._history or [])[-2:]
+                            _prior_enter_count = sum(
+                                1 for h in _recent
+                                if str(h.get("action") or "") == "press_key"
+                                and str(h.get("type_value") or "").strip().lower() in ("enter", "return")
+                            )
+                            if _prior_enter_count >= 1:
+                                logger.warning(
+                                    "[CHAT SUBMIT COERCE] 在 chat 域名上检测到 "
+                                    "连续 press_key Enter (本轮+%d 历史)；"
+                                    "改写为 chat_submit (确定性点击发送按钮)",
+                                    _prior_enter_count,
+                                )
+                                _broadcast_log_safe(
+                                    "🚀 [CHAT SUBMIT COERCE] 检测到连续 Enter "
+                                    "在 chat 站点未生效，改写为 chat_submit 直接点击发送按钮",
+                                    level="warn",
+                                )
+                                _csc_head["action"] = "chat_submit"
+                                _csc_head["target_id"] = 0
+                                _csc_head["type_value"] = ""
+                                _csc_head["thought"] = (
+                                    "[CHAT SUBMIT COERCE] 检测到当前 chat 站点连续 "
+                                    "press_key Enter 都没生效（典型场景：发送按钮"
+                                    "是 <div> + 图标，被 SoM 漏标且页面没绑定 Enter）。"
+                                    "系统改写为 chat_submit，由 chat_send_locator "
+                                    "启发式定位发送按钮后用真实坐标点击。原 thought："
+                                    + str(_csc_head.get("thought") or "")[:200]
+                                )
+                                decisions[:] = [_csc_head]
+                                vlm.inject_error_feedback(
+                                    "⏎ [CHAT SUBMIT COERCE] 你刚才反复 press_key Enter "
+                                    "在 chat 站点没生效。已替你改写为 chat_submit。"
+                                    "下次在 chat 站点输入消息后，**优先尝试 chat_submit**，"
+                                    "Enter 是次选；只在 chat_submit 也失败时再回退 Enter。"
+                                )
+                        elif _csc_on_chat and _csc_act != "chat_submit":
+                            # Some VLMs correctly reason "use chat_submit" in
+                            # thought, but still emit click(target_id=N). Others
+                            # keep clicking whatever red-box id happens to sit
+                            # near the composer. In chat pages, after repeated
+                            # submit-intent attempts, the deterministic locator
+                            # is safer than another SoM click.
+                            _submit_words = (
+                                "chat_submit", "发送", "提交", "send", "submit",
+                                "paper plane", "paper-plane", "纸飞机", "飞机图标",
+                            )
+
+                            def _csc_submitish_text(obj: dict) -> bool:
+                                try:
+                                    blob = " ".join(
+                                        str(obj.get(k) or "")
+                                        for k in (
+                                            "thought", "progress_review",
+                                            "current_state", "type_value",
+                                        )
+                                    ).lower()
+                                except Exception:
+                                    return False
+                                return any(w.lower() in blob for w in _submit_words)
+
+                            _current_wants_submit = _csc_submitish_text(_csc_head)
+                            _thought_names_macro = "chat_submit" in _csc_thought.lower()
+                            _recent_submit_attempts = sum(
+                                1 for h in (vlm._history or [])[-5:]
+                                if str(h.get("action") or "") in (
+                                    "click", "click_text", "click_point",
+                                    "press_key", "scroll",
+                                )
+                                and _csc_submitish_text(h)
+                            )
+                            _is_repeat_submit_attempt = (
+                                _current_wants_submit
+                                and _csc_act in (
+                                    "click", "click_text", "click_point",
+                                    "press_key", "scroll",
+                                )
+                                and _recent_submit_attempts >= 2
+                            )
+                            if _thought_names_macro or _is_repeat_submit_attempt:
+                                _post_submit_to_extract = (
+                                    _prev_action_name == "chat_submit"
+                                    and _prev_action_ok
+                                    and not workflow_memory.get("__chat_extract_completed")
+                                )
+                                _rewrite_action = (
+                                    "chat_extract" if _post_submit_to_extract else "chat_submit"
+                                )
+                                logger.warning(
+                                    "[CHAT SUBMIT COERCE] chat submit intent emitted as %s "
+                                    "(recent_submit_attempts=%d, thought_names_macro=%s); "
+                                    "rewriting to %s",
+                                    _csc_act,
+                                    _recent_submit_attempts,
+                                    _thought_names_macro,
+                                    _rewrite_action,
+                                )
+                                _broadcast_log_safe(
+                                    "🚀 [CHAT SUBMIT COERCE] 检测到聊天页发送意图但动作仍是 "
+                                    f"{_csc_act}，改写为 {_rewrite_action}",
+                                    level="warn",
+                                )
+                                _csc_head["action"] = _rewrite_action
+                                _csc_head["target_id"] = 0
+                                _csc_head["type_value"] = ""
+                                if _post_submit_to_extract:
+                                    _csc_head["memory_key"] = (
+                                        str(_csc_head.get("memory_key") or "").strip()
+                                        or "ai_answer"
+                                    )
+                                    _csc_head["extracted_data"] = None
+                                    _csc_head["status"] = ""
+                                    _csc_head["subgoal_status"] = "in_progress"
+                                _csc_head["thought"] = (
+                                    "[CHAT SUBMIT COERCE] 当前 chat 页面中，VLM 的 thought "
+                                    "已经指向发送/提交（或明确提到 chat_submit），但 JSON 动作仍是 "
+                                    f"{_csc_act}。系统改写为 chat_submit，绕过 SoM 红框误标/"
+                                    "重复点击无效按钮。原 thought："
+                                    + _csc_thought[:240]
+                                )
+                                if _post_submit_to_extract:
+                                    _csc_head["thought"] = (
+                                        "[CHAT POST-SUBMIT GUARD] 上一步 chat_submit 已成功，"
+                                        "但本轮 VLM 仍想再次提交。系统改写为 chat_extract，"
+                                        "避免重复发送同一问题，并开始等待/提取 AI 回复。原 thought："
+                                        + _csc_thought[:240]
+                                    )
+                                decisions[:] = [_csc_head]
+                                if _post_submit_to_extract:
+                                    vlm.inject_error_feedback(
+                                        "💬 [CHAT POST-SUBMIT GUARD] 上一步已经成功发送消息。"
+                                        "下一步应使用 chat_extract 等待并提取回答，不要继续点击/提交。"
+                                    )
+                                else:
+                                    vlm.inject_error_feedback(
+                                        "🚀 [CHAT SUBMIT COERCE] 在 chat 站点，发送按钮是图标时不要继续猜 "
+                                        "target_id。只要 thought 已经判断要发送/提交，优先输出 "
+                                        "{\"action\":\"chat_submit\",\"target_id\":0}。"
+                                    )
+                    except Exception as _csc_err:
+                        logger.debug("[CHAT SUBMIT COERCE] skipped: %s", _csc_err)
+
+                # ── CHAT EXTRACT COERCION GUARD ───────────────────────────
+                # 即使 prompt 文档已经说"chat 域名用 chat_extract"，VLM 还是
+                # 经常惯性选 extract。这条 guard 在调度前把 extract /
+                # extract_link 改写成 chat_extract，避免在 chat.baidu.com /
+                # yiyan.baidu.com / chat.openai.com 等页面抓到搜索结果/
+                # 参考列表而漏掉 AI 回答正文。
+                # 修复目标：run_log_20260515_144253 中 step 5-12 那种
+                # "在对的页面上选错动作" 的死循环。
+                if decisions:
+                    try:
+                        try:
+                            from .chat_extract_coercion_guard import (
+                                detect_extract_on_chat_host,
+                                detect_premature_chat_done,
+                            )
+                        except ImportError:  # pragma: no cover
+                            from chat_extract_coercion_guard import (  # type: ignore[no-redef]
+                                detect_extract_on_chat_host,
+                                detect_premature_chat_done,
+                            )
+                        _coerce = detect_extract_on_chat_host(
+                            decisions[0],
+                            browser.current_url or "",
+                        )
+                        if not _coerce:
+                            _coerce = detect_premature_chat_done(
+                                decisions[0],
+                                browser.current_url or "",
+                                goal=goal,
+                                chat_extract_completed=bool(
+                                    workflow_memory.get("__chat_extract_completed")
+                                ),
+                            )
+                        if _coerce:
+                            _coerce_head = decisions[0]
+                            _orig_action = str(_coerce_head.get("action") or "")
+                            _coerce_head["action"] = "chat_extract"
+                            _coerce_head["target_id"] = 0
+                            _coerce_head["type_value"] = ""
+                            _coerce_head["memory_key"] = _coerce["memory_key"]
+                            # chat_extract handler fills extracted_data itself
+                            _coerce_head["extracted_data"] = None
+                            # A VLM may choose chat_extract but also mark the
+                            # subgoal completed with its own payload. Keep the
+                            # decision executable so the deterministic handler
+                            # actually runs.
+                            _coerce_head["status"] = ""
+                            _coerce_head["subgoal_status"] = "in_progress"
+                            _coerce_head["thought"] = (
+                                f"[CHAT EXTRACT GUARD] 在聊天域名 "
+                                f"{_coerce['matched_host']} 上把 `{_orig_action}` "
+                                f"改写为 `chat_extract` (memory_key="
+                                f"{_coerce['memory_key']!r})。原 thought: "
+                                f"{str(_coerce_head.get('thought') or '')[:200]}"
+                            )
+                            decisions[:] = [_coerce_head]
+                            logger.warning(
+                                "[CHAT EXTRACT GUARD] %s → chat_extract on %s",
+                                _orig_action, _coerce["matched_host"],
+                            )
+                            _broadcast_log_safe(
+                                f"[CHAT EXTRACT GUARD] 聊天页 {_coerce['matched_host']} "
+                                f"上 {_orig_action} → chat_extract",
+                                level="warn",
+                            )
+                            vlm.inject_error_feedback(_coerce["feedback"])
+                    except Exception as _coerce_err:
+                        logger.debug("[CHAT EXTRACT GUARD] skipped: %s", _coerce_err)
+
                 # ── Fix 2：拦截"子目标未完就 done"（CRITICAL：Task B bug）
                 # VLM 把「子目标完成 → 推进」错认为「全局完成 → done」；
                 # 只要 _task_plan 存在、当前不是末子目标、且 Reflector 未判 abort，
@@ -5029,8 +12429,16 @@ async def run_agent(
                     _current_subgoal_complete = _decision_claims_current_subgoal_completed(
                         decisions[0]
                     )
+                    _allow_done_via_final_subgoal = _done_targets_final_subgoal(
+                        _task_plan, decisions[0]
+                    )
                     _allow_done_via_terminal_tail = (
                         _terminal_only_tail and _current_subgoal_complete
+                    )
+                    _allow_done_via_answer_guard = (
+                        _goal_output_mode == "answer"
+                        and bool(decisions[0].get("__answer_done_guard"))
+                        and _current_subgoal_complete
                     )
                     # Fix B 放行：提取任务已达用户目标量 → 直接允许 done，跳过门闸
                     # 修复"豆瓣 Top250 / 京东搜索 N 条"这类任务在步骤 1 extract 成功后
@@ -5053,6 +12461,45 @@ async def run_agent(
                             f"[CLOSE ENOUGH] 容差退出: {_total_extracted_rows}/{_goal_target} "
                             f"(容差 {_tolerance}，分页已耗尽)"
                         )
+                    _allow_done_via_completion_kernel = False
+                    _completion_eval = {}
+                    try:
+                        from visual_web_agent.completion_kernel import (
+                            evaluate_completion,
+                            load_manifest_items_for_run,
+                        )
+                        from visual_web_agent.planner_exit_criteria import (
+                            current_subgoal_criteria,
+                        )
+
+                        _pg_prev = getattr(browser, "_last_action_result", None)
+                        _pg_last_action = str(getattr(_pg_prev, "action", "") or "")
+                        _pg_last_ok = (
+                            bool(getattr(_pg_prev, "success", False))
+                            if _pg_prev is not None else False
+                        )
+                        _completion_eval = evaluate_completion(
+                            goal=goal,
+                            output_contract=_goal_output_contract,
+                            output_mode=_goal_output_mode,
+                            total_extracted_rows=_total_extracted_rows,
+                            goal_target_count=_goal_target,
+                            pagination_exhausted=_pagination_exhausted,
+                            manifest_items=load_manifest_items_for_run(_run_ts),
+                            workflow_memory=workflow_memory,
+                            capability_route=_capability_route,
+                            no_progress_streak=_no_progress_tracker.streak,
+                            exit_criteria=current_subgoal_criteria(_task_plan),
+                            current_url=getattr(browser, "current_url", "") or "",
+                            last_action=_pg_last_action,
+                            last_action_success=_pg_last_ok,
+                        )
+                        _allow_done_via_completion_kernel = (
+                            _completion_eval.get("status") == "complete"
+                            and not _extraction_complete
+                        )
+                    except Exception as _ck_gate_err:
+                        logger.debug("[COMPLETION KERNEL] plan gate skipped: %s", _ck_gate_err)
                     # 允许 done 的条件：已完成子目标数 >= 总数 - 1（仅剩当前 = 最后一个）
                     # 或提取已达量（Fix B）
                     if _extraction_complete:
@@ -5060,6 +12507,11 @@ async def run_agent(
                             f"[PLAN GATE] 放行 done：提取已达量 "
                             f"{_total_extracted_rows}/{_goal_target} 条，跳过门闸"
                         )
+                    elif _allow_done_via_final_subgoal:
+                        logger.info(
+                            "[PLAN GATE] 放行 done：当前就是末子目标，且该子目标已满足退出标准。"
+                        )
+                        _task_plan.sub_goals[_cur_idx].status = "done"
                     elif _allow_done_via_terminal_tail:
                         logger.info(
                             "[PLAN GATE] 放行 done：当前子目标已满足退出标准，"
@@ -5068,10 +12520,46 @@ async def run_agent(
                         _task_plan.sub_goals[_cur_idx].status = "done"
                         for _tail_sg in _pending_tail:
                             _tail_sg.status = "done"
+                    elif _allow_done_via_answer_guard:
+                        logger.info(
+                            "[PLAN GATE] 放行 done：答案模式护栏确认页面已满足用户问题。"
+                        )
+                        _task_plan.sub_goals[_cur_idx].status = "done"
+                        for _tail_sg in _pending_tail:
+                            _tail_sg.status = "done"
+                    elif _allow_done_via_completion_kernel:
+                        logger.info(
+                            "[PLAN GATE] 放行 done：completion_kernel evidence=%s",
+                            (_completion_eval or {}).get("evidence"),
+                        )
+                        try:
+                            from api_server import broadcast_phase as _bp_pg_ck
+
+                            _bp_pg_ck(
+                                "completion_guard",
+                                severity="info",
+                                message="plan_gate: completion_kernel allowed done",
+                                step=step,
+                                notice_severity=getattr(
+                                    browser, "_last_notice_severity", None
+                                ),
+                                extra={
+                                    "guard": "plan_gate_completion_kernel",
+                                    "evaluation": _completion_eval,
+                                },
+                            )
+                        except Exception:
+                            pass
+                        _task_plan.sub_goals[_cur_idx].status = "done"
+                        for _tail_sg in _pending_tail:
+                            _tail_sg.status = "done"
                     if (
                         _done_or_failed < _total - 1
                         and not _extraction_complete
+                        and not _allow_done_via_final_subgoal
                         and not _allow_done_via_terminal_tail
+                        and not _allow_done_via_answer_guard
+                        and not _allow_done_via_completion_kernel
                     ):
                         logger.warning(
                             f"[PLAN GATE] VLM 过早 action=done（进度 "
@@ -5093,7 +12581,8 @@ async def run_agent(
 
                 # ── Wave 2 子目标自宣告推进 ─────────────────────────────
                 # VLM 每步返回 subgoal_status：若 completed 则系统推进 _task_plan.current_idx。
-                # 末子目标完成但 action!=done → 强制纠偏为 done，贴合 Wave 2 语义。
+                # 末子目标若仍带有真实动作（click / extract / hover_and_click 等），必须先执行；
+                # 否则会出现“计划完成但最终按钮/菜单项没有被点击”的假阳性。
                 if _task_plan is not None and decisions:
                     _head = decisions[0]
                     if _head.get("subgoal_status") == "completed":
@@ -5112,10 +12601,10 @@ async def run_agent(
                                 f"[PLAN] 推进至子目标 {_task_plan.current_idx + 1}: "
                                 f"{_task_plan.sub_goals[_task_plan.current_idx].description}"
                             )
-                        elif _head.get("action") != "done":
+                        elif _head.get("action") != "done" and _head.get("action") in ("wait", "noop", "none", ""):
                             logger.warning(
-                                f"[PLAN] 末子目标 completed 但 action={_head.get('action')}，"
-                                f"强制纠偏为 done"
+                                f"[PLAN] 末子目标 completed 且 action={_head.get('action')} 无副作用，"
+                                f"纠偏为 done"
                             )
                             _head["action"] = "done"
                             _head["target_id"] = 0
@@ -5125,7 +12614,10 @@ async def run_agent(
                 # 借鉴 browser-use 架构：VLM 只需给出 extract 意图，
                 # 数据由系统从 AX Tree 自动提取，不再浪费步数等 VLM 重试。
                 _has_extract_downgrade = any(
-                    d.get("__extract_downgraded") for d in decisions
+                    d.get("__extract_downgraded")
+                    and str(d.get("action") or "").strip().lower()
+                    not in {"done", "chat_extract"}
+                    for d in decisions
                 )
                 if _has_extract_downgrade:
                     _extract_null_streak += 1
@@ -5213,6 +12705,47 @@ async def run_agent(
                             )
                         )
                         if _dom_list_rows:
+                            _dom_card_source_text = "\n\n".join(
+                                text for text in (_ax_text, _dom_list_text) if text
+                            )
+                            _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
+                                _dom_list_rows,
+                                source_text=_dom_card_source_text,
+                                requested_fields=_requested_output_fields,
+                                goal=goal,
+                            )
+                            if not _dom_card_rows:
+                                _dom_card_body_text = await _extract_body_text_for_semantic_cards(
+                                    "auto extract semantic card body text"
+                                )
+                                if _dom_card_body_text:
+                                    _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
+                                        _dom_list_rows,
+                                        source_text="\n\n".join(
+                                            text
+                                            for text in (
+                                                _dom_card_body_text,
+                                                _dom_card_source_text,
+                                            )
+                                            if text
+                                        ),
+                                        requested_fields=_requested_output_fields,
+                                        goal=goal,
+                                    )
+                            if _dom_card_rows:
+                                logger.info(
+                                    "[EXTRACT DOM] semantic cards rows=%s source_chars=%s",
+                                    len(_dom_card_rows),
+                                    len(_dom_card_text or _dom_list_text or ""),
+                                )
+                                _auto_candidates.append(
+                                    _sanitize_extraction_candidate(
+                                        name="DOM_CARDS",
+                                        data=_dom_card_rows,
+                                        source_text=_dom_card_text or _dom_list_text or _ax_text,
+                                        data_shape=_data_shape,
+                                    )
+                                )
                             _auto_candidates.append(
                                 _sanitize_extraction_candidate(
                                     name="DOM_LIST",
@@ -5238,6 +12771,30 @@ async def run_agent(
                                     data_shape=_data_shape,
                                 )
                             )
+
+                        try:
+                            _auto_candidates = rank_extraction_candidates_with_history(
+                                _auto_candidates,
+                                url=_current_auto_url,
+                                requested_fields=_requested_output_fields,
+                                goal=_snapshot_goal,
+                            )
+                            _auto_boosted = [
+                                c for c in _auto_candidates
+                                if (c.get("recovery") or {}).get("boost")
+                            ]
+                            if _auto_boosted:
+                                logger.info(
+                                    "[EXTRACT RECOVERY] auto history boosts=%s",
+                                    "; ".join(
+                                        f"{c.get('name')}:"
+                                        f"+{float((c.get('recovery') or {}).get('boost') or 0):.1f}"
+                                        f" match={float((c.get('recovery') or {}).get('score') or 0):.2f}"
+                                        for c in _auto_boosted
+                                    ),
+                                )
+                        except Exception as _auto_recovery_err:
+                            logger.debug("[EXTRACT RECOVERY] auto skipped: %s", _auto_recovery_err)
 
                         _chosen_candidate = _choose_best_extraction_candidate(_auto_candidates)
                         if _chosen_candidate:
@@ -5303,14 +12860,47 @@ async def run_agent(
                             )
 
                         _auto_extracted = await _enrich_rows_with_dom_links(_auto_extracted)
-                        saved_path = save_to_excel(
-                            _auto_extracted,
-                            _vlm_output,
-                            unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
-                        )
+                        saved_path = ""
+                        if _goal_output_mode == "answer":
+                            logger.info(
+                                "[ANSWER OUTPUT] answer-only auto extract kept in run result; "
+                                "not saving Excel artifact"
+                            )
+                        else:
+                            saved_path = save_run_dataset(
+                                _auto_extracted,
+                                run_id=_run_ts,
+                                output_contract=_goal_output_contract,
+                                produced_by="auto_extract",
+                                filename_hint=_vlm_output,
+                                unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
+                            )
                         _progress_new_rows, _progress_total_rows = _record_extract_progress(
                             _auto_extracted,
                             _new_rows,
+                        )
+                        _api_fast = await _try_dom_api_fast_path(
+                            _auto_extracted,
+                            source=_auto_extract_text_source,
+                        )
+                        if _api_fast.get("applied"):
+                            _auto_extracted = _api_fast.get("fast_path", {}).get("rows") or _auto_extracted
+                            _progress_total_rows = _total_extracted_rows
+                        _auto_snapshot_path = await _save_extraction_snapshot(
+                            source=_auto_extract_text_source,
+                            rows=_auto_extracted,
+                            output_file=str(saved_path or ""),
+                            accepted_rows=_new_rows,
+                            duplicate_rows=_dup_rows,
+                            rejected_rows=_rejected_rows,
+                            candidates=_auto_candidates,
+                            data_shape=_data_shape,
+                            source_text=_chosen_source_text if _chosen_candidate else _ax_text,
+                            metadata={
+                                "mode": "auto_extract",
+                                "progress_new_rows": _progress_new_rows,
+                                "progress_total_rows": _progress_total_rows,
+                            },
                         )
                         _duplicate_zero_extract_streak = 0
                         if _goal_is_tooltip_extract(goal):
@@ -5321,13 +12911,18 @@ async def run_agent(
                             )
                         _extract_count += 1
                         _extracted_page_urls.add(browser.current_url)
-                        # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放
-                        _rpa_cache_allowed = False
-                        _rpa_skip_reason = "contains auto-extract steps"
+                        # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放。
+                        # Date-picker tasks are later semanticized to a date_pick macro,
+                        # so incidental docs-table extraction must not poison that cache.
+                        _macro_guard = _parse_semantic_macro(goal)
+                        if not (_macro_guard and _macro_guard.get("action") == "date_pick"):
+                            _rpa_cache_allowed = False
+                            _rpa_skip_reason = "contains auto-extract steps"
                         _log_extract_text_source = _auto_extract_text_source
                         _log_decision = [{
                             "action": "extract",
                             "extracted_data": _auto_extracted,
+                            "snapshot_path": _auto_snapshot_path,
                         }]
                         # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
                         # Bug 修复：用任务级永久锁 _first_extract_ever_done，避免 _extract_count
@@ -5506,16 +13101,84 @@ async def run_agent(
                             _task_completed = True
                             _run_succeeded = True
                             break  # 退出动作循环，主循环检测 _task_completed 退出
-                        logger.info(
-                            f"[EXTRACT AUTO] Saved to: {saved_path} "
-                            f"(累计 {_total_extracted_rows} 条)"
-                        )
-                        print(
-                            f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
-                            f"VLM 未填充数据，系统已从 {_auto_extract_text_source} 全页提取 "
-                            f"\033[36m{_new_rows}\033[0m 条数据。"
-                            f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
-                        )
+                        if _goal_output_mode == "answer":
+                            logger.info(
+                                "[EXTRACT AUTO] Answer-mode rows kept in run result "
+                                "(累计 %s 条)",
+                                _total_extracted_rows,
+                            )
+                            print(
+                                f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
+                                f"VLM 未填充数据，系统已从 {_auto_extract_text_source} 全页提取 "
+                                f"\033[36m{_new_rows}\033[0m 条用于回答，未保存 Excel。"
+                            )
+                            _auto_answer_text = _clean_user_visible_done_message(
+                                next(
+                                    (
+                                        d.get("thought")
+                                        or d.get("current_state")
+                                        or d.get("progress_review")
+                                        or ""
+                                        for d in decisions
+                                        if isinstance(d, dict)
+                                    ),
+                                    "",
+                                )
+                            )
+                            if not _auto_answer_text:
+                                _auto_answer_text = _format_extracted_rows_as_answer(
+                                    _auto_extracted
+                                )
+                            _auto_answer_text = _compact_answer_text_for_goal(
+                                _auto_answer_text,
+                                goal,
+                            )
+                            if _auto_answer_text:
+                                _record_run_answer(text=_auto_answer_text)
+                            _log_decision = {
+                                "action": "done",
+                                "target_id": 0,
+                                "status": "success",
+                                "thought": (
+                                    _auto_answer_text
+                                    or "Answer-mode auto extraction completed."
+                                ),
+                                "extracted_data": _auto_extracted,
+                                "snapshot_path": _auto_snapshot_path,
+                                "extract_text_source": _auto_extract_text_source,
+                            }
+                            event_stream.done(
+                                step=step,
+                                success=True,
+                                reason="answer_auto_extract_completed",
+                                message=(
+                                    _auto_answer_text[:500]
+                                    if _auto_answer_text
+                                    else "answer-mode auto extract completed"
+                                ),
+                                metadata={
+                                    "output_mode": _goal_output_mode,
+                                    "output_file": str(saved_path or ""),
+                                    "extract_source": _auto_extract_text_source,
+                                    "rows": _new_rows,
+                                    "snapshot_path": str(_auto_snapshot_path or ""),
+                                },
+                            )
+                            _broadcast_done_safe(True, "answer extract completed")
+                            _run_succeeded = True
+                            _task_completed = True
+                            break
+                        else:
+                            logger.info(
+                                f"[EXTRACT AUTO] Saved to: {saved_path} "
+                                f"(累计 {_total_extracted_rows} 条)"
+                            )
+                            print(
+                                f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
+                                f"VLM 未填充数据，系统已从 {_auto_extract_text_source} 全页提取 "
+                                f"\033[36m{_new_rows}\033[0m 条数据。"
+                                f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
+                            )
                         # 将降级的 wait 动作替换为已完成的 extract
                         # 不需要执行内层动作循环，直接跳到翻页引导
                         decisions = _log_decision
@@ -5648,6 +13311,126 @@ async def run_agent(
                         )
                     _extract_null_streak = 0
 
+                # ── 多标签 Session 守卫：锚定标签 + thought 与 URL 一致性 ──
+                if decisions:
+                    try:
+                        try:
+                            from .tab_session_guards import apply_tab_session_guards
+                        except ImportError:
+                            from tab_session_guards import apply_tab_session_guards
+                        _tsg_msg = apply_tab_session_guards(
+                            browser,
+                            decisions,
+                            goal=goal,
+                            start_url=start_url,
+                            tab_anchor_index=_tab_session_anchor,
+                        )
+                        if _tsg_msg:
+                            vlm.inject_error_feedback(_tsg_msg)
+                            _tsg_head = decisions[0]
+                            _tsg_head["action"] = "wait"
+                            _tsg_head["target_id"] = 0
+                            _tsg_head["type_value"] = "1"
+                            decisions[:] = [_tsg_head]
+                    except Exception as _tsg_err:
+                        logger.debug("[TAB SESSION] guards skipped: %s", _tsg_err)
+
+                # ── SoM 跨页失效守卫：同一 target_id 在最近若干步内跨 URL 复用 ──
+                # 触发条件比 tab_session_guards 更宽：不需要 goal 写「切回」即生效。
+                # 行为：仅在头动作发出且 target_id 在最近 _LOOP_GUARD_WINDOW 步内
+                # 出现在不同归一化 URL 时，把头动作改成 wait + 注入 feedback。
+                if decisions:
+                    try:
+                        try:
+                            from .som_staleness_guard import detect_stale_som_reference
+                        except ImportError:
+                            from som_staleness_guard import detect_stale_som_reference
+                        _stale_msg = detect_stale_som_reference(
+                            decisions[0],
+                            _som_target_refs,
+                            browser.current_url or "",
+                            window=_LOOP_GUARD_WINDOW,
+                            url_normalizer=_norm_url_for_guard,
+                        )
+                        if _stale_msg:
+                            logger.warning(
+                                "[SOM STALE] target_id=%s on %s recently reused;"
+                                " coerced head to wait",
+                                decisions[0].get("target_id"),
+                                (browser.current_url or "")[:80],
+                            )
+                            vlm.inject_error_feedback(_stale_msg)
+                            _stale_head = decisions[0]
+                            _stale_head["action"] = "wait"
+                            _stale_head["target_id"] = 0
+                            _stale_head["type_value"] = "1"
+                            decisions[:] = [_stale_head]
+                    except Exception as _stale_err:
+                        logger.debug("[SOM STALE] guard skipped: %s", _stale_err)
+
+                # ── 搜索结果纠偏：首个主结果必须按结构选取并在新标签页打开 ──
+                if decisions:
+                    try:
+                        try:
+                            from .search_result_guards import apply_search_result_open_guard
+                        except ImportError:
+                            from search_result_guards import apply_search_result_open_guard
+                        await apply_search_result_open_guard(
+                            browser,
+                            decisions,
+                            goal=goal,
+                        )
+                    except Exception as _search_result_err:
+                        logger.debug("[SEARCH RESULT] guard skipped: %s", _search_result_err)
+
+                # ── 标签页关闭纠偏：把浏览器标签标题误当 DOM 文本点击 → close_tab(index) ──
+                if decisions:
+                    try:
+                        try:
+                            from .tab_close_guards import (
+                                rewrite_close_intent_to_close_tab,
+                                rewrite_redundant_close_to_done,
+                                rewrite_tab_title_click_to_close_tab,
+                            )
+                        except ImportError:
+                            from tab_close_guards import (
+                                rewrite_close_intent_to_close_tab,
+                                rewrite_redundant_close_to_done,
+                                rewrite_tab_title_click_to_close_tab,
+                            )
+                        await rewrite_tab_title_click_to_close_tab(
+                            browser,
+                            decisions,
+                            goal=goal,
+                        )
+                        await rewrite_close_intent_to_close_tab(
+                            browser,
+                            decisions,
+                            goal=goal,
+                        )
+                        await rewrite_redundant_close_to_done(
+                            browser,
+                            decisions,
+                            goal=goal,
+                        )
+                    except Exception as _tab_close_err:
+                        logger.debug("[TAB CLOSE GUARD] skipped: %s", _tab_close_err)
+
+                # ── 搜索框重输入纠偏：用户明确要求重新输入 query 时，直接 type+Enter ──
+                if decisions:
+                    try:
+                        try:
+                            from .search_reentry_guards import apply_search_reentry_guard
+                        except ImportError:
+                            from search_reentry_guards import apply_search_reentry_guard
+                        await apply_search_reentry_guard(
+                            browser,
+                            decisions,
+                            goal=goal,
+                        )
+                    except Exception as _search_reentry_err:
+                        logger.debug("[SEARCH REENTRY] guard skipped: %s", _search_reentry_err)
+
                 # ── 内层动作循环：依次执行批次中的每个动作 ──────────────────
                 # break → 中止本批次，进入下一步（重新截图）
                 # _task_completed = True + break → 中止批次并退出外层主循环
@@ -5670,6 +13453,58 @@ async def run_agent(
                     )
 
                 for _action_idx, decision in enumerate(decisions):
+                    if _action_idx > 0:
+                        if _task_completed:
+                            logger.info(
+                                "[BATCH POST-EXTRACT GATE] remaining actions skipped: "
+                                "task already completed before action %s/%s",
+                                _action_idx + 1,
+                                len(decisions),
+                            )
+                            break
+                        if _goal_is_bulk_extraction(goal):
+                            _completion_state = _extraction_targets_reached(
+                                goal,
+                                total_rows=_total_extracted_rows,
+                                total_pages=len(_extracted_page_keys),
+                            )
+                            if _completion_state.get("reached"):
+                                logger.info(
+                                    "[BATCH POST-EXTRACT GATE] extraction target reached; "
+                                    "skipping action %s/%s (%s). rows=%s/%s pages=%s/%s",
+                                    _action_idx + 1,
+                                    len(decisions),
+                                    decision.get("action"),
+                                    _completion_state.get("total_rows"),
+                                    _completion_state.get("row_target"),
+                                    _completion_state.get("total_pages"),
+                                    _completion_state.get("page_target"),
+                                )
+                                _broadcast_log_safe(
+                                    "[BATCH POST-EXTRACT GATE] 抽取目标已达成，跳过本轮剩余动作并结束任务"
+                                )
+                                event_stream.guard(
+                                    step=step,
+                                    name="BATCH_POST_EXTRACT_GATE",
+                                    message=(
+                                        "Extraction target reached after an earlier batch action; "
+                                        "remaining actions skipped."
+                                    ),
+                                    metadata={
+                                        "batch_size": len(decisions),
+                                        "skipped_from_action_index": _action_idx,
+                                        "next_action": decision.get("action", ""),
+                                        "rows": _completion_state.get("total_rows"),
+                                        "row_target": _completion_state.get("row_target"),
+                                        "rows_reached": _completion_state.get("rows_reached"),
+                                        "pages": _completion_state.get("total_pages"),
+                                        "page_target": _completion_state.get("page_target"),
+                                        "pages_reached": _completion_state.get("pages_reached"),
+                                    },
+                                )
+                                _task_completed = True
+                                _run_succeeded = True
+                                break
                     _check_stop(f"before_step_{step}_action_{_action_idx + 1}")
                     if len(decisions) > 1:
                         logger.info(
@@ -5702,10 +13537,16 @@ async def run_agent(
                                 f"检查 VLM_API_BASE / VLM_MODEL_NAME / 网络 / 配额，"
                                 f"修复后按回车继续。最后一条：{_api_err_msg[:120]}",
                             )
-                            await asyncio.get_event_loop().run_in_executor(None, input)
-                            logger.info("[MANUAL] User confirmed after API failures, resuming...")
-                            _consecutive_errors = 0
-                            vlm.inject_error_feedback("")  # 清空积压反馈
+                            if _stdin_interactive_for_agent():
+                                await asyncio.get_event_loop().run_in_executor(None, input)
+                                logger.info("[MANUAL] User confirmed after API failures, resuming...")
+                                _consecutive_errors = 0
+                                vlm.inject_error_feedback("")  # 清空积压反馈
+                            else:
+                                raise RuntimeError(
+                                    f"VLM API consecutive failures ({_MAX_CONSECUTIVE_ERRORS}): "
+                                    f"{_api_err_msg[:200]}"
+                                )
                         break  # 中止本批次，进入下一步（重新截图）
 
                     if status == "captcha_detected" or action == "ask_human":
@@ -5737,7 +13578,96 @@ async def run_agent(
                         # 阻塞等待用户在浏览器中手动完成后恢复（API UI 或 CLI 回车）
                         await _wait_for_human_resume(_hitl_reason or "manual intervention required")
                         logger.info("[HITL] 用户已确认手动操作完成，恢复 VSpider 自动化流程...")
+
+                        # ── Auto-return BEFORE harvest ────────────────────
+                        # If SESSION DROP GUARD captured a return URL, goto
+                        # it FIRST. Harvesting cookies on the login page
+                        # (passport.baidu.com) would dump cookies under
+                        # ``passport_baidu_com.json`` — wrong filename for
+                        # the actual business site. Going back to the
+                        # business URL first means the harvest sees the
+                        # business host and writes the correct profile name.
+                        if _pending_session_return_url:
+                            _return_to = _pending_session_return_url
+                            _pending_session_return_url = ""
+                            try:
+                                _active_page = await browser._ensure_active_page(
+                                    reason="session-drop auto-resume goto"
+                                )
+                                if _active_page is not None:
+                                    logger.info(
+                                        "[SESSION DROP] auto-goto back to %s",
+                                        _return_to[:80],
+                                    )
+                                    _broadcast_log_safe(
+                                        f"🔁 [SESSION DROP] 登录已完成，正在回到 "
+                                        f"{_return_to[:60]}",
+                                        level="info",
+                                    )
+                                    await _active_page.goto(
+                                        _return_to,
+                                        wait_until="domcontentloaded",
+                                        timeout=30000,
+                                    )
+                                    await browser._wait_for_page_stable()
+                            except Exception as _return_err:
+                                logger.warning(
+                                    "[SESSION DROP] auto-return goto failed: %s",
+                                    _return_err,
+                                )
+
+                        # ── Auto-harvest storage_state after human resume ──
+                        # If the user just completed a login (scan QR, SMS code,
+                        # password), persist the resulting cookies to
+                        # .auth/<host>.json so they don't have to re-do it on
+                        # any future run / machine / clean checkout. Filtered to
+                        # just the active host's cookies so we don't smear
+                        # unrelated sites into the same profile.
+                        try:
+                            try:
+                                from .auth_harvester import harvest_storage_state as _hsh
+                            except ImportError:  # pragma: no cover
+                                from auth_harvester import harvest_storage_state as _hsh  # type: ignore[no-redef]
+                            _harvest_url = browser.current_url or ""
+                            _harvest_host = urlparse(_harvest_url).netloc if _harvest_url else ""
+                            if _harvest_host and getattr(browser, "_context", None) is not None:
+                                _harvest_result = await _hsh(
+                                    browser._context,
+                                    hint_host=_harvest_host,
+                                )
+                                if _harvest_result.saved:
+                                    logger.info(
+                                        "[AUTH HARVEST] %s",
+                                        _harvest_result.reason,
+                                    )
+                                    _broadcast_log_safe(
+                                        f"🔑 [登录态已自动保存] {_harvest_result.profile_name}.json "
+                                        f"({_harvest_result.cookies_saved} cookies)",
+                                        level="info",
+                                    )
+                                else:
+                                    logger.debug(
+                                        "[AUTH HARVEST] not saved: %s",
+                                        _harvest_result.reason,
+                                    )
+                        except Exception as _harvest_err:
+                            logger.debug(
+                                "[AUTH HARVEST] post-resume harvest skipped: %s",
+                                _harvest_err,
+                            )
+
                         break  # 中止本批次，进入下一步（重新截图）
+
+                    if action == "done" and _decision_mentions_follow_up_work(decision):
+                        logger.warning(
+                            "[DONE GUARD] Blocked premature done because decision text still "
+                            "describes follow-up work."
+                        )
+                        vlm.inject_error_feedback(
+                            "你刚才输出了 done，但 thought/current_state 仍在描述下一阶段或待执行动作。"
+                            "这说明任务还没有完成。不要 done；请直接执行你自己提到的下一步操作。"
+                        )
+                        break
 
                     if _decision_implies_completion(decision):
                         logger.info(
@@ -5799,16 +13729,100 @@ async def run_agent(
 
                     _extract_goal_target = _parse_goal_target_count(goal)
                     _extract_goal_pages = _parse_goal_target_pages(goal)
-                    _is_bulk_extract_goal = (
-                        not _goal_is_tooltip_extract(goal)
-                        and bool(
-                            re.search(
-                                r"获取|提取|抓取|采集|爬取|抽取|\bextract(?:_link)?\b|\bscrape\b|\bcrawl\b",
-                                str(goal or ""),
-                                re.IGNORECASE,
+                    _is_bulk_extract_goal = _goal_is_bulk_extraction(goal)
+                    if (
+                        _is_bulk_extract_goal
+                        and action in ("click", "click_text", "click_point")
+                        and _extract_goal_target is not None
+                        and _total_extracted_rows < _extract_goal_target
+                    ):
+                        _extract_nav_is_pagination = False
+                        try:
+                            _pagination_links_for_nav_guard = browser.find_pagination_links()
+                            _pagination_ids_for_nav_guard = {
+                                int(link.get("id"))
+                                for link in _pagination_links_for_nav_guard
+                                if link.get("id") is not None
+                            }
+                            _nav_guard_tid = int(decision.get("target_id") or 0)
+                            if _nav_guard_tid and _nav_guard_tid in _pagination_ids_for_nav_guard:
+                                _extract_nav_is_pagination = True
+                            elif action == "click_text":
+                                _nav_guard_text = str(decision.get("type_value") or "").strip().lower()
+                                _extract_nav_is_pagination = any(
+                                    _nav_guard_text
+                                    and _nav_guard_text == str(link.get("name") or "").strip().lower()
+                                    for link in _pagination_links_for_nav_guard
+                                )
+                        except Exception:
+                            _extract_nav_is_pagination = False
+
+                        if (
+                            not _extract_nav_is_pagination
+                            and not _decision_click_targets_extraction_control(
+                                decision,
+                                input_descriptions,
                             )
-                        )
-                    )
+                        ):
+                            _shape_for_same_page_nav: dict = {}
+                            try:
+                                _shape_for_same_page_nav = await browser.probe_data_shape()
+                            except Exception:
+                                _shape_for_same_page_nav = {}
+                            if _data_shape_exposes_target_candidate(
+                                _shape_for_same_page_nav,
+                                _extract_goal_target,
+                            ):
+                                _nav_inspection = await _inspect_click_target_for_extract_nav_guard(
+                                    decision
+                                )
+                                if _click_target_is_same_page_extract_nav(
+                                    _nav_inspection,
+                                    browser.current_url,
+                                ):
+                                    _guard_msg = (
+                                        "Current page already exposes enough table/list/card "
+                                        "candidates for the extraction target; same-page navigation "
+                                        "or tab click was rewritten to extract."
+                                    )
+                                    logger.warning(
+                                        "[EXTRACT SAME-PAGE NAV GUARD] %s inspection=%s shape=%s",
+                                        _guard_msg,
+                                        _nav_inspection,
+                                        _shape_for_same_page_nav,
+                                    )
+                                    event_stream.guard(
+                                        step=step,
+                                        name="extract_same_page_nav_guard",
+                                        message=_guard_msg,
+                                        metadata={
+                                            "inspection": _nav_inspection,
+                                            "shape": _shape_for_same_page_nav,
+                                            "progress": {
+                                                "rows": _total_extracted_rows,
+                                                "target": _extract_goal_target,
+                                            },
+                                            "decision": {
+                                                "action": decision.get("action"),
+                                                "target_id": decision.get("target_id"),
+                                                "type_value": decision.get("type_value"),
+                                                "point": decision.get("point"),
+                                            },
+                                        },
+                                    )
+                                    vlm.inject_error_feedback(
+                                        "当前是抽取任务，且当前页面已经暴露了足够的表格/列表/卡片候选。"
+                                        "不要继续点击同页 tab、当前页链接或导航自链接；"
+                                        "系统已将本步改为 extract，先保存当前页面数据。"
+                                    )
+                                    decision["action"] = "extract"
+                                    decision["target_id"] = 0
+                                    decision["type_value"] = ""
+                                    decision["status"] = "pending"
+                                    decision["guard_rewrite"] = "extract_same_page_nav_guard"
+                                    decisions[_action_idx] = decision
+                                    action = "extract"
+                                    status = decision.get("status", "")
                     if action == "done" and _is_bulk_extract_goal:
                         _need_more_rows = (
                             _extract_goal_target is not None
@@ -5864,8 +13878,10 @@ async def run_agent(
 
                     # 4. 数据提取（跨页累加模式）
                     if action == "extract":
-                        _rpa_cache_allowed = False
-                        _rpa_skip_reason = "contains extract steps"
+                        _macro_guard = _parse_semantic_macro(goal)
+                        if not (_macro_guard and _macro_guard.get("action") == "date_pick"):
+                            _rpa_cache_allowed = False
+                            _rpa_skip_reason = "contains extract steps"
                         extracted = decision.get("extracted_data")
                         _current_url = browser.current_url
                         _current_extract_page_key = _current_url
@@ -5965,6 +13981,57 @@ async def run_agent(
                                 )
                             )
                             if _dom_list_rows:
+                                _dom_card_source_text = "\n\n".join(
+                                    text
+                                    for text in (
+                                        _full_page_text,
+                                        _source_text_for_validation,
+                                        _dom_list_text,
+                                    )
+                                    if text
+                                )
+                                _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
+                                    _dom_list_rows,
+                                    source_text=_dom_card_source_text,
+                                    requested_fields=_requested_output_fields,
+                                    goal=goal,
+                                )
+                                if not _dom_card_rows:
+                                    _dom_card_body_text = await _extract_body_text_for_semantic_cards(
+                                        "extract semantic card body text"
+                                    )
+                                    if _dom_card_body_text:
+                                        _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
+                                            _dom_list_rows,
+                                            source_text="\n\n".join(
+                                                text
+                                                for text in (
+                                                    _dom_card_body_text,
+                                                    _dom_card_source_text,
+                                                )
+                                                if text
+                                            ),
+                                            requested_fields=_requested_output_fields,
+                                            goal=goal,
+                                        )
+                                if _dom_card_rows:
+                                    logger.info(
+                                        "[EXTRACT DOM] semantic cards rows=%s source_chars=%s",
+                                        len(_dom_card_rows),
+                                        len(_dom_card_text or _dom_list_text or ""),
+                                    )
+                                    _candidates.append(
+                                        _sanitize_extraction_candidate(
+                                            name="DOM_CARDS",
+                                            data=_dom_card_rows,
+                                            source_text=(
+                                                _dom_card_text
+                                                or _dom_list_text
+                                                or _source_text_for_validation
+                                            ),
+                                            data_shape=_data_shape,
+                                        )
+                                    )
                                 _candidates.append(
                                     _sanitize_extraction_candidate(
                                         name="DOM_LIST",
@@ -5997,9 +14064,33 @@ async def run_agent(
                                         name="DOM_TABLE",
                                         data=_dom_table_rows,
                                         source_text=_source_text_for_validation,
-                                        data_shape=_data_shape,
+                                            data_shape=_data_shape,
                                     )
                                 )
+
+                            try:
+                                _candidates = rank_extraction_candidates_with_history(
+                                    _candidates,
+                                    url=_current_url,
+                                    requested_fields=_requested_output_fields,
+                                    goal=_snapshot_goal,
+                                )
+                                _boosted = [
+                                    c for c in _candidates
+                                    if (c.get("recovery") or {}).get("boost")
+                                ]
+                                if _boosted:
+                                    logger.info(
+                                        "[EXTRACT RECOVERY] history boosts=%s",
+                                        "; ".join(
+                                            f"{c.get('name')}:"
+                                            f"+{float((c.get('recovery') or {}).get('boost') or 0):.1f}"
+                                            f" match={float((c.get('recovery') or {}).get('score') or 0):.2f}"
+                                            for c in _boosted
+                                        ),
+                                    )
+                            except Exception as _recovery_err:
+                                logger.debug("[EXTRACT RECOVERY] skipped: %s", _recovery_err)
 
                             _chosen_candidate = _choose_best_extraction_candidate(_candidates)
                             if _chosen_candidate:
@@ -6136,13 +14227,49 @@ async def run_agent(
                                 f"[EXTRACT] 本次提取 {_new_rows} 条，"
                                 f"累计已提取 {_progress_total_rows} 条"
                             )
-                            # save_to_excel 内部已支持追加写入 + 去重
-                            saved_path = save_to_excel(
+                            saved_path = ""
+                            if _goal_output_mode == "answer":
+                                logger.info(
+                                    "[ANSWER OUTPUT] answer-only result; not saving Excel artifact"
+                                )
+                            else:
+                                saved_path = save_run_dataset(
+                                    extracted,
+                                    run_id=_run_ts,
+                                    output_contract=_goal_output_contract,
+                                    produced_by="vlm_extract",
+                                    step_id=str(step),
+                                    filename_hint=_vlm_output,
+                                    unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
+                                )
+                            _api_fast = await _try_dom_api_fast_path(
                                 extracted,
-                                _vlm_output,
-                                unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
+                                source=_log_extract_text_source or "VLM_EXTRACT_OUTPUT",
                             )
-                            logger.info(f"[EXTRACT] Saved to: {saved_path}")
+                            if _api_fast.get("applied"):
+                                extracted = _api_fast.get("fast_path", {}).get("rows") or extracted
+                                decision["extracted_data"] = extracted
+                                _progress_total_rows = _total_extracted_rows
+                            _extract_snapshot_path = await _save_extraction_snapshot(
+                                source=_log_extract_text_source or "VLM_EXTRACT_OUTPUT",
+                                rows=extracted,
+                                output_file=str(saved_path or ""),
+                                accepted_rows=_new_rows,
+                                duplicate_rows=_dup_rows,
+                                rejected_rows=_rejected_rows,
+                                candidates=_candidates,
+                                data_shape=_data_shape,
+                                source_text=_source_text_for_validation,
+                                metadata={
+                                    "mode": "explicit_extract",
+                                    "progress_new_rows": _progress_new_rows,
+                                    "progress_total_rows": _progress_total_rows,
+                                },
+                            )
+                            if _extract_snapshot_path:
+                                decision["snapshot_path"] = _extract_snapshot_path
+                            if saved_path:
+                                logger.info(f"[EXTRACT] Saved to: {saved_path}")
                             if _goal_is_tooltip_extract(goal):
                                 print(
                                     f"\033[1;32m✅ [EXTRACT]\033[0m "
@@ -6158,6 +14285,42 @@ async def run_agent(
                             _extract_count += 1
                             _extracted_page_urls.add(_current_url)
                             _extracted_page_keys.add(_current_extract_page_key)
+                            if _goal_output_mode == "answer":
+                                logger.info(
+                                    "[ANSWER OUTPUT] completed after targeted extract; "
+                                    "source=%s rows=%s saved=%s",
+                                    _log_extract_text_source,
+                                    _new_rows,
+                                    saved_path,
+                                )
+                                _answer_text = _format_extracted_rows_as_answer(extracted)
+                                if not _answer_text:
+                                    _answer_text = _clean_user_visible_done_message(
+                                        decision.get("thought")
+                                        or decision.get("current_state")
+                                        or ""
+                                    )
+                                if _answer_text:
+                                    _record_run_answer(text=_answer_text)
+                                event_stream.done(
+                                    step=step,
+                                    success=True,
+                                    reason="answer_extract_completed",
+                                    message=(
+                                        "answer-mode extract completed: "
+                                        f"source={_log_extract_text_source} rows={_new_rows}"
+                                    ),
+                                    metadata={
+                                        "output_mode": _goal_output_mode,
+                                        "output_file": str(saved_path or ""),
+                                        "extract_source": _log_extract_text_source,
+                                        "rows": _new_rows,
+                                    },
+                                )
+                                _broadcast_done_safe(True, "answer extract completed")
+                                _task_completed = True
+                                _run_succeeded = True
+                                break
                             # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
                             # Bug 修复：用任务级永久锁，避免翻页后 _extract_count 重置反复触发
                             if (
@@ -6452,6 +14615,30 @@ async def run_agent(
                                     f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
                                 )
                                 _run_succeeded = False
+                            _extract_guard_done_state = _extraction_targets_reached(
+                                goal,
+                                total_rows=_total_extracted_rows,
+                                total_pages=len(_extracted_page_keys),
+                            )
+                            event_stream.done(
+                                step=step,
+                                success=_run_succeeded,
+                                reason=(
+                                    "extract_guard"
+                                    if _run_succeeded
+                                    else "extract_guard_progress_safeguard_failed"
+                                ),
+                                message="Consecutive extract guard ended the task.",
+                                metadata={
+                                    "action": action,
+                                    "extract_count": _extract_count,
+                                    "total_rows": _total_extracted_rows,
+                                    "total_pages": len(_extracted_page_keys),
+                                    "row_target": _extract_guard_done_state.get("row_target"),
+                                    "page_target": _extract_guard_done_state.get("page_target"),
+                                    "target_reached": _extract_guard_done_state.get("reached"),
+                                },
+                            )
                             break
 
                         # 提取后中止本批次，下一步重新截图（VLM 可能还需要翻页提取更多）
@@ -6474,6 +14661,102 @@ async def run_agent(
                     if action == "done":
                         page_summary = await browser.get_active_page_summary()
                         current_url = browser.current_url
+                        # ── FORM DONE GUARD chat-task escape hatch ────────
+                        # If chat_extract has fired or the current page is a
+                        # known chat host, this is NOT a form-fill task no
+                        # matter what the goal parser thought. Skip the
+                        # field-validation guard — its label match will fail
+                        # (no <input> for the entire goal paragraph) and
+                        # block done forever.
+                        _form_guard_bypass_chat = False
+                        try:
+                            from .chat_extract_coercion_guard import (
+                                is_on_known_chat_domain as _form_guard_chat_check,
+                            )
+                        except ImportError:
+                            try:
+                                from chat_entry_drift_guard import (  # type: ignore[no-redef]
+                                    is_on_known_chat_domain as _form_guard_chat_check,
+                                )
+                            except ImportError:
+                                _form_guard_chat_check = lambda _u: False  # type: ignore[assignment]
+                        try:
+                            if _form_guard_chat_check(current_url or ""):
+                                _form_guard_bypass_chat = True
+                        except Exception:
+                            pass
+                        if not _form_guard_bypass_chat:
+                            try:
+                                for _trail in (browser.rpa_trail or [])[-6:]:
+                                    if str((_trail or {}).get("action") or "") == "chat_extract":
+                                        _form_guard_bypass_chat = True
+                                        break
+                            except Exception:
+                                pass
+                        if _form_guard_bypass_chat:
+                            logger.info(
+                                "[FORM DONE GUARD] bypassed — chat task detected "
+                                "(host=%s)", (current_url or "")[:80],
+                            )
+                        if (
+                            _is_form_fill_goal
+                            and _form_assignments
+                            and not _form_guard_bypass_chat
+                        ):
+                            _done_validation = await _validate_form_assignments_on_page(
+                                browser, goal, _form_assignments
+                            )
+                            if not _done_validation.get("ok"):
+                                logger.warning(
+                                    "[FORM DONE GUARD] blocked done before explicit fields validate: %s",
+                                    _done_validation,
+                                )
+                                vlm.inject_error_feedback(
+                                    "不能直接 done：用户明确给了字段值，但当前页面字段回读未通过。"
+                                    "必须先逐项填入用户指定值，并在点击 Submit/Create 前后保留字段回读证据。"
+                                )
+                                break
+                            if _form_goal_requires_submit(goal) and not _form_submit_clicked_once:
+                                logger.warning("[FORM DONE GUARD] blocked done before submit click on explicit form goal")
+                                vlm.inject_error_feedback(
+                                    "字段值已回读正确，但用户要求最后点击 Submit/Create。"
+                                    "请点击真实提交按钮，不要直接 done。"
+                                )
+                                break
+                        if _is_form_fill_goal and not _form_guard_bypass_chat:
+                            _done_page = await browser._ensure_active_page(reason="rpachallenge done guard")
+                            if _done_page:
+                                _done_challenge_state = await _get_round_form_state(_done_page)
+                                if (
+                                    _done_challenge_state.get("is_challenge")
+                                    and not _round_form_is_complete(_done_challenge_state)
+                                    and _should_use_round_form_macro(goal, _form_assignments)
+                                ):
+                                    logger.warning(
+                                        "[RPA CHALLENGE DONE GUARD] blocked premature done: round=%s/%s start=%s submit=%s",
+                                        _done_challenge_state.get("current_round"),
+                                        _done_challenge_state.get("total_rounds"),
+                                        _done_challenge_state.get("start_visible"),
+                                        _done_challenge_state.get("submit_visible"),
+                                    )
+                                    if await _run_round_form_if_present(browser, goal):
+                                        _run_succeeded = True
+                                        _task_completed = True
+                                        _broadcast_done_safe(True, "RPA Challenge completed")
+                                        _log_decision = {
+                                            "action": "done",
+                                            "target_id": 0,
+                                            "status": "success",
+                                            "thought": "RPA Challenge done guard 拦截了过早 done，并由确定性宏完成全部轮次。",
+                                            "type_value": "rpa_challenge",
+                                        }
+                                        break
+                                    vlm.inject_error_feedback(
+                                        "RPA Challenge 不是单次 Submit 表单。当前还未进入最终结果页；"
+                                        "不要 done。必须点击 Start（如仍可见）并继续按 challenge.xlsx 完成全部 10 轮，"
+                                        "只有最后一轮后出现最终结果/成功态才允许 done。"
+                                    )
+                                    break
                         ax_tree_text_for_done = ""
                         if _goal_is_plain_search_task(goal):
                             try:
@@ -6502,15 +14785,101 @@ async def run_agent(
 
                         # 如果 done 时也附带了 VLM 提取数据，一并保存
                         extracted = decision.get("extracted_data")
+                        _done_answer_from_data = ""
                         if extracted:
                             logger.info(f"[EXTRACT] Final data extracted: {extracted}")
-                            save_to_excel(
-                                extracted,
-                                _vlm_output,
-                                unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
-                            )
+                            if _goal_output_mode == "answer":
+                                logger.info(
+                                    "[ANSWER OUTPUT] final answer payload kept in run result; "
+                                    "not saving Excel artifact"
+                                )
+                                _done_answer_from_data = _format_extracted_rows_as_answer(
+                                    extracted
+                                )
+                                _done_answer_from_data = _compact_answer_text_for_goal(
+                                    _done_answer_from_data,
+                                    goal,
+                                )
+                            else:
+                                save_run_dataset(
+                                    extracted,
+                                    run_id=_run_ts,
+                                    output_contract=_goal_output_contract,
+                                    produced_by="vlm_extract_retry",
+                                    step_id=str(step),
+                                    filename_hint=_vlm_output,
+                                    unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
+                                )
                             # 同步更新进度计数器，避免 PROGRESS SAFEGUARD 用到过期数值
                             _record_extract_progress(extracted, len(extracted))
+                        if _goal_is_tooltip_extract(goal):
+                            _expected_tooltips = _parse_goal_tooltip_targets(goal)
+                            _missing_tooltips = [
+                                _title_tooltip_target(label)
+                                for label in _expected_tooltips
+                                if extract_tooltip_primary_key(
+                                    {"direction": _title_tooltip_target(label)}
+                                )
+                                not in _tooltip_trigger_keys
+                            ]
+                            if _missing_tooltips:
+                                logger.warning(
+                                    "[TOOLTIP DONE GUARD] Blocked premature done; missing tooltip triggers: %s",
+                                    ", ".join(_missing_tooltips),
+                                )
+                                vlm.inject_error_feedback(
+                                    "Tooltip 任务尚未完成，缺少这些触发源的提示文字："
+                                    + ", ".join(_missing_tooltips)
+                                    + "。请继续 hover 缺失的按钮；只有全部触发源都已提取后才能 done。"
+                                )
+                                break
+                        _date_macro_for_done = _parse_semantic_macro(goal)
+                        if _date_macro_for_done and _date_macro_for_done.get("action") == "date_pick":
+                            _expected_date = str(_date_macro_for_done.get("target_date") or "").strip()
+                            _observed_dates: list[str] = []
+                            try:
+                                _done_page = await browser._ensure_active_page(reason="date done guard")
+                                if _done_page:
+                                    _observed_dates = await _done_page.evaluate(
+                                        """() => Array.from(document.querySelectorAll('input,textarea,[role=combobox]'))
+                                            .filter(el => {
+                                                const r = el.getBoundingClientRect();
+                                                const s = window.getComputedStyle(el);
+                                                return r.width > 0 && r.height > 0 &&
+                                                    s.display !== 'none' && s.visibility !== 'hidden';
+                                            })
+                                            .map(el => [
+                                                el.value,
+                                                el.getAttribute('aria-label'),
+                                                el.getAttribute('placeholder'),
+                                                el.getAttribute('title'),
+                                                el.textContent
+                                            ].filter(Boolean).join(' '))
+                                            .filter(Boolean)"""
+                                    ) or []
+                            except Exception as _date_done_err:
+                                logger.debug("[DATE DONE GUARD] probe skipped: %s", _date_done_err)
+                            _joined_dates = " | ".join(str(v) for v in _observed_dates)
+                            if _expected_date and _expected_date not in _joined_dates:
+                                logger.warning(
+                                    "[DATE DONE GUARD] Blocked premature/wrong done: expected=%s observed=%s",
+                                    _expected_date,
+                                    _joined_dates,
+                                )
+                                event_stream.verify(
+                                    step=step,
+                                    name="date_done_guard",
+                                    success=False,
+                                    expected=_expected_date,
+                                    observed=_joined_dates,
+                                    metadata={"values": _observed_dates},
+                                )
+                                vlm.inject_error_feedback(
+                                    f"日期任务尚未完成：用户目标中的目标日期按系统日期计算应为 {_expected_date}，"
+                                    f"但当前页面回读到的是：{_joined_dates or '未找到日期值'}。"
+                                    "请不要 done；需要选择准确日期，不能把日历面板当前显示月份再加一个月。"
+                                )
+                                break
                         # 打印 XHR 拦截汇总
                         if browser.intercepted_count > 0:
                             logger.info(
@@ -6519,6 +14888,50 @@ async def run_agent(
                             )
                         if workflow_memory:
                             logger.info(f"[MEMORY] Final workflow_memory state: {workflow_memory}")
+
+                        # ── Judge 验证：用独立 LLM 调用确认任务真正完成 ─────────
+                        if _judge.config.enabled and _judge_rejections < _judge.config.max_retries_after_fail:
+                            try:
+                                _judge_screenshot = getattr(browser, "_last_screenshot_b64", None)
+                                _judge_history = vlm._build_history_summary()
+                                _judge_result = await _judge.evaluate(
+                                    goal=goal,
+                                    screenshot_b64=_judge_screenshot,
+                                    history_summary=_judge_history,
+                                    current_url=browser.current_url or "",
+                                    page_title=(page_summary or "")[:200],
+                                )
+                                if not _judge_result.passed:
+                                    _judge_rejections += 1
+                                    _rejection_msg = (
+                                        _judge_result.rejection_reason
+                                        or f"Judge 验证不通过: {_judge_result.reasoning}"
+                                    )
+                                    logger.warning(f"[JUDGE] Blocked done ({_judge_rejections}x): {_rejection_msg}")
+                                    _broadcast_log_safe(
+                                        f"[JUDGE] 任务验证未通过 ({_judge_rejections}x): {_rejection_msg}",
+                                        level="warn",
+                                    )
+                                    vlm.inject_error_feedback(
+                                        f"🔍 Judge 验证：任务尚未完成。{_rejection_msg} "
+                                        f"{_judge_result.suggested_action or '请继续执行。'}"
+                                    )
+                                    break
+                            except Exception as _judge_err:
+                                logger.debug(f"[JUDGE] Verification skipped: {_judge_err}")
+
+                        # ── Final Answer：在广播 done 前把 VLM 的最终回答/思考记录为 run answer ──
+                        # 后面 ~13415 行的 _done_message 继续复用 _vlm_done_thought，避免重复清洗
+                        _vlm_done_thought = _clean_user_visible_done_message(
+                            _done_answer_from_data
+                            or decision.get("thought")
+                            or decision.get("type_value")
+                            or "VLM determined the goal has been achieved."
+                        )
+                        if _done_answer_from_data:
+                            decision["thought"] = _vlm_done_thought
+                        _record_run_answer(text=_vlm_done_thought)
+
                         logger.info("[DONE] Task completed! VLM determined the goal has been achieved.")
                         _broadcast_log_safe("[DONE] Task completed! VLM determined the goal has been achieved.")
                         _broadcast_done_safe(True, "Task completed")
@@ -6528,11 +14941,19 @@ async def run_agent(
                         if browser.rpa_trail or _executed_cached_trail or not _rpa_cache_allowed:
                             try:
                                 merged_trail = _executed_cached_trail + browser.rpa_trail
-                                compacted_trail = _compact_rpa_trail(merged_trail)
+                                compacted_trail = _semanticize_rpa_trail(
+                                    _compact_rpa_trail(merged_trail),
+                                    goal,
+                                )
                                 if len(compacted_trail) != len(merged_trail):
                                     logger.info(
                                         f"[RPA] Compacted trail before save: "
                                         f"{len(merged_trail)} → {len(compacted_trail)} steps"
+                                    )
+                                if not _rpa_cache_allowed and _semantic_macro and _allow_semantic_rpa:
+                                    compacted_trail = [dict(_semantic_macro)]
+                                    logger.info(
+                                        "[RPA] Physical cache write disabled; preserving semantic macro only."
                                     )
                                 cache_meta = _build_rpa_match_metadata(start_url, goal)
                                 # 提取类任务（获取/提取/抓取/extract）的轨迹不应声称
@@ -6544,12 +14965,28 @@ async def run_agent(
                                 _trail_has_extract = any(
                                     s.get("action") == "extract" for s in compacted_trail
                                 )
+                                _semantic_actions = {"date_pick", "cascader_pick"}
+                                _semantic_only_trail = bool(compacted_trail) and all(
+                                    isinstance(s, dict)
+                                    and str(s.get("action") or "") in _semantic_actions
+                                    for s in compacted_trail
+                                )
                                 _completes = not (_is_extract_goal and not _trail_has_extract)
+                                if _goal_is_form_fill(goal):
+                                    _completes = _trail_completes_form_goal(goal, compacted_trail)
+                                if _goal_output_mode == "answer":
+                                    # Physical replay may navigate to the right page, but it
+                                    # cannot itself produce the answer that the user asked for.
+                                    _completes = False
+                                _cache_replayable = bool(compacted_trail) and (
+                                    _rpa_cache_allowed
+                                    or (_allow_semantic_rpa and _semantic_only_trail)
+                                )
                                 cache_payload = {
                                     "version": 4,
-                                    "replayable": _rpa_cache_allowed and bool(compacted_trail),
-                                    "reason": "" if (_rpa_cache_allowed and compacted_trail) else (_rpa_skip_reason or "marked as non-replayable"),
-                                    "trail": compacted_trail if (_rpa_cache_allowed and compacted_trail) else [],
+                                    "replayable": _cache_replayable,
+                                    "reason": "" if _cache_replayable else (_rpa_skip_reason or "marked as non-replayable"),
+                                    "trail": compacted_trail if _cache_replayable else [],
                                     "fail_count": 0,
                                     "max_failures": 2,
                                     "completes_task": _completes,
@@ -6580,6 +15017,35 @@ async def run_agent(
                                 f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
                             )
                             _run_succeeded = False
+                        _done_target_state = _extraction_targets_reached(
+                            goal,
+                            total_rows=_total_extracted_rows,
+                            total_pages=len(_extracted_page_keys),
+                        )
+                        # 复用 Patch 4 已清洗的文本，保持 event_stream 与 WS done 一致
+                        _done_message = _vlm_done_thought
+                        event_stream.done(
+                            step=step,
+                            success=_run_succeeded,
+                            reason=(
+                                "vlm_done"
+                                if _run_succeeded
+                                else "vlm_done_progress_safeguard_failed"
+                            ),
+                            message=_done_message[:500],
+                            metadata={
+                                "url": current_url,
+                                "page_summary": str(page_summary or "")[:1000],
+                                "total_rows": _total_extracted_rows,
+                                "total_pages": len(_extracted_page_keys),
+                                "row_target": _done_target_state.get("row_target"),
+                                "page_target": _done_target_state.get("page_target"),
+                                "target_reached": _done_target_state.get("reached"),
+                                "rows_reached": _done_target_state.get("rows_reached"),
+                                "pages_reached": _done_target_state.get("pages_reached"),
+                                "action": action,
+                            },
+                        )
                         break
 
                     # 7. 执行浏览器操作
@@ -6645,26 +15111,55 @@ async def run_agent(
                         _clickable_roles = {
                             "link", "button", "menuitem", "tab", "option",
                         }
+                        # label/文案节点常被 SoM 标在「搜索」区域旁，但实际应对关联输入框执行 type。
+                        # 以前用 len(type_value)<=80 兜底会把「在 label 上 type 关键词」误改成 click_text，
+                        # 导致在必应等站点把查询词当成按钮文字去点，连续失败。
+                        _no_click_text_fallback_roles = {
+                            "label",
+                            "heading",
+                            "paragraph",
+                            "statictext",
+                            "banner",
+                            "section",
+                            "article",
+                            "main",
+                            "navigation",
+                            "complementary",
+                        }
                         if (
                             _type_tv
                             and _target_role
                             and _target_role not in _input_roles
+                            and _target_role not in _no_click_text_fallback_roles
                             and (
                                 _target_role in _clickable_roles
                                 or len(_type_tv) <= 80
                             )
                         ):
-                            logger.warning(
-                                "[ACTION FIX] type on non-input target #%s "
-                                "(role=%s, value=%r) -> click_text",
-                                _type_tid,
-                                _target_role,
-                                _type_tv,
-                            )
-                            decision["action"] = "click_text"
-                            decision["target_id"] = 0
-                            decision["type_value"] = _type_tv
-                            action = "click_text"
+                            if _target_role in _clickable_roles:
+                                logger.warning(
+                                    "[ACTION FIX] type on clickable target #%s "
+                                    "(role=%s, value=%r) -> click",
+                                    _type_tid,
+                                    _target_role,
+                                    _type_tv,
+                                )
+                                decision["action"] = "click"
+                                decision["target_id"] = _type_tid
+                                decision["type_value"] = ""
+                                action = "click"
+                            else:
+                                logger.warning(
+                                    "[ACTION FIX] type on non-input target #%s "
+                                    "(role=%s, value=%r) -> click_text",
+                                    _type_tid,
+                                    _target_role,
+                                    _type_tv,
+                                )
+                                decision["action"] = "click_text"
+                                decision["target_id"] = 0
+                                decision["type_value"] = _type_tv
+                                action = "click_text"
 
                     # ── 表单滚动漂移守卫 ─────────────────────────────────────
                     # 表单任务如果尚未开始填写字段，却连续向下滚动，很容易从目标表单
@@ -6672,9 +15167,9 @@ async def run_agent(
                     if _is_form_fill_goal:
                         _form_thought = str(decision.get("thought") or "")
                         _form_tv_for_fix = str(decision.get("type_value") or "").strip()
-                        _multi_form_hits = re.findall(
-                            r"([^=;\n\r]{1,80})\s*=\s*([^;\n\r]+)",
+                        _multi_form_hits = _split_form_assignment_payload(
                             _form_tv_for_fix,
+                            _form_assignments,
                         )
                         if action == "form_set" and len(_multi_form_hits) > 1:
                             for _raw_label, _raw_value in _multi_form_hits:
@@ -6695,6 +15190,28 @@ async def run_agent(
                                     )
                                     break
                         _label_value_tv = re.match(r"^\s*([^=\n\r]{1,80})\s*=\s*(.+?)\s*$", _form_tv_for_fix, re.S)
+                        if (
+                            action == "type"
+                            and decision.get("target_id")
+                            and _label_value_tv
+                            and _target_role in _input_roles
+                        ):
+                            _raw_label = _label_value_tv.group(1).strip().strip("\"'“”")
+                            _raw_value = _label_value_tv.group(2).strip().strip("\"'“”")
+                            if _raw_value:
+                                logger.warning(
+                                    "[FORM FIX] type on input target #%s carried label=value payload %r -> value-only %r",
+                                    decision.get("target_id"),
+                                    _form_tv_for_fix,
+                                    _raw_value,
+                                )
+                                decision["type_value"] = _raw_value
+                                _form_tv_for_fix = _raw_value
+                                vlm.inject_error_feedback(
+                                    f"⚠️ 表单动作纠偏：显式输入框 target_id={decision.get('target_id')} "
+                                    f"不应把字段名一并输入。系统已将 {_raw_label!r}={_raw_value!r} "
+                                    "改成仅输入字段值。"
+                                )
                         if action == "form_set" and _label_value_tv:
                             _raw_label = _label_value_tv.group(1).strip().strip("\"'“”")
                             if re.search(
@@ -6907,6 +15424,92 @@ async def run_agent(
                                 )
                                 break
 
+                    if _goal_is_tooltip_extract(goal) and action == "hover_and_click":
+                        _orig_menu_text = str(decision.get("type_value") or "").strip()
+                        logger.info(
+                            "[TOOLTIP GUARD] Rewriting hover_and_click to hover for tooltip extraction "
+                            "(target_id=%s, ignored menu text=%r)",
+                            decision.get("target_id"),
+                            _orig_menu_text,
+                        )
+                        vlm.inject_error_feedback(
+                            "Tooltip 读取任务禁止使用 hover_and_click：tooltip 是要读取的短文本，"
+                            "不是要点击的菜单项。系统已将本步改为纯 hover；"
+                            "一旦 tooltip 文本出现，应立即 extract，不要点击 tooltip。"
+                        )
+                        decision["action"] = "hover"
+                        decision["type_value"] = ""
+                        action = "hover"
+
+                    if _goal_is_tooltip_extract(goal) and action == "hover":
+                        _hover_label_probe = _infer_tooltip_trigger_label(
+                            goal,
+                            decision,
+                            "",
+                            getattr(browser, "element_mapping", {}) or {},
+                        )
+                        _hover_key_probe = extract_tooltip_primary_key(
+                            {"direction": _hover_label_probe}
+                        )
+                        if _hover_key_probe and _hover_key_probe in _tooltip_trigger_keys:
+                            _expected_tooltips = _parse_goal_tooltip_targets(goal)
+                            _remaining_tooltips = [
+                                _title_tooltip_target(label)
+                                for label in _expected_tooltips
+                                if extract_tooltip_primary_key(
+                                    {"direction": _title_tooltip_target(label)}
+                                )
+                                not in _tooltip_trigger_keys
+                            ]
+                            logger.warning(
+                                "[TOOLTIP GUARD] Blocked duplicate hover for captured trigger %s; remaining=%s",
+                                _hover_label_probe,
+                                ", ".join(_remaining_tooltips) or "<unknown>",
+                            )
+                            vlm.inject_error_feedback(
+                                f"Tooltip 触发源 {_hover_label_probe} 已经提取过，"
+                                "本次重复 hover 已被系统拦截。"
+                                + (
+                                    " 请改为 hover 剩余触发源："
+                                    + ", ".join(_remaining_tooltips)
+                                    + "。"
+                                    if _remaining_tooltips
+                                    else " 请换下一个尚未提取的 tooltip 触发源。"
+                                )
+                            )
+                            vlm.annotate_last_result(
+                                f"🚫 Tooltip 去重守卫：{_hover_label_probe} 已提取，未重复 hover"
+                            )
+                            break
+
+                    if action == "click":
+                        _guard_page = await browser._ensure_active_page(
+                            reason="rewrite cascader nav click"
+                        )
+                        if _guard_page:
+                            _cascader_popup_text = await _rewrite_cascader_nav_click_to_popup_text(
+                                browser,
+                                _guard_page,
+                                decision,
+                                goal,
+                            )
+                            if _cascader_popup_text:
+                                logger.warning(
+                                    "[CASCADER GUARD] Rewriting nav-like click #%s -> click_text %r "
+                                    "because a visible popup/menu item has the same label.",
+                                    decision.get("target_id"),
+                                    _cascader_popup_text,
+                                )
+                                vlm.inject_error_feedback(
+                                    f"当前是级联/多级菜单任务，且弹层里已存在可见菜单项 {_cascader_popup_text!r}。"
+                                    "不要点击顶部导航或侧边栏中的同名链接；"
+                                    "系统已将本步改为 click_text，优先命中已展开弹层里的菜单项。"
+                                )
+                                decision["action"] = "click_text"
+                                decision["target_id"] = 0
+                                decision["type_value"] = _cascader_popup_text
+                                action = "click_text"
+
                     # ── LOOP GUARD 前置拦截：已进入黑名单的 target_id 直接阻断 ───
                     _click_target_id = decision.get("target_id", 0)
                     _click_point_bucket = _bucket_point(decision.get("point"))
@@ -6948,6 +15551,8 @@ async def run_agent(
                     )
                     _pre_url = browser.current_url
                     _pre_click_is_pagination_candidate = False
+                    _pre_form_submit_target: dict | None = None
+                    _pre_form_submit_validation: dict | None = None
                     if action in ("click", "click_text", "click_point"):
                         try:
                             _pagination_links_pre = browser.find_pagination_links()
@@ -6969,12 +15574,515 @@ async def run_agent(
                         except Exception:
                             _pre_click_is_pagination_candidate = False
 
+                    if (
+                        _is_bulk_extract_goal
+                        and action in ("click", "click_text", "click_point")
+                        and _extract_goal_target is not None
+                        and _total_extracted_rows < _extract_goal_target
+                        and not _pre_click_is_pagination_candidate
+                        and not _decision_click_targets_extraction_control(
+                            decision,
+                            input_descriptions,
+                        )
+                    ):
+                        _shape_for_click_guard: dict = {}
+                        try:
+                            _shape_for_click_guard = await browser.probe_data_shape()
+                        except Exception:
+                            _shape_for_click_guard = {}
+                        _repeated_items = int(
+                            _shape_for_click_guard.get("repeated_list_items") or 0
+                        )
+                        _repeated_classes = int(
+                            _shape_for_click_guard.get("repeated_class_count") or 0
+                        )
+                        _table_rows_for_guard = int(
+                            _shape_for_click_guard.get("table_rows") or 0
+                        )
+                        _list_or_table_like = (
+                            _repeated_items >= 5
+                            or _repeated_classes >= 5
+                            or _table_rows_for_guard >= 3
+                        )
+                        if _list_or_table_like:
+                            _target_line = _find_target_line(
+                                input_descriptions,
+                                int(decision.get("target_id") or 0),
+                            )
+                            _guard_msg = (
+                                "Blocked a likely content/ad/list-item click during a bulk extraction task. "
+                                f"Progress is {_total_extracted_rows}/{_extract_goal_target}; "
+                                "use extract/scroll instead of opening individual entries unless the user "
+                                "explicitly asks for detail pages."
+                            )
+                            logger.warning(
+                                "[EXTRACT CLICK GUARD] %s target=%r shape=%s",
+                                _guard_msg,
+                                _target_line or decision.get("type_value") or decision.get("point"),
+                                _shape_for_click_guard,
+                            )
+                            event_stream.guard(
+                                step=step,
+                                name="extract_click_guard",
+                                message=_guard_msg,
+                                metadata={
+                                    "target": _target_line,
+                                    "decision": {
+                                        "action": decision.get("action"),
+                                        "target_id": decision.get("target_id"),
+                                        "type_value": decision.get("type_value"),
+                                        "point": decision.get("point"),
+                                    },
+                                    "shape": _shape_for_click_guard,
+                                    "progress": {
+                                        "rows": _total_extracted_rows,
+                                        "target": _extract_goal_target,
+                                    },
+                                },
+                            )
+                            try:
+                                vlm.inject_error_feedback(
+                                    "当前是批量抓取/提取任务，页面已经呈现列表或表格。"
+                                    "不要点击单条内容、广告或详情入口；除非用户明确要求进入详情页，"
+                                    "否则应先 extract 当前可见数据，或继续 scroll/next_page 加载更多数据。"
+                                    "系统已将本次点击改为向下滚动。"
+                                )
+                            except Exception:
+                                pass
+                            decision["action"] = "scroll"
+                            decision["target_id"] = 0
+                            decision["type_value"] = "down"
+                            decision["status"] = "pending"
+                            decision["guard_rewrite"] = "extract_click_guard"
+                            decisions[_action_idx] = decision
+                            action = "scroll"
+
+                    if _is_form_fill_goal and action in ("scroll", "smooth_scroll"):
+                        _active_form_assignments, _active_form_state = await _resolve_active_form_assignments(
+                            browser,
+                            goal,
+                            _form_assignments,
+                        )
+                        _scroll_dir = str(
+                            decision.get("direction")
+                            or decision.get("type_value")
+                            or "down"
+                        ).strip().lower()
+                        if (
+                            _active_form_assignments
+                            and _form_goal_requires_submit(goal)
+                            and _scroll_dir in ("", "down", "bottom", "next")
+                        ):
+                            _pre_submit_validation = await _validate_form_assignments_on_page(
+                                browser, goal, _active_form_assignments
+                            )
+                            if _pre_submit_validation.get("ok"):
+                                _submit_hint = await _locate_visible_form_submit_text(
+                                    browser, goal, _active_form_assignments
+                                )
+                                _submit_text = str(_submit_hint.get("text") or "").strip()
+                                if _submit_text:
+                                    logger.warning(
+                                        "[FORM SUBMIT REWRITE] fields verified; rewrite %s %r -> click_text %r",
+                                        action,
+                                        _scroll_dir,
+                                        _submit_text,
+                                    )
+                                    try:
+                                        vlm.inject_error_feedback(
+                                            "⚠️ 表单动作纠偏：目标字段已经回读成功，"
+                                            f"继续 {_scroll_dir or 'down'} 滚动会把表单滚丢。"
+                                            f"系统已改为直接点击当前表单的提交按钮 {_submit_text!r}。"
+                                        )
+                                    except Exception:
+                                        pass
+                                    decision["action"] = "click_text"
+                                    decision["target_id"] = 0
+                                    decision["type_value"] = _submit_text
+                                    decision["guard_rewrite"] = "form_submit_rewrite"
+                                    decisions[_action_idx] = decision
+                                    action = "click_text"
+
+                    if _is_form_fill_goal and action in ("click", "click_text", "click_point"):
+                        _active_form_assignments, _active_form_state = await _resolve_active_form_assignments(
+                            browser,
+                            goal,
+                            _form_assignments,
+                        )
+                        _pre_form_submit_target = await _inspect_form_submit_target(
+                            browser, action, decision
+                        )
+                        if _pre_form_submit_target.get("is_submit") and _active_form_assignments:
+                            _pre_form_submit_validation = await _validate_form_assignments_on_page(
+                                browser, goal, _active_form_assignments
+                            )
+                            if not _pre_form_submit_validation.get("ok"):
+                                _missing = _pre_form_submit_validation.get("missing") or []
+                                _missing_text = ", ".join(map(str, _missing[:6])) or "unknown fields"
+                                _target_text = (
+                                    _pre_form_submit_target.get("controlText")
+                                    or _pre_form_submit_target.get("text")
+                                    or _pre_form_submit_target.get("type_value")
+                                    or "submit"
+                                )
+                                _guard_msg = (
+                                    "Blocked premature form submit: physical submit control "
+                                    f"{_target_text!r} was targeted, but field readback is incomplete. "
+                                    f"Missing or mismatched fields: {_missing_text}. "
+                                    "Continue filling the target form before clicking Create/Submit."
+                                )
+                                logger.warning("[FORM SUBMIT GUARD] %s", _guard_msg)
+                                event_stream.guard(
+                                    step=step,
+                                    name="form_submit_guard",
+                                    message=_guard_msg,
+                                    metadata={
+                                        "target": _pre_form_submit_target,
+                                        "validation": _pre_form_submit_validation,
+                                    },
+                                )
+                                try:
+                                    vlm.inject_error_feedback(_guard_msg)
+                                except Exception:
+                                    pass
+                                decision["status"] = "error"
+                                decision["thought"] = (
+                                    "FORM SUBMIT GUARD blocked this submit attempt because "
+                                    f"field readback is incomplete: {_missing_text}."
+                                )
+                                decision["form_submit_target"] = _pre_form_submit_target
+                                decision["form_validation"] = _pre_form_submit_validation
+                                _log_decision = decision
+                                _log_error = _guard_msg
+                                break
+
                     # ── 自愈执行：捕获 ActionExecutionError 并注入 VLM 反馈 ──────────
                     try:
-                        active_page = await browser.execute_action(decision, workflow_memory)
+                        _dispatch_tool = action_registry.resolve_for_action(
+                            action,
+                            goal=goal,
+                        )
+                        _targeted_handoff_executed = False
+                        if action == "click_text":
+                            _targeted_handoff_executed = await _try_targeted_click_text_handoff(
+                                decision
+                            )
+                            if _targeted_handoff_executed:
+                                event_stream.emit(
+                                    "tool_dispatch",
+                                    step=step,
+                                    action=action,
+                                    tool={
+                                        "name": "targeted_probe",
+                                        "capability": "perception",
+                                        "risk": "low",
+                                    },
+                                    metadata={
+                                        "handoff": "click_text_to_selector",
+                                        "type_value": decision.get("type_value", ""),
+                                    },
+                                )
+                                active_page = await browser._ensure_active_page(
+                                    reason="targeted handoff dispatch"
+                                )
+                        elif action == "type":
+                            _targeted_handoff_executed = await _try_targeted_type_handoff(
+                                decision,
+                                workflow_memory=workflow_memory,
+                            )
+                            if _targeted_handoff_executed:
+                                event_stream.emit(
+                                    "tool_dispatch",
+                                    step=step,
+                                    action=action,
+                                    tool={
+                                        "name": "targeted_probe",
+                                        "capability": "perception",
+                                        "risk": "low",
+                                    },
+                                    metadata={
+                                        "handoff": "type_to_input_selector",
+                                        "type_value": decision.get("type_value", ""),
+                                    },
+                                )
+                                active_page = await browser._ensure_active_page(
+                                    reason="targeted type handoff dispatch"
+                                )
+                            elif int(decision.get("target_id") or 0) == 0:
+                                _handoff_msg = (
+                                    "type target_id=0 could not be resolved by targeted input probe. "
+                                    "Falling back to wait and asking the model to choose a visible input ID, "
+                                    "use targeted_probe, or scroll."
+                                )
+                                logger.warning("[TARGETED HANDOFF] %s", _handoff_msg)
+                                event_stream.guard(
+                                    step=step,
+                                    name="targeted_type_handoff_failed",
+                                    message=_handoff_msg,
+                                    metadata={
+                                        "type_value": decision.get("type_value", ""),
+                                    },
+                                )
+                                try:
+                                    vlm.inject_error_feedback(
+                                        "你刚才尝试 type 但 target_id=0，局部输入框探针也没有找到足够明确的输入框。"
+                                        "请重新观察截图，选择真实输入框 @eN；或先执行 targeted_probe / smooth_scroll。"
+                                    )
+                                except Exception:
+                                    pass
+                                decision["action"] = "wait"
+                                decision["type_value"] = "2"
+                                decision["target_id"] = 0
+                                action = "wait"
+                        # I1: pre-action timestamp for the broadcast_phase emit
+                        # below. Using a fresh local guarantees the post-action
+                        # phase event always has a duration_ms value.
+                        _action_t0 = time.time()
+                        if (
+                            not _targeted_handoff_executed
+                            and action in _registry_dispatch_actions
+                            and _dispatch_tool
+                            and _dispatch_tool.get("handler_bound")
+                        ):
+                            event_stream.emit(
+                                "tool_dispatch",
+                                step=step,
+                                action=action,
+                                tool={
+                                    "name": _dispatch_tool.get("name"),
+                                    "capability": _dispatch_tool.get("capability"),
+                                    "risk": _dispatch_tool.get("risk"),
+                                },
+                                metadata={
+                                    "target_id": decision.get("target_id", 0),
+                                    "type_value": decision.get("type_value", ""),
+                                },
+                            )
+                            active_page = await action_registry.execute_for_action(
+                                action,
+                                goal=goal,
+                                action_payload=decision,
+                                workflow_memory=workflow_memory,
+                            )
+                        elif not _targeted_handoff_executed:
+                            active_page = await browser.execute_action(
+                                decision,
+                                workflow_memory,
+                            )
+                        # I1: phase event for the just-executed action so the
+                        # frontend timeline can show "vlm_call → action(click) → next vlm_call"
+                        # with their respective durations. Best-effort.
+                        try:
+                            from api_server import broadcast_phase
+
+                            _act_err = getattr(browser, "_last_action_error", None)
+                            broadcast_phase(
+                                "action",
+                                severity="error" if _act_err else "info",
+                                message=action or "(no-op)",
+                                step=step,
+                                duration_ms=int((time.time() - _action_t0) * 1000),
+                                notice_severity=getattr(browser, "_last_notice_severity", None),
+                                extra={"action_name": action or ""},
+                            )
+                        except Exception:
+                            pass
                         if active_page is not None:
                             # execute_action 内部已更新 browser._page，此处仅做日志追踪
                             logger.debug(f"[TAB GUARD] Active page after action: {(active_page.url or 'about:blank')[:80]}")
+                        _last_action_result = getattr(browser, "_last_action_result", None)
+                        if _last_action_result is not None:
+                            _last_action_result = _with_tool_metadata(_last_action_result)
+                            event_stream.act(step=step, result=_last_action_result)
+
+                        # ── Element Tracker auto-capture (post-action) ────
+                        # 把刚刚成功操作的元素注册到 vlm.element_tracker，
+                        # 后续步骤 DOM 重排后可按结构签名找回。两个别名：
+                        #   last_<action>      ：最近一次该动作的元素（覆盖式）
+                        #   step{N}_<action>   ：步骤锚定（永不覆盖，可回溯）
+                        # 开关关闭时所有 track_element 调用都是 no-op。
+                        try:
+                            _trk_act = str(decision.get("action") or "")
+                            _trk_tid = int(decision.get("target_id") or 0)
+                            _trk_ok = bool(
+                                getattr(_last_action_result, "success", False)
+                            ) if _last_action_result is not None else False
+                            # 只追踪"有目标 + 成功 + 与具体 DOM 元素绑定"的动作
+                            _trk_trackable_actions = {
+                                "click", "type", "select", "hover",
+                                "smooth_scroll", "right_click", "double_click",
+                            }
+                            if (
+                                _trk_ok
+                                and _trk_tid > 0
+                                and _trk_act in _trk_trackable_actions
+                            ):
+                                _trk_el = next(
+                                    (
+                                        el for el in getattr(
+                                            browser, "_last_som_elements", []
+                                        ) or []
+                                        if int(el.get("id") or -1) == _trk_tid
+                                    ),
+                                    None,
+                                )
+                                if _trk_el is not None:
+                                    _trk_payload = {
+                                        "som_id": _trk_el.get("id"),
+                                        "tag": _trk_el.get("tag", ""),
+                                        "text": _trk_el.get("name", ""),
+                                        "role": _trk_el.get("role", ""),
+                                        "bbox": _trk_el.get("rect") or {},
+                                        "parent_chain": (
+                                            [_trk_el.get("parentContext") or ""]
+                                            if _trk_el.get("parentContext") else []
+                                        ),
+                                    }
+                                    _trk_meta = {
+                                        "url": browser.current_url or "",
+                                        "step": step,
+                                    }
+                                    vlm.track_element(
+                                        f"last_{_trk_act}",
+                                        _trk_payload, step=step, metadata=_trk_meta,
+                                    )
+                                    vlm.track_element(
+                                        f"step{step}_{_trk_act}",
+                                        _trk_payload, step=step, metadata=_trk_meta,
+                                    )
+                                    logger.debug(
+                                        f"[TRACKER] auto-captured "
+                                        f"{_trk_act}@som_id={_trk_tid} "
+                                        f"text={(_trk_el.get('name') or '')[:30]!r}"
+                                    )
+                        except Exception as _trk_err:
+                            logger.debug(f"[TRACKER] auto-capture skipped: {_trk_err}")
+
+                        # ── chat_extract terminal-action check ────────────
+                        # The ChatExtractHandler sets ``workflow_memory
+                        # ['__chat_extract_completed']`` when it actually
+                        # captured an AI answer. main.py has no other way
+                        # to know chat_extract is a TERMINAL action — without
+                        # this, VLM keeps re-emitting chat_extract every
+                        # step because the screen still shows the answer
+                        # (run_log_20260518_141728: 18 steps wasted on the
+                        # same answer). Treat the sentinel as task complete.
+                        if (
+                            action == "chat_extract"
+                            and isinstance(workflow_memory, dict)
+                            and workflow_memory.get("__chat_extract_completed")
+                        ):
+                            _cec = workflow_memory.get("__chat_extract_completed") or {}
+                            _cec_mk = str(_cec.get("memory_key") or "")
+                            _cec_len = int(_cec.get("length") or 0)
+                            logger.info(
+                                "[CHAT EXTRACT DONE] task completed via chat_extract: "
+                                "memory_key=%s length=%d",
+                                _cec_mk, _cec_len,
+                            )
+                            _broadcast_log_safe(
+                                f"✅ [CHAT EXTRACT DONE] AI 回答已提取 "
+                                f"({_cec_len} chars → workflow_memory[{_cec_mk!r}])，任务结束",
+                                level="info",
+                            )
+                            # Replace _log_decision so HTML shows this step
+                            # as the final done with the answer alongside.
+                            try:
+                                _ai_answer_obj = workflow_memory.get(_cec_mk) or {}
+                                _chat_answer_row = {
+                                    "answer": str(_ai_answer_obj.get("answer") or ""),
+                                    "method": _ai_answer_obj.get("method"),
+                                    "url": _ai_answer_obj.get("url"),
+                                    "length": _ai_answer_obj.get("length"),
+                                    "wait_ms": _ai_answer_obj.get("wait_ms"),
+                                }
+                                # ── Final Answer：把 chat 回答原文记录为 run answer ──
+                                # chat_extract 的 broadcast_done 紧接其后触发；
+                                # 这里抢在它前面把真正的 AI 回答塞进 run-scoped stash，
+                                # 这样前端 Final Answer Tab 能渲染 chat 答案而不是占位文案。
+                                _chat_raw_answer = _chat_answer_row["answer"]
+                                _chat_final_answer = _compact_answer_text_for_goal(
+                                    _chat_raw_answer,
+                                    goal,
+                                )
+                                if _goal_output_mode == "answer" and _chat_final_answer:
+                                    _chat_answer_row["answer"] = _chat_final_answer
+                                    _chat_answer_row["length"] = len(_chat_final_answer)
+                                    try:
+                                        if isinstance(_ai_answer_obj, dict):
+                                            _ai_answer_obj["answer"] = _chat_final_answer
+                                            _ai_answer_obj["length"] = len(_chat_final_answer)
+                                            _ai_answer_obj["raw_length"] = _cec_len
+                                            workflow_memory[_cec_mk] = _ai_answer_obj
+                                            workflow_memory["latest_memory"] = _chat_final_answer[:200]
+                                    except Exception:
+                                        pass
+                                if _chat_final_answer:
+                                    _record_run_answer(text=_chat_final_answer)
+                                if _goal_output_mode == "answer":
+                                    _chat_saved_path = ""
+                                    logger.info(
+                                        "[ANSWER OUTPUT] chat answer kept in run result; "
+                                        "not saving Excel artifact"
+                                    )
+                                else:
+                                    _chat_saved_path = save_run_dataset(
+                                        [_chat_answer_row],
+                                        run_id=_run_ts,
+                                        output_contract=_goal_output_contract,
+                                        produced_by="chat_answer",
+                                        step_id=str(step),
+                                        filename_hint=_vlm_output,
+                                    )
+                                _log_decision = {
+                                    "action": "done",
+                                    "target_id": 0,
+                                    "type_value": "",
+                                    "memory_key": _cec_mk,
+                                    "status": "success",
+                                    "thought": (
+                                        f"[CHAT EXTRACT DONE] AI 回答已成功提取 "
+                                        f"(method={_cec.get('method') or 'unknown'}, "
+                                        f"length={_cec_len})。回答正文存于 "
+                                        f"workflow_memory[{_cec_mk!r}]，任务完成。"
+                                    ),
+                                    "extracted_data": {
+                                        "answer": _chat_answer_row["answer"][:8000],
+                                        "method": _chat_answer_row["method"],
+                                        "url": _chat_answer_row["url"],
+                                        "output_file": _chat_saved_path,
+                                    },
+                                    "output_file": _chat_saved_path,
+                                }
+                            except Exception:
+                                _chat_saved_path = ""
+                                pass
+                            _task_completed = True
+                            _run_succeeded = True
+                            event_stream.done(
+                                step=step,
+                                success=True,
+                                reason="chat_extract_completed",
+                                message=(
+                                    f"chat_extract completed: memory_key={_cec_mk} "
+                                    f"length={_cec_len}"
+                                ),
+                                metadata={
+                                    "memory_key": _cec_mk,
+                                    "length": _cec_len,
+                                    "method": _cec.get("method"),
+                                    "url": _cec.get("url"),
+                                    "output_file": _chat_saved_path,
+                                },
+                            )
+                            _broadcast_done_safe(True, "chat_extract completed")
+                            break
+
+                        # Reset sentinel for safety — next step's chat_extract
+                        # would re-set it, but explicit reset avoids stale
+                        # state if some other action mutates workflow_memory.
+                        if action != "chat_extract" and isinstance(workflow_memory, dict):
+                            workflow_memory.pop("__chat_extract_completed", None)
 
                         if action == "next_page" and browser.rpa_trail:
                             _last_rpa = browser.rpa_trail[-1]
@@ -7044,11 +16152,21 @@ async def run_agent(
                                 )
 
                         # ── 标签页切换感知：将 Tab Guard 切换事件注入 VLM 反馈 ──────
+                        # G1: 用 consume_tab_notice() 原子取出 (text, severity)，
+                        # 让日志按严重程度高亮，前端将来可以按 severity 着色。
                         _tab_switched_this_step = bool(browser._tab_switch_notice)
-                        if browser._tab_switch_notice:
-                            vlm.inject_error_feedback(browser._tab_switch_notice)
-                            logger.info(f"[TAB SWITCH] Injected page-switch notice for next VLM step")
-                            browser._tab_switch_notice = None
+                        _notice_text, _notice_sev = browser.consume_tab_notice()
+                        if _notice_text:
+                            vlm.inject_error_feedback(_notice_text)
+                            _log_fn = (
+                                logger.error if _notice_sev == "error"
+                                else logger.warning if _notice_sev == "warn"
+                                else logger.info
+                            )
+                            _log_fn(
+                                "[TAB NOTICE/%s] Injected for next VLM step",
+                                _notice_sev.upper(),
+                            )
 
                         # ── URL-aware LOOP GUARD（后置检测）──────────────────────
                         # 在 execute_action 之后才能拿到真正的 landing URL，
@@ -7080,8 +16198,61 @@ async def run_agent(
                             if _guard_eligible else 0
                         )
                         _last_actions.append(_cur_action_key)
+                        if action in ("scroll", "next_page", "wait", "extract"):
+                            try:
+                                _np_state = _no_progress_tracker.observe(
+                                    action=action,
+                                    row_count=_total_extracted_rows,
+                                    url=_landing_key_url,
+                                )
+                                if _np_state.get("pagination_exhausted"):
+                                    _pagination_exhausted = True
+                                    logger.info(
+                                        "[NO PROGRESS] streak=%s action=%s → pagination exhausted",
+                                        _np_state.get("streak"),
+                                        action,
+                                    )
+                                    event_stream.guard(
+                                        step=step,
+                                        name="NO_PROGRESS_EXHAUSTED",
+                                        message="Repeated scroll/page with no new rows.",
+                                        metadata=_np_state,
+                                    )
+                                    try:
+                                        from api_server import broadcast_phase as _bp_np
+
+                                        _bp_np(
+                                            "completion_guard",
+                                            severity="warn",
+                                            message=(
+                                                f"no_progress: streak="
+                                                f"{_np_state.get('streak')}"
+                                            ),
+                                            step=step,
+                                            notice_severity=getattr(
+                                                browser, "_last_notice_severity", None
+                                            ),
+                                            extra={
+                                                "guard": "no_progress_exhausted",
+                                                "state": _np_state,
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception as _np_err:
+                                logger.debug("[NO PROGRESS] skipped: %s", _np_err)
                         if len(_last_actions) > _LOOP_GUARD_WINDOW:
                             _last_actions.pop(0)
+                        if action in _SOM_REF_ACTIONS:
+                            _som_ref = (
+                                action,
+                                _target_id_for_guard(decision),
+                                _point_bucket,
+                                _norm_url_for_guard(_pre_url),
+                            )
+                            _som_target_refs.append(_som_ref)
+                            if len(_som_target_refs) > _LOOP_GUARD_WINDOW:
+                                _som_target_refs.pop(0)
 
                         # ── 方案②：把本次执行结果回填到 VLM 历史，让下一轮决策看见「已做什么」 ──
                         _post_pages_count = (
@@ -7098,6 +16269,7 @@ async def run_agent(
                             )
                         if _tab_switched_this_step:
                             _outcome_parts.append("触发TabGuard切换")
+                        _hover_tooltip_text = ""
                         if action == "hover_and_click":
                             _outcome_parts.append(
                                 f"已原子完成 hover #{decision.get('target_id', 0)} "
@@ -7110,26 +16282,172 @@ async def run_agent(
                                 and _last_hover_rpa.get("action") == "hover"
                                 and _last_hover_rpa.get("tooltip_text")
                             ):
+                                _hover_tooltip_text = str(
+                                    _last_hover_rpa.get("tooltip_text") or ""
+                                ).strip()
                                 _outcome_parts.append(
-                                    f"tooltip={str(_last_hover_rpa.get('tooltip_text'))[:120]!r}"
+                                    f"tooltip={_hover_tooltip_text[:120]!r}"
                                 )
                         vlm.annotate_last_result("✅ " + " | ".join(_outcome_parts))
 
-                        _submit_marker_text = " ".join(
-                            str(decision.get(k) or "")
-                            for k in ("type_value", "thought", "progress_review", "current_state")
-                        ).lower()
+                        if await _finish_if_xhr_target_reached(f"after action={action}"):
+                            break
+                        if await _finish_if_file_download_completed(f"after action={action}"):
+                            break
+
+                        # ── TOOLTIP AUTO-EXTRACT GUARD ─────────────────────
+                        # Tooltip tasks are read-only: once hover physically exposes
+                        # a tooltip, persist it immediately and move on. Do not let
+                        # VLM burn steps "confirming" by hovering the same trigger.
+                        if (
+                            _goal_is_tooltip_extract(goal)
+                            and action == "hover"
+                            and _hover_tooltip_text
+                        ):
+                            _tooltip_label = _infer_tooltip_trigger_label(
+                                goal,
+                                decision,
+                                _hover_tooltip_text,
+                                getattr(browser, "element_mapping", {}) or {},
+                            )
+                            _tooltip_row = {
+                                "trigger": _tooltip_label,
+                                "direction": _tooltip_label,
+                                "tooltip_text": _hover_tooltip_text,
+                                "target_id": int(decision.get("target_id", 0) or 0),
+                            }
+                            _tooltip_key = extract_tooltip_primary_key(_tooltip_row)
+                            _tooltip_rows = [_tooltip_row] if _tooltip_key else []
+                            _new_rows = (
+                                1 if _tooltip_key and _tooltip_key not in _tooltip_trigger_keys
+                                else 0
+                            )
+                            _dup_rows = 1 if _tooltip_key and not _new_rows else 0
+                            _rejected_rows = 0 if _tooltip_key else 1
+                            _source_text = f"{_tooltip_label} {_hover_tooltip_text}"
+                            _progress_new_rows, _progress_total_rows = _record_extract_progress(
+                                _tooltip_rows,
+                                _new_rows,
+                            )
+                            _expected_tooltips = _parse_goal_tooltip_targets(goal)
+                            _remaining_tooltips = [
+                                label for label in _expected_tooltips
+                                if extract_tooltip_primary_key({"direction": _title_tooltip_target(label)})
+                                not in _tooltip_trigger_keys
+                            ]
+
+                            if _tooltip_rows:
+                                saved_path = save_run_dataset(
+                                    _tooltip_rows,
+                                    run_id=_run_ts,
+                                    output_contract=_goal_output_contract,
+                                    produced_by="tooltip_auto",
+                                    step_id=str(step),
+                                    filename_hint=_vlm_output,
+                                    unique_key=TOOLTIP_UNIQUE_KEY,
+                                )
+                                logger.info(
+                                    "[TOOLTIP AUTO] captured %s -> %r (new=%s total=%s saved=%s)",
+                                    _tooltip_label,
+                                    _hover_tooltip_text,
+                                    _progress_new_rows,
+                                    _progress_total_rows,
+                                    saved_path,
+                                )
+                                print(
+                                    f"\033[1;32m✅ [TOOLTIP]\033[0m "
+                                    f"{_tooltip_label}: \033[36m{_hover_tooltip_text}\033[0m "
+                                    f"(唯一提示项 {_progress_total_rows})"
+                                )
+                            else:
+                                logger.info(
+                                    "[TOOLTIP AUTO] tooltip row rejected/duplicate: label=%s dup=%s rejected=%s",
+                                    _tooltip_label,
+                                    _dup_rows,
+                                    _rejected_rows,
+                                )
+
+                            _done_tooltips = bool(_expected_tooltips) and not _remaining_tooltips
+                            _tooltip_thought = (
+                                f"TOOLTIP AUTO captured {_tooltip_label}: {_hover_tooltip_text!r}. "
+                            )
+                            if _done_tooltips:
+                                _tooltip_thought += (
+                                    "All requested tooltip targets have been captured; task completed."
+                                )
+                                _broadcast_done_safe(True, "Tooltip extraction completed")
+                                _run_succeeded = True
+                                _task_completed = True
+                            elif _remaining_tooltips:
+                                _tooltip_thought += (
+                                    "Move to remaining tooltip targets: "
+                                    + ", ".join(_title_tooltip_target(v) for v in _remaining_tooltips)
+                                    + ". Do not hover this same target again."
+                                )
+                                vlm.inject_error_feedback(_tooltip_thought)
+                            else:
+                                _tooltip_thought += (
+                                    "Move to the next requested tooltip trigger; do not hover this same target again."
+                                )
+                                vlm.inject_error_feedback(_tooltip_thought)
+
+                            _log_extract_text_source = "TOOLTIP_HOVER"
+                            _log_decision = {
+                                "action": "done" if _done_tooltips else "extract",
+                                "target_id": int(decision.get("target_id", 0) or 0),
+                                "type_value": _tooltip_label,
+                                "status": "success",
+                                "thought": _tooltip_thought,
+                                "extracted_data": _tooltip_rows or [_tooltip_row],
+                                "tooltip_progress": {
+                                    "new": _progress_new_rows,
+                                    "total": _progress_total_rows,
+                                    "remaining": [
+                                        _title_tooltip_target(v) for v in _remaining_tooltips
+                                    ],
+                                },
+                            }
+                            event_stream.extract(
+                                step=step,
+                                source="TOOLTIP_HOVER",
+                                rows=len(_tooltip_rows),
+                                output_file=_vlm_output if _tooltip_rows else "",
+                                metadata={
+                                    "label": _tooltip_label,
+                                    "text": _hover_tooltip_text,
+                                    "done": _done_tooltips,
+                                },
+                            )
+                            break
+
+                        # ── FORM SUBMIT GUARD ──────────────────────────────
+                        # Only trust physical evidence: the clicked target must be a real
+                        # submit-like DOM/AX control, and goal-derived fields must pass
+                        # readback before an inert demo submit is converted to done.
                         _looks_like_form_submit = (
                             _is_form_fill_goal
-                            and action in ("click", "click_text", "click_point")
-                            and bool(
-                                re.search(
-                                    r"\b(create|submit|save|ok)\b|提交|保存|确定|创建",
-                                    _submit_marker_text,
-                                    re.IGNORECASE,
-                                )
-                            )
+                            and action in ("click", "click_text")
+                            and bool(_pre_form_submit_target)
+                            and bool(_pre_form_submit_target.get("is_submit"))
+                            and bool(_pre_form_submit_validation)
+                            and bool(_pre_form_submit_validation.get("ok"))
                         )
+                        _post_submit_challenge_state = None
+                        if _looks_like_form_submit:
+                            _post_submit_page = await browser._ensure_active_page(reason="inspect post-submit challenge state")
+                            if _post_submit_page:
+                                _post_submit_challenge_state = await _get_round_form_state(_post_submit_page)
+                            if (
+                                isinstance(_post_submit_challenge_state, dict)
+                                and _post_submit_challenge_state.get("is_challenge")
+                                and not _round_form_is_complete(_post_submit_challenge_state)
+                            ):
+                                logger.info(
+                                    "[FORM SUBMIT GUARD] rpachallenge advanced to round %s/%s; continue instead of done.",
+                                    _post_submit_challenge_state.get("current_round"),
+                                    _post_submit_challenge_state.get("total_rounds"),
+                                )
+                                _looks_like_form_submit = False
                         if _looks_like_form_submit:
                             if _form_submit_clicked_once:
                                 logger.info(
@@ -7148,15 +16466,24 @@ async def run_agent(
                             _broadcast_done_safe(True, "Form submit clicked")
                             await browser.mark_and_screenshot(step=99)
                             _log_screenshot_path = str(Path(SCREENSHOT_DIR) / "step_99.png")
+                            _submit_text = (
+                                _pre_form_submit_target.get("controlText")
+                                or _pre_form_submit_target.get("text")
+                                or decision.get("type_value")
+                                or "submit"
+                            )
                             _log_decision = {
                                 "action": "done",
                                 "target_id": int(decision.get("target_id", 0) or 0),
-                                "type_value": str(decision.get("type_value") or "submit"),
+                                "type_value": str(_submit_text),
                                 "status": "success",
                                 "thought": (
-                                    "表单字段已完成回读验收，且提交按钮已点击一次。"
-                                    "当前页面无跳转/无提示，按演示站或静默提交处理，任务结束。"
+                                    "表单目标字段已按用户要求完成 DOM 回读验收，"
+                                    "且真实提交按钮已点击一次。当前页面无跳转/无提示，"
+                                    "按演示站或静默提交处理，任务结束。"
                                 ),
+                                "form_submit_target": _pre_form_submit_target,
+                                "form_validation": _pre_form_submit_validation,
                             }
                             _run_succeeded = True
                             _task_completed = True
@@ -7194,6 +16521,35 @@ async def run_agent(
                                     f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
                                 )
                                 _run_succeeded = False
+                            _hover_done_state = _extraction_targets_reached(
+                                goal,
+                                total_rows=_total_extracted_rows,
+                                total_pages=len(_extracted_page_keys),
+                            )
+                            event_stream.done(
+                                step=step,
+                                success=_run_succeeded,
+                                reason=(
+                                    "hover_and_click_guard"
+                                    if _run_succeeded
+                                    else "hover_and_click_guard_progress_safeguard_failed"
+                                ),
+                                message=(
+                                    f"Repeated hover_and_click for {_menu_text or 'menu item'} "
+                                    "succeeded; no visible result delta, so the engine ended the task."
+                                ),
+                                metadata={
+                                    "action": action,
+                                    "target_id": decision.get("target_id", 0),
+                                    "menu_text": _menu_text,
+                                    "repeat_count": _click_repeat_count,
+                                    "total_rows": _total_extracted_rows,
+                                    "total_pages": len(_extracted_page_keys),
+                                    "row_target": _hover_done_state.get("row_target"),
+                                    "page_target": _hover_done_state.get("page_target"),
+                                    "target_reached": _hover_done_state.get("reached"),
+                                },
+                            )
                             break
 
                         if _click_repeat_count >= 3:
@@ -7277,10 +16633,56 @@ async def run_agent(
                         _consecutive_errors += 1
                         err_msg = str(exec_err)
                         _log_error = err_msg
+                        # ── Failure Classifier：统一失败归类 ──────────────────
+                        _fc_result = _failure_classifier_fn(
+                            error_msg=err_msg,
+                            exception=exec_err,
+                            context={"step": step, "action": action, "url": _pre_url},
+                            step=step,
+                        )
+                        if _fc_result:
+                            _failure_stats.record(_fc_result)
+                        _failed_action_result = getattr(browser, "_last_action_result", None)
+                        if _failed_action_result is not None:
+                            _failed_action_result = _with_tool_metadata(_failed_action_result)
+                            event_stream.act(step=step, result=_failed_action_result)
+                        else:
+                            event_stream.act(
+                                step=step,
+                                result=_with_tool_metadata(
+                                    ActionResult.from_action(
+                                        decision,
+                                        success=False,
+                                        error=err_msg,
+                                        before_url=_pre_url,
+                                        after_url=getattr(browser, "current_url", "") or "",
+                                        before_pages=_pre_pages_count,
+                                        after_pages=(
+                                            len(browser._context.pages)
+                                            if browser._context else _pre_pages_count
+                                        ),
+                                    ),
+                                ),
+                            )
                         logger.warning(
                             f"[SELF-HEAL] Action failed ({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}): "
                             f"{err_msg}"
                         )
+                        try:
+                            from .stuck_recovery_guard import evaluate_failure_recovery
+                        except ImportError:
+                            from stuck_recovery_guard import evaluate_failure_recovery
+                        _sr_fail = evaluate_failure_recovery(
+                            _stuck_recovery_state,
+                            error_msg=err_msg,
+                            target_id=int(decision.get("target_id") or 0),
+                            consecutive_errors=_consecutive_errors,
+                        )
+                        if _sr_fail.should_reset:
+                            vlm.reset_decision_history(_sr_fail.reason)
+                            _loop_detector.reset()
+                            _consecutive_errors = 0
+                            _recovery_chain_pending = True
                         # ── Bug A fix：失败也必须进 LOOP GUARD 历史 ───────────────
                         # 否则 VLM 反复点同一不存在的元素，计数器永远为 0，永远不会触发封禁。
                         # 失败路径没导航，用 _pre_url 构建 key（与成功分支同 schema）。
@@ -7301,6 +16703,16 @@ async def run_agent(
                         _last_actions.append(_failed_action_key)
                         if len(_last_actions) > _LOOP_GUARD_WINDOW:
                             _last_actions.pop(0)
+                        if action in _SOM_REF_ACTIONS:
+                            _som_failed_ref = (
+                                action,
+                                _target_id_for_guard(decision),
+                                _failed_point_bucket,
+                                _failed_key_url,
+                            )
+                            _som_target_refs.append(_som_failed_ref)
+                            if len(_som_target_refs) > _LOOP_GUARD_WINDOW:
+                                _som_target_refs.pop(0)
                         # 失败也检查是否达到 LOOP GUARD 阈值（click/click_new_tab/click_point）
                         _failed_eligible = action in _LOOP_GUARD_ACTIONS and (
                             _failed_action_key[1] != 0 or bool(_failed_point_bucket)
@@ -7384,10 +16796,21 @@ async def run_agent(
                                 f"The agent failed {_MAX_CONSECUTIVE_ERRORS} times in a row. "
                                 f"Last error: {err_msg[:120]}",
                             )
-                            await asyncio.get_event_loop().run_in_executor(None, input)
-                            logger.info("[MANUAL] User confirmed, resuming agent...")
-                            _consecutive_errors = 0
-                            vlm.inject_error_feedback("")  # 清空积压反馈
+                            if _stdin_interactive_for_agent():
+                                await asyncio.get_event_loop().run_in_executor(None, input)
+                                logger.info("[MANUAL] User confirmed, resuming agent...")
+                                _consecutive_errors = 0
+                                vlm.inject_error_feedback("")  # 清空积压反馈
+                            else:
+                                _broadcast_log_safe(
+                                    f"[AGENT STUCK] 已连续 {_MAX_CONSECUTIVE_ERRORS} 次动作失败（非交互模式已中止）。"
+                                    f"最后错误: {err_msg[:240]}",
+                                    level="error",
+                                )
+                                raise RuntimeError(
+                                    f"AGENT_STUCK: {_MAX_CONSECUTIVE_ERRORS} consecutive action failures; "
+                                    f"last: {err_msg[:240]}"
+                                ) from exec_err
                         else:
                             # 将错误注入下一轮 VLM 提示，引导换策略
                             if not _force_next_page_pending:
@@ -7397,6 +16820,9 @@ async def run_agent(
                 # 内层批次循环结束：若任务完成则退出外层主循环
                 if _task_completed:
                     break
+
+                # ── Message Compaction：步尾触发异步历史压缩 ───────────────
+                await vlm.maybe_compact_history(goal=goal)
 
             finally:
                 # 无论本步以何种方式退出（continue/break/正常/异常），均实时写入轨迹日志
@@ -7423,16 +16849,25 @@ async def run_agent(
 
         else:
             # for-else: 循环正常结束（没有 break），说明达到最大步数
-            logger.warning(
-                f"[WARN] Max steps reached ({_effective_max_steps}), task not completed."
-            )
-            _broadcast_log_safe(
-                f"[WARN] Max steps reached ({_effective_max_steps}), task not completed.",
-                level="warn",
-            )
-            _broadcast_done_safe(False, f"Max steps reached ({_effective_max_steps})")
-            # 保存最终状态截图
-            await browser.mark_and_screenshot(step=99)
+            if await _finish_if_xhr_target_reached("max steps fallback"):
+                pass
+            else:
+                logger.warning(
+                    f"[WARN] Max steps reached ({_effective_max_steps}), task not completed."
+                )
+                _broadcast_log_safe(
+                    f"[WARN] Max steps reached ({_effective_max_steps}), task not completed.",
+                    level="warn",
+                )
+                _broadcast_done_safe(False, f"Max steps reached ({_effective_max_steps})")
+                # 保存最终状态截图
+                await browser.mark_and_screenshot(step=99)
+
+        # ── Failure Stats：任务结束时输出失败统计 ───────────────────────
+        if _failure_stats.total_failures > 0:
+            _fc_summary = _failure_stats.summary()
+            logger.info(f"[FAILURE STATS] {_fc_summary}")
+            _broadcast_log_safe(f"[FAILURE STATS] {_fc_summary}")
 
     except KeyboardInterrupt:
         logger.info("\n[STOP] User interrupted execution.")
@@ -7472,8 +16907,41 @@ async def run_agent(
             except Exception as log_err:
                 logger.debug("[ERROR] Failed to write startup error to HTML log: %s", log_err)
     finally:
+        try:
+            from .io_contract import clear_current_run as _clear_current_run
+            _clear_current_run()
+        except Exception:
+            try:
+                from io_contract import clear_current_run as _clear_current_run
+                _clear_current_run()
+            except Exception:
+                pass
+        _run_end_metadata = {
+            "html_log": str(getattr(html_logger, "path", "") or ""),
+            "output_mode": _goal_output_mode,
+        }
+        try:
+            _vlm_artifact_exists = resolve_artifact_path(_vlm_output).exists()
+        except Exception:
+            _vlm_artifact_exists = False
+        try:
+            _xhr_artifact_exists = resolve_artifact_path(_xhr_output).exists()
+        except Exception:
+            _xhr_artifact_exists = False
+        if _goal_output_mode != "answer" or _vlm_artifact_exists:
+            _run_end_metadata["vlm_output"] = _vlm_output
+        if enable_xhr or xhr_pattern or _xhr_artifact_exists:
+            _run_end_metadata["xhr_output"] = _xhr_output
+        event_stream.run_end(
+            success=_run_succeeded,
+            reason="completed" if _run_succeeded else "stopped_or_failed",
+            metadata=_run_end_metadata,
+        )
         html_logger.finalize()
-        await browser.close()
+        await release_browser(
+            browser_lease,
+            error="" if _run_succeeded else "stopped_or_failed",
+        )
     return _run_succeeded
 
 

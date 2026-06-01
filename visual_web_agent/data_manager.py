@@ -13,24 +13,78 @@ import re
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Callable
+from typing import Any, Callable
 
 import pandas as pd
 
 try:
-    from .artifact_manager import register_artifact, resolve_artifact_path
+    from .artifact_manager import register_artifact, resolve_artifact_path, resolve_output_path
     from .data_sanitizer import (
         TOOLTIP_INTERNAL_KEY,
         TOOLTIP_UNIQUE_KEY,
         extract_tooltip_primary_key,
     )
+    from .io_contract import (
+        append_manifest_item as _append_manifest_item,
+        current_base_dir as _current_base_dir,
+        current_run_id as _current_run_id,
+    )
 except ImportError:
-    from artifact_manager import register_artifact, resolve_artifact_path
+    from artifact_manager import register_artifact, resolve_artifact_path, resolve_output_path
     from data_sanitizer import (
         TOOLTIP_INTERNAL_KEY,
         TOOLTIP_UNIQUE_KEY,
         extract_tooltip_primary_key,
     )
+    from io_contract import (
+        append_manifest_item as _append_manifest_item,
+        current_base_dir as _current_base_dir,
+        current_run_id as _current_run_id,
+    )
+
+
+_XLSX_MIME = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+def _record_in_run_manifest(
+    abs_path: str,
+    *,
+    rows: int,
+    produced_by: str,
+) -> None:
+    """Best-effort: when a run is active, also write the xlsx into the
+    run-scoped ``manifest.json`` so the IO contract closes for the
+    structured-extraction path that still goes through legacy
+    ``save_to_excel`` instead of the new ``save_artifact`` dispatcher.
+
+    Any failure is swallowed (logged) to keep the legacy hot path safe.
+    """
+    rid = _current_run_id()
+    if not rid:
+        return
+    try:
+        import hashlib
+
+        path_obj = Path(abs_path)
+        if not path_obj.exists():
+            return
+        body = path_obj.read_bytes()
+        sha = hashlib.sha256(body).hexdigest()
+        _append_manifest_item(
+            rid,
+            kind="dataset_rows",
+            path=str(path_obj),
+            size=len(body),
+            sha256=sha,
+            mime=_XLSX_MIME,
+            produced_by=produced_by,
+            extra={"row_count": int(rows or 0)},
+            base_dir=_current_base_dir(),
+        )
+    except Exception as exc:
+        logger.debug("[IO CONTRACT] manifest append for %s skipped: %s", abs_path, exc)
 
 logger = logging.getLogger("vspider.data")
 
@@ -41,6 +95,123 @@ _RESET = "\033[0m"
 
 
 _SYSTEM_COLS = {"_extracted_at", "_row_hash"}
+
+
+def _nested_get(row: dict, path: tuple[str, ...]) -> Any:
+    cur: Any = row
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _feed_labels(row: dict) -> list[str]:
+    labels: list[str] = []
+    category = row.get("category")
+    if isinstance(category, dict):
+        labels.append(_clean_text(category.get("category_name")))
+    for tag in row.get("tags") or []:
+        if isinstance(tag, dict):
+            labels.append(_clean_text(tag.get("tag_name")))
+            labels.append(_clean_text(tag.get("tag_alias")))
+    article = row.get("article_info")
+    if isinstance(article, dict):
+        labels.append(_clean_text(article.get("mark_content")))
+    return [label for label in labels if label]
+
+
+def _is_promoted_feed_row(row: dict) -> bool:
+    labels = " ".join(_feed_labels(row)).lower()
+    return any(
+        marker in labels
+        for marker in ("广告", "推广", "ad", "ads", "sponsored")
+    )
+
+
+def _normalize_intercept_row(row: dict) -> dict | None:
+    """Flatten common feed/article API rows before Excel persistence."""
+    if not isinstance(row, dict):
+        return None
+    source = row.get("item_info") if isinstance(row.get("item_info"), dict) else row
+    ad_payload_keys = ("advertisement_info", "advert_info", "ad_info", "ads_info")
+    if any(isinstance(source.get(key), dict) for key in ad_payload_keys):
+        return None
+    if _clean_text(source.get("advert_id") or row.get("advert_id")):
+        return None
+    if str(source.get("item_type") or row.get("item_type") or "").strip().lower() in {
+        "ad",
+        "ads",
+        "advert",
+        "advertisement",
+        "14",
+    }:
+        return None
+    content = source.get("content") if isinstance(source.get("content"), dict) else {}
+    content_counter = (
+        source.get("content_counter") if isinstance(source.get("content_counter"), dict) else {}
+    )
+    content_author = source.get("author") if isinstance(source.get("author"), dict) else {}
+    if content:
+        title = _clean_text(content.get("title") or source.get("title"))
+        author_name = _clean_text(content_author.get("name") or source.get("author"))
+        digg_count = content_counter.get("like")
+        article_id = _clean_text(content.get("content_id") or source.get("content_id"))
+        if title and (author_name or digg_count is not None):
+            return {
+                "title": title,
+                "author": author_name,
+                "digg_count": digg_count,
+                "url": f"https://juejin.cn/post/{article_id}" if article_id else "",
+                "article_id": article_id,
+            }
+
+    article = source.get("article_info") if isinstance(source.get("article_info"), dict) else {}
+    author = source.get("author_user_info") if isinstance(source.get("author_user_info"), dict) else {}
+    if article:
+        if _is_promoted_feed_row(source):
+            return None
+        title = _clean_text(article.get("title") or source.get("title"))
+        author_name = _clean_text(author.get("user_name") or source.get("author") or source.get("user_name"))
+        digg_count = article.get("digg_count")
+        link_url = _clean_text(article.get("link_url") or source.get("url") or source.get("link_url"))
+        article_id = _clean_text(article.get("article_id") or source.get("article_id"))
+        if not link_url and article_id:
+            link_url = f"https://juejin.cn/post/{article_id}"
+        if title and (author_name or digg_count is not None):
+            tags = [
+                _clean_text(tag.get("tag_name"))
+                for tag in source.get("tags") or []
+                if isinstance(tag, dict) and _clean_text(tag.get("tag_name"))
+            ]
+            return {
+                "title": title,
+                "author": author_name,
+                "digg_count": digg_count,
+                "url": link_url,
+                "article_id": article_id,
+                "tags": ", ".join(tags),
+            }
+    if {"user_name", "articles"} & set(source.keys()) and not {"title", "content", "article_info"} & set(source.keys()):
+        return None
+    return row
+
+
+def _normalize_intercept_rows(rows: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for row in rows or []:
+        item = _normalize_intercept_row(row)
+        if item:
+            normalized.append(item)
+    return normalized
+
+
+def _is_article_dataframe(df: pd.DataFrame) -> bool:
+    return {"title", "author", "digg_count"}.issubset(set(map(str, df.columns)))
 
 _COLUMN_ALIAS_SIGNATURES = {
     "rank": {
@@ -191,7 +362,7 @@ def _normalize_extracted_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             unique_target = f"{target}_{suffix}"
         normalized[unique_target] = series
 
-    return normalized
+    return normalized.dropna(axis=1, how="all")
 
 
 def _fill_sequential_rank_if_safe(df: pd.DataFrame) -> pd.DataFrame:
@@ -461,7 +632,7 @@ def save_to_excel(
         filters: 可选过滤规则
         unique_key: 去重字段
     """
-    filepath = resolve_artifact_path(filename)
+    filepath = resolve_output_path(filename)
 
     # 统一转换为 list[dict]
     if isinstance(data, dict):
@@ -487,7 +658,12 @@ def save_to_excel(
     df_new = pd.DataFrame(data_list)
     abs_path, total = _save_dataframe_to_excel(df_new, filepath, unique_key)
     logger.info(f"[VLM Extract] Saved to: {abs_path} (total {total} rows)")
-    register_artifact(abs_path)
+    register_artifact(
+        abs_path,
+        kind="dataset_rows",
+        mime=_XLSX_MIME,
+        produced_by="vlm_extract",
+    )
     return abs_path
 
 
@@ -515,14 +691,30 @@ def save_intercepted_data(
     Returns:
         保存的文件绝对路径
     """
-    filepath = resolve_artifact_path(filename)
+    filepath = resolve_output_path(filename)
 
     if not json_list or len(json_list) == 0:
         logger.warning("[XHR Intercept] Empty data list, skipping save.")
         return str(filepath.resolve())
 
+    json_list = _normalize_intercept_rows(json_list)
+    if not json_list:
+        logger.warning("[XHR Intercept] All intercepted rows filtered out after normalization.")
+        return str(filepath.resolve())
+
     df_new = pd.DataFrame(json_list)
     new_count = len(df_new)
+    if filepath.exists() and not df_new.empty:
+        try:
+            existing_columns = pd.read_excel(filepath, engine="openpyxl", nrows=0)
+            if _is_article_dataframe(existing_columns) and not _is_article_dataframe(df_new):
+                logger.info(
+                    "[XHR Intercept] Skipping non-article payload because %s already has article schema.",
+                    filepath.name,
+                )
+                return str(filepath.resolve())
+        except Exception:
+            pass
 
     abs_path, total = _save_dataframe_to_excel(df_new, filepath, unique_key)
 
@@ -536,5 +728,10 @@ def save_intercepted_data(
         f"[XHR Intercept] Saved {new_count} new records -> {abs_path} "
         f"(total {total} rows)"
     )
-    register_artifact(abs_path)
+    register_artifact(
+        abs_path,
+        kind="dataset_rows",
+        mime=_XLSX_MIME,
+        produced_by="xhr_intercept",
+    )
     return abs_path
