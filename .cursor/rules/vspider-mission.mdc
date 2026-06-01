@@ -1,0 +1,175 @@
+---
+description: VSpider 项目核心使命与永久工作原则（持久记忆）
+alwaysApply: true
+---
+
+# VSpider 使命与铁律
+
+> **项目宗旨（定稿）**：爬取万物、操控万物，做到**高效、通用、精准、简便**，实现**类人工作模式**。
+> Agent 必须**智能、遇阻即换路**——多角度尝试解决问题，禁止单一路径走到底。
+>
+> 一切工作围绕：**根据用户需求，完成相应操作；爬取万物、操控万物，实现类人工作模式。**
+
+## 一、四字铁律（每一条 PR / 改动都要自检）
+
+1. **准确**：能用 DOM / AX / Playwright / JS 确定性路径，绝不依赖 VLM 视觉猜测；动作必须有可校验的 evidence（readback、selector、bbox、URL/DOM 变化）。
+2. **高效**：最少回合完成目标；能局部感知就不全页 SoM；能 API replay 就不重放浏览器；能缓存就不重抓；避免死循环（用现有 `loop_detector` / `wait_loop_guard` / `submit_loop_guard`）。
+3. **通用**：新能力优先注册进 `action_registry.py`，通过 `capability_router.py` 路由，而不是写死在某条业务分支；不要为单站点写一次性补丁。
+4. **简便**：用户只提供"自然语言目标 + URL（可选附件）"即可启动；前端 / CLI / API 三入口对等；产出文件路径、Run 记录、回放 fixture 必须自动落盘，无需用户手工拼装。
+
+## 一-B、输入契约（input_contract.v1）—— 与输出契约对称
+
+**铁律**：输入**不是"一个 URL + 一个 prompt + 一个 xlsx"**，必须是结构化、可推断、可省略的契约。任何强制 form 字段单 URL / 默认 Excel 的代码都视为 bug。
+
+### 输入契约结构（统一字段）
+
+每个请求在路由阶段都要归一为：
+
+```json
+{
+  "goal": "用户自然语言任务（唯一始终必填）",
+  "urls": [
+    {"url": "https://...", "role": "start | reference | dataset | api | unknown",
+     "system_id": "auto | user-defined", "auth_profile": "auto | <name>"}
+  ],
+  "attachments": [
+    {"path": "temp_uploads/<sha>.xlsx", "filename": "...", "mime": "...",
+     "size": 12345, "sha256": "...", "intent": "batch_rows | upload_to_page | prompt_context | media_source | unknown",
+     "schema": {"columns": ["..."], "url_column": "auto | <name>"}}
+  ],
+  "auth_profiles": ["..."],
+  "model_overrides": { "vlm": {...}, "semantic": {...} },
+  "constraints": { "max_runs": 0, "rate_limit_qps": 0, "allow_cross_system": true }
+}
+```
+
+### 推断与放宽规则
+
+1. **`goal` 是唯一必填**。`urls` 和 `attachments` 都可为空。
+2. **`urls` 缺失时**：planner（semantic LLM）从 `goal` 提取候选 URL，或建议默认入口（搜索引擎 / 站内搜索）；前端可让用户确认，不再前端硬卡。
+3. **`urls` 多条时**：调度器按 `role` + `system_id` 分流：
+   - `start` 多个 → 并行 N 个子 run（共享 manifest）
+   - `start + reference` → 主流程在 start，reference 走 spider_lite/api_replay 旁路
+   - `dataset` → 当 URL 列表来源使用（与 attachments.intent=batch_rows 等价）
+4. **`attachments[i].intent` 必推断**（按 mime + 列名 + goal 语义）：
+   | mime / 后缀 | 默认 intent | 备注 |
+   |---|---|---|
+   | `.csv/.xlsx/.xls/.tsv/.parquet` | `batch_rows` | 走 smart_batch_runner，按行展开 |
+   | `.json/.jsonl/.yaml` | `batch_rows` 或 `prompt_context` | 看是否数组结构 |
+   | `.txt/.md` | `prompt_context` | 拼进 system message |
+   | `.pdf` | `prompt_context`（抽文本）或 `upload_to_page` | 看 goal 是否含"上传/提交此 PDF" |
+   | `.png/.jpg/.webp` | `prompt_context`（多模态喂 VLM）或 `upload_to_page` | 同上 |
+   | `.mp4/.mp3/.zip/<其他>` | `upload_to_page` 或 `media_source` | 默认不解包 |
+   | 含 `url / link / 网址` 列的表 | `batch_rows + dataset_source` | URL 列自动并入 `urls[].role=start` |
+5. **`upload_to_page` 与 `batch_rows` 不再共用入口**：API 必须显式区分（payload 字段或独立路由），不允许"上传 PDF 反而被当 DataFrame 解析炸掉"。
+
+### 文件落盘与治理（强约束）
+
+- **`temp_uploads/` 改为内容寻址**：落盘路径用 `temp_uploads/<sha256>.<ext>`，原 `filename` 只在 `attachments[i].filename` 元数据里保留。
+- **冲突即去重**：同 sha256 直接复用，不重写文件。
+- **TTL + GC**：未被任何 run 引用、且超过 N 小时的文件由后台清理。
+- **大小 / MIME 双校验**：前后端各一遍，后端用真实 `magic bytes` 不信文件名后缀。
+- **占位符不仅服务行**：`{{列名}}` 仅在 `intent=batch_rows` 生效；其他附件以 `{{attachment.<name>.text}}` / `{{attachment.<name>.summary}}` 等键暴露给 prompt 渲染层。
+
+### 跨系统调度（cross_system）
+
+- `urls[].system_id` + `auth_profile` 是一等公民；workflow_graph 已经识别 `cross_system` risk_flag，**execution_kernel 必须真按 system 切 context / 切 storage_state**。
+- 同一 run 内允许有多个 `BrowserSession`，每个 system 独占 cookie / origin / storage；切换由 `route_executor` 按 step.system_id 调度。
+- 数据接力：A 系统产出的 `items` 通过 `WorkflowDataEdge` 喂给 B 系统的 step，不依赖文件落盘。
+
+### 强约束（与输出契约对齐）
+
+- **禁止**任何入口把 `url` 当 form-level 必填。
+- **禁止** `temp_uploads/` 出现 `upload.xlsx` 之类默认文件名兜底。
+- **禁止**把上传文件**只**当批处理 DataFrame；必须先判 intent。
+- 每个 run 必须在 `runs/<run_id>/input_contract.json` 落盘，与 `output_contract.json` 对称，作为复现起点。
+
+## 一-A、输出形态由任务驱动（绝对不允许默认 Excel）
+
+**铁律**：输出**不是固定的 xlsx/csv**，必须由用户任务 + 被抓内容共同推断。任何"默认落盘到 Excel"的代码都视为 bug。
+
+### 输出契约结构（统一字段）
+
+每个 run 必须在路由阶段产出一个 `output_contract`：
+
+```json
+{
+  "mode": "answer | artifact | mixed | default",
+  "output_kind": "answer_text | dataset_rows | dataset_records | media_image | media_video | media_audio | media_pdf | media_archive | file_generic | html_snapshot | screenshot | code_or_text | mixed",
+  "container": "inline_text | xlsx | csv | jsonl | json | files_folder | zip | html | markdown",
+  "fields": ["..."],
+  "post_process": ["dedup", "transcode", "ocr", "thumbnail", "..."],
+  "reasons": ["..."]
+}
+```
+
+### 推断顺序（planner 模型 + 规则双路）
+
+1. **用户显式声明优先**：附件、`--output`、Prompt 里的"存为 PDF / 保存图片 / 输出 markdown / 只回答一个数字"等。
+2. **被抓内容类型其次**：response `Content-Type`、URL 后缀、媒体标签 (`<img> <video> <audio> <a download>`)、文件流大小。
+3. **任务语义最后**：由 planner（semantic LLM）判断"问答 / 数据集 / 媒体下载 / 报告"四大类。
+4. **以上都拿不准** → **保留 mode="default"，把 raw 内容存为 `files_folder/`，并在 `run_summary` 里向用户回写"已抓到 X，未指定输出，请选择落盘形式"，绝不擅自塞进 xlsx**。
+
+### output_kind → container 映射建议（非强制，可被用户覆盖）
+
+| output_kind | 默认 container | 备注 |
+|---|---|---|
+| `answer_text` | `inline_text` | 只回 chat 流，不落盘 |
+| `dataset_rows` | `xlsx` 或 `csv` | 行数 < 100 走 inline + xlsx；> 100 走 jsonl + xlsx |
+| `dataset_records` | `jsonl` | 嵌套结构、不规则字段 |
+| `media_image` | `files_folder` | 同时写 `manifest.json`（url、alt、size、sha256） |
+| `media_video` / `media_audio` | `files_folder` | 大文件断点续传、记录 codec/duration |
+| `media_pdf` | `files_folder` | 可选 OCR/抽文本作为副产物 |
+| `media_archive` | `files_folder` | zip/rar/7z 原样落盘，不自动解压 |
+| `file_generic` | `files_folder` | 未知后缀走通用下载 |
+| `html_snapshot` | `html` | 单页或多页快照，配 selector fingerprint |
+| `screenshot` | `files_folder` | 走 `browser_env.screenshot()` |
+| `mixed` | `files_folder` | 多种产物并存，必须写 `manifest.json` 索引 |
+
+### 强约束
+
+- **禁止**在 `data_manager.py` / `data_export.py` 默认调 `xlsx`，必须读 `output_contract.container`。
+- **禁止**结构化抽取器把图片 URL / 视频 URL 当 row 写进 xlsx 算"完成"——这是把媒体任务伪装成数据任务，必须走 `media_*` 分支真下载。
+- 任何新 action / capability 新增产出，都要在 `ActionResult.output_kind` + `output_path` 上声明，event_stream 必须有对应 `verify` 事件证明文件落地。
+
+## 二、能力分层（动改前先认准所属层）
+
+`intent_planning` → `operations_plane` → `runtime_guards` → `browser_substrate` → `data_plane` → `execution_kernel` → `model_plane`
+
+- 改"决策口径" → `capability_router.py` / `planner_contract.py`
+- 改"动作执行" → `action_registry.py` + `actions.py` 对应 handler
+- 改"风险拦截" → `runtime_guards` 系列（loop / wait / submit / tab / session / drop）
+- 改"数据抽取" → `extraction_engine/` + `data_manager.py` + `spider_lite.py`
+- 改"浏览器底座" → `browser_control.py` / `browser_backend.py` / `browser_pool.py`
+- 改"提示词 / VLM" → `prompts.py` / `prompt_skills.py` / `vlm_client.py`
+
+跨层改动要在 PR/说明里写明"为什么必须跨层"。
+
+## 三、类人工作模式（Human-like）核心信条
+
+- **看 → 想 → 做 → 验证 → 留痕**：每个 turn 必须产出 `ActionResult`（含 evidence）与 `event_stream` 事件，失败时生成 `capability_failure_fixture` 供离线回放。
+- **遇到验证码 / 登录 / 异常** → 走 `auth_harvester` / `human_guard` / `broadcast_human_intervention`，不要硬刷或乱点。
+- **遇到 selector 漂移** → 走 `selector_fingerprint` + `recovery`，不要直接放弃或瞎试。
+- **遇到列表 / 表格** → 优先 `extract_row` / `table_extract` / `list_extract`，禁止全页截图喂 VLM 当万能锤。
+
+## 四、产出契约（不可破坏）
+
+- `browser_action_trace.v1` / `browser_action_issue_summary.v1`
+- `planner_feedback.v1`
+- `input_contract.v1`（见 §一-B，**所有 run 必带，决定输入解读 / 跨系统调度**）
+- `output_contract.v1`（见 §一-A，**所有 run 必带，决定落盘形式**）
+- `capability_failure_fixture` / `capability_failure_replay`
+- `event_stream_<timestamp>.jsonl`
+- `runs/<run_id>/` 下结构：
+  ```
+  runs/<run_id>/
+    input_contract.json      # 任务→urls/attachments/auth/约束的归一化结果
+    output_contract.json     # 任务→输出推断结果
+    manifest.json            # 实际落地的所有产物索引（kind/path/size/sha256/source_url）
+    artifacts/               # 真正的产物：图片 / 视频 / pdf / xlsx / jsonl / html / ...
+    html_trace.html          # 轨迹
+    event_stream.jsonl
+    screenshots/
+  ```
+
+新加字段只能"加"，不能"删/改名"，向下兼容。**`manifest.json` 是用户和下游唯一可信的产物总表，禁止只写 xlsx 不写 manifest。**

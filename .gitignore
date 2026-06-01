@@ -45,3 +45,8 @@ test_page.html
 skyvern-main/
 browser-use-main/
 WebVoyager-main/
+
+# Run + workspace artifacts (regenerated per run; never tracked)
+runs/
+workspace/*
+!workspace/test_assets/

@@ -1,110 +1,181 @@
-# VSpider - 纯视觉网页智能体 (Visual Web Agent)
+# VSpider - Capability-Orchestrated Browser Agent
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-async-green.svg)](https://playwright.dev/python/)
+[![Vue](https://img.shields.io/badge/Vue-3-green.svg)](https://vuejs.org/)
 
-一个基于**纯视觉大模型 (VLM)** 驱动的网页自动化 Agent，专为**离线内网环境**设计。
+VSpider 是一个自研的网页自动化与结构化抽取系统。它从早期的“截图 → SoM 标注 → VLM 决策 → 浏览器操作”循环，演化为 **Capability Router + Browser Control + Runtime Guards + Data Plane + Regression Fixtures** 的分层浏览器智能体。
 
-## 🏗️ 架构
+项目目标是：在网页点击、填写、悬停、翻页、抽取、回放和诊断场景中，优先使用可验证的 DOM/AX/Playwright/JS deterministic 路径；视觉/VLM 能力作为规划、理解和兜底能力，而不是替代所有确定性执行。
 
-```
-截图 → SoM 标注 → VLM 决策 → 浏览器操作 → 循环
-```
+## 当前架构
+
+VSpider 当前按七层能力组织：
 
 ```text
-visual_web_agent/
-├── main.py            # 主程序入口，Agent 核心执行循环
-├── config.py          # 配置管理（.env 加载）
-├── browser_env.py     # Playwright 浏览器封装（导航、截图、操作执行）
-├── vlm_client.py      # VLM 异步客户端（请求、重试、历史记忆）
-├── prompts.py         # System Prompt 定义
-├── data_manager.py    # 数据管理（Excel 保存、去重、过滤）
-├── som_inject.js      # SoM 视觉标记注入脚本
-└── requirements.txt   # 依赖包
+intent_planning
+  capability_router.py       # 意图识别、能力路由、planner feedback
+  planner_contract.py        # execution_plan / risk flags / planner input
+
+operations_plane
+  api_server.py              # FastAPI 应用入口与跨模块集成
+  capability_failure_fixture_api.py
+  artifact_manager.py        # artifact path / URL / registry
+  run_registry.py
+  queue_state.py
+
+runtime_guards
+  loop_detector.py
+  wait_loop_guard.py
+  submit_loop_guard.py
+  tab/session/drop guards
+
+browser_substrate
+  browser_control.py         # 低层浏览器控制 API 与 action trace
+  browser_backend.py         # local / remote Playwright backend
+  browser_pool.py            # runtime status / capacity / health
+  browser_env.py             # Agent loop 使用的 Playwright browser env
+
+data_plane
+  extraction_engine/         # selector / snapshot / recovery / strategies
+  data_manager.py
+  data_sanitizer.py
+  spider_lite.py
+  network_intelligence.py
+
+execution_kernel
+  main.py                    # 主 Agent loop
+  actions.py                 # action handlers
+  action_registry.py         # deterministic tool catalog
+  action_result.py           # structured action evidence
+  route_executor.py
+
+model_plane
+  vlm_client.py
+  prompts.py
+  prompt_skills.py
+  message_compaction.py
 ```
 
-## ✨ 核心特性
+## 核心能力
 
-- **纯视觉驱动**：通过 SoM (Set of Mark) 标注截图 + VLM 决策，无需解析 DOM 结构
-- **Cookie/登录态持久化**：跨次运行复用浏览器会话
-- **XHR/Fetch 自动拦截**：后台静默捕获 API 返回的报表数据
-- **智能元素穿透**：即使 VLM 选中了 wrapper 元素，也能自动定位到真正的 input/button
-- **反检测**：集成 playwright-stealth 隐身衣
-- **对话历史记忆**：VLM 可感知最近操作历史，避免死循环
-- **API 自动重试**：偶发网络错误自动重试
-- **Dialog 自动处理**：alert/confirm/prompt 弹窗自动接受
+- **Capability Router**：将用户目标路由到 browser control、spider、extractor、API replay、human guard 等能力。
+- **Browser Control API**：提供 open、snapshot、click、fill、hover、type、press、scroll、wait、navigate、selector、similar、screenshot 等低层操作。
+- **ActionRef 合约**：归一化 SoM、AX、selector、bbox、browser ref，降低目标定位不稳定性。
+- **Runtime Preflight/Drift/Issue Summary**：在 route、plan、execute、UI 侧展示浏览器 runtime 状态和风险。
+- **Browser Action Trace**：成功/失败 action 都可产生 `browser_action_trace.v1` 与 `browser_action_issue_summary.v1`。
+- **Failure Fixture Regression**：可从 capability execute failure bundle 生成 fixture，离线 replay，批量 replay，查看 history 和 latest-vs-previous trend。
+- **Extraction Engine**：支持结构化抽取、snapshot replay、selector fingerprint/recovery 等离线可复现能力。
+- **Frontend Capability Panel**：展示 capability trace、runtime health、browser action issues、failure fixtures、batch replay history/trend。
 
-## 🚀 快速开始
+## 快速开始
 
-### 1. 安装依赖
+### 安装后端依赖
 
-```bash
-cd visual_web_agent
-pip install -r requirements.txt
+```powershell
+pip install -r visual_web_agent/requirements.txt
 playwright install chromium
 ```
 
-### 2. 配置 VLM
+### 安装前端依赖
 
-```bash
-cp .env.example .env
-# 编辑 .env，填入你的 VLM API 地址和 Key
+```powershell
+npm install --prefix vspider-ui
 ```
 
-### 3. 运行
+### 配置环境变量
 
-```bash
-python main.py --url "http://your-target.com" --goal "你的任务描述"
+```powershell
+Copy-Item .env.example .env
 ```
 
-## 📖 CLI 参数
+编辑 `.env` 或 `visual_web_agent/.env.example` 中对应配置，填入模型服务地址、Key、浏览器后端等参数。
 
-| 参数 | 必填 | 说明 |
-|------|------|------|
-| `--url` | ✅ | 目标网页 URL |
-| `--goal` | ✅ | 自然语言任务描述 |
-| `--user-data-dir` | ❌ | 浏览器数据目录（Cookie 持久化） |
-| `--context` | ❌ | 额外上下文信息 |
-| `--constraints` | ❌ | 操作约束和限制 |
-| `--output` | ❌ | 输出要求 |
+### 启动 API 服务
 
-## 🎯 支持的操作
-
-| 动作 | 说明 |
-|------|------|
-| `click` | 点击元素 |
-| `type` | 输入文本（自动清空 + 逐字键入） |
-| `hover` | 悬停展开下拉菜单 |
-| `scroll` | 页面滚动 |
-| `select` | 原生下拉框选择 |
-| `press_key` | 键盘按键（Enter/Escape/Tab） |
-| `goto` | URL 直接导航 |
-| `extract` | 视觉数据提取 |
-| `extract_link` | 提取元素链接 |
-| `download_image` | 下载图片 |
-| `upload` | 文件上传 |
-| `done` | 任务完成 |
-
-## 📋 运行示例
-
-```bash
-# 登录并查询数据
-python main.py \
-  --url "http://192.168.1.100/login" \
-  --goal "登录营销2.0系统并进入查询页面"
-
-# 带约束的复杂任务
-python main.py \
-  --url "https://example.com" \
-  --goal "导出所有订单数据" \
-  --constraints "如果遇到验证码，执行 ask_human" \
-  --output "保存为 orders.xlsx"
+```powershell
+python api_server.py
 ```
 
-## ⚙️ 环境变量
+### 启动前端
 
-参见 [.env.example](visual_web_agent/.env.example) 了解所有可配置项。
+```powershell
+npm run dev --prefix vspider-ui
+```
 
-## 📄 License
+### 运行 Agent CLI
+
+```powershell
+python -m visual_web_agent.main --url "https://example.com" --goal "提取页面上的列表数据"
+```
+
+## 常用验证命令
+
+Y99 后推荐使用统一验证脚本，避免误扫外部参考仓库或临时目录：
+
+```powershell
+python scripts/validate_y.py y100_capability_fixture_router --target-test tests/test_capability_router.py
+```
+
+该脚本会依次执行：
+
+1. targeted pytest
+2. `npm run build` in `vspider-ui`
+3. core pytest set
+4. full `python -m pytest tests -q`
+
+清理 pytest 临时目录：
+
+```powershell
+python scripts/clean_pytest_tmp.py
+python scripts/clean_pytest_tmp.py --apply
+```
+
+默认 `clean_pytest_tmp.py` 是 dry-run，只有带 `--apply` 才会删除。
+
+## 测试发现规则
+
+根目录 `pytest.ini` 将默认测试发现限制在 `tests/`，并排除：
+
+- `.tmp_*`
+- `tmp*`
+- `workspace`
+- `browser-use-main`
+- `skyvern-main`
+- `WebVoyager-main`
+- `vspider-ui/node_modules`
+- `vspider-ui/dist`
+
+因此推荐使用：
+
+```powershell
+python -m pytest tests -q --basetemp .tmp_pytest_validate_local_full
+```
+
+## 外部参考项目
+
+仓库中可能包含 `browser-use-main`、`skyvern-main`、`WebVoyager-main` 等参考目录。它们用于架构学习和对比，不是 VSpider 的运行时依赖。当前原则是借鉴浏览器状态、工具注册、事件流、selector recovery、视觉 grounding 等模式，但不直接引入 vendor dependency，除非明确需要。
+
+## 运行示例
+
+```powershell
+python -m visual_web_agent.main `
+  --url "https://example.com" `
+  --goal "打开页面，填写搜索条件，并导出结果表格"
+```
+
+```powershell
+python -m visual_web_agent.debug_cli state --url "https://example.com"
+python -m visual_web_agent.debug_cli clickable --url "https://example.com"
+python -m visual_web_agent.debug_cli tools --goal "点击 Next 翻页"
+```
+
+## 相关文档
+
+- `docs/open_source_patterns.md`
+- `docs/vspider_architecture_backlog.md`
+- `docs/AGENT_NOTES.md`
+
+## License
 
 MIT

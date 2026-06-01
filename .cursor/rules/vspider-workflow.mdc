@@ -1,0 +1,63 @@
+---
+description: VSpider 代码库工作规范与已知陷阱
+alwaysApply: true
+---
+
+# VSpider 工程规范
+
+## 一、Windows + CRLF 现实
+
+- `visual_web_agent/*.py` 全部是 **CRLF**。编辑工具用 `\n` 直接 patch 经常"string not found"。
+- 跨空行的大块改动：写 `_patch_<feature>.py`，按字节读、替换、写回，patch 完即删。
+- 不要手数空行；不要假设两个空行 = `\n\n`。
+
+## 二、PowerShell 现实
+
+- `python -c "..."` 在 PS 5/7 会被改写引号 → 改为写临时 `.py` 文件再执行。
+- `tail` / `head` / `grep` 不是 PS 内建，统一用 Cursor 工具（Read / Grep / Glob）。
+- 路径含空格用双引号包；不要用 `ls -la` / `find` / `sed` / `awk`。
+
+## 三、文件体量警戒线
+
+以下文件**已超大**，禁止再灌内容，新功能拆模块：
+
+| 文件 | 体量 | 拆分方向 |
+|---|---|---|
+| `visual_web_agent/main.py` | ~850 KB | Agent loop / phase 拆为 `phases/` |
+| `visual_web_agent/actions.py` | ~314 KB | 按 capability 拆 `actions/<cap>.py` |
+| `visual_web_agent/browser_env.py` | ~207 KB | 浏览器原语 / SoM / AX 各自独立 |
+| `visual_web_agent/vlm_client.py` | ~121 KB | provider / compaction / parser 分离 |
+| `visual_web_agent/prompts.py` | ~101 KB | 与 `prompt_skills.py` 协同拆 |
+| `api_server.py` | ~130 KB | 各业务 router 拆到 `*_api.py` |
+| `vspider-ui/src/App.vue` | ~287 KB | 抽组件到 `components/` 与 `composables/` |
+
+## 四、测试与验证
+
+- 单测目录 **只看 `tests/`**（`pytest.ini` 已 norecursedirs 排除外部参考仓与 tmp）。
+- Y99 之后改动统一走：
+  ```powershell
+  python scripts/validate_y.py <slice_id> --target-test tests/test_<file>.py
+  ```
+  该脚本会跑：定向测试 → `npm run build` → 核心 pytest → 全量 pytest。
+- 不要尝试修 `test_html_logger_can_use_shared_run_id`（Windows AV 锁 tmp，永久 deselect）。
+- 新 deterministic action 必须配 stub-frame 回归（参考 `tests/test_extract_row_and_tree_check.py::_StubLocator`）。
+
+## 五、外部参考仓
+
+`browser-use-main` / `skyvern-main` / `WebVoyager-main` 仅用于**架构学习**，不引入运行时依赖。借鉴模式，但代码不直接 import。
+
+## 六、Action / 能力新增范式
+
+新增一个确定性能力，**必走六步**：
+
+1. 在 `action_registry.py::build_default_action_registry` 注册 `ActionTool`（含 aliases / tags / evidence）。
+2. 在 `actions.py` 写 handler（参考 row_action v2 模板：iframe → selector chain → 最短文本去歧义 → `_click_locator_with_js_fallback` → `browser._tab_switch_notice` → `browser.rpa_trail.append`）。
+3. 在 `capability_router.py` 增/调路由关键字（同时支持中英文正则）。
+4. 在 `prompts.py` / `prompt_skills.py` 加 skill 区块（触发词 + 行为约定）。
+5. 在 `tests/` 加 stub-frame 测试 + 至少一条 agent_case 回归。
+6. 在 `docs/vspider_architecture_backlog.md` 记一行 Slice。
+
+## 七、提交建议
+
+- 小步多 commit：单 handler + 单 prompt + 单测；600 行级 omnibus 重构会被拒。
+- commit message 要写明：能力名 / 影响层 / 是否新增 contract 字段。
