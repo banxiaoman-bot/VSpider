@@ -29,6 +29,7 @@ temp_uploads/
 .pytest_cache/
 pytest-cache-files-*/
 tmp*/
+.tmp_*/
 
 # IDE / tooling
 .claude/
@@ -39,3 +40,8 @@ auto_extract_fallback_*
 
 # Local test pages
 test_page.html
+
+# External reference repos — architecture study only, never tracked (vspider-workflow §5)
+skyvern-main/
+browser-use-main/
+WebVoyager-main/

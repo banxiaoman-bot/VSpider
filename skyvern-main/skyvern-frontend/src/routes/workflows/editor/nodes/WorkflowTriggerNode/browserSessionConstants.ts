@@ -1,4 +1,0 @@
-const PARENT_SESSION_VALUE = "__parent__";
-const FRESH_SESSION_VALUE = "__fresh__";
-
-export { FRESH_SESSION_VALUE, PARENT_SESSION_VALUE };
