@@ -28,6 +28,10 @@ _FULL_CONTENT_RE = re.compile(
     r"\b(full|complete|detail|article|body|premium|vip|unlock)\b|完整|全文|详情|正文|会员|解锁",
     re.I,
 )
+_MARKDOWN_RE = re.compile(
+    r"\b(markdown|readable|reader[ -]?mode|clean text|main content|rag|llm[ -]?friendly)\b|正文提取|转\s*markdown|网页转\s*md|可读正文|喂给?大模型",
+    re.I,
+)
 _FORM_RE = re.compile(r"\b(form|fill|submit|register|input|textbox)\b|表单|填写|填入|提交|输入", re.I)
 _CHAT_RE = re.compile(r"\b(chatgpt|claude|kimi|deepseek|gemini|copilot|chat|ai answer)\b|文心|豆包|通义|元宝|智谱|助手|聊天|对话|AI", re.I)
 _FILE_RE = re.compile(r"\b(upload|download|file|excel|csv|xlsx)\b|上传|下载|文件|导入|导出", re.I)
@@ -481,6 +485,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     crawl = bool(_CRAWL_RE.search(text))
     api = bool(_API_RE.search(text))
     full_content = bool(_FULL_CONTENT_RE.search(text))
+    markdown_doc = bool(_MARKDOWN_RE.search(text))
     form = bool(_FORM_RE.search(text) or "form" in strategy_context.get("capabilities", []))
     chat = bool(_CHAT_RE.search(text) or "chat" in strategy_context.get("capabilities", []))
     file_io = bool(_FILE_RE.search(text))
@@ -494,6 +499,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "crawl": crawl,
         "api_or_network": api or full_content,
         "full_content_preferred": full_content,
+        "markdown_preferred": markdown_doc,
         "form": form,
         "chat": chat,
         "file_io": file_io,
@@ -524,6 +530,8 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
     if signals.get("structured"):
         _add(plan, "generic_extractor", "extraction", "Y6/Y22", ["POST /api/extractor/run", "POST /api/extractor/select"], "Use JSON/HTML table/card/selector extraction before screenshot-based extract.", "deterministic_router")
         _add(plan, "item_pipeline", "post_processing", "Y28", ["GET /api/spider/{run_id}/items"], "Validate fields, required values, dedupe, empty rows, and pagination of extracted items.", "runtime_guards")
+    if signals.get("markdown_preferred"):
+        _add(plan, "page_to_markdown", "extraction", "Y-FITMD", ["ActionRegistry: page_to_markdown"], "Convert the current page into denoised LLM-friendly Markdown (readability denoise + density prune + numbered link references + optional BM25 focus query) for question-answering / RAG feeds instead of full-page screenshots.", "deterministic_router")
     if signals.get("crawl") or (signals.get("structured") and signals.get("artifact_required")):
         _add(plan, "robots_throttle", "crawl_guard", "Y23", ["POST /api/robots/check", "POST /api/robots/reserve"], "Check robots/throttle before spidering or repeated domain fetches.", "runtime_guards")
         _add(plan, "spider_lite", "crawl_extract", "Y24", ["POST /api/spider/run", "GET /api/spider/{run_id}", "GET /api/spider/{run_id}/items"], "Use Spider Lite for multi-page structured extraction with selectors and item pipeline.", "deterministic_router")

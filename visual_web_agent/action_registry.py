@@ -500,6 +500,40 @@ def build_default_action_registry() -> ActionRegistry:
         changes_state=False,
     ))
     register(ActionTool(
+        name="page_to_markdown",
+        capability="extract",
+        description=(
+            "Convert the current page into denoised, LLM-friendly Markdown: "
+            "strips nav/header/footer/aside/script/ads, density-prunes link "
+            "farms, maps headings/lists, and numbers links into a reference "
+            "section. type_value is an optional BM25 focus query that keeps "
+            "only relevant blocks. Writes a markdown_doc artifact + manifest "
+            "and stores the text in memory. Prefer this over a full-page "
+            "screenshot for question-answering / RAG feeds (far fewer tokens)."
+        ),
+        actions=("page_to_markdown",),
+        aliases=(
+            "markdown",
+            "to markdown",
+            "readable",
+            "reader mode",
+            "clean text",
+            "main content",
+            "正文",
+            "正文提取",
+            "转markdown",
+            "转 markdown",
+            "网页转md",
+            "可读正文",
+            "喂给大模型",
+            "RAG",
+        ),
+        tags=("extract", "markdown", "readability", "rag", "deterministic"),
+        evidence=("output_path", "word_count", "link_count", "source_url"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
         name="chat_extract",
         capability="extract",
         description=(

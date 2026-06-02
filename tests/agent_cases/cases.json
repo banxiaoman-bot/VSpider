@@ -580,5 +580,20 @@
       "success": true,
       "min_output_rows": 1
     }
+  },
+  {
+    "id": "fit_markdown_wikipedia_article",
+    "category": "extraction",
+    "capability": [
+      "page_to_markdown",
+      "extract",
+      "readability"
+    ],
+    "url": "https://en.wikipedia.org/wiki/Web_scraping",
+    "goal": "把当前文章页正文转换成干净的 Markdown（去掉导航、侧栏、页脚、脚本），用 page_to_markdown 完成；然后基于得到的 Markdown 正文回答：Web scraping 的定义是什么。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
   }
 ]

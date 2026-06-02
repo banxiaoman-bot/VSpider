@@ -3,7 +3,6 @@ from __future__ import annotations
 import time
 import uuid
 import json
-from collections import deque
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -15,6 +14,7 @@ from visual_web_agent.artifact_manager import artifact_url, register_artifact, r
 from visual_web_agent.extraction_engine import generic
 from visual_web_agent.page_cache import PageCacheMissError, PageResponseCache
 from visual_web_agent.robots_policy import RobotsPolicyManager
+from visual_web_agent.crawl_frontier import build_frontier, normalize_keywords
 
 
 @dataclass
@@ -25,17 +25,50 @@ class FetchResult:
 
 
 class _LinkParser(HTMLParser):
+    """Collect ``(href, anchor_text)`` pairs in document order.
+
+    Anchor text feeds the best-first frontier relevance score
+    (``crawl_frontier.score_url`` weights it at 0.5). Text is accumulated
+    between ``<a href=...>`` and ``</a>`` (including nested inline tags) and
+    whitespace-collapsed on flush. A dangling unclosed ``<a>`` is flushed by
+    :meth:`close`, so callers must ``feed`` then ``close``.
+    """
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.links: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if str(tag or "").lower() != "a":
             return
+        if self._href is not None:
+            self._flush()
         data = {str(k).lower(): v or "" for k, v in attrs}
         href = str(data.get("href") or "").strip()
         if href:
-            self.links.append(href)
+            self._href = href
+            self._text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._href is not None and data:
+            self._text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if str(tag or "").lower() == "a" and self._href is not None:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._href is not None:
+            anchor = " ".join("".join(self._text).split())
+            self.links.append((self._href, anchor))
+        self._href = None
+        self._text = []
+
+    def close(self) -> None:
+        super().close()
+        self._flush()
 
 
 Fetcher = Callable[[str], FetchResult | dict[str, Any] | str]
@@ -143,10 +176,10 @@ class SpiderLiteManager:
         self.runs[run_id] = result
         page_cache = self._page_cache(config)
         result["page_cache"] = page_cache.public_state()
-        queue: deque[tuple[str, int]] = deque((url, 0) for url in config["start_urls"])
+        frontier = build_frontier(config["crawl_strategy"], keywords=config["keywords"], seeds=config["start_urls"])
         seen: set[str] = set()
-        while queue and len(result["pages"]) < config["max_pages"]:
-            url, depth = queue.popleft()
+        while len(frontier) and len(result["pages"]) < config["max_pages"]:
+            url, depth = frontier.pop()
             url = normalize_url(url)
             if not url or url in seen:
                 continue
@@ -176,11 +209,11 @@ class SpiderLiteManager:
             result["pages"].append(page_record)
             result["items"].extend(self._extract_items(fetched, config))
             if config["follow_links"] and depth < config["max_depth"]:
-                for link in extract_links(fetched.html, fetched.url):
-                    if len(seen) + len(queue) >= config["max_pages"] * 5:
+                for link, anchor_text in extract_links_with_anchors(fetched.html, fetched.url):
+                    if len(seen) + len(frontier) >= config["max_pages"] * 5:
                         break
                     if domain_of(link) in config["allowed_domains"] and link not in seen:
-                        queue.append((link, depth + 1))
+                        frontier.push(link, depth + 1, anchor_text=anchor_text)
         pipeline = self._apply_item_pipeline(result["items"], config["item_pipeline"])
         result["items"] = pipeline["items"]
         result["item_pipeline"] = pipeline["stats"]
@@ -353,6 +386,8 @@ class SpiderLiteManager:
             "export_format": str(payload.get("export_format") or payload.get("feed_format") or "jsonl"),
             "export_filename": str(payload.get("export_filename") or payload.get("filename") or ""),
             "item_pipeline": self._item_pipeline_config(payload),
+            "crawl_strategy": _crawl_strategy(payload),
+            "keywords": normalize_keywords(payload.get("keywords") or payload.get("relevance_keywords") or payload.get("relevance_query") or payload.get("crawl_keywords") or ""),
         }
 
     def _item_pipeline_config(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -368,6 +403,14 @@ class SpiderLiteManager:
         if "max_items" not in pipeline and payload.get("max_items") is not None:
             pipeline["max_items"] = payload.get("max_items")
         return pipeline
+
+
+_VALID_CRAWL_STRATEGIES = {"bfs", "best_first"}
+
+
+def _crawl_strategy(payload: dict[str, Any]) -> str:
+    strat = str(payload.get("crawl_strategy") or ("best_first" if payload.get("best_first") else "bfs")).strip().lower()
+    return strat if strat in _VALID_CRAWL_STRATEGIES else "bfs"
 
 
 def default_fetch(url: str) -> FetchResult:
@@ -396,15 +439,20 @@ def coerce_fetch_result(value: FetchResult | dict[str, Any] | str, *, fallback_u
 
 
 def extract_links(html: str, base_url: str) -> list[str]:
+    return [url for url, _anchor in extract_links_with_anchors(html, base_url)]
+
+
+def extract_links_with_anchors(html: str, base_url: str) -> list[tuple[str, str]]:
     parser = _LinkParser()
     parser.feed(str(html or ""))
-    out: list[str] = []
+    parser.close()
+    out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for href in parser.links:
+    for href, anchor in parser.links:
         joined = normalize_url(urljoin(str(base_url or ""), href))
         if joined and joined not in seen:
             seen.add(joined)
-            out.append(joined)
+            out.append((joined, anchor))
     return out
 
 

@@ -604,3 +604,137 @@ Out of scope (deliberate, YAGNI):
 
 - CLI `--upload-file` keeps `set_input_files` (upload_to_page) semantics; no
   new CLI image-as-prompt flag this slice.
+
+
+## Slice FITMD-1: Fit Markdown (page → LLM-friendly Markdown)
+
+Goal:
+
+- Borrow crawl4ai's "fit markdown": turn a full page into denoised,
+  LLM-friendly Markdown for question-answering / RAG, deterministically and
+  with far fewer VLM tokens than a full-page screenshot. Read-only, stub-testable.
+
+Add / change:
+
+- `extraction_engine/fit_markdown.py` — pure `html_to_fit_markdown(html, *,
+  base_url, query, prune, bm25_threshold)`: tag + class/id boilerplate denoise
+  (nav/header/footer/aside/script/ads), density pruning of link-farm blocks,
+  heading/list/blockquote/code mapping, numbered link references (relative URLs
+  resolved against `base_url`), optional BM25 query filter. Zero external deps
+  (stdlib `html.parser`, mirrors `generic.py`).
+- `page_to_markdown_action.py` — `PageToMarkdownHandler` in its **own module**
+  (not appended to `actions.py` per workflow §三). Reads the live tab HTML →
+  fit markdown → writes a `markdown_doc` artifact + manifest entry, mirrors the
+  text into `workflow_memory`, records RPA-trail evidence. `type_value` is an
+  optional BM25 focus query.
+- `vlm_client.VSpiderAction` — `+1` action literal `page_to_markdown`.
+- `actions.py` — bottom trigger-import so the handler self-registers (no new
+  handler body added to the oversized file).
+- `action_registry.py` — `ActionTool` `page_to_markdown` (capability=extract,
+  zh/en aliases, evidence=output_path/word_count/link_count/source_url).
+- `capability_router.py` — `_MARKDOWN_RE` + `markdown_preferred` signal +
+  `page_to_markdown` backend-plan step.
+- `prompts.py` / `prompt_skills.py` — `PAGE_TO_MARKDOWN_SKILL` block +
+  `_PAGE_TO_MARKDOWN_TRIGGERS` + selection wiring.
+- `tests/agent_cases/cases.json` — `fit_markdown_wikipedia_article` regression.
+
+Acceptance:
+
+- `tests/test_fit_markdown.py` 13 passed (denoise / structure / link refs /
+  BM25 query / edge cases).
+- `tests/test_page_to_markdown_handler.py` 8 passed (schema, registration,
+  memory writeback, artifact + manifest persistence, query focus, no-page error).
+- `tests/test_page_to_markdown_router.py` 5 passed (zh/en signal + plan step).
+- `tests/test_page_to_markdown_prompt.py` 5 passed (skill map + prompt injection).
+
+Out of scope (deliberate, separate slices):
+
+- URL Seeder (sitemap / Common Crawl), deep-crawl best-first + resume_state,
+  proxy-chain upgrade, chunking/cosine filtering. These are the other crawl4ai
+  borrow-points and ship independently.
+
+
+## Slice CRAWL-BF1: Best-first deep-crawl frontier (opt-in)
+
+Goal:
+
+- Borrow crawl4ai's best-first deep crawl: pop the most *relevant* link first
+  so the crawler reaches on-topic pages in fewer rounds (mission §一 "高效 /
+  最少回合 / 智能"). The legacy crawl is a FIFO BFS over a `deque`; best-first
+  is strictly opt-in, so default behaviour (and every existing test) is
+  byte-identical.
+
+Add / change:
+
+- `crawl_frontier.py` — new pure module (stdlib only, stub-testable):
+  `normalize_keywords`, `score_url(url, keywords, *, anchor_text)` (keyword hits
+  in URL path/query @1.0 + anchor @0.5), `BFSFrontier` (FIFO, deque-identical),
+  `BestFirstFrontier` (max-heap; tie-breaks score → shallower depth → insertion
+  FIFO; degrades to depth/FIFO when no keywords), `build_frontier(strategy, *,
+  keywords, seeds)` factory (unknown strategy → BFS).
+- `spider_lite.py` — `run()` swaps the raw `deque` for `build_frontier(...)`
+  (push/pop/len only; BFS path unchanged). `_config` adds `crawl_strategy`
+  (`crawl_strategy` / `best_first` flag, validated against {bfs, best_first},
+  default bfs) and `keywords` (`keywords` / `relevance_keywords` /
+  `relevance_query` / `crawl_keywords`). No agent-action / vlm_client change —
+  this is crawl infra, not a new VSpiderAction.
+
+Acceptance:
+
+- `tests/test_crawl_frontier.py` 18 passed (keyword norm, URL scoring, BFS FIFO,
+  best-first ordering + tie-breaks + no-keyword degradation, factory).
+- `tests/test_spider_lite_best_first.py` 5 passed (BFS default unchanged,
+  best-first visits relevant page first, full-order, relevance_query alias,
+  unknown-strategy fallback).
+- `tests/test_spider_lite.py` 9 passed (legacy BFS crawl behaviour intact).
+
+Out of scope (deliberate, next slices):
+
+- Anchor-text-enriched link extraction (richer best-first signal — shipped in
+  CRAWL-BF2 below), URL Seeder (sitemap), resume_state checkpointing,
+  chunking/cosine filtering.
+
+
+## Slice CRAWL-BF2: Anchor-text-enriched link extraction
+
+Goal:
+
+- Wire the dormant anchor-text relevance signal into best-first crawl.
+  CRAWL-BF1's `score_url` already weights anchor text at 0.5, but the legacy
+  link extraction discarded anchor text (kept only `href`), so best-first only
+  ever saw URL-path tokens. Capturing anchor text lets the frontier rank a link
+  whose *URL* is opaque (e.g. `/p?id=42`) but whose *anchor* is on-topic
+  (mission §一 "精准 / 高效 / 最少回合"). Default BFS is byte-identical
+  (it ignores `anchor_text`).
+
+Add / change:
+
+- `spider_lite._LinkParser` — now collects `(href, anchor_text)` pairs:
+  accumulates text between `<a href=...>` and `</a>` (incl. nested inline
+  tags), whitespace-collapses on flush, and flushes a dangling unclosed `<a>`
+  via a `close()` override.
+- `spider_lite.extract_links_with_anchors(html, base_url) -> list[tuple[str,
+  str]]` — new public function (dedup by normalized URL, first anchor wins,
+  document order). `extract_links` is re-expressed on top of it and stays
+  byte-identical (`list[str]`, dedup, order) so every legacy caller/test is
+  untouched.
+- `spider_lite.run()` — follow-links loop now iterates
+  `extract_links_with_anchors(...)` and passes `anchor_text=` into
+  `frontier.push(...)`. No agent-action / vlm_client change — crawl infra only.
+
+Acceptance:
+
+- `tests/test_link_anchor_extraction.py` 8 passed (extract_links backward
+  compat, anchor capture, whitespace/nested-tag collapse, empty anchor, dedup
+  keeps first anchor, unclosed trailing anchor; best-first reorders on an
+  anchor-only keyword while BFS keeps document order).
+- `tests/test_spider_lite.py` 9 + `tests/test_spider_lite_best_first.py` 5 +
+  `tests/test_crawl_frontier.py` 18 still pass (no regression).
+- `scripts/validate_y.py CRAWL-BF2 --target-test
+  tests/test_link_anchor_extraction.py` → target / frontend_build / core /
+  full all exit 0 (full: 2281 passed, 2 skipped).
+
+Out of scope (deliberate, next slices):
+
+- URL Seeder (sitemap / Common Crawl), resume_state checkpointing,
+  chunking/cosine filtering, proxy-chain upgrade.

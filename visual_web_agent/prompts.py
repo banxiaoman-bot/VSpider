@@ -1010,6 +1010,11 @@ _CHAT_ENTRY_TRIGGERS = (
     "ai 回答", "ai回答", "ai 回复", "ai回复",
     "介绍一下", "回答一下", "解释一下",  # common chat-style asks
 )
+_PAGE_TO_MARKDOWN_TRIGGERS = (
+    "markdown", "转md", "转 md", "网页转md", "可读正文", "正文提取", "提取正文",
+    "reader mode", "readable", "clean text", "main content", "去噪正文",
+    "喂给大模型", "喂大模型", "rag", "llm friendly", "llm-friendly", "page to markdown",
+)
 
 
 def _looks_like_login_surface(browser_state: str) -> bool:
@@ -1126,6 +1131,8 @@ def build_system_prompt(
         skills.append("semantic")
     if _text_has_any(haystack, _CHAT_ENTRY_TRIGGERS):
         skills.append("chat_entry")
+    if _text_has_any(haystack, _PAGE_TO_MARKDOWN_TRIGGERS):
+        skills.append("page_to_markdown")
     if _text_has_any(haystack, ("示例", "范例", "few-shot", "few shot")):
         skills.append("few_shot")
 
