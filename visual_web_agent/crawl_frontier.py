@@ -127,25 +127,30 @@ class BestFirstFrontier:
 
     def __init__(self, seeds: Iterable[str] = (), *, keywords: object = ()) -> None:
         self.keywords = normalize_keywords(keywords)
-        self._heap: list[tuple[float, int, int, str]] = []
+        self._heap: list[tuple[float, int, int, str, str]] = []
         self._counter = itertools.count()
         for url in seeds:
             self.push(url, 0)
 
     def push(self, url: str, depth: int, *, anchor_text: str = "") -> None:
-        score = score_url(url, self.keywords, anchor_text=anchor_text)
-        heappush(self._heap, (-score, int(depth), next(self._counter), str(url)))
+        anchor = str(anchor_text or "")
+        score = score_url(url, self.keywords, anchor_text=anchor)
+        heappush(self._heap, (-score, int(depth), next(self._counter), str(url), anchor))
 
     def pop(self) -> tuple[str, int]:
-        _neg_score, depth, _seq, url = heappop(self._heap)
+        _neg_score, depth, _seq, url, _anchor = heappop(self._heap)
         return url, depth
 
     def __len__(self) -> int:
         return len(self._heap)
 
     def snapshot(self) -> list[dict]:
-        """Pending ``[{"url", "depth"}]`` (heap order; re-scored on restore)."""
-        return [{"url": url, "depth": depth} for _neg, depth, _seq, url in self._heap]
+        """Pending ``[{"url", "depth", "anchor_text"}]`` — anchor kept so a
+        best-first resume re-applies the 0.5 anchor weight (CRAWL-RESUME2)."""
+        return [
+            {"url": url, "depth": depth, "anchor_text": anchor}
+            for _neg, depth, _seq, url, anchor in self._heap
+        ]
 
 
 def build_frontier(
@@ -170,5 +175,5 @@ def build_frontier(
     for item in pending or ():
         url = str(item.get("url") or "").strip()
         if url:
-            frontier.push(url, int(item.get("depth") or 0))
+            frontier.push(url, int(item.get("depth") or 0), anchor_text=str(item.get("anchor_text") or ""))
     return frontier

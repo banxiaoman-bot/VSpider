@@ -70,6 +70,19 @@ def test_best_first_frontier_snapshot_and_restore_rescores() -> None:
     assert restored.pop()[0] == "https://e.com/python-guide"
 
 
+def test_best_first_snapshot_preserves_anchor_signal() -> None:
+    # keyword only in the ANCHOR text, never in the URL path.
+    frontier = build_frontier("best_first", keywords=["python"])
+    frontier.push("https://e.com/aaa", 1, anchor_text="boring filler")
+    frontier.push("https://e.com/bbb", 1, anchor_text="python tutorial")
+    snap = frontier.snapshot()
+    # snapshot carries the anchor text so a resume can re-apply the 0.5 weight
+    assert any(item.get("anchor_text") == "python tutorial" for item in snap)
+    restored = build_frontier("best_first", keywords=["python"], pending=snap)
+    # anchor-scored page (bbb) is popped before the URL-only zero-score page
+    assert restored.pop()[0] == "https://e.com/bbb"
+
+
 # --- spider_lite opt-in wiring ---------------------------------------------
 
 HUB = "https://example.com/"
