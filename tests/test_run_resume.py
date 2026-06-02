@@ -14,6 +14,7 @@ from visual_web_agent.run_checkpoint import (
     CHECKPOINT_VERSION,
     RUN_CHECKPOINT_FILENAME,
     ResumeDecision,
+    RunCheckpointer,
     build_checkpoint_state,
     clear_run_checkpoint,
     decide_resume,
@@ -200,3 +201,73 @@ class TestMarkManifestResumed:
         mark_manifest_resumed("run_q", {}, base_dir=tmp_path)
         raw = json.loads((tmp_path / "run_q" / "manifest.json").read_text(encoding="utf-8"))
         assert "resumed_from" not in raw
+
+
+class TestRunCheckpointer:
+    def test_disabled_is_inert(self, tmp_path: Path) -> None:
+        cp = RunCheckpointer.begin("run_off", resume=False, goal="g", base_dir=tmp_path)
+        assert cp.enabled is False
+        assert cp.should_resume is False
+        # record / finish are no-ops that never write a file
+        assert cp.record(3, item_count=5) is None
+        assert cp.finish(False) is None
+        assert load_run_checkpoint("run_off", base_dir=tmp_path) is None
+        assert not (tmp_path / "run_off" / "manifest.json").exists()
+
+    def test_enabled_fresh_writes_then_clears_on_success(self, tmp_path: Path) -> None:
+        cp = RunCheckpointer.begin(
+            "run_on", resume=True, goal="g", start_url="https://a.com", base_dir=tmp_path,
+        )
+        assert cp.enabled is True
+        # fresh run: nothing to resume from
+        assert cp.should_resume is False
+        assert cp.decision.reason == "no_checkpoint"
+
+        cp.record(1, phase="observe", item_count=2, last_action="click")
+        cp.record(4, phase="execute", item_count=9)
+        saved = load_run_checkpoint("run_on", base_dir=tmp_path)
+        assert saved is not None
+        assert saved["turn"] == 4
+        assert saved["status"] == "in_progress"
+        assert saved["item_count"] == 9
+        assert saved["goal"] == "g"
+
+        cp.finish(True)
+        assert load_run_checkpoint("run_on", base_dir=tmp_path) is None
+
+    def test_failure_persists_failed_status(self, tmp_path: Path) -> None:
+        cp = RunCheckpointer.begin("run_fail", resume=True, goal="g", base_dir=tmp_path)
+        cp.record(6, item_count=3)
+        cp.finish(False)
+        saved = load_run_checkpoint("run_fail", base_dir=tmp_path)
+        assert saved is not None
+        assert saved["status"] == "failed"
+        assert saved["turn"] == 6
+        assert saved["item_count"] == 3
+
+    def test_resumes_from_prior_and_marks_manifest(self, tmp_path: Path) -> None:
+        # a prior failed run left a checkpoint
+        prior = build_checkpoint_state(
+            "run_r", goal="g", start_url="https://a.com",
+            turn=5, status="failed", completed_steps=["s1", "s2"], item_count=4,
+        )
+        save_run_checkpoint("run_r", prior, base_dir=tmp_path)
+
+        cp = RunCheckpointer.begin(
+            "run_r", resume=True, goal="g", start_url="https://a.com", base_dir=tmp_path,
+        )
+        assert cp.should_resume is True
+        assert cp.decision.from_turn == 5
+        # manifest got resumed_from provenance
+        raw = json.loads((tmp_path / "run_r" / "manifest.json").read_text(encoding="utf-8"))
+        assert raw["resumed_from"]["turn"] == 5
+        assert raw["resumed_from"]["completed_steps"] == 2
+
+    def test_goal_mismatch_does_not_resume_or_mark(self, tmp_path: Path) -> None:
+        prior = build_checkpoint_state("run_g", goal="old goal", turn=3, status="failed")
+        save_run_checkpoint("run_g", prior, base_dir=tmp_path)
+        cp = RunCheckpointer.begin("run_g", resume=True, goal="new goal", base_dir=tmp_path)
+        assert cp.should_resume is False
+        assert cp.decision.reason == "goal_mismatch"
+        # no resume -> manifest provenance is never written (file stays absent)
+        assert not (tmp_path / "run_g" / "manifest.json").exists()

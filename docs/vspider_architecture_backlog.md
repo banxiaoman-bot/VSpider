@@ -1175,3 +1175,43 @@ Out of scope (deliberate, step 2):
   `clear_run_checkpoint` on success); deterministic partial-run replay; a
   `resume_run` action / prompt skill. Step 1 ships only the primitive + decision
   so the loop wiring lands as a separate reviewable slice.
+
+
+## Slice RUN-RESUME1 (step 2a): RunCheckpointer lifecycle glue
+
+Goal:
+
+- Wrap the step-1 primitives in a single stateful helper so the agent loop needs
+  only a few guarded one-liners (begin / per-turn record / finish), and so the
+  lifecycle (load prior → decide_resume → mark manifest provenance → write each
+  turn → clear on success / persist `failed` on abort) is unit-testable WITHOUT
+  the VLM loop. Opt-in via `constraints.resume`; inert + byte-identical when off.
+
+Add / change:
+
+- `run_checkpoint.RunCheckpointer` — `begin(run_id, *, resume, goal, start_url,
+  base_dir)` (inert when `resume` falsy; else load + `decide_resume` +
+  `mark_manifest_resumed` on a detected resume), `record(turn, *, phase,
+  item_count, last_action, completed_steps, extra)` (atomic `in_progress` write),
+  `finish(success)` (clear on success / write `failed` otherwise),
+  `should_resume` property. **Every method swallows its own I/O errors** so a
+  checkpoint failure can never abort the agent run.
+
+Acceptance:
+
+- `tests/test_run_resume.py` 26 passed (+5: disabled-inert writes nothing;
+  enabled-fresh writes in_progress then clears on success; failure persists
+  `failed`; resume-from-prior marks `manifest.resumed_from`; goal-mismatch
+  neither resumes nor writes a manifest). `py_compile` OK, lint clean.
+
+Out of scope (step 2b + step 3):
+
+- Step 2b: the actual `main.py` wiring — 4 guarded call sites in `run_agent`
+  (`_run_ckpt=None` init near `_run_succeeded`; `RunCheckpointer.begin(_run_ts,
+  resume=bool(run_constraints.get("resume")), goal, start_url)` just before the
+  `for step in range(...)` loop; `record(step, item_count=_total_extracted_rows)`
+  in the step `finally`; `finish(_run_succeeded)` in the teardown `finally`).
+  Held back because it edits the 850KB core loop (a core-link change) and wants
+  an explicit go-ahead per repo rules.
+- Step 3: actually consuming `decision.completed_steps` to skip already-done work
+  (non-deterministic VLM replay) + a `resume_run` action / prompt skill.

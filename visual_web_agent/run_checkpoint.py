@@ -41,6 +41,7 @@ __all__ = [
     "ResumeDecision",
     "decide_resume",
     "mark_manifest_resumed",
+    "RunCheckpointer",
 ]
 
 
@@ -247,3 +248,138 @@ def mark_manifest_resumed(
     manifest = read_manifest(run_id, base_dir=base_dir)
     set_resumed_from(manifest, resumed_from)
     return write_manifest(run_id, manifest, base_dir=base_dir)
+
+
+class RunCheckpointer:
+    """Stateful lifecycle glue around the run-checkpoint primitives (step 2).
+
+    Wraps begin / per-turn record / finish so the agent loop only needs a few
+    guarded one-liners. Opt-in: when ``resume`` is falsy the checkpointer is
+    *inert* (no file written, manifest untouched), preserving the default-off /
+    byte-identical contract. Every method swallows its own I/O errors so a
+    checkpoint failure can never abort the agent run.
+
+    Note: step 2 wires the *write* side (durable per-turn checkpoint) and resume
+    *provenance* (``manifest.resumed_from`` on a detected resume). Actually
+    consuming ``decision.completed_steps`` to skip already-done work in the VLM
+    loop is deferred to step 3 (non-deterministic replay).
+    """
+
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        enabled: bool,
+        goal: str = "",
+        start_url: str = "",
+        base_dir: str | Path | None = None,
+        decision: ResumeDecision | None = None,
+    ) -> None:
+        self.run_id = str(run_id or "")
+        self.enabled = bool(enabled)
+        self.goal = str(goal or "")
+        self.start_url = str(start_url or "")
+        self.base_dir = base_dir
+        self.decision = decision if decision is not None else ResumeDecision(False, reason="resume_disabled")
+        self._completed: list[str] = list(self.decision.completed_steps or [])
+        self._last_turn: int = int(self.decision.from_turn or 0)
+        self._item_count: int = int(self.decision.item_count or 0)
+
+    @classmethod
+    def begin(
+        cls,
+        run_id: str,
+        *,
+        resume: bool,
+        goal: str = "",
+        start_url: str = "",
+        base_dir: str | Path | None = None,
+    ) -> "RunCheckpointer":
+        """Load any prior checkpoint, decide resume, and mark manifest provenance.
+
+        Returns an inert checkpointer when ``resume`` is falsy.
+        """
+
+        if not resume:
+            return cls(
+                run_id, enabled=False, goal=goal, start_url=start_url, base_dir=base_dir,
+                decision=ResumeDecision(False, reason="resume_disabled"),
+            )
+
+        try:
+            prior = load_run_checkpoint(run_id, base_dir=base_dir)
+        except Exception:
+            prior = None
+        decision = decide_resume(prior, resume=True, goal=goal, start_url=start_url)
+        inst = cls(
+            run_id, enabled=True, goal=goal, start_url=start_url, base_dir=base_dir,
+            decision=decision,
+        )
+        if decision.should_resume:
+            try:
+                mark_manifest_resumed(run_id, decision.resumed_from, base_dir=base_dir)
+            except Exception:
+                pass
+        return inst
+
+    def record(
+        self,
+        turn: int,
+        *,
+        phase: str = "",
+        item_count: int | None = None,
+        last_action: str = "",
+        completed_steps: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Path | None:
+        """Persist an ``in_progress`` checkpoint for ``turn``; no-op when disabled."""
+
+        if not self.enabled:
+            return None
+        try:
+            self._last_turn = int(turn or 0)
+            if completed_steps is not None:
+                self._completed = [str(s) for s in completed_steps]
+            if item_count is not None:
+                self._item_count = int(item_count or 0)
+            state = build_checkpoint_state(
+                self.run_id,
+                goal=self.goal,
+                start_url=self.start_url,
+                turn=self._last_turn,
+                phase=phase,
+                status="in_progress",
+                completed_steps=self._completed,
+                item_count=self._item_count,
+                last_action=last_action,
+                extra=extra,
+            )
+            return save_run_checkpoint(self.run_id, state, base_dir=self.base_dir)
+        except Exception:
+            return None
+
+    def finish(self, success: bool) -> Path | None:
+        """Clear the checkpoint on success; persist a ``failed`` one otherwise."""
+
+        if not self.enabled:
+            return None
+        try:
+            if success:
+                clear_run_checkpoint(self.run_id, base_dir=self.base_dir)
+                return None
+            state = build_checkpoint_state(
+                self.run_id,
+                goal=self.goal,
+                start_url=self.start_url,
+                turn=self._last_turn,
+                status="failed",
+                completed_steps=self._completed,
+                item_count=self._item_count,
+            )
+            return save_run_checkpoint(self.run_id, state, base_dir=self.base_dir)
+        except Exception:
+            return None
+
+    @property
+    def should_resume(self) -> bool:
+        return bool(self.decision.should_resume)
