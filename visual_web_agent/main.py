@@ -8272,6 +8272,27 @@ async def run_agent(
         _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
         _tooltip_trigger_keys: set[str] = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
         _pagination_exhausted = False  # 分页已耗尽（滚到底+翻页失败），用于容差退出
+        # RUN-RESUME1 step3a-wire-2b: opt-in resume seed (inert unless constraints.resume).
+        # Rebuild the dedup seen-set from the prior run's dataset so a resumed
+        # run skips rows already on disk and only appends genuinely new ones.
+        if bool((run_constraints or {}).get("resume")):
+            try:
+                try:
+                    from .resume_seed import seed_seen_from_last_run
+                except ImportError:
+                    from resume_seed import seed_seen_from_last_run  # type: ignore[no-redef]
+                _resume_seed = seed_seen_from_last_run(goal, start_url, _run_ts)
+                if _resume_seed.seen:
+                    _seen_extract_row_keys |= _resume_seed.seen
+                    _total_extracted_rows = max(_total_extracted_rows, _resume_seed.count)
+                    logger.info(
+                        "[RUN-RESUME] seeded %s fingerprints / %s rows from prior run %s",
+                        len(_resume_seed.seen),
+                        _resume_seed.count,
+                        _resume_seed.prior_run_id,
+                    )
+            except Exception as _seed_err:
+                logger.debug("[RUN-RESUME] resume seed skipped: %s", _seed_err)
         try:
             from visual_web_agent.completion_kernel import NoProgressTracker
         except ImportError:
@@ -10527,6 +10548,20 @@ async def run_agent(
             )
         except Exception:
             _run_ckpt = None
+
+        # RUN-RESUME1 step3a-wire-2b: register this run in the cross-launch resume
+        # index up-front so a crash mid-run can still be resumed (the next launch
+        # seeds from the prior run's dataset, located via its manifest). Inert
+        # unless constraints.resume.
+        if bool((run_constraints or {}).get("resume")):
+            try:
+                try:
+                    from .resume_seed import record_run_for_resume
+                except ImportError:
+                    from resume_seed import record_run_for_resume  # type: ignore[no-redef]
+                record_run_for_resume(goal, start_url, _run_ts, status="in_progress")
+            except Exception:
+                pass
 
         for step in range(1, _effective_max_steps + 1):
             _check_stop(f"before_step_{step}")
@@ -16963,6 +16998,24 @@ async def run_agent(
                 _run_ckpt.finish(_run_succeeded)
         except Exception:
             pass
+
+        # RUN-RESUME1 step3a-wire-2b: finalize the resume-index entry with the
+        # final row count + status (last-wins upsert). Inert unless resume.
+        if bool((run_constraints or {}).get("resume")):
+            try:
+                try:
+                    from .resume_seed import record_run_for_resume as _rec_resume
+                except ImportError:
+                    from resume_seed import record_run_for_resume as _rec_resume  # type: ignore[no-redef]
+                _rec_resume(
+                    goal,
+                    start_url,
+                    _run_ts,
+                    item_count=_total_extracted_rows,
+                    status="completed" if _run_succeeded else "failed",
+                )
+            except Exception:
+                pass
 
         _run_end_metadata = {
             "html_log": str(getattr(html_logger, "path", "") or ""),
