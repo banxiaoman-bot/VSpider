@@ -11,14 +11,16 @@ The downloader is intentionally minimal:
 - HTTP client is abstracted behind a tiny ``StreamingClient`` protocol so
   unit tests can inject a fake without spinning up sockets.
 
-Range / multi-part download is NOT yet implemented; the function fetches
-the whole resource in one streaming pass. We will graduate to range
-resume in a follow-up slice if traffic patterns demand it.
+Range / If-Range resume is opt-in via ``resume=True`` (DL-RESUME1): a stable
+per-URL ``.part`` + a ``.meta`` validator let an interrupted download continue
+instead of restarting. Default ``resume=False`` keeps the legacy single-pass
+behaviour.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -122,6 +124,76 @@ def _httpx_client(timeout: float, follow_redirects: bool = True) -> StreamingCli
     )
 
 
+def _url_part_key(url: str) -> str:
+    """Stable per-URL key for the resumable ``.part`` filename."""
+    return hashlib.sha256(str(url or "").encode("utf-8")).hexdigest()[:24]
+
+
+def _validator_from_headers(headers: Any) -> str:
+    """ETag (preferred) or Last-Modified, used as the If-Range validator."""
+    try:
+        etag = headers.get("etag") or headers.get("ETag") or ""
+        if etag:
+            return str(etag)
+        return str(headers.get("last-modified") or headers.get("Last-Modified") or "")
+    except AttributeError:
+        return ""
+
+
+def _read_part_validator(meta_path: Path | None) -> str:
+    if meta_path is None or not meta_path.exists():
+        return ""
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        return str(data.get("validator") or "") if isinstance(data, dict) else ""
+    except Exception:
+        return ""
+
+
+def _write_part_validator(meta_path: Path | None, validator: str) -> None:
+    if meta_path is None:
+        return
+    try:
+        meta_path.write_text(
+            json.dumps({"validator": str(validator or "")}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _seed_hasher_from_part(part_name: str, hasher: Any, chunk_size: int) -> tuple[int, bytes]:
+    """Fold an existing ``.part`` into ``hasher`` so a 206 append yields the
+    same sha256 as a single-pass download. Returns ``(bytes_seeded, head_sample)``."""
+    size = 0
+    head_sample = b""
+    try:
+        with open(part_name, "rb") as existing:
+            while True:
+                block = existing.read(max(1, chunk_size))
+                if not block:
+                    break
+                if not head_sample:
+                    head_sample = block[:1024]
+                hasher.update(block)
+                size += len(block)
+    except Exception:
+        return 0, b""
+    return size, head_sample
+
+
+def _discard_part(part_name: str, meta_path: Path | None) -> None:
+    try:
+        Path(part_name).unlink(missing_ok=True)
+    except Exception:
+        pass
+    if meta_path is not None:
+        try:
+            meta_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def download_candidate(
     candidate: MediaCandidate,
     dest_dir: str | Path,
@@ -131,6 +203,7 @@ def download_candidate(
     chunk_size: int = 64 * 1024,
     extra_headers: dict[str, str] | None = None,
     max_bytes: int | None = None,
+    resume: bool = False,
 ) -> DownloadOutcome:
     """Download ``candidate.url`` into ``dest_dir`` with sha256 dedup.
 
@@ -162,12 +235,27 @@ def download_candidate(
                 error=f"client_init_failed: {exc}",
             )
 
-    fd, tmp_name = tempfile.mkstemp(prefix="download.", suffix=".part", dir=str(dest))
+    part_meta_path = None
+    fd = None
+    if resume:
+        part_path = dest / f".{_url_part_key(candidate.url)}.part"
+        part_meta_path = Path(str(part_path) + ".meta")
+        existing_size = part_path.stat().st_size if part_path.exists() else 0
+        if existing_size > 0:
+            headers["Range"] = f"bytes={existing_size}-"
+            _validator = _read_part_validator(part_meta_path)
+            if _validator:
+                headers["If-Range"] = _validator
+        tmp_name = str(part_path)
+    else:
+        fd, tmp_name = tempfile.mkstemp(prefix="download.", suffix=".part", dir=str(dest))
+
     hasher = hashlib.sha256()
     size = 0
     head_sample = b""
     status_code = 0
     response_mime = ""
+    appended = False
 
     try:
         with client.stream("GET", candidate.url, headers=headers, timeout=timeout) as response:  # type: ignore[arg-type]
@@ -178,12 +266,30 @@ def download_candidate(
             except AttributeError:
                 content_type_raw = ""
             response_mime = str(content_type_raw or "").split(";", 1)[0].strip().lower()
+
+            if resume and status_code == 416:
+                _discard_part(tmp_name, part_meta_path)
+                if own_client:
+                    try:
+                        client.close()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                return DownloadOutcome(
+                    ok=False,
+                    candidate=candidate,
+                    final_kind=candidate.kind,
+                    status_code=status_code,
+                    error="range_not_satisfiable",
+                )
+
             if status_code and status_code >= 400:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
-                Path(tmp_name).unlink(missing_ok=True)
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                if not resume:
+                    Path(tmp_name).unlink(missing_ok=True)
                 if own_client:
                     try:
                         client.close()  # type: ignore[attr-defined]
@@ -196,7 +302,17 @@ def download_candidate(
                     status_code=status_code,
                     error=f"http_{status_code}",
                 )
-            with os.fdopen(fd, "wb") as fh:
+
+            appended = bool(resume and status_code == 206 and Path(tmp_name).exists())
+            if resume:
+                _write_part_validator(part_meta_path, _validator_from_headers(response_headers))
+                if appended:
+                    size, head_sample = _seed_hasher_from_part(tmp_name, hasher, chunk_size)
+                file_handle = open(tmp_name, "ab" if appended else "wb")
+            else:
+                file_handle = os.fdopen(fd, "wb")
+
+            with file_handle as fh:
                 for chunk in response.iter_bytes(chunk_size):
                     if not chunk:
                         continue
@@ -208,10 +324,11 @@ def download_candidate(
                     if max_bytes is not None and size > max_bytes:
                         raise OSError(f"size_exceeded_limit:{max_bytes}")
     except Exception as exc:
-        try:
-            Path(tmp_name).unlink(missing_ok=True)
-        except Exception:
-            pass
+        if not resume:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
         if own_client:
             try:
                 client.close()  # type: ignore[attr-defined]
@@ -232,7 +349,8 @@ def download_candidate(
             pass
 
     if size == 0:
-        Path(tmp_name).unlink(missing_ok=True)
+        if not resume:
+            Path(tmp_name).unlink(missing_ok=True)
         return DownloadOutcome(
             ok=False,
             candidate=candidate,
@@ -273,6 +391,11 @@ def download_candidate(
                 status_code=status_code,
                 error=f"rename_failed: {exc}",
             )
+    if part_meta_path is not None:
+        try:
+            part_meta_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     return DownloadOutcome(
         ok=True,
@@ -283,5 +406,5 @@ def download_candidate(
         mime=final_mime,
         final_kind=final_kind,
         status_code=status_code,
-        extra={"response_mime": response_mime, "sniffed_mime": sniffed_mime},
+        extra={"response_mime": response_mime, "sniffed_mime": sniffed_mime, "resumed": bool(appended)},
     )

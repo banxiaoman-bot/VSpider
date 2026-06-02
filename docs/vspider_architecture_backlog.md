@@ -1088,3 +1088,41 @@ Out of scope (deliberate, next slices):
 - Frontend / API toggle to set constraints.resume; content-hash row keys for
   rows without a URL column; resuming the in-flight row (RUN-RESUME1 territory);
   DL-RESUME1 (download Range) and RUN-RESUME1 (agent mid-task checkpoint).
+
+
+## Slice DL-RESUME1: Media downloader HTTP Range / If-Range resume
+
+Goal:
+
+- Close the gap "an interrupted media download restarts from byte 0": opt-in
+  resume continues a partial download via HTTP Range instead of re-fetching the
+  whole resource (mission §一 "高效 — 能不重抓就不重抓"). Default off →
+  byte-identical to the legacy single-pass download.
+
+Add / change:
+
+- `media_harvester/downloader.py` — `download_candidate(..., resume=False)`. When
+  resume, a stable per-URL `.{sha(url)[:24]}.part` (+ a `.meta` validator sidecar)
+  lets a retry send `Range: bytes=<size>-` + `If-Range: <etag|last-modified>`.
+  206 → append (hasher seeded from the existing part so the final sha256 matches a
+  single-pass download); 200 → overwrite (server ignored range / resource changed);
+  416 → discard the stale part and error. On mid-stream failure the `.part` +
+  `.meta` are kept so the next call continues; on success the part is renamed to the
+  content-addressed `<sha>.<ext>` and the meta removed. New helpers: `_url_part_key`,
+  `_validator_from_headers`, `_read_part_validator` / `_write_part_validator`,
+  `_seed_hasher_from_part`, `_discard_part`. `extra.resumed` records the append.
+
+Acceptance:
+
+- `tests/test_download_resume.py` 5 passed (fresh resume sends no Range; partial
+  continues with Range=bytes=200- + If-Range and appends to the right sha; server
+  ignoring range overwrites cleanly; mid-stream failure keeps the .part; the default
+  non-resume path sends no Range and still cleans its .part on failure).
+- `tests/test_media_harvester.py` + `tests/test_media_harvester_agent_hook.py` (53)
+  still pass (resume is additive + opt-in).
+
+Out of scope (deliberate, next slices):
+
+- Wiring resume=True through the harvester / agent download hook + a run policy;
+  parallel multi-part (segmented) download; disk-space / TTL GC of stale `.part`
+  files; RUN-RESUME1 (agent mid-task checkpoint).
