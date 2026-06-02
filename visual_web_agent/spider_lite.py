@@ -179,6 +179,18 @@ class SpiderLiteManager:
         result["page_cache"] = page_cache.public_state()
         frontier = build_frontier(config["crawl_strategy"], keywords=config["keywords"], seeds=config["start_urls"])
         seen: set[str] = set()
+        resume_state = self._load_resume_state(config)
+        if resume_state is not None:
+            seen.update(str(url) for url in (resume_state.get("seen") or []))
+            result["pages"].extend(resume_state.get("pages") or [])
+            result["items"].extend(resume_state.get("items") or [])
+            result["errors"].extend(resume_state.get("errors") or [])
+            frontier = build_frontier(
+                config["crawl_strategy"],
+                keywords=config["keywords"],
+                pending=resume_state.get("pending") or [],
+            )
+            result["resumed"] = True
         while len(frontier) and len(result["pages"]) < config["max_pages"]:
             url, depth = frontier.pop()
             url = normalize_url(url)
@@ -215,6 +227,8 @@ class SpiderLiteManager:
                         break
                     if domain_of(link) in config["allowed_domains"] and link not in seen:
                         frontier.push(link, depth + 1, anchor_text=anchor_text)
+            self._maybe_checkpoint(config, result, seen, frontier)
+        self._maybe_checkpoint(config, result, seen, frontier, force=True)
         pipeline = self._apply_item_pipeline(result["items"], config["item_pipeline"])
         result["items"] = pipeline["items"]
         result["item_pipeline"] = pipeline["stats"]
@@ -383,6 +397,47 @@ class SpiderLiteManager:
         else:
             config["allowed_domains"] = sorted({domain_of(url) for url in merged if domain_of(url)})
 
+    def _load_resume_state(self, config: dict[str, Any]) -> dict[str, Any] | None:
+        """Load a prior checkpoint for ``resume_state_path`` (None if absent)."""
+        path = config.get("resume_state_path")
+        if not path:
+            return None
+        from visual_web_agent.crawl_checkpoint import load_checkpoint
+
+        return load_checkpoint(path)
+
+    def _maybe_checkpoint(
+        self,
+        config: dict[str, Any],
+        result: dict[str, Any],
+        seen: set[str],
+        frontier: Any,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Persist crawl progress to ``resume_state_path`` (opt-in, no-op off).
+
+        Saves every ``checkpoint_every`` pages and once at the end (``force``)
+        so even a crawl shorter than the cadence still leaves a checkpoint.
+        """
+        path = config.get("resume_state_path")
+        if not path:
+            return
+        if not force and len(result["pages"]) % max(1, config.get("checkpoint_every", 1)):
+            return
+        from visual_web_agent.crawl_checkpoint import save_checkpoint
+
+        save_checkpoint(path, {
+            "run_id": config["run_id"],
+            "strategy": config["crawl_strategy"],
+            "keywords": config["keywords"],
+            "seen": sorted(seen),
+            "pending": frontier.snapshot(),
+            "pages": result["pages"],
+            "items": result["items"],
+            "errors": result["errors"],
+        })
+
     def _config(self, payload: dict[str, Any]) -> dict[str, Any]:
         starts = payload.get("start_urls") or payload.get("urls") or []
         if isinstance(starts, str):
@@ -422,6 +477,8 @@ class SpiderLiteManager:
             "crawl_strategy": _crawl_strategy(payload),
             "keywords": normalize_keywords(payload.get("keywords") or payload.get("relevance_keywords") or payload.get("relevance_query") or payload.get("crawl_keywords") or ""),
             "seed_sitemap": seed_sitemap,
+            "resume_state_path": str(payload.get("resume_state_path") or payload.get("resume_state") or "").strip(),
+            "checkpoint_every": max(1, min(int(payload.get("checkpoint_every") or 1), 1000)),
         }
 
     def _item_pipeline_config(self, payload: dict[str, Any]) -> dict[str, Any]:

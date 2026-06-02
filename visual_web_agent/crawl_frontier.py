@@ -112,6 +112,10 @@ class BFSFrontier:
     def __len__(self) -> int:
         return len(self._queue)
 
+    def snapshot(self) -> list[dict]:
+        """Pending ``[{"url", "depth"}]`` in FIFO order (for resume_state)."""
+        return [{"url": url, "depth": depth} for url, depth in self._queue]
+
 
 class BestFirstFrontier:
     """Max-heap frontier: highest relevance first.
@@ -139,19 +143,32 @@ class BestFirstFrontier:
     def __len__(self) -> int:
         return len(self._heap)
 
+    def snapshot(self) -> list[dict]:
+        """Pending ``[{"url", "depth"}]`` (heap order; re-scored on restore)."""
+        return [{"url": url, "depth": depth} for _neg, depth, _seq, url in self._heap]
+
 
 def build_frontier(
     strategy: str,
     *,
     keywords: object = (),
     seeds: Iterable[str] = (),
+    pending: Iterable[dict] = (),
 ):
     """Factory: return the frontier for ``strategy`` seeded at depth 0.
 
     Unknown strategies fall back to :class:`BFSFrontier` so callers never get
-    a surprise crawl-ordering change from a typo.
+    a surprise crawl-ordering change from a typo. ``pending`` restores a
+    snapshot (``[{"url", "depth"}]`` from :meth:`snapshot`) after the seeds —
+    used by ``spider_lite`` resume_state to rebuild an interrupted frontier.
     """
     strat = str(strategy or BFS).strip().lower()
     if strat == BEST_FIRST:
-        return BestFirstFrontier(seeds, keywords=keywords)
-    return BFSFrontier(seeds)
+        frontier: BFSFrontier | BestFirstFrontier = BestFirstFrontier(seeds, keywords=keywords)
+    else:
+        frontier = BFSFrontier(seeds)
+    for item in pending or ():
+        url = str(item.get("url") or "").strip()
+        if url:
+            frontier.push(url, int(item.get("depth") or 0))
+    return frontier

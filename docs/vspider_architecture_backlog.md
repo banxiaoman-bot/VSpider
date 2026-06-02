@@ -819,3 +819,44 @@ Out of scope (deliberate, next slices):
 - Wire chunks into the `page_to_markdown` handler as a `chunks.jsonl` artifact
   (needs an action-schema field — own slice), embedding/cosine chunking,
   semantic/topic segmentation, token-based (vs word) budgets.
+
+
+## Slice CRAWL-RESUME1: Resumable deep-crawl checkpointing (opt-in)
+
+Goal:
+
+- Borrow crawl4ai's resumable deep crawl: a long crawl periodically persists
+  its progress so an interrupted run resumes from the saved frontier instead of
+  re-fetching everything (mission §一 "高效 / 最少回合"; §三 "能缓存就不重抓").
+  Opt-in via `resume_state_path`; default crawl is byte-identical.
+
+Add / change:
+
+- `crawl_checkpoint.py` — new pure module: `save_checkpoint(path, state)`
+  (atomic tmp-file + `os.replace`, makes parent dirs) and `load_checkpoint(path)`
+  (tolerant — missing / corrupt → `None`). No crawl logic, trivially testable.
+- `crawl_frontier.py` — `BFSFrontier.snapshot()` / `BestFirstFrontier.snapshot()`
+  return pending `[{"url", "depth"}]`; `build_frontier(..., pending=...)`
+  restores a snapshot after the seeds (best-first re-scores by URL — anchor is
+  not persisted, a documented best-effort tradeoff).
+- `spider_lite.py` — `_config` reads `resume_state_path` + `checkpoint_every`
+  (default 1, clamped ≤1000). `run()` loads a prior checkpoint (restoring
+  `seen` / `pages` / `items` / `errors` + rebuilding the frontier from
+  `pending`, sets `result["resumed"]=True`), and `_maybe_checkpoint()` saves
+  every `checkpoint_every` pages plus once at the end (`force`). All gated on
+  `resume_state_path`, so the default path adds no keys and no I/O.
+
+Acceptance:
+
+- `tests/test_crawl_resume.py` 8 passed (checkpoint round-trip / missing /
+  corrupt; BFS + best-first snapshot+restore; run writes checkpoint; resume
+  skips already-seen URLs and continues from pending without re-fetch; default
+  run writes nothing and has no `resumed` flag).
+- `tests/test_crawl_frontier.py` 18 + `tests/test_spider_lite.py` 9 +
+  `tests/test_spider_lite_best_first.py` 5 + `tests/test_link_anchor_extraction.py`
+  8 + `tests/test_url_seeder.py` 12 still pass (default crawl byte-identical).
+
+Out of scope (deliberate, next slices):
+
+- Persisting page-response cache alongside the checkpoint, checkpoint
+  compaction / TTL, anchor-preserving best-first resume, cross-process locking.
