@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import hashlib
 import math
 import re
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
@@ -160,6 +160,38 @@ def sanitize_extracted_rows(
         result.accepted += 1
 
     return result
+
+
+def rebuild_seen_fingerprints(
+    rows: Iterable[dict[str, Any]] | None,
+) -> tuple[set[str], int]:
+    """Rebuild the dedup seen-fingerprint set + accepted count from prior rows.
+
+    On a resumed run the previous run's dataset artifact holds the rows already
+    written to disk. Feeding those rows here reconstructs the exact fingerprints
+    :func:`sanitize_extracted_rows` recorded for them -- it reuses the same
+    :func:`_non_empty_values` + :func:`_row_fingerprints` primitives -- so the
+    resumed extraction recognises re-seen rows as duplicates and only appends
+    genuinely new ones. URL identity (``link``/``href`` canonicalised to ``url``
+    at write time) fingerprints stably, so a stored row dedups its raw form.
+
+    Pure: no I/O, deterministic, order-independent for the returned set. Returns
+    ``(seen_fingerprints, accepted_count)`` where ``accepted_count`` counts the
+    non-empty dict rows (restores ``_total_extracted_rows`` on resume).
+    """
+
+    seen: set[str] = set()
+    count = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        clean = _non_empty_values(row)
+        if not clean:
+            continue
+        for fingerprint in _row_fingerprints(clean):
+            seen.add(fingerprint)
+        count += 1
+    return seen, count
 
 
 def extract_tooltip_primary_key(row_dict: dict[str, Any]) -> str:
