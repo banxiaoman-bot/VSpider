@@ -860,3 +860,192 @@ Out of scope (deliberate, next slices):
 
 - Persisting page-response cache alongside the checkpoint, checkpoint
   compaction / TTL, anchor-preserving best-first resume, cross-process locking.
+
+
+## Slice FITMD-3: page_to_markdown emits a chunks.jsonl artifact
+
+Goal:
+
+- Wire FITMD-2 chunking into the `page_to_markdown` handler end-to-end: every
+  run also splits the produced fit-markdown into RAG-ready chunks and persists
+  them, so a downstream RAG / QA step gets ready-to-embed slices for free
+  (mission §一-A "产出形态由任务驱动" — markdown_doc + its chunk index).
+  Achieved *without* a new action-schema field (chunking runs automatically
+  with heading-strategy defaults), so no cross-layer `vlm_client` / `actions`
+  change is needed.
+
+Add / change:
+
+- `page_to_markdown_action.py` — after `html_to_fit_markdown`, run
+  `chunk_markdown(result.markdown, strategy="heading")`, expose `chunk_count` +
+  `chunks_path` in `workflow_memory` and the RPA trail, and add
+  `_persist_chunks()` which writes a `markdown_chunks` jsonl artifact (via
+  `data_writers.write_jsonl`) + manifest entry when a run context is active.
+  Markdown output / `markdown_doc` artifact are unchanged; chunks are additive.
+
+Acceptance:
+
+- `tests/test_page_to_markdown_chunks.py` 5 passed (chunk_count in memory,
+  count present without run context, RPA-trail chunk_count, chunks.jsonl
+  persisted with heading/index/word_count/text, markdown_doc still written
+  alongside).
+- `tests/test_page_to_markdown_handler.py` 8 + `_router.py` 5 + `_prompt.py` 5 +
+  `tests/test_chunking.py` 11 still pass (markdown behaviour unchanged).
+
+Out of scope (deliberate, next slices):
+
+- An action-schema field to pick chunk strategy / max_words / query-rank at call
+  time, embedding/cosine chunking, exposing chunks via the planner contract.
+
+
+## Slice CRAWL-RESUME2: Anchor-preserving best-first resume
+
+Goal:
+
+- Close CRAWL-RESUME1's documented gap: the best-first frontier discarded
+  anchor text after `push`, so a resumed crawl re-scored pending links by URL
+  only and lost the anchor@0.5 relevance signal (CRAWL-BF2). Persist the anchor
+  in the snapshot so resume re-applies it.
+
+Add / change:
+
+- `crawl_frontier.BestFirstFrontier` — heap entries now carry the anchor text
+  (`(-score, depth, seq, url, anchor)`); `snapshot()` emits
+  `{"url", "depth", "anchor_text"}`; `build_frontier(..., pending=)` re-pushes
+  with `anchor_text=`. BFS is unaffected (it ignores anchor). `spider_lite`
+  resume_state therefore round-trips the anchor signal with no handler change.
+
+Acceptance:
+
+- `tests/test_crawl_resume.py` 9 passed (added: snapshot preserves anchor and a
+  restored frontier pops the anchor-only-keyword page first).
+- `tests/test_crawl_frontier.py` 18 + `tests/test_spider_lite_best_first.py` 5 +
+  `tests/test_link_anchor_extraction.py` 8 + `tests/test_spider_lite.py` 9 still
+  pass (heap tie-break unaffected — the unique seq still decides equal scores).
+
+
+## Slice CRAWL-SEED2: URL Seeder HEAD liveness probe + content-type
+
+Goal:
+
+- Borrow crawl4ai's URL-seeder `live_check` / metadata pass: cheaply HEAD-probe
+  candidate URLs (status + content-type, no body) so dead links are dropped
+  before they enter the crawl frontier (mission §一 "高效 / 准确"). Opt-in via an
+  injected `head_fetcher`; absent it, everything is a no-op.
+
+Add / change:
+
+- `url_seeder.UrlSeeder` — `__init__(fetcher, *, head_fetcher=None)`;
+  `_normalize_head(resp)` coerces a head response (dict / object,
+  `status_code` + `content_type` / `headers`) to `(status, content_type)`;
+  `probe_url(url) -> {url, status_code, content_type, live}` (`live` =
+  `200<=status<400`, error / no-fetcher → not-live); `seed_from_sitemap` /
+  `seed_from_robots` gain `live_only=` to filter to live URLs.
+
+Acceptance:
+
+- `tests/test_url_seeder_probe.py` 7 passed (probe live 200 / dead 404 /
+  no-fetcher / error-swallow; live_only drops dead; keep-all default; live_only
+  no-op without head_fetcher).
+- `tests/test_url_seeder.py` 12 still pass (probe is purely additive).
+
+Out of scope (deliberate, next slices):
+
+- Real network HEAD backend, parallel probing, content-type → output_kind
+  routing, last-modified / size metadata scoring.
+
+
+## Slice PROXY-1: Proxy-chain rotation strategy (pure)
+
+Goal:
+
+- Borrow crawl4ai's proxy rotation (RoundRobin / failover): turn the single
+  static proxy (`config.PROXY_SERVER`) into a resilient chain the browser
+  substrate can rotate through (mission §一 "通用 / 遇阻即换路"). Pure rotation
+  + spec parsing now; the `browser_env` wiring is a separate slice because that
+  file is oversized (workflow §三).
+
+Add / change:
+
+- `proxy_chain.py` — new pure module: `parse_proxy(spec)` normalizes
+  `host:port` / `scheme://host:port` / `user:pass@host:port` /
+  `scheme://user:pass@host:port` / dict into a Playwright proxy dict
+  (`{server, username?, password?}`, the shape `browser_env` already feeds
+  Playwright); `ProxyChain(proxies, strategy)` with `current()` / `next()`
+  (round-robin advances, failover holds until `mark_failed()`); `build_proxy_chain`
+  factory (unknown strategy → round-robin, invalid specs dropped).
+
+Acceptance:
+
+- `tests/test_proxy_chain.py` 11 passed (parse: plain / scheme / creds /
+  scheme+creds / dict / empty; round-robin cycle; failover hold + mark_failed;
+  current no-advance; empty chain safe; unknown-strategy fallback; invalid-spec
+  drop).
+
+Out of scope (deliberate, next slices):
+
+- Wire `ProxyChain` into `browser_env` launch + per-context rotation on
+  block / bot-challenge, health scoring, geo/sticky-session pools.
+
+
+## Slice CRAWL-SEED3: URL Seeder real HEAD fetcher (urllib)
+
+Goal:
+
+- Close CRAWL-SEED2's "Real network HEAD backend" gap: ship a production
+  `head_fetcher` so `live_only` seeding works against a live site, not just a
+  stub (mission §一 "高效 — 能不重抓就不重抓"). Opt-in; the default crawl path is
+  unchanged (callers must pass `head_fetcher=default_head_fetch`).
+
+Add / change:
+
+- `url_seeder.default_head_fetch(url, *, timeout=10.0)` — stdlib `urllib`
+  `Request(method="HEAD")` + `urlopen`; returns `{status_code, content_type}`.
+  `HTTPError` (404/500…) keeps its real status via `exc.code`; network / DNS
+  errors collapse to status `0` so `probe_url` reports not-live. Exported in
+  `__all__`; `_normalize_head` already understands the returned dict.
+
+Acceptance:
+
+- `tests/test_url_seeder_probe.py` 11 passed (added 4: HEAD success, HTTPError
+  keeps 404, network error → status 0, default_head_fetch wired into probe_url;
+  all via a monkeypatched `urlopen`, no network).
+
+Out of scope (deliberate, next slices):
+
+- Parallel probing, last-modified / size metadata scoring, content-type →
+  output_kind routing, HEAD→GET fallback for servers that reject HEAD.
+
+
+## Slice PROXY-2: Wire proxy-chain into browser_env launch
+
+Goal:
+
+- Close PROXY-1's "wire ProxyChain into browser_env" gap: the browser substrate
+  resolves its launch proxy from a rotatable chain instead of the single static
+  `PROXY_SERVER` (mission §一 "通用 / 遇阻即换路"). Backward compatible — a lone
+  `PROXY_SERVER` still works; logic lives in `proxy_chain`, not the oversized
+  `browser_env` (workflow §三).
+
+Add / change:
+
+- `proxy_chain.build_chain_from_config(cfg)` — reads `PROXY_CHAIN`
+  (list / comma-str, `round_robin` / `failover`), falling back to a one-entry
+  chain from `PROXY_SERVER` (+ `PROXY_USERNAME` / `PROXY_PASSWORD`); empty chain
+  when nothing is configured. `config` gains `PROXY_CHAIN` / `PROXY_STRATEGY`
+  (env `VSPIDER_PROXY_CHAIN` / `VSPIDER_PROXY_STRATEGY` + `apply_run_constraints`).
+  `browser_env.start()` now sets `_proxy_cfg = build_chain_from_config(config)
+  .current()` and keeps `self._proxy_chain` for future re-route-on-block.
+
+Acceptance:
+
+- `tests/test_proxy_chain.py` 17 passed (added 6: config chain priority, csv
+  split, single-server fallback, empty chain, strategy honored, missing-attrs
+  safe). `tests/test_bot_challenge_extras.py` still passes (config constraints).
+- Full `validate_y` green: target + npm build + core + full (2346 passed,
+  2 skipped).
+
+Out of scope (deliberate, next slices):
+
+- Per-context rotation on block / bot-challenge (`mark_failed()` + relaunch),
+  proxy health scoring, geo / sticky-session pools.
