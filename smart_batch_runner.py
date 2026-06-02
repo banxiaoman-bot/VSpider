@@ -32,6 +32,11 @@ except Exception:
 
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
+# Batch-row resume (BATCH-RESUME1): the orchestrator skips rows already marked
+# done; these drive carrying a prior run's progress back into a fresh DataFrame.
+_RESUME_DONE_STATUS = "成功"
+_URL_KEY_CANDIDATES = ("url", "链接", "网址", "链接地址", "link", "链接url")
+
 
 def _emit_log(message: str, level: str = "info") -> None:
     """统一日志出口：控制台 + WebSocket 广播。"""
@@ -197,6 +202,83 @@ def _run_single_goal(prompt: str) -> str:
     return prompt.strip()
 
 
+def _row_resume_key(df: pd.DataFrame) -> str:
+    """Pick a stable per-row key column for resume matching.
+
+    Prefers a URL-like column (case-insensitive); returns ``""`` when none
+    exists, in which case the caller falls back to positional (row-order)
+    matching against the prior result file.
+    """
+    lower = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in _URL_KEY_CANDIDATES:
+        if candidate in lower:
+            return str(lower[candidate])
+    return ""
+
+
+def _merge_prior_progress(
+    df: pd.DataFrame,
+    prior_df: pd.DataFrame,
+    *,
+    key_col: str = "",
+) -> tuple[pd.DataFrame, int]:
+    """Carry a prior run's *successful* rows into ``df`` so the orchestrator's
+    existing skip-on-``成功`` logic resumes instead of re-running them.
+
+    Only ``填报状态 == "成功"`` is carried — failed / unprocessed rows are left
+    untouched so they get retried. Matching is by ``key_col`` when it is present
+    in both frames (robust to row reorder / inserted rows); otherwise it falls
+    back to positional (row-order) matching. Rows already ``成功`` in ``df`` are
+    left as-is and not re-counted. Returns ``(df, resumed_count)``.
+    """
+    if prior_df is None or "填报状态" not in getattr(prior_df, "columns", []):
+        return df, 0
+    if df is None or df.empty:
+        return df, 0
+    if "填报状态" not in df.columns:
+        df["填报状态"] = "未处理"
+    if "日志备注" not in df.columns:
+        df["日志备注"] = ""
+
+    resumed = 0
+    use_key = bool(key_col) and key_col in df.columns and key_col in prior_df.columns
+    if use_key:
+        prior_has_note = "日志备注" in prior_df.columns
+        done: dict[str, str] = {}
+        for _, prow in prior_df.iterrows():
+            if str(prow.get("填报状态", "")).strip() == _RESUME_DONE_STATUS:
+                key = str(prow.get(key_col, "")).strip()
+                if key:
+                    done[key] = str(prow.get("日志备注", "") or "") if prior_has_note else ""
+        for index, row in df.iterrows():
+            key = str(row.get(key_col, "")).strip()
+            if not key or key not in done:
+                continue
+            if str(row.get("填报状态", "")).strip() == _RESUME_DONE_STATUS:
+                continue
+            df.at[index, "填报状态"] = _RESUME_DONE_STATUS
+            df.at[index, "日志备注"] = done[key] or "上次已成功(续跑跳过)"
+            resumed += 1
+        return df, resumed
+
+    prior_status = list(prior_df["填报状态"])
+    prior_notes = (
+        list(prior_df["日志备注"]) if "日志备注" in prior_df.columns else [""] * len(prior_status)
+    )
+    for pos, index in enumerate(df.index):
+        if pos >= len(prior_status):
+            break
+        if str(prior_status[pos]).strip() != _RESUME_DONE_STATUS:
+            continue
+        if str(df.at[index, "填报状态"]).strip() == _RESUME_DONE_STATUS:
+            continue
+        note = prior_notes[pos] if pos < len(prior_notes) else ""
+        df.at[index, "填报状态"] = _RESUME_DONE_STATUS
+        df.at[index, "日志备注"] = str(note or "上次已成功(续跑跳过)")
+        resumed += 1
+    return df, resumed
+
+
 def _persist_io_contracts_safe(
     *,
     run_id: str,
@@ -260,6 +342,7 @@ async def run_smart_batch(
     run_id: str = "",
     urls: list[str] | None = None,
     run_constraints: dict | None = None,
+    resume: bool = False,
 ) -> bool:
     """
     批处理入口（供 FastAPI BackgroundTasks 调用）。
@@ -400,6 +483,21 @@ async def run_smart_batch(
     output_file = str(resolve_artifact_path(f"{Path(file_path).stem}_处理结果.xlsx", subdir="batch"))
     _emit_log(f"📫 已载入 {total} 条记录，结果文件: {output_file}")
 
+    # BATCH-RESUME1: opt-in断点续跑。resume 显式参数或 run_constraints.resume 任一为真，
+    # 且上次结果文件存在时，把上次「成功」行合并回来，让 orchestrator 自动跳过它们。
+    _rc = run_constraints if isinstance(run_constraints, dict) else {}
+    effective_resume = bool(resume) or bool(_rc.get("resume"))
+    if effective_resume and Path(output_file).exists():
+        try:
+            prior_df = pd.read_excel(output_file)
+            df, _resumed = _merge_prior_progress(df, prior_df, key_col=_row_resume_key(df))
+            if _resumed:
+                _emit_log(f"♻️ [Batch Resume] 从上次结果续跑：跳过 {_resumed}/{total} 行已成功")
+            else:
+                _emit_log("♻️ [Batch Resume] 上次结果无可续行，全量执行")
+        except Exception as resume_exc:
+            _emit_log(f"⚠️ [Batch Resume] 读取上次结果失败，全量重跑: {resume_exc}", level="warn")
+
     def _save_progress() -> None:
         try:
             df.to_excel(output_file, index=False)
@@ -457,6 +555,7 @@ def run_smart_batch_sync(
     run_id: str = "",
     urls: list[str] | None = None,
     run_constraints: dict | None = None,
+    resume: bool = False,
 ) -> bool:
     """CLI 同步入口。
 
@@ -482,6 +581,7 @@ def run_smart_batch_sync(
             run_id=run_id,
             urls=urls,
             run_constraints=run_constraints,
+            resume=resume,
         )
     )
 

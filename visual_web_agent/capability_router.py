@@ -36,7 +36,7 @@ _FORM_RE = re.compile(r"\b(form|fill|submit|register|input|textbox)\b|表单|填
 _CHAT_RE = re.compile(r"\b(chatgpt|claude|kimi|deepseek|gemini|copilot|chat|ai answer)\b|文心|豆包|通义|元宝|智谱|助手|聊天|对话|AI", re.I)
 _FILE_RE = re.compile(r"\b(upload|download|file|excel|csv|xlsx)\b|上传|下载|文件|导入|导出", re.I)
 _CACHE_RE = re.compile(r"\b(cache|record|replay|debug|dev mode)\b|缓存|录制|回放|调试", re.I)
-_QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|metrics)\b|批量|队列|重试|恢复|暂停|指标|监控", re.I)
+_QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|metrics|checkpoint)\b|批量|队列|重试|恢复|续跑|断点|续传|暂停|指标|监控", re.I)
 _BROWSER_RE = re.compile(r"\b(click|scroll|hover|tab|cookie|storage|console|screenshot|browser|locator|selector|similar)\b|点击|滚动|悬停|标签页|浏览器|选择器|相似元素", re.I)
 _AUTH_RE = re.compile(r"\b(login|signin|auth|captcha|2fa|otp)\b|登录|认证|验证码|短信", re.I)
 

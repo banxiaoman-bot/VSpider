@@ -1049,3 +1049,42 @@ Out of scope (deliberate, next slices):
 
 - Per-context rotation on block / bot-challenge (`mark_failed()` + relaunch),
   proxy health scoring, geo / sticky-session pools.
+
+
+## Slice BATCH-RESUME1: Batch-row resume (skip already-successful rows)
+
+Goal:
+
+- Close the gap "an interrupted xlsx batch restarts from row 0": opt-in resume
+  carries a prior run's successful rows back into a freshly-loaded DataFrame so
+  the orchestrator's existing skip-on-成功 logic continues instead of re-running
+  everything (mission §一 "高效 — 能不重抓就不重抓"; §四 长批量最怕跑一半断).
+  Default off → byte-identical to the legacy full re-run.
+
+Add / change:
+
+- `smart_batch_runner.py` — `_row_resume_key(df)` (prefers a URL-like column,
+  else "" → positional match) + `_merge_prior_progress(df, prior_df, key_col=)`
+  (carries only 填报状态=="成功" by key or row position, never downgrades an
+  already-success row, returns resumed_count). `run_smart_batch` /
+  `run_smart_batch_sync` gain `resume: bool`; resume is also read from
+  `run_constraints["resume"]`, so the API path (which already threads
+  run_constraints) needs no api_server change. On resume the prior
+  `<stem>_处理结果.xlsx` (stable artifact path) is merged before the run.
+- `capability_router._QUEUE_RE` — adds 续跑 / 断点 / 续传 / checkpoint keywords.
+
+Acceptance:
+
+- `tests/test_batch_resume.py` 9 passed (key selection; keyed merge carries only
+  success, retries failed, handles reorder / new rows; positional fallback +
+  shorter prior; no-status guard; no-downgrade guard). Pure DataFrame, no
+  agent / network.
+- `tests/test_smart_batch_runner_status.py` / `_dispatch.py` /
+  `test_batch_orchestrator.py` / `test_capability_router.py` still pass (resume
+  is additive + opt-in).
+
+Out of scope (deliberate, next slices):
+
+- Frontend / API toggle to set constraints.resume; content-hash row keys for
+  rows without a URL column; resuming the in-flight row (RUN-RESUME1 territory);
+  DL-RESUME1 (download Range) and RUN-RESUME1 (agent mid-task checkpoint).
