@@ -159,6 +159,7 @@ class SpiderLiteManager:
 
     def run(self, payload: dict[str, Any]) -> dict[str, Any]:
         config = self._config(payload)
+        self._apply_sitemap_seeds(config)
         run_id = config["run_id"]
         created_at = time.time()
         result: dict[str, Any] = {
@@ -351,6 +352,37 @@ class SpiderLiteManager:
             rows.append(item)
         return rows
 
+    def _apply_sitemap_seeds(self, config: dict[str, Any]) -> None:
+        """Opt-in: expand ``start_urls`` from a sitemap before crawling.
+
+        No-op unless ``seed_sitemap`` is set, so the default crawl path stays
+        byte-identical. Seeds discovered via :class:`url_seeder.UrlSeeder` are
+        merged after any explicit ``start_urls`` (deduped, explicit-first) and
+        their hosts are unioned into ``allowed_domains`` so the domain gate in
+        :meth:`run` lets them through.
+        """
+        if not config.get("seed_sitemap"):
+            return
+        from visual_web_agent.url_seeder import UrlSeeder
+
+        seeded = UrlSeeder(self.fetcher).seed_from_sitemap(
+            config["seed_sitemap"],
+            max_urls=max(1, config["max_pages"]) * 5,
+            allowed_domains=config["allowed_domains"] or None,
+        )
+        merged = list(config["start_urls"])
+        seen = set(merged)
+        for url in seeded:
+            if url and url not in seen:
+                seen.add(url)
+                merged.append(url)
+        config["start_urls"] = merged
+        if config["allowed_domains"]:
+            extra = {domain_of(url) for url in seeded if domain_of(url)}
+            config["allowed_domains"] = sorted(set(config["allowed_domains"]) | extra)
+        else:
+            config["allowed_domains"] = sorted({domain_of(url) for url in merged if domain_of(url)})
+
     def _config(self, payload: dict[str, Any]) -> dict[str, Any]:
         starts = payload.get("start_urls") or payload.get("urls") or []
         if isinstance(starts, str):
@@ -359,7 +391,8 @@ class SpiderLiteManager:
         if single:
             starts = [single, *list(starts)]
         start_urls = [normalize_url(url) for url in starts if normalize_url(url)]
-        if not start_urls:
+        seed_sitemap = str(payload.get("seed_sitemap") or payload.get("sitemap") or "").strip()
+        if not start_urls and not seed_sitemap:
             raise ValueError("start_urls are required")
         allowed = payload.get("allowed_domains") or []
         if isinstance(allowed, str):
@@ -388,6 +421,7 @@ class SpiderLiteManager:
             "item_pipeline": self._item_pipeline_config(payload),
             "crawl_strategy": _crawl_strategy(payload),
             "keywords": normalize_keywords(payload.get("keywords") or payload.get("relevance_keywords") or payload.get("relevance_query") or payload.get("crawl_keywords") or ""),
+            "seed_sitemap": seed_sitemap,
         }
 
     def _item_pipeline_config(self, payload: dict[str, Any]) -> dict[str, Any]:

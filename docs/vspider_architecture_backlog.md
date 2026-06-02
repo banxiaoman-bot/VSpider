@@ -736,5 +736,86 @@ Acceptance:
 
 Out of scope (deliberate, next slices):
 
-- URL Seeder (sitemap / Common Crawl), resume_state checkpointing,
-  chunking/cosine filtering, proxy-chain upgrade.
+- URL Seeder (sitemap / Common Crawl — shipped in CRAWL-SEED1 below),
+  resume_state checkpointing, chunking/cosine filtering, proxy-chain upgrade.
+
+
+## Slice CRAWL-SEED1: URL Seeder (sitemap / robots discovery)
+
+Goal:
+
+- Borrow crawl4ai's `AsyncUrlSeeder`: discover a site's URL inventory from
+  `sitemap.xml` / sitemap-index / `robots.txt` so a crawl can start from the
+  site's own map instead of crawling blindly from one page (mission §一
+  "高效 / 通用 / 最少回合"). Pure stdlib parsing + a fetcher-injected walk,
+  stub-testable (no network). Opt-in wiring keeps the default crawl unchanged.
+
+Add / change:
+
+- `url_seeder.py` — new pure module (stdlib only):
+  `parse_sitemap_locs(xml)` (`<loc>` text via `html.parser`, urlset + index),
+  `is_sitemap_index(xml)`, `sitemap_urls_from_robots(robots)` (`Sitemap:`
+  directives), and `UrlSeeder(fetcher)` with `seed_from_sitemap(url, *,
+  max_urls, max_sitemaps, allowed_domains, keywords)` (BFS over sitemaps,
+  recurses indexes, dedup/order/cap, optional domain + `score_url` keyword
+  filter) and `seed_from_robots(url, ...)`. Reuses `crawl_frontier.score_url`
+  and `spider_lite.normalize_url/domain_of`; `spider_lite` imports it lazily
+  (inside `run`) to avoid an import cycle.
+- `spider_lite._config` — reads `seed_sitemap` (`seed_sitemap` / `sitemap`);
+  `start_urls` requirement is relaxed *only* when `seed_sitemap` is present
+  (default error path unchanged).
+- `spider_lite._apply_sitemap_seeds(config)` — opt-in (no-op without
+  `seed_sitemap`): merges discovered seeds after explicit `start_urls`
+  (deduped, explicit-first) and unions their hosts into `allowed_domains` so the
+  domain gate in `run` admits them. Called at the top of `run()`.
+
+Acceptance:
+
+- `tests/test_url_seeder.py` 12 passed (loc parse + whitespace/non-loc tags,
+  index detection, robots directives, flat seed, index recursion, max_urls cap,
+  domain filter, keyword filter, robots entrypoint, spider seed-only run,
+  start_urls-still-required guard).
+- `tests/test_spider_lite.py` 9 + `tests/test_spider_lite_best_first.py` 5 +
+  `tests/test_link_anchor_extraction.py` 8 + `tests/test_crawl_frontier.py` 18
+  still pass (default crawl byte-identical).
+
+Out of scope (deliberate, next slices):
+
+- Common Crawl / search-API seeding, HEAD-based liveness + metadata scoring,
+  resume_state checkpointing, chunking/cosine filtering (shipped in FITMD-2
+  below), proxy-chain upgrade.
+
+
+## Slice FITMD-2: Markdown chunking + BM25 relevance filtering
+
+Goal:
+
+- Borrow crawl4ai's chunking strategies: split FITMD-1 fit-markdown output into
+  RAG-ready chunks and rank / filter them against a query, so downstream
+  question-answering / RAG feeds only the relevant slices of a long page
+  (mission §一 "高效 / 精准 / 最少回合"). Pure stdlib, reuses fit_markdown's
+  BM25 so scoring never drifts. Stub-testable, no consumer behaviour changed.
+
+Add / change:
+
+- `extraction_engine/chunking.py` — new pure module:
+  `Chunk(text, index, word_count, heading)`; `chunk_markdown(md, *, strategy,
+  max_words, overlap, min_words)` with strategies `heading` (split at
+  `#`..`######`, window-split oversized sections, keep section heading),
+  `window` (word-budget packing with overlap), `paragraph` (one per blank-line
+  block); `score_chunks` / `rank_chunks` / `filter_chunks` reusing
+  `fit_markdown._bm25_scores` + `_tokenize` (empty query = no-op).
+
+Acceptance:
+
+- `tests/test_chunking.py` 11 passed (heading sectioning + heading field,
+  oversized-section split, window budget + overlap tail, paragraph mode,
+  min_words drop + reindex, empty input, BM25 score ordering, rank top_k,
+  filter threshold, empty-query passthrough).
+- `tests/test_fit_markdown.py` 13 still pass (BM25 helpers reused, not changed).
+
+Out of scope (deliberate, next slices):
+
+- Wire chunks into the `page_to_markdown` handler as a `chunks.jsonl` artifact
+  (needs an action-schema field — own slice), embedding/cosine chunking,
+  semantic/topic segmentation, token-based (vs word) budgets.
