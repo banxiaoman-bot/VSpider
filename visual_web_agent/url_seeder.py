@@ -119,17 +119,68 @@ def _response_text(fetched: Any) -> str:
     return str(getattr(fetched, "html", "") or "")
 
 
-class UrlSeeder:
-    """Discover seed URLs by walking sitemaps with an injected ``fetcher``."""
+def _normalize_head(resp: Any) -> tuple[int, str]:
+    """Coerce a ``head_fetcher`` return into ``(status_code, content_type)``."""
+    if resp is None:
+        return 0, ""
+    if isinstance(resp, dict):
+        status = resp.get("status_code") or resp.get("status") or 0
+        headers = resp.get("headers") if isinstance(resp.get("headers"), dict) else {}
+        content_type = (
+            resp.get("content_type")
+            or headers.get("content-type")
+            or headers.get("Content-Type")
+            or ""
+        )
+    else:
+        status = getattr(resp, "status_code", 0) or 0
+        content_type = getattr(resp, "content_type", "") or ""
+        if not content_type:
+            headers = getattr(resp, "headers", {}) or {}
+            if isinstance(headers, dict):
+                content_type = headers.get("content-type") or headers.get("Content-Type") or ""
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+    return status, str(content_type or "")
 
-    def __init__(self, fetcher: Fetcher) -> None:
+
+class UrlSeeder:
+    """Discover seed URLs by walking sitemaps with an injected ``fetcher``.
+
+    An optional ``head_fetcher`` (HEAD-style: returns status + content-type, no
+    body) enables :meth:`probe_url` liveness checks and ``live_only`` filtering.
+    """
+
+    def __init__(self, fetcher: Fetcher, *, head_fetcher: Fetcher | None = None) -> None:
         self.fetcher = fetcher
+        self.head_fetcher = head_fetcher
 
     def _fetch_text(self, url: str) -> str:
         try:
             return _response_text(self.fetcher(url))
         except Exception:
             return ""
+
+    def probe_url(self, url: str) -> dict[str, Any]:
+        """HEAD-probe ``url`` → ``{url, status_code, content_type, live}``.
+
+        ``live`` is ``200 <= status < 400``. With no ``head_fetcher`` (or on any
+        error) the URL is reported not-live with status ``0``.
+        """
+        out: dict[str, Any] = {"url": str(url), "status_code": 0, "content_type": "", "live": False}
+        if not self.head_fetcher:
+            return out
+        try:
+            resp = self.head_fetcher(url)
+        except Exception:
+            return out
+        status, content_type = _normalize_head(resp)
+        out["status_code"] = status
+        out["content_type"] = content_type
+        out["live"] = 200 <= status < 400
+        return out
 
     def seed_from_sitemap(
         self,
@@ -139,12 +190,15 @@ class UrlSeeder:
         max_sitemaps: int = 50,
         allowed_domains: Iterable[str] | None = None,
         keywords: object | None = None,
+        live_only: bool = False,
     ) -> list[str]:
         """BFS over ``sitemap_url`` (recursing into sitemap indexes) → page URLs.
 
         ``allowed_domains`` keeps only seeds on those hosts; ``keywords`` keeps
         only seeds whose URL scores > 0 (``crawl_frontier.score_url``). Result is
-        deduped, in document order, capped at ``max_urls``.
+        deduped, in document order, capped at ``max_urls``. ``live_only`` drops
+        URLs that fail a :meth:`probe_url` HEAD check (no-op without a
+        ``head_fetcher``).
         """
         allow = {domain_of(str(d)) for d in (allowed_domains or [])}
         allow.discard("")
@@ -183,6 +237,8 @@ class UrlSeeder:
                 pages.append(page)
                 if len(pages) >= max_urls:
                     break
+        if live_only and self.head_fetcher:
+            pages = [p for p in pages if self.probe_url(p)["live"]]
         return pages
 
     def seed_from_robots(
@@ -193,6 +249,7 @@ class UrlSeeder:
         max_sitemaps: int = 50,
         allowed_domains: Iterable[str] | None = None,
         keywords: object | None = None,
+        live_only: bool = False,
     ) -> list[str]:
         """Read ``robots.txt`` ``Sitemap:`` directives, then seed from each."""
         text = self._fetch_text(robots_url)
@@ -205,6 +262,7 @@ class UrlSeeder:
                 max_sitemaps=max_sitemaps,
                 allowed_domains=allowed_domains,
                 keywords=keywords,
+                live_only=live_only,
             ):
                 if page not in seen:
                     seen.add(page)
