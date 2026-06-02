@@ -1215,3 +1215,39 @@ Out of scope (step 2b + step 3):
   an explicit go-ahead per repo rules.
 - Step 3: actually consuming `decision.completed_steps` to skip already-done work
   (non-deterministic VLM replay) + a `resume_run` action / prompt skill.
+
+
+## Slice RUN-RESUME1 (step 2b): wire RunCheckpointer into the agent loop
+
+Goal:
+
+- Actually call the step-2a checkpointer from `main.py::run_agent` so a real
+  `resume=True` run leaves a durable per-turn `run_checkpoint.json`, records
+  `manifest.resumed_from` when it detects a resumable prior, and clears the
+  checkpoint on success. Opt-in; `resume` unset (default) → fully inert,
+  byte-identical to before.
+
+Add / change:
+
+- `main.py::run_agent` — 4 guarded insertions (+27 lines, additive only):
+  `_run_ckpt = None` init (next to `_run_succeeded`); `RunCheckpointer.begin(
+  _run_ts, resume=bool((run_constraints or {}).get("resume")), goal, start_url)`
+  just before the `for step in range(...)` loop; `_run_ckpt.record(step,
+  item_count=_total_extracted_rows)` in the per-step `finally`;
+  `_run_ckpt.finish(_run_succeeded)` in the run teardown `finally`. Each call is
+  `if _run_ckpt is not None`-guarded and the begin/finish sites are also
+  try/except-wrapped, so a checkpoint failure can never abort or alter a run. The
+  pre-loop early-return fast paths sit upstream of the begin site, so they stay
+  untouched (no checkpoint started → nothing to clear).
+
+Acceptance:
+
+- `validate_y run-resume`: target `tests/test_run_resume.py` 26 passed →
+  `npm run build` ✓ → core 102 passed → **full 2386 passed, 2 skipped** (138s).
+  `py_compile main.py` OK, lint clean, `main.py` EOL (CRLF) preserved, diff +27/-0.
+
+Out of scope (step 3):
+
+- Consuming `decision.completed_steps` / `from_turn` to actually skip already-done
+  work on a resumed VLM run (non-deterministic replay); a `resume_run` action +
+  prompt skill; surfacing resume state into `workflow_memory` / the planner.

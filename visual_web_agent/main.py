@@ -7351,6 +7351,7 @@ async def run_agent(
     action_registry.bind("targeted_probe", _targeted_probe_tool)
     _registry_dispatch_actions = {"hover_and_click", "next_page", "targeted_probe"}
     _run_succeeded = False
+    _run_ckpt = None  # RUN-RESUME1 step2b: run checkpointer (set before the step loop)
     _selected_tools: list[dict] = []
     _capability_route: dict | None = None
     # E1b: runtime cross-system tracker. Built from the capability route's
@@ -10511,6 +10512,21 @@ async def run_agent(
                 "[TAB SESSION] anchor tab index=%s (goal mentions return to first/start tab)",
                 _tab_session_anchor,
             )
+
+        # RUN-RESUME1 step2b: opt-in run checkpoint (inert unless constraints.resume)
+        try:
+            try:
+                from .run_checkpoint import RunCheckpointer
+            except ImportError:
+                from run_checkpoint import RunCheckpointer
+            _run_ckpt = RunCheckpointer.begin(
+                _run_ts,
+                resume=bool((run_constraints or {}).get("resume")),
+                goal=goal,
+                start_url=start_url,
+            )
+        except Exception:
+            _run_ckpt = None
 
         for step in range(1, _effective_max_steps + 1):
             _check_stop(f"before_step_{step}")
@@ -16868,6 +16884,10 @@ async def run_agent(
                     memory_state=dict(workflow_memory),
                 )
 
+                # RUN-RESUME1 step2b: persist a per-turn checkpoint (inert unless resume)
+                if _run_ckpt is not None:
+                    _run_ckpt.record(step, item_count=_total_extracted_rows)
+
         else:
             # for-else: 循环正常结束（没有 break），说明达到最大步数
             if await _finish_if_xhr_target_reached("max steps fallback"):
@@ -16937,6 +16957,13 @@ async def run_agent(
                 _clear_current_run()
             except Exception:
                 pass
+        # RUN-RESUME1 step2b: clear checkpoint on success / persist failed otherwise
+        try:
+            if _run_ckpt is not None:
+                _run_ckpt.finish(_run_succeeded)
+        except Exception:
+            pass
+
         _run_end_metadata = {
             "html_log": str(getattr(html_logger, "path", "") or ""),
             "output_mode": _goal_output_mode,
