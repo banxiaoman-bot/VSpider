@@ -321,6 +321,7 @@ async def run_smart_batch(
             base_goal = _run_single_goal(prompt)
             augmented_goal = base_goal
             upload_path_for_agent = ""
+            prompt_images_for_agent: list[str] = []
             if attachment_result is not None:
                 augmented_goal = _augment_prompt_with_attachment(base_goal, attachment_result)
                 if attachment_intent == "upload_to_page":
@@ -328,10 +329,15 @@ async def run_smart_batch(
                         getattr(attachment_result, "upload_path", "")
                         or (file_path or "")
                     )
+                prompt_images_for_agent = list(
+                    getattr(attachment_result, "image_b64", []) or []
+                )
 
             async def _run_one(**kwargs: object) -> bool:
                 kwargs.setdefault("vlm_options", vlm_options or None)
                 kwargs.setdefault("run_constraints", run_constraints)
+                if prompt_images_for_agent:
+                    kwargs.setdefault("prompt_images", prompt_images_for_agent)
                 return await agent_main.run_agent(**kwargs)
 
             ok_count, total_runs = await run_start_urls_parallel(

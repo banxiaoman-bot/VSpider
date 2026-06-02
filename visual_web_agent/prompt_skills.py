@@ -1123,8 +1123,30 @@ chat.openai.com / claude.ai / 等）上**type 完消息后**：
 """.strip()
 
 
+PAGE_TO_MARKDOWN_SKILL = """
+## Skill: Page → Fit Markdown（整页转 LLM 友好正文）
+适用：把当前页面转成 markdown / 可读正文 / reader mode / 干净正文 / 喂给大模型 / RAG 语料 / 问答前先抽正文。
+
+何时用 page_to_markdown（而不是 extract / 截图）：
+- 目标是“读懂整页内容再回答/总结/问答/做 RAG”，而不是抓结构化表格行。
+- 想省 token：整页截图喂 VLM 很贵，本动作先把正文去噪成 markdown 再读。
+
+用法：
+1. action=page_to_markdown，target_id=0。
+2. type_value 选填：填“聚焦关键词/问题”，用 BM25 只保留相关段落（如 type_value="退款政策"）；不填保留全部正文。
+3. memory_key 选填：默认写到 page_markdown；结果含 {markdown, markdown_path, word_count, links, source_url}。
+
+行为约定：
+1. 自动去掉导航/页眉/页脚/侧栏/脚本/广告，按密度剪掉链接农场块。
+2. 标题→#、列表→-、链接→编号引用 [1] + 末尾 References（相对链接按当前 URL 解析为绝对地址）。
+3. 落盘为 markdown_doc 产物并登记 manifest；正文同时写回 memory，可直接 {{page_markdown.markdown}} 引用。
+4. 只读动作，不改变页面；读完即可基于 memory 里的 markdown 回答或继续下一步。
+""".strip()
+
+
 SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
+    "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,
     "feed_ad_filter": FEED_AD_FILTER_SKILL,

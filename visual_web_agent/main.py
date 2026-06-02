@@ -6854,6 +6854,7 @@ async def run_agent(
     auth_profiles: str | None = None,
     vlm_options: dict | None = None,
     run_constraints: dict | None = None,
+    prompt_images: list[str] | None = None,
 ) -> bool:
     """
     Agent 核心运转循环。
@@ -6890,6 +6891,16 @@ async def run_agent(
         if vlm_options.get("max_tokens") is not None:
             _cfg.VLM_MAX_TOKENS = int(vlm_options["max_tokens"])
         _cfg.VLM_TEXT_ONLY = str(vlm_options.get("model_type", "")).lower() == "text"
+
+    # MM-2: prompt_context image attachments ride along into vlm.ask(extra_images=).
+    # Schedule is deterministic + configurable (default adaptive) to bound tokens.
+    try:
+        from .prompt_image_policy import should_include_prompt_images as _should_include_prompt_images
+    except ImportError:
+        from prompt_image_policy import should_include_prompt_images as _should_include_prompt_images
+    _prompt_image_policy = str((vlm_options or {}).get("prompt_image_policy", "adaptive"))
+    _prompt_images = list(prompt_images or [])
+    _last_prompt_image_url: str | None = None
 
     # 每次运行生成独立的带时间戳文件名，避免多次运行数据混在一起
     _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -11332,6 +11343,13 @@ async def run_agent(
                             logger.debug("[RECOVERY CHAIN] skipped: %s", _rc_err)
                             decisions = None
                     if decisions is None:
+                        _cur_url = getattr(browser, "current_url", "") or start_url
+                        _send_prompt_imgs = bool(_prompt_images) and _should_include_prompt_images(
+                            step,
+                            policy=_prompt_image_policy,
+                            last_sent_url=_last_prompt_image_url,
+                            current_url=_cur_url,
+                        )
                         decisions = await vlm.ask(
                             screenshot_b64,
                             goal,
@@ -11342,7 +11360,10 @@ async def run_agent(
                             max_steps=_effective_max_steps,
                             som_elements=getattr(browser, "_last_som_elements", None),
                             capability_route=_capability_route,
+                            extra_images=(_prompt_images if _send_prompt_imgs else None),
                         )
+                        if _send_prompt_imgs:
+                            _last_prompt_image_url = _cur_url
                     try:
                         from api_server import broadcast_phase
 

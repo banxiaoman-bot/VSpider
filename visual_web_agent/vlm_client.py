@@ -168,6 +168,7 @@ class VSpiderAction(BaseModel):
         "set_prompt_response", # 预装填下一次原生 prompt() 的回答（一次性）
         "chat_extract",   # 通用 AI 聊天回答提取：等待流式完成 + 选择器级联 + 兜底大文本块，避开"搜索-然后-回答"页面的搜索结果干扰
         "chat_submit",    # 通用 AI 聊天发送按钮点击：当 SoM 漏标了图标式发送按钮（<div>+SVG）或 press_key Enter 无效时使用；底层用启发式 locator 直接点击
+        "page_to_markdown", # 整页 HTML→去噪 LLM 友好 Markdown：type_value=可选聚焦 query，落 markdown_doc 产物 + 写回 memory
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(
         default=0,

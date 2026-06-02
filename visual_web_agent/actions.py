@@ -6510,3 +6510,14 @@ class ChatSubmitHandler(ActionHandler):
             logger.debug("[chat_submit] rpa_trail append failed: %s", _trail_err)
 
         return None
+
+
+# ── Out-of-module capability handlers ────────────────────────────────────────
+# New deterministic capabilities ship as their own modules (workflow rule §三:
+# actions.py is oversized — do not add more handler bodies here). Importing the
+# module triggers its @ActionRegistry.register decorator so the agent loop can
+# dispatch the new action by name.
+try:
+    from . import page_to_markdown_action as _page_to_markdown_action  # noqa: F401
+except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
+    import page_to_markdown_action as _page_to_markdown_action  # type: ignore  # noqa: F401
