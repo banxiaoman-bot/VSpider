@@ -26,6 +26,7 @@ __all__ = [
     "parse_proxy",
     "ProxyChain",
     "build_proxy_chain",
+    "build_chain_from_config",
 ]
 
 ROUND_ROBIN = "round_robin"
@@ -119,4 +120,38 @@ class ProxyChain:
 
 def build_proxy_chain(specs: Iterable[Any], *, strategy: str = ROUND_ROBIN) -> ProxyChain:
     """Factory: build a :class:`ProxyChain`; unknown strategy → round-robin."""
+    return ProxyChain(specs, strategy=strategy)
+
+
+def build_chain_from_config(cfg: Any) -> ProxyChain:
+    """Build a :class:`ProxyChain` from a config module / object.
+
+    Reads ``PROXY_CHAIN`` (list, or comma-separated str) first; falls back to a
+    single-entry chain assembled from ``PROXY_SERVER`` (+ ``PROXY_USERNAME`` /
+    ``PROXY_PASSWORD``) for backward compatibility with the legacy single static
+    proxy. Returns an empty chain (``current() is None``) when nothing is
+    configured. ``PROXY_STRATEGY`` (default round-robin) picks the rotation.
+
+    This is the seam ``browser_env`` uses so proxy logic stays out of that
+    oversized file (workflow §三).
+    """
+    specs: list[Any] = []
+    chain_specs = getattr(cfg, "PROXY_CHAIN", None) or []
+    if isinstance(chain_specs, str):
+        chain_specs = [p.strip() for p in chain_specs.split(",") if p.strip()]
+    for spec in chain_specs:
+        if spec:
+            specs.append(spec)
+    if not specs:
+        server = str(getattr(cfg, "PROXY_SERVER", "") or "").strip()
+        if server:
+            single: dict[str, str] = {"server": server}
+            user = str(getattr(cfg, "PROXY_USERNAME", "") or "").strip()
+            pwd = str(getattr(cfg, "PROXY_PASSWORD", "") or "").strip()
+            if user:
+                single["username"] = user
+            if pwd:
+                single["password"] = pwd
+            specs.append(single)
+    strategy = str(getattr(cfg, "PROXY_STRATEGY", ROUND_ROBIN) or ROUND_ROBIN).strip().lower()
     return ProxyChain(specs, strategy=strategy)

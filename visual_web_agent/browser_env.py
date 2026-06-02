@@ -1722,17 +1722,22 @@ class BrowserEnv:
         )
 
         logger.info(f"Launching persistent context: {user_data_path.resolve()}")
-        _proxy_cfg = None
-        _proxy_server = str(getattr(config, "PROXY_SERVER", "") or "").strip()
-        if _proxy_server:
-            _proxy_cfg = {"server": _proxy_server}
-            _proxy_user = str(getattr(config, "PROXY_USERNAME", "") or "").strip()
-            _proxy_pass = str(getattr(config, "PROXY_PASSWORD", "") or "").strip()
-            if _proxy_user:
-                _proxy_cfg["username"] = _proxy_user
-            if _proxy_pass:
-                _proxy_cfg["password"] = _proxy_pass
-            logger.info("[BROWSER] proxy enabled: %s", _proxy_server)
+        # proxy: single static (PROXY_SERVER) or rotating chain (PROXY_CHAIN),
+        # resolved by the proxy_chain module so the logic stays out of this
+        # oversized file (workflow section 3); self._proxy_chain is kept for
+        # future re-route-on-block rotation.
+        try:
+            from visual_web_agent.proxy_chain import build_chain_from_config
+            self._proxy_chain = build_chain_from_config(config)
+        except Exception:
+            self._proxy_chain = None
+        _proxy_cfg = self._proxy_chain.current() if self._proxy_chain else None
+        if _proxy_cfg:
+            logger.info(
+                "[BROWSER] proxy enabled: %s (chain=%d)",
+                _proxy_cfg.get("server", ""),
+                len(self._proxy_chain),
+            )
 
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_path.resolve()),

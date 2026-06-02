@@ -10,8 +10,11 @@ wiring is a separate slice (browser_env.py is oversized per workflow §三).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from visual_web_agent.proxy_chain import (
     ProxyChain,
+    build_chain_from_config,
     build_proxy_chain,
     parse_proxy,
 )
@@ -96,3 +99,53 @@ def test_invalid_specs_are_dropped() -> None:
     chain = build_proxy_chain(["", None, "good:1", {"server": ""}])
     assert len(chain) == 1
     assert chain.next()["server"] == "good:1"
+
+
+# --- build_chain_from_config (browser_env seam) ----------------------------
+
+def test_config_chain_takes_priority() -> None:
+    cfg = SimpleNamespace(PROXY_CHAIN=["a:1", "b:2"], PROXY_SERVER="ignored:9", PROXY_STRATEGY="round_robin")
+    chain = build_chain_from_config(cfg)
+    assert len(chain) == 2
+    assert chain.next()["server"] == "a:1"
+    assert chain.next()["server"] == "b:2"
+
+
+def test_config_comma_string_chain_is_split() -> None:
+    cfg = SimpleNamespace(PROXY_CHAIN="a:1, b:2 , c:3", PROXY_SERVER="")
+    chain = build_chain_from_config(cfg)
+    assert len(chain) == 3
+
+
+def test_config_falls_back_to_single_static_server() -> None:
+    cfg = SimpleNamespace(
+        PROXY_CHAIN=[],
+        PROXY_SERVER="1.2.3.4:8080",
+        PROXY_USERNAME="u",
+        PROXY_PASSWORD="p",
+    )
+    chain = build_chain_from_config(cfg)
+    assert len(chain) == 1
+    assert chain.current() == {"server": "1.2.3.4:8080", "username": "u", "password": "p"}
+
+
+def test_config_empty_chain_when_no_proxy() -> None:
+    cfg = SimpleNamespace(PROXY_CHAIN=[], PROXY_SERVER="")
+    chain = build_chain_from_config(cfg)
+    assert len(chain) == 0
+    assert chain.current() is None
+
+
+def test_config_strategy_is_honored() -> None:
+    cfg = SimpleNamespace(PROXY_CHAIN=["a:1", "b:2"], PROXY_SERVER="", PROXY_STRATEGY="failover")
+    chain = build_chain_from_config(cfg)
+    assert chain.strategy == "failover"
+    assert chain.next()["server"] == "a:1"
+    assert chain.next()["server"] == "a:1"
+
+
+def test_config_missing_attrs_safe() -> None:
+    # a bare object with no proxy attributes at all -> empty chain, no crash
+    chain = build_chain_from_config(SimpleNamespace())
+    assert len(chain) == 0
+    assert chain.current() is None
