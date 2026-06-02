@@ -10,8 +10,9 @@ Stub head fetcher (a plain dict map); no network.
 
 from __future__ import annotations
 
+from visual_web_agent import url_seeder
 from visual_web_agent.spider_lite import FetchResult
-from visual_web_agent.url_seeder import UrlSeeder
+from visual_web_agent.url_seeder import UrlSeeder, default_head_fetch
 
 
 URLSET = (
@@ -87,3 +88,48 @@ def test_live_only_is_noop_without_head_fetcher() -> None:
     seeder = _seeder(with_head=False)
     seeds = seeder.seed_from_sitemap("https://e.com/sitemap.xml", live_only=True)
     assert seeds == ["https://e.com/live", "https://e.com/dead"]
+
+
+# --- default_head_fetch: real HEAD via urllib (urlopen monkeypatched) ------
+
+class _FakeHeadResp:
+    def __init__(self, status: int, content_type: str = "") -> None:
+        self.status = status
+        self.headers = {"content-type": content_type} if content_type else {}
+
+    def __enter__(self) -> "_FakeHeadResp":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+def test_default_head_fetch_success(monkeypatch) -> None:
+    monkeypatch.setattr(url_seeder, "urlopen", lambda req, timeout=10.0: _FakeHeadResp(200, "text/html"))
+    assert default_head_fetch("https://e.com/x") == {"status_code": 200, "content_type": "text/html"}
+
+
+def test_default_head_fetch_keeps_http_error_status(monkeypatch) -> None:
+    from urllib.error import HTTPError
+
+    def _raise(req, timeout=10.0):
+        raise HTTPError("https://e.com/x", 404, "Not Found", {"content-type": "text/plain"}, None)
+
+    monkeypatch.setattr(url_seeder, "urlopen", _raise)
+    assert default_head_fetch("https://e.com/x")["status_code"] == 404
+
+
+def test_default_head_fetch_network_error_is_status_0(monkeypatch) -> None:
+    def _boom(req, timeout=10.0):
+        raise OSError("dns down")
+
+    monkeypatch.setattr(url_seeder, "urlopen", _boom)
+    assert default_head_fetch("https://e.com/x") == {"status_code": 0, "content_type": ""}
+
+
+def test_default_head_fetch_wires_into_probe_url(monkeypatch) -> None:
+    monkeypatch.setattr(url_seeder, "urlopen", lambda req, timeout=10.0: _FakeHeadResp(200, "application/pdf"))
+    seeder = UrlSeeder(_get_fetch, head_fetcher=default_head_fetch)
+    meta = seeder.probe_url("https://e.com/file.pdf")
+    assert meta["live"] is True
+    assert meta["content_type"] == "application/pdf"

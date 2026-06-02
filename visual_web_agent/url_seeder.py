@@ -28,7 +28,9 @@ import re
 from collections import deque
 from html.parser import HTMLParser
 from typing import Any, Callable, Iterable
+from urllib.error import HTTPError
 from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from visual_web_agent.crawl_frontier import normalize_keywords, score_url
 from visual_web_agent.spider_lite import domain_of, normalize_url
@@ -37,6 +39,7 @@ __all__ = [
     "parse_sitemap_locs",
     "is_sitemap_index",
     "sitemap_urls_from_robots",
+    "default_head_fetch",
     "UrlSeeder",
 ]
 
@@ -144,6 +147,35 @@ def _normalize_head(resp: Any) -> tuple[int, str]:
     except (TypeError, ValueError):
         status = 0
     return status, str(content_type or "")
+
+
+def default_head_fetch(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """Real stdlib HEAD probe → ``{"status_code", "content_type"}``.
+
+    Mirrors :func:`spider_lite.default_fetch` but issues an HTTP ``HEAD`` so a
+    URL's liveness + content-type are checked without downloading the body
+    (mission §一 "高效 — 能不重抓就不重抓"). HTTP error responses (404/500…)
+    keep their real status via :class:`urllib.error.HTTPError`; network / DNS
+    failures collapse to status ``0`` so :meth:`UrlSeeder.probe_url` treats them
+    as not-live. Pass as ``UrlSeeder(fetcher, head_fetcher=default_head_fetch)``.
+    """
+    req = Request(str(url), method="HEAD", headers={"User-Agent": "VSpider-UrlSeeder/1.0"})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            status = int(getattr(resp, "status", 0) or getattr(resp, "code", 0) or 200)
+            headers = getattr(resp, "headers", None)
+            content_type = headers.get("content-type", "") if headers else ""
+            return {"status_code": status, "content_type": str(content_type or "")}
+    except HTTPError as exc:
+        content_type = ""
+        try:
+            if exc.headers:
+                content_type = exc.headers.get("content-type", "") or ""
+        except Exception:
+            content_type = ""
+        return {"status_code": int(getattr(exc, "code", 0) or 0), "content_type": str(content_type)}
+    except Exception:
+        return {"status_code": 0, "content_type": ""}
 
 
 class UrlSeeder:
