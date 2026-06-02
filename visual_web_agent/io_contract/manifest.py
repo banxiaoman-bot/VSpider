@@ -81,14 +81,18 @@ class Manifest:
     items: list[ManifestItem] = field(default_factory=list)
     updated_at: str = field(default_factory=_now_iso)
     version: str = VERSION
+    resumed_from: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "version": self.version,
             "run_id": self.run_id,
             "items": [it.to_dict() for it in self.items],
             "updated_at": self.updated_at,
         }
+        if self.resumed_from:
+            payload["resumed_from"] = dict(self.resumed_from)
+        return payload
 
     def to_json(self, *, indent: int | None = 2) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
@@ -119,11 +123,13 @@ class Manifest:
                     extra=dict(raw.get("extra") or {}),
                 )
             )
+        raw_resumed = payload.get("resumed_from")
         return cls(
             run_id=str(payload.get("run_id") or ""),
             items=items,
             updated_at=str(payload.get("updated_at") or _now_iso()),
             version=str(payload.get("version") or VERSION),
+            resumed_from=dict(raw_resumed) if isinstance(raw_resumed, dict) else {},
         )
 
     def find_by_sha(self, sha256: str) -> ManifestItem | None:
@@ -150,6 +156,19 @@ class Manifest:
 
 def new_manifest(run_id: str) -> Manifest:
     return Manifest(run_id=str(run_id or ""))
+
+
+def set_resumed_from(manifest: Manifest, resumed_from: dict[str, Any] | None) -> Manifest:
+    """Record run-resume provenance on the manifest (RUN-RESUME1).
+
+    Additive + idempotent: an empty / falsy payload clears the marker so an
+    unused-resume run stays byte-identical (``resumed_from`` is then omitted
+    from :meth:`Manifest.to_dict`). Returns the manifest for chaining.
+    """
+
+    manifest.resumed_from = dict(resumed_from or {})
+    manifest.updated_at = _now_iso()
+    return manifest
 
 
 def merge_source_url(existing: ManifestItem, new_urls: Iterable[str]) -> None:

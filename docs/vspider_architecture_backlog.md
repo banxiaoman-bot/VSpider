@@ -1126,3 +1126,52 @@ Out of scope (deliberate, next slices):
 - Wiring resume=True through the harvester / agent download hook + a run policy;
   parallel multi-part (segmented) download; disk-space / TTL GC of stale `.part`
   files; RUN-RESUME1 (agent mid-task checkpoint).
+
+
+## Slice RUN-RESUME1: Agent mid-task run checkpoint (step 1 — primitive)
+
+Goal:
+
+- Close the last 断点重跑 gap (#3) "a crashed / killed agent run restarts from
+  turn 0": lay the deterministic foundation for an agent run to persist how far
+  it got and to *decide* (purely) whether a later run should resume. Default off
+  → byte-identical to today (no `run_checkpoint.json` written, manifest
+  `resumed_from` omitted) (mission §一 "高效 — 能不重抓就不重抓"; 长任务最怕跑一半断).
+
+Add / change:
+
+- New `visual_web_agent/run_checkpoint.py` (stdlib only, mirrors
+  `crawl_checkpoint`): `build_checkpoint_state(...)` (pure `run_checkpoint.v1`
+  dict), `save_run_checkpoint` / `load_run_checkpoint` / `clear_run_checkpoint`
+  (atomic tmp + `os.replace` write; tolerant missing / corrupt → None) under
+  `runs/<run_id>/run_checkpoint.json`; `ResumeDecision` + `decide_resume(prior,
+  *, resume, goal, start_url)` (pure policy: resume-off / no-checkpoint /
+  prior-terminal / goal|url-mismatch → fresh; else resume from the recorded turn
+  exposing a `resumed_from` provenance payload); `mark_manifest_resumed`
+  (read-modify-write manifest provenance).
+- `io_contract/manifest.py` — `Manifest` gains an optional `resumed_from` field
+  (+ `set_resumed_from` helper). `to_dict` emits the key **only when non-empty**
+  so unused-resume runs stay byte-identical; `from_dict` parses it tolerantly.
+- `capability_router._QUEUE_RE` already routes resume / 续跑 / 断点 / checkpoint
+  (added in BATCH-RESUME1) → no router change needed.
+
+Acceptance:
+
+- `tests/test_run_resume.py` 21 passed (build/coerce; save-load round trip;
+  missing / corrupt → None; atomic overwrite leaves no temp; clear; decide_resume
+  off / no-checkpoint / terminal / goal-mismatch / url-mismatch / in-progress /
+  failed-resumable; manifest resumed_from absent-by-default / set / clear /
+  bad-input; mark_manifest_resumed writes + empty stays byte-identical). Pure
+  I/O + pure policy, no agent / network.
+- Regression: `tests/test_io_contract_persistence.py` + io_contract runtime +
+  register_artifact + data_writers dispatch + media_harvester (92) still pass
+  (manifest field is additive + omitted when empty). `py_compile` OK, lint clean.
+
+Out of scope (deliberate, step 2):
+
+- Wiring `save_run_checkpoint` into the `main.py` agent loop turn-by-turn (write a
+  checkpoint each turn, read `constraints.resume` → `decide_resume`, skip
+  already-`completed_steps`, `mark_manifest_resumed` on resume,
+  `clear_run_checkpoint` on success); deterministic partial-run replay; a
+  `resume_run` action / prompt skill. Step 1 ships only the primitive + decision
+  so the loop wiring lands as a separate reviewable slice.
