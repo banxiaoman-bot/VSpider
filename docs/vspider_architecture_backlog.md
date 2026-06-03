@@ -1623,3 +1623,42 @@ Out of scope (deliberate, next slices):
   parallel probing; last-modified / size metadata scoring; wiring probe_url's
   output_kind into the run's output_contract resolver.
 
+
+## Slice SEED-PARALLEL: URL seeder batch + parallel HEAD probing
+
+Goal:
+
+- Close SEED-NEXT's "parallel probing" gap (mission §一 "高效 — 最少回合"). `live_only`
+  seeding probed one URL at a time, so a sitemap with N candidates paid N sequential
+  HEAD round-trips. Batch the probes and run them concurrently while keeping results
+  deterministic. Additive + opt-in; the default crawl path (no `live_only`) is unchanged.
+
+Add / change (url_seeder.py +44/-2, pure / stdlib):
+
+- `UrlSeeder.probe_urls(urls, *, concurrency=8)` — batch wrapper over `probe_url`.
+  `concurrency <= 1` probes serially; otherwise a `ThreadPoolExecutor` of up to
+  `concurrency` workers (capped at `_MAX_PROBE_CONCURRENCY=32` and the URL count) runs
+  the HEAD probes. **Output order always matches input order** (results mapped back by
+  index via `as_completed`, not completion order); a per-URL failure is swallowed (that
+  URL reported not-live via a pre-seeded placeholder) so one dead probe never aborts the
+  batch.
+- `seed_from_sitemap` / `seed_from_robots` gain `probe_concurrency=8`; the `live_only`
+  filter now calls `probe_urls(pages, concurrency=probe_concurrency)` and zips metas back
+  to pages instead of a serial `probe_url` comprehension. Filtering result is identical
+  to the serial path (same order, same drops) — only execution is parallelized.
+
+Acceptance:
+
+- `validate_y seed-parallel` (target → npm build → core → full): target
+  `tests/test_url_seeder_probe.py` → **30 passed** (22 prior + 8 new: probe_urls empty /
+  serial-order / concurrency<1-serial / parallel-order-preserving / barrier-proves-real-
+  parallelism / error-swallowing; sitemap + robots `live_only` parallel drop-dead) →
+  `npm run build` ✓ → core **102 passed** → **full 2540 passed, 2 skipped** (135s) →
+  `[validate_y] success`. ReadLints clean.
+
+Out of scope (deliberate, next slices):
+
+- async/await probing (stays threaded to match the sync `Fetcher` contract); per-host
+  rate limiting / politeness delay between probes; retry-with-backoff on transient 5xx;
+  surfacing probe metadata (output_kind / content-type) into the seeded frontier scoring.
+
