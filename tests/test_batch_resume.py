@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import pandas as pd
 
-from smart_batch_runner import _merge_prior_progress, _row_resume_key
+from smart_batch_runner import (
+    _content_columns,
+    _merge_prior_progress,
+    _row_content_hash,
+    _row_resume_key,
+)
 
 
 # --- _row_resume_key -------------------------------------------------------
@@ -109,3 +114,89 @@ def test_merge_does_not_downgrade_already_success_row() -> None:
     # already 成功 -> not re-counted, note preserved
     assert resumed == 0
     assert merged["填报状态"].iloc[0] == "成功"
+
+
+# --- BATCH-RESUME2: content-hash row keys (no URL column) -------------------
+
+def test_content_hash_matches_reordered_rows() -> None:
+    # no URL-like column -> content-hash key survives row reorder
+    df = pd.DataFrame({"name": ["b", "a", "c"]})  # reordered vs prior
+    df["填报状态"] = "未处理"
+    df["日志备注"] = ""
+    prior = pd.DataFrame({
+        "name": ["a", "b", "c"],
+        "填报状态": ["成功", "失败", "成功"],
+        "日志备注": ["ok-a", "", "ok-c"],
+    })
+    merged, resumed = _merge_prior_progress(df, prior, key_col="")
+    statuses = dict(zip(merged["name"], merged["填报状态"]))
+    assert statuses["a"] == "成功"   # matched by content despite reorder
+    assert statuses["c"] == "成功"
+    assert statuses["b"] == "未处理"  # was 失败 -> retried
+    assert resumed == 2
+
+
+def test_content_hash_handles_inserted_rows() -> None:
+    df = pd.DataFrame({"name": ["a", "new", "c"]})
+    df["填报状态"] = "未处理"
+    df["日志备注"] = ""
+    prior = pd.DataFrame({"name": ["a", "c"], "填报状态": ["成功", "成功"]})
+    merged, resumed = _merge_prior_progress(df, prior, key_col="")
+    statuses = dict(zip(merged["name"], merged["填报状态"]))
+    assert statuses["a"] == "成功"
+    assert statuses["c"] == "成功"
+    assert statuses["new"] == "未处理"  # brand-new row runs
+    assert resumed == 2
+
+
+def test_content_hash_carries_only_success_multicol() -> None:
+    df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    df["填报状态"] = "未处理"
+    df["日志备注"] = ""
+    prior = pd.DataFrame({
+        "a": [1, 2, 3], "b": ["x", "y", "z"],
+        "填报状态": ["成功", "失败", "未处理"],
+    })
+    merged, resumed = _merge_prior_progress(df, prior, key_col="")
+    assert list(merged["填报状态"]) == ["成功", "未处理", "未处理"]
+    assert resumed == 1
+
+
+def test_content_hash_carries_duplicate_content_rows() -> None:
+    # two identical-content rows both resume from one prior success (idempotent)
+    df = pd.DataFrame({"name": ["dup", "dup", "other"]})
+    df["填报状态"] = "未处理"
+    df["日志备注"] = ""
+    prior = pd.DataFrame({"name": ["dup", "other"], "填报状态": ["成功", "未处理"]})
+    merged, resumed = _merge_prior_progress(df, prior, key_col="")
+    assert list(merged["填报状态"]) == ["成功", "成功", "未处理"]
+    assert resumed == 2
+
+
+def test_positional_fallback_when_schemas_differ() -> None:
+    # df has an extra column the prior lacks -> content schemas differ -> positional
+    df = pd.DataFrame({"name": ["x", "y"], "extra": [1, 2]})
+    df["填报状态"] = "未处理"
+    df["日志备注"] = ""
+    prior = pd.DataFrame({"name": ["x", "y"], "填报状态": ["成功", "未处理"]})
+    merged, resumed = _merge_prior_progress(df, prior, key_col="")
+    assert list(merged["填报状态"]) == ["成功", "未处理"]  # positional pos0 成功
+    assert resumed == 1
+
+
+def test_row_content_hash_order_independent_and_normalizes_blanks() -> None:
+    cols = ["a", "b"]
+    r1 = pd.Series({"a": "x", "b": "y"})
+    r2 = pd.Series({"b": "y", "a": "x"})  # same data, different field order
+    assert _row_content_hash(r1, cols) == _row_content_hash(r2, cols)
+    # NaN / None / blank all normalize to the same hash
+    rblank = pd.Series({"a": float("nan"), "b": None})
+    rempty = pd.Series({"a": "", "b": ""})
+    assert _row_content_hash(rblank, cols) == _row_content_hash(rempty, cols)
+    # different content -> different hash
+    assert _row_content_hash(pd.Series({"a": "x", "b": "z"}), cols) != _row_content_hash(r1, cols)
+
+
+def test_content_columns_excludes_status_cols() -> None:
+    df = pd.DataFrame({"name": ["a"], "填报状态": ["成功"], "日志备注": ["ok"]})
+    assert _content_columns(df) == ["name"]
