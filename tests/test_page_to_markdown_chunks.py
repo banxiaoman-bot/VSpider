@@ -49,8 +49,8 @@ class _StubBrowser:
         self.rpa_trail: list = []
 
 
-def _make_ctx(html: str, url: str, *, memory_key: str = "") -> ActionContext:
-    action = VSpiderAction(action="page_to_markdown", target_id=0, type_value="", memory_key=memory_key)
+def _make_ctx(html: str, url: str, *, memory_key: str = "", query: str = "") -> ActionContext:
+    action = VSpiderAction(action="page_to_markdown", target_id=0, type_value=query, memory_key=memory_key)
     return ActionContext(action=action, browser=_StubBrowser(), workflow_memory={}, page=_StubPage(html, url))
 
 
@@ -111,3 +111,46 @@ def test_markdown_artifact_still_written(tmp_path: Path) -> None:
     mem = ctx.workflow_memory["doc_md"]
     assert Path(mem["markdown_path"]).suffix == ".md"
     assert Path(mem["chunks_path"]).suffix == ".jsonl"
+
+
+# --- FITMD-4: focus query ranks + scores the chunks artifact ---------------
+
+def _chunk_records_from(ctx: ActionContext) -> list[dict]:
+    path = ctx.workflow_memory["doc_md"]["chunks_path"]
+    return [
+        json.loads(line)
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_chunks_unranked_and_unscored_without_query(tmp_path: Path) -> None:
+    # no focus query -> document order, no score key (byte-identical to FITMD-3)
+    ctx = _make_ctx(SAMPLE, "https://example.com", memory_key="doc_md")
+    set_current_run("p2m_noq", base_dir=str(tmp_path))
+    try:
+        asyncio.run(PageToMarkdownHandler().execute(ctx))
+    finally:
+        clear_current_run()
+    records = _chunk_records_from(ctx)
+    assert [r["heading"] for r in records] == ["Alpha", "Beta"]
+    assert all("score" not in r for r in records)
+
+
+def test_focus_query_ranks_chunks_most_relevant_first(tmp_path: Path) -> None:
+    # "Second" appears only in the Beta section -> Beta must rank first and the
+    # records must carry a BM25 score in descending order.
+    ctx = _make_ctx(SAMPLE, "https://example.com", memory_key="doc_md", query="Second")
+    set_current_run("p2m_ranked", base_dir=str(tmp_path))
+    try:
+        asyncio.run(PageToMarkdownHandler().execute(ctx))
+    finally:
+        clear_current_run()
+    records = _chunk_records_from(ctx)
+    assert records[0]["heading"] == "Beta"
+    assert all("score" in r for r in records)
+    assert records[0]["score"] > 0.0
+    scores = [r["score"] for r in records]
+    assert scores == sorted(scores, reverse=True)
+    # original document position is preserved for traceability
+    assert all("index" in r for r in records)
