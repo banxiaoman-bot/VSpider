@@ -232,6 +232,9 @@ class BrowserEnv:
         self._playwright = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        # PROXY-4: rotatable proxy chain. Built once (start / _ensure_proxy_chain)
+        # and preserved across restart() so rotation state survives a reroute.
+        self._proxy_chain = None
         self._closed: bool = False
         self._som_js: str = ""
         self._screenshot_dir: Path = Path(config.SCREENSHOT_DIR)
@@ -1726,11 +1729,7 @@ class BrowserEnv:
         # resolved by the proxy_chain module so the logic stays out of this
         # oversized file (workflow section 3); self._proxy_chain is kept for
         # future re-route-on-block rotation.
-        try:
-            from visual_web_agent.proxy_chain import build_chain_from_config
-            self._proxy_chain = build_chain_from_config(config)
-        except Exception:
-            self._proxy_chain = None
+        self._ensure_proxy_chain()
         _proxy_cfg = self._proxy_chain.current() if self._proxy_chain else None
         if _proxy_cfg:
             logger.info(
@@ -2182,6 +2181,59 @@ Object.defineProperty(navigator, 'languages', {
         self._last_action_result = None
         self._closed = False
         await self.start(url)
+
+    def _ensure_proxy_chain(self):
+        """Build the proxy chain once and cache it (PROXY-4 build-once).
+
+        ``start()`` is re-entered by ``restart()``; rebuilding the chain there
+        would reset rotation state (``_idx`` / quarantine) back to the first
+        proxy, so a reroute-then-restart could never actually switch IPs. Build
+        only when absent so the advanced chain survives a restart. The chain
+        logic itself stays in the ``proxy_chain`` module (workflow §三).
+        """
+        if getattr(self, "_proxy_chain", None) is None:
+            try:
+                from visual_web_agent.proxy_chain import build_chain_from_config
+                self._proxy_chain = build_chain_from_config(config)
+            except Exception:
+                self._proxy_chain = None
+        return self._proxy_chain
+
+    async def reroute_proxy_on_block(
+        self,
+        url: str,
+        *,
+        result=None,
+        state=None,
+        reason: str = "bot challenge",
+    ) -> bool:
+        """Rotate to the next proxy and relaunch when a block warrants it (PROXY-4).
+
+        Consults the pure ``should_rotate_on_challenge`` policy (PROXY-3) over the
+        bot-challenge ``result`` / ``state``. When it says rotate AND a multi-proxy
+        chain is configured, the current proxy is marked failed (advancing to the
+        next healthy one) and the context is ``restart``ed so the relaunch picks up
+        the new proxy via the build-once chain. Returns True iff a reroute happened.
+
+        No-op (returns False) without a usable >1 proxy chain, so single-proxy /
+        no-proxy runs are unaffected. The decision lives in ``proxy_chain``; this
+        thin method is the only browser-substrate touch (workflow §三).
+        """
+        try:
+            from visual_web_agent.proxy_chain import should_rotate_on_challenge
+        except Exception:
+            return False
+        chain = getattr(self, "_proxy_chain", None)
+        if chain is None or len(chain) < 2:
+            return False
+        if not should_rotate_on_challenge(result, state):
+            return False
+        before = (chain.current() or {}).get("server", "")
+        chain.mark_failed()
+        after = (chain.current() or {}).get("server", "")
+        logger.warning("[PROXY] reroute on block (%s): %s -> %s", reason, before, after)
+        await self.restart(url, reason=f"proxy reroute: {reason}")
+        return True
 
     async def refresh_auth_sentinel(self) -> str:
         """
