@@ -38,12 +38,19 @@ def _normalise_per_step_systems(raw: Any) -> dict[str, dict[str, str]]:
 def _stamp_system_metadata(
     attempts: list[dict[str, Any]],
     capability_to_system: dict[str, dict[str, str]],
+    router: Any = None,
 ) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
     """Tag each attempt with its planned ``system_id`` and bucket per system.
 
     The legacy "no cross-system" path is preserved as
     ``systems_involved=["system_1"]`` so downstream consumers always see
     at least one system entry.
+
+    When a :class:`~visual_web_agent.session_router.SessionRouter` is
+    supplied (E1c-2), the effective ``auth_profile`` is resolved with the
+    router's precedence -- an explicit per-step profile wins, else the
+    system's profile declared in ``workflow_graph.systems``, else ``auto``
+    (which is left unstamped).
     """
 
     systems_involved: list[str] = []
@@ -53,8 +60,13 @@ def _stamp_system_metadata(
         info = capability_to_system.get(capability)
         system_id = (info or {}).get("system_id") or "system_1"
         attempt["system_id"] = system_id
-        if info and info.get("auth_profile") and info["auth_profile"] != "auto":
-            attempt["auth_profile"] = info["auth_profile"]
+        explicit_profile = str((info or {}).get("auth_profile") or "")
+        if router is not None:
+            resolved_profile = router.resolved_auth_profile(system_id, explicit_profile or "auto")
+        else:
+            resolved_profile = explicit_profile
+        if resolved_profile and resolved_profile != "auto":
+            attempt["auth_profile"] = resolved_profile
         if info and info.get("step_id"):
             attempt["step_id"] = info["step_id"]
         if system_id not in systems_involved:
@@ -64,6 +76,48 @@ def _stamp_system_metadata(
         systems_involved.append("system_1")
         system_attempts.setdefault("system_1", [])
     return systems_involved, system_attempts
+
+
+def _router_from_route(route: dict[str, Any]) -> Any:
+    """Build a (pool-less) SessionRouter from a route's workflow_graph.
+
+    Returns ``None`` on any failure so the executor degrades to the legacy
+    per-step-only auth handling instead of crashing.
+    """
+
+    try:
+        from .session_router import build_session_router
+
+        return build_session_router("route_executor", route)
+    except Exception:
+        return None
+
+
+def _build_session_plan(
+    systems_involved: list[str],
+    router: Any,
+) -> list[dict[str, Any]]:
+    """Resolve, per involved system, the session a downstream executor needs.
+
+    Each entry is ``{system_id, auth_profile, domain}``. This is plan-stepped
+    output: ``route_executor`` itself stays browserless, but E1c-3's reactive
+    loop can use this to pre-acquire / switch ``BrowserSession`` handles.
+    """
+
+    plan: list[dict[str, Any]] = []
+    for system_id in systems_involved:
+        if router is not None:
+            auth_profile = router.resolved_auth_profile(system_id)
+            domain = router.plan.domain_for(system_id)
+        else:
+            auth_profile = "auto"
+            domain = ""
+        plan.append({
+            "system_id": system_id,
+            "auth_profile": auth_profile,
+            "domain": domain,
+        })
+    return plan
 
 
 def _attempt_error(capability: str, exc: Exception) -> dict[str, Any]:
@@ -114,7 +168,8 @@ class DeterministicRouteExecutor:
         else:
             attempts.append({"capability": "spider_lite", "status": "skipped", "reason": "allow_network is false"})
         status = "fallback" if any(item.get("status") == "attempted" for item in attempts) else "skipped"
-        systems_involved, system_attempts = _stamp_system_metadata(attempts, capability_to_system)
+        router = _router_from_route(route)
+        systems_involved, system_attempts = _stamp_system_metadata(attempts, capability_to_system, router)
         return {
             "status": status,
             "completed": False,
@@ -125,6 +180,7 @@ class DeterministicRouteExecutor:
             "fallback_reason": self._fallback_reason(attempts),
             "systems_involved": systems_involved,
             "system_attempts": system_attempts,
+            "session_plan": _build_session_plan(systems_involved, router),
         }
 
     def _try_selector(self, payload: dict[str, Any], source: Any, route: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -243,8 +299,9 @@ class DeterministicRouteExecutor:
         payload: dict[str, Any],
         capability_to_system: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        router = _router_from_route(route)
         systems_involved, system_attempts = _stamp_system_metadata(
-            attempts, capability_to_system or {}
+            attempts, capability_to_system or {}, router
         )
         return {
             "status": "completed",
@@ -258,6 +315,7 @@ class DeterministicRouteExecutor:
             "fallback_reason": "",
             "systems_involved": systems_involved,
             "system_attempts": system_attempts,
+            "session_plan": _build_session_plan(systems_involved, router),
         }
 
     def _fallback_reason(self, attempts: list[dict[str, Any]]) -> str:
