@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 
 from visual_web_agent.run_checkpoint import ResumeDecision
 from visual_web_agent.run_resume_consume import (
+    _fuzzy_match,
     apply_completed_steps_to_plan,
     build_resume_note,
     plan_completed_step_labels,
@@ -158,3 +159,86 @@ class TestApplyCompletedStepsToPlan:
         assert skipped == 0
         assert plan.current_idx == 0
         assert plan.sub_goals[0].status == "active"
+
+
+# --- RUN-RESUME1 step 5: fuzzy / semantic label matching -------------------
+
+class TestFuzzyApply:
+    def test_case_and_fullwidth_insensitive_skip(self) -> None:
+        plan = _Plan(
+            sub_goals=[
+                _SG(1, "Search Python", status="active"),
+                _SG(2, "extract rows", status="pending"),
+            ],
+            current_idx=0,
+        )
+        # recorded label differs by case + full-width spelling/space
+        skipped = apply_completed_steps_to_plan(plan, ["ｓｅａｒｃｈ　python"])
+        assert skipped == 1
+        assert plan.current_idx == 1
+
+    def test_spacing_insensitive_skip(self) -> None:
+        plan = _Plan(
+            sub_goals=[_SG(1, "搜索 python", status="active"), _SG(2, "下一步", status="pending")],
+            current_idx=0,
+        )
+        skipped = apply_completed_steps_to_plan(plan, ["搜索python"])  # no space
+        assert skipped == 1
+
+    def test_punctuation_insensitive_skip(self) -> None:
+        plan = _Plan(
+            sub_goals=[_SG(1, "open the page", status="active"), _SG(2, "next", status="pending")],
+            current_idx=0,
+        )
+        skipped = apply_completed_steps_to_plan(plan, ["open the page!!!"])
+        assert skipped == 1
+
+    def test_leading_prefix_extended_subgoal_skips(self) -> None:
+        plan = _Plan(
+            sub_goals=[
+                _SG(1, "搜索 python 并点开第一个结果", status="active"),
+                _SG(2, "提取表格", status="pending"),
+            ],
+            current_idx=0,
+        )
+        skipped = apply_completed_steps_to_plan(plan, ["搜索 python"])
+        assert skipped == 1
+        assert plan.current_idx == 1
+
+    def test_reordered_does_not_match(self) -> None:
+        plan = _Plan(
+            sub_goals=[_SG(1, "python 搜索", status="active"), _SG(2, "next", status="pending")],
+            current_idx=0,
+        )
+        skipped = apply_completed_steps_to_plan(plan, ["搜索 python"])
+        assert skipped == 0  # reordered -> conservative, no skip
+
+    def test_unrelated_token_overlap_does_not_match(self) -> None:
+        plan = _Plan(
+            sub_goals=[_SG(1, "open settings page", status="active"), _SG(2, "go", status="pending")],
+            current_idx=0,
+        )
+        skipped = apply_completed_steps_to_plan(plan, ["open page"])  # overlap, not prefix
+        assert skipped == 0
+
+
+class TestFuzzyMatchHelper:
+    def test_exact_normalized(self) -> None:
+        assert _fuzzy_match("Open Page", "open   page") is True
+
+    def test_fullwidth_and_punct(self) -> None:
+        assert _fuzzy_match("搜索（python）", "搜索 python") is True
+
+    def test_squashed_prefix(self) -> None:
+        assert _fuzzy_match("搜索 python", "搜索 python 并点开") is True
+
+    def test_too_short_prefix_rejected(self) -> None:
+        # below the 4-char squashed-prefix floor -> no fuzzy prefix match
+        assert _fuzzy_match("ab", "abcdef") is False
+
+    def test_blank_is_false(self) -> None:
+        assert _fuzzy_match("", "anything") is False
+        assert _fuzzy_match("x", "") is False
+
+    def test_unrelated_is_false(self) -> None:
+        assert _fuzzy_match("open page", "open settings page") is False
