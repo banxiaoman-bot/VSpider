@@ -1369,3 +1369,46 @@ Out of scope:
   avoided — the agent re-observes each turn); cross-run resume across *different*
   goals / start URLs.
 
+
+## Slice RUN-RESUME1 (step 4): unified resume switch end-to-end
+
+Goal:
+
+- Make the `constraints.resume` switch reachable + uniform across all three opt-in
+  resume mechanisms (mission §四 "简便 — 前端/CLI/API 三入口对等"; §一-B input
+  contract `constraints.resume`). Before: batch row-skip (BATCH-RESUME1) + the agent
+  run checkpoint (RUN-RESUME1 step2b/3a) already read `run_constraints.resume`, but
+  (a) the media-download Range/If-Range resume (DL-RESUME1) was implemented yet never
+  wired, and (b) the frontend had no toggle (users had to hand-craft constraints
+  JSON). One switch now turns on batch + run + download together. Default off →
+  byte-identical to the legacy single-pass run.
+
+Add / change (1 new test + 5 changed, +24):
+
+- `media_harvester/harvester.py` (+5) — `harvest_to_run(..., resume=False)` forwards
+  `resume` into `download_candidate(resume=resume)` (DL-RESUME1's download logic was
+  already complete; this threads the flag through). Docstring notes the Range behaviour.
+- `media_harvester/agent_hook.py` (+2) — `maybe_run_media_harvest(..., resume=False)`
+  forwards into `harvest_to_run`.
+- `main.py::run_agent` (+1, execution_kernel) — the media-hook call site passes
+  `resume=bool((run_constraints or {}).get("resume"))`, the same key batch + run use.
+- `vspider-ui/src/composables/useTaskSubmit.js` (+4) — `buildTaskConstraints({resume})`
+  emits `constraints.resume = true` when enabled.
+- `vspider-ui/src/App.vue` (+12) — a "断点续跑（resume）" el-switch in the 运行约束 panel
+  bound to a `resumeEnabled` ref, threaded into the `buildTaskConstraints({...})` call.
+- `tests/test_media_harvest_resume_wire.py` (new) — 5 tests: harvest_to_run + the hook
+  forward resume True/False and default to False (captured `download_candidate` stub).
+
+Acceptance:
+
+- `validate_y run-resume1-step4` (target → npm build → core → full): target
+  `tests/test_media_harvest_resume_wire.py` → **5 passed** → `npm run build` ✓ → core
+  **102 passed** → **full 2481 passed, 2 skipped** (136s) → `[validate_y] success`.
+  `py_compile` OK, lint clean; CRLF preserved on harvester.py / main.py / App.vue.
+
+Out of scope (deliberate, next slices):
+
+- Per-mechanism granular toggles (one flag covers all three by design); content-hash
+  row keys for batch rows without a URL column; download `.part` TTL / disk-space GC;
+  surfacing `constraints.resume` into the input_contract.json schema doc + a CLI flag.
+
