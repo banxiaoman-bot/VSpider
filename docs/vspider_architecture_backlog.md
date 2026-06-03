@@ -1539,3 +1539,46 @@ Out of scope (deliberate, next slices):
   content-addressed final artifacts themselves; cross-run global temp-dir GC;
   honoring a configurable retention policy from run constraints.
 
+
+## Slice RUN-RESUME1 (step 5): fuzzy / semantic completed-step matching
+
+Goal:
+
+- Close step 3's "fuzzy / semantic matching of completed-step labels (currently
+  exact normalized match)" gap (mission "类人工作模式"). On a resume the planner
+  regenerates the TaskPlan, so a sub-goal's wording can drift from the recorded
+  label (case, punctuation, full-width chars, spacing, a trailing clause). Exact
+  match then fails to skip a genuinely-done step. Step 5 upgrades the skip matcher
+  to a tolerant — but deliberately conservative — comparison. Backward compatible:
+  exact matches behave exactly as before.
+
+Add / change (run_resume_consume.py +51/-3, pure):
+
+- `_norm2(value)` — aggressive normalize: NFKC (full-width → half-width),
+  lowercase, punctuation stripped (keeps word chars incl. CJK), whitespace collapsed.
+- `_fuzzy_match(a, b)` — tiered, deterministic: exact `_norm` equality (the step-3
+  behaviour) → `_norm2` equality (case / full-width / punctuation insensitive) →
+  whitespace-squashed equality (spacing insensitive) → squashed leading-prefix
+  (`len >= 4`) so a re-worded / extended sub-goal ("搜索 python" vs "搜索 Python
+  并点开") still resumes. Reordered or merely token-overlapping phrases never match.
+- `apply_completed_steps_to_plan` now skips a leading sub-goal when it `_fuzzy_match`es
+  *any* recorded completed step (was: exact-normalized set membership). All other
+  guards unchanged (never skips the final sub-goal; self-healing re-observation).
+
+Acceptance:
+
+- `validate_y run-resume1-step5` (target → npm build → core → full): target
+  `tests/test_run_resume_consume.py` + `tests/test_resume_run_integration.py` →
+  **32 passed** (14 prior consume + 6 integration + 12 new: full-width/case,
+  spacing, punctuation, leading-prefix skips; reordered + token-overlap rejected;
+  helper exact/full-width/prefix/too-short/blank/unrelated) → `npm run build` ✓ →
+  core **102 passed** → **full 2521 passed, 2 skipped** (134s) → `[validate_y]
+  success`. `py_compile` OK, lint clean.
+
+Out of scope (deliberate, next slices):
+
+- Embedding / semantic-similarity matching (would add a model dependency — the
+  squashed-prefix heuristic is pure stdlib); token-set / edit-distance fuzzy
+  matching (rejected as too loose for a skip decision); matching non-leading
+  (out-of-order) completed steps.
+
