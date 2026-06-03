@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from visual_web_agent import url_seeder
 from visual_web_agent.spider_lite import FetchResult
-from visual_web_agent.url_seeder import UrlSeeder, default_head_fetch
+from visual_web_agent.url_seeder import (
+    UrlSeeder,
+    content_type_to_output_kind,
+    default_head_fetch,
+)
 
 
 URLSET = (
@@ -48,6 +52,7 @@ def test_probe_url_live_200() -> None:
         "status_code": 200,
         "content_type": "text/html",
         "live": True,
+        "output_kind": "html_snapshot",
     }
 
 
@@ -133,3 +138,96 @@ def test_default_head_fetch_wires_into_probe_url(monkeypatch) -> None:
     meta = seeder.probe_url("https://e.com/file.pdf")
     assert meta["live"] is True
     assert meta["content_type"] == "application/pdf"
+    assert meta["output_kind"] == "media_pdf"
+
+
+# --- SEED-NEXT: HEAD->GET fallback for servers that reject HEAD -------------
+
+def test_head_405_falls_back_to_get(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_urlopen(req, timeout=10.0):
+        calls.append(req.get_method())
+        if req.get_method() == "HEAD":
+            return _FakeHeadResp(405)
+        return _FakeHeadResp(200, "application/pdf")  # GET succeeds
+
+    monkeypatch.setattr(url_seeder, "urlopen", fake_urlopen)
+    result = default_head_fetch("https://e.com/no-head")
+    assert result == {"status_code": 200, "content_type": "application/pdf"}
+    assert calls == ["HEAD", "GET"]
+
+
+def test_head_501_falls_back_to_get(monkeypatch) -> None:
+    def fake_urlopen(req, timeout=10.0):
+        if req.get_method() == "HEAD":
+            return _FakeHeadResp(501)
+        return _FakeHeadResp(206, "video/mp4")  # Range honored -> 206
+
+    monkeypatch.setattr(url_seeder, "urlopen", fake_urlopen)
+    result = default_head_fetch("https://e.com/x")
+    assert result["status_code"] == 206
+    assert result["content_type"] == "video/mp4"
+
+
+def test_head_200_does_not_fall_back(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_urlopen(req, timeout=10.0):
+        calls.append(req.get_method())
+        return _FakeHeadResp(200, "text/html")
+
+    monkeypatch.setattr(url_seeder, "urlopen", fake_urlopen)
+    default_head_fetch("https://e.com/ok")
+    assert calls == ["HEAD"]  # no GET fallback on 200
+
+
+def test_get_fallback_sends_range_header(monkeypatch) -> None:
+    seen: dict = {}
+
+    def fake_urlopen(req, timeout=10.0):
+        if req.get_method() == "GET":
+            seen.update({k.lower(): v for k, v in req.header_items()})
+            return _FakeHeadResp(200, "image/png")
+        return _FakeHeadResp(405)
+
+    monkeypatch.setattr(url_seeder, "urlopen", fake_urlopen)
+    default_head_fetch("https://e.com/x")
+    assert seen.get("range") == "bytes=0-0"
+
+
+# --- SEED-NEXT: content_type -> output_kind routing ------------------------
+
+class TestContentTypeToOutputKind:
+    def test_media_families(self) -> None:
+        assert content_type_to_output_kind("image/jpeg") == "media_image"
+        assert content_type_to_output_kind("video/mp4") == "media_video"
+        assert content_type_to_output_kind("audio/mpeg") == "media_audio"
+
+    def test_documents_and_data(self) -> None:
+        assert content_type_to_output_kind("application/pdf") == "media_pdf"
+        assert content_type_to_output_kind("application/zip") == "media_archive"
+        assert content_type_to_output_kind("text/csv") == "dataset_rows"
+        assert content_type_to_output_kind("application/json") == "dataset_records"
+        assert content_type_to_output_kind("text/html") == "html_snapshot"
+
+    def test_strips_charset_param_and_case(self) -> None:
+        assert content_type_to_output_kind("TEXT/HTML; charset=UTF-8") == "html_snapshot"
+
+    def test_other_text_is_code_or_text(self) -> None:
+        assert content_type_to_output_kind("text/plain") == "code_or_text"
+
+    def test_unknown_is_file_generic(self) -> None:
+        assert content_type_to_output_kind("application/octet-stream") == "file_generic"
+
+    def test_empty_is_blank(self) -> None:
+        assert content_type_to_output_kind("") == ""
+        assert content_type_to_output_kind(None) == ""
+
+
+def test_probe_url_surfaces_output_kind() -> None:
+    head_map = {"https://e.com/pic": {"status_code": 200, "content_type": "image/png"}}
+    seeder = UrlSeeder(_get_fetch, head_fetcher=lambda u: head_map.get(u, {"status_code": 0}))
+    meta = seeder.probe_url("https://e.com/pic")
+    assert meta["output_kind"] == "media_image"
+    assert meta["live"] is True
