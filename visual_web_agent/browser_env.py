@@ -36,6 +36,7 @@ try:
     from .auth_manager import apply_storage_state_to_context, load_auth_profiles
     from .artifact_manager import artifact_root, register_artifact
     from .action_result import ActionResult
+    from .browser_profile import resolve_user_data_dir
     from .data_manager import save_intercepted_data
     from .network_intelligence import record_candidate as _record_network_candidate
     from .vlm_client import VSpiderAction
@@ -44,6 +45,7 @@ except ImportError:
     from auth_manager import apply_storage_state_to_context, load_auth_profiles
     from artifact_manager import artifact_root, register_artifact
     from action_result import ActionResult
+    from browser_profile import resolve_user_data_dir
     from data_manager import save_intercepted_data
     from network_intelligence import record_candidate as _record_network_candidate
     from vlm_client import VSpiderAction
@@ -1691,7 +1693,7 @@ class BrowserEnv:
             selector=synthetic_selector,
         )
 
-    async def start(self, url: str) -> None:
+    async def start(self, url: str, *, user_data_dir_override: str | None = None) -> None:
         """
         启动持久化浏览器上下文并导航到指定 URL。
 
@@ -1700,6 +1702,9 @@ class BrowserEnv:
 
         Args:
             url: 初始页面 URL
+            user_data_dir_override: 跨系统会话隔离用——为目标 system 指定独立
+                Chromium profile 目录，避开 launch_persistent_context 的单实例
+                锁；None 时沿用全局 config.BROWSER_USER_DATA_DIR（默认行为）。
         """
         # 加载 SoM 注入脚本
         self._closed = False
@@ -1710,8 +1715,13 @@ class BrowserEnv:
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
-        # 解析 user_data_dir 路径
-        user_data_path = Path(config.BROWSER_USER_DATA_DIR or (Path(__file__).parent / "browser_data"))
+        # 解析 user_data_dir 路径（cross-system 切换可经 override 给每个 system
+        # 独立 profile，避开 launch_persistent_context 的单实例锁）
+        user_data_path = resolve_user_data_dir(
+            user_data_dir_override,
+            default_base=config.BROWSER_USER_DATA_DIR,
+            packaged_fallback=Path(__file__).parent / "browser_data",
+        )
         user_data_path.mkdir(parents=True, exist_ok=True)
 
         # 启动 Playwright + 持久化 Chromium 上下文
