@@ -370,6 +370,61 @@ class TestSessionRouterLaunchForSwitch:
         assert session.browser.started[0]["user_data_dir_override"] is None
 
 
+class TestSessionRouterActivateSwitch:
+    def test_no_switch_returns_none(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_1")
+        got = _run(router.activate_switch(directive, url="https://x", home_browser="HOME"))
+        assert got is None
+
+    def test_forward_hop_launches_once_and_returns_session_browser(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(
+            to_system_id="system_1", from_system_id="system_2", full_state=_FULL_STATE
+        )
+        session = router.get_active("system_1")
+        got = _run(
+            router.activate_switch(
+                directive,
+                url="https://alpha.com",
+                user_data_dir_base="/profiles",
+                full_state=_FULL_STATE,
+            )
+        )
+        assert got is session.browser
+        assert session.browser.started[0]["user_data_dir_override"] == "/profiles/sys_system_1"
+        # revisiting the same system reuses the launched handle, never re-starting
+        got2 = _run(
+            router.activate_switch(
+                directive, url="https://alpha.com", user_data_dir_base="/profiles", full_state=_FULL_STATE
+            )
+        )
+        assert got2 is session.browser
+        assert len(session.browser.started) == 1
+
+    def test_hop_back_to_home_returns_home_browser_without_launch(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(to_system_id="system_2", from_system_id="system_1")
+        got = _run(
+            router.activate_switch(
+                directive, url="https://beta.com", home_system_id="system_2", home_browser="HOME_LEASE"
+            )
+        )
+        assert got == "HOME_LEASE"
+        session2 = router.get_active("system_2")
+        assert session2.browser.started == []  # a home hop never launches a pool session
+
+    def test_unknown_target_returns_none(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = {"should_switch": True, "to_system_id": "system_9", "run_id": "r1"}
+        got = _run(router.activate_switch(directive, url="https://x"))
+        assert got is None
+
+
 class TestBuildSessionRouter:
     def test_build_from_capability_route(self) -> None:
         route = {"workflow_graph": {"systems": _SYSTEMS}}

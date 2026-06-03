@@ -90,6 +90,9 @@ class SessionRouter:
     run_id: str
     plan: SystemAuthPlan = field(default_factory=SystemAuthPlan)
     pool: BrowserSessionPool | None = None
+    # session_ids already launched via activate_switch, so a revisit reuses the
+    # handle instead of re-starting its BrowserEnv (E1c-3b-2c).
+    _launched: set[str] = field(default_factory=set)
 
     # ----- resolution (pure) ---------------------------------------------
 
@@ -265,6 +268,47 @@ class SessionRouter:
             result["applied_origins"] = int(origin_count)
         result["final_url"] = getattr(session.browser, "current_url", "") or ""
         return result
+
+    async def activate_switch(
+        self,
+        directive: dict[str, Any],
+        *,
+        url: str,
+        user_data_dir_base: str = "",
+        full_state: dict[str, Any] | None = None,
+        home_system_id: str = "",
+        home_browser: Any = None,
+    ) -> Any | None:
+        """Resolve + execute the active-browser rebind for a hop (E1c-3b-2c).
+
+        Path-1 physical switch: returns the browser handle the reactive loop
+        should rebind to, or ``None`` when nothing should change. A hop back to
+        the home system returns ``home_browser`` (the primary lease) without
+        touching the pool; a hop to any other system launches that system's
+        pooled :class:`BrowserSession` once (isolated profile + staged state via
+        :meth:`launch_for_switch`) and returns its browser. Idempotent per
+        session: a revisit reuses the already-launched handle, never restarting.
+        """
+
+        if not directive.get("should_switch"):
+            return None
+        target = str(directive.get("to_system_id") or "").strip()
+        if not target:
+            return None
+        if home_system_id and target == str(home_system_id).strip():
+            return home_browser
+        session = self.get_active(target)
+        if session is None:
+            return None
+        if session.session_id not in self._launched:
+            isolated = (
+                f"{user_data_dir_base.rstrip('/')}/sys_{target}" if user_data_dir_base else ""
+            )
+            await self.launch_for_switch(
+                session, url, user_data_dir=isolated, full_state=full_state
+            )
+            self._launched.add(session.session_id)
+        return session.browser
 
     async def release_all(self, *, error: str = "") -> list[str]:
         if self.pool is not None:

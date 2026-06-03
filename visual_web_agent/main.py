@@ -7363,6 +7363,11 @@ async def run_agent(
     # cross-system hop would switch to (decision + evidence). None (inert) when
     # routing fails so the hot loop hook is a safe no-op.
     _session_router = None
+    # E1c-3b-2c: the home (primary lease) handle + system id, captured on the
+    # first cross-system transition so a hop back to the home system rebinds to
+    # the original lease rather than a fresh pooled session.
+    _home_browser = None
+    _home_system_id = ""
 
     def _check_stop(context: str) -> None:
         if stop_event and stop_event.is_set():
@@ -10704,6 +10709,46 @@ async def run_agent(
                                             session_id=_switch.get("session_id", ""),
                                             auth_profile=_switch.get("auth_profile", ""),
                                             cookie_count=_switch.get("cookie_count", 0),
+                                        )
+                                    # E1c-3b-2c (path 1): physically rebind the active
+                                    # handle to the launched isolated session (or back
+                                    # to the home lease). Best-effort: a failure leaves
+                                    # the current handle untouched.
+                                    try:
+                                        if _home_browser is None:
+                                            _home_browser = browser
+                                            _home_system_id = _sys_transition.from_system_id or ""
+                                        # Read the live profile base the same way
+                                        # BrowserEnv.start does, so each system's
+                                        # isolated profile is a sibling of it.
+                                        try:
+                                            from . import config as _switch_cfg
+                                        except ImportError:
+                                            import config as _switch_cfg
+                                        _switch_target_browser = await _session_router.activate_switch(
+                                            _switch,
+                                            url=getattr(browser, "current_url", "") or "",
+                                            user_data_dir_base=getattr(_switch_cfg, "BROWSER_USER_DATA_DIR", "") or "",
+                                            full_state=_switch_full_state,
+                                            home_system_id=_home_system_id,
+                                            home_browser=_home_browser,
+                                        )
+                                        if (
+                                            _switch_target_browser is not None
+                                            and _switch_target_browser is not browser
+                                        ):
+                                            browser = _switch_target_browser
+                                            event_stream.emit(
+                                                "session_switch_activated",
+                                                run_id=_switch.get("run_id", ""),
+                                                to_system_id=_switch.get("to_system_id", ""),
+                                                to_system_name=_switch.get("to_system_name", ""),
+                                                session_id=_switch.get("session_id", ""),
+                                            )
+                                    except Exception as _activate_err:
+                                        logger.debug(
+                                            "[SESSION ROUTER] switch activate skipped: %s",
+                                            _activate_err,
                                         )
                             except Exception as _switch_err:
                                 logger.debug("[SESSION ROUTER] switch acquire skipped: %s", _switch_err)
