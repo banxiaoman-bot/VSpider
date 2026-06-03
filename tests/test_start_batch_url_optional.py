@@ -142,3 +142,69 @@ class TestStartBatchUrlOptional:
         assert body.get("status") == "success", body
         assert body.get("target_url") == "https://site-a.test/"
         assert "https://site-b.test/" in (body.get("urls") or [])
+
+
+class TestStartBatchAttachmentIntent:
+    """input_contract §一-B: ``/api/start_batch`` must report the inferred
+    attachment intent so the frontend can explicitly route batch_rows vs
+    upload_to_page vs prompt_context, instead of treating every upload as a
+    batch DataFrame."""
+
+    def test_no_file_reports_empty_intent(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import api_server as api
+
+        monkeypatch.setattr(api, "_start_queue_workers", lambda bt: ([], {}))
+        monkeypatch.setattr(api, "_task_snapshot", lambda: {"running": False, "in_cooldown": False})
+
+        resp = client.post(
+            "/api/start_batch",
+            data={"prompt": "抓取 https://a.test/ 列表"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("status") == "success", body
+        assert body.get("attachment_intent") == ""
+
+    def test_xlsx_with_row_goal_reports_batch_rows(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import api_server as api
+
+        monkeypatch.setattr(api, "_start_queue_workers", lambda bt: ([], {}))
+        monkeypatch.setattr(api, "_task_snapshot", lambda: {"running": False, "in_cooldown": False})
+
+        resp = client.post(
+            "/api/start_batch",
+            data={"prompt": "按行逐条填报", "target_url": "https://form.example/"},
+            files={
+                "file": (
+                    "rows.xlsx",
+                    b"PK\x03\x04fake-xlsx-bytes",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("status") == "success", body
+        assert body.get("attachment_intent") == "batch_rows", body
+
+    def test_pdf_with_upload_goal_reports_upload_to_page(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import api_server as api
+
+        monkeypatch.setattr(api, "_start_queue_workers", lambda bt: ([], {}))
+        monkeypatch.setattr(api, "_task_snapshot", lambda: {"running": False, "in_cooldown": False})
+
+        resp = client.post(
+            "/api/start_batch",
+            data={"prompt": "把这个 PDF 上传到页面", "target_url": "https://form.example/"},
+            files={"file": ("doc.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("status") == "success", body
+        assert body.get("attachment_intent") == "upload_to_page", body

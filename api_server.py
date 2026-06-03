@@ -3011,6 +3011,20 @@ async def start_batch(
             saved_path_obj.write_bytes(content)
             saved_path = str(saved_path_obj)
 
+    attachment_intent = ""
+    if saved_path:
+        try:
+            from visual_web_agent.io_contract import infer_attachment_intent as _infer_attachment_intent
+
+            attachment_intent = _infer_attachment_intent(
+                filename=safe_name,
+                mime=upload_mime,
+                goal=merged_prompt,
+            )
+        except Exception as _intent_exc:
+            logger.debug("[start_batch] attachment intent inference failed: %s", _intent_exc)
+            attachment_intent = ""
+
     mode_label = "batch" if saved_path else "single"
     logger.info(
         f"[start_batch] 任务入队 ({mode_label})\n"
@@ -3022,6 +3036,7 @@ async def start_batch(
         f"semantic={vlm_options.get('semantic_model') or '<default>'}, "
         f"semantic_base={vlm_options.get('semantic_base_url') or '<default>'}\n"
         f"  file       : {safe_name!r}  ({file_size_kb:.1f} KB)\n"
+        f"  intent     : {attachment_intent or '<none>'}\n"
         f"  saved_to   : {saved_path or '<none>'}\n"
         f"  overwritten: {existed}"
     )
@@ -3088,6 +3103,7 @@ async def start_batch(
         "vlm_model_type": vlm_options.get("model_type", "vl"),
         "upload_sha256": upload_sha256,
         "upload_mime": upload_mime,
+        "attachment_intent": attachment_intent,
     }
 
 
