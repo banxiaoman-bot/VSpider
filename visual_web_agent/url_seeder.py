@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError
@@ -151,6 +152,14 @@ def _normalize_head(resp: Any) -> tuple[int, str]:
 
 
 _HEAD_REJECTED_STATUSES = (405, 501)
+
+# Upper bound for parallel HEAD probing (SEED-PARALLEL). Probes are cheap I/O so
+# this is higher than the agent-run cap in ``concurrency_config`` (16), but still
+# bounded so a large seed set can't spawn an unbounded thread pool.
+_MAX_PROBE_CONCURRENCY = 32
+
+# Default parallelism for batch HEAD probing when a caller doesn't specify one.
+_DEFAULT_PROBE_CONCURRENCY = 8
 
 
 def _urllib_probe(
@@ -292,6 +301,41 @@ class UrlSeeder:
         out["output_kind"] = content_type_to_output_kind(content_type)
         return out
 
+    def probe_urls(
+        self,
+        urls: Iterable[str],
+        *,
+        concurrency: int = _DEFAULT_PROBE_CONCURRENCY,
+    ) -> list[dict[str, Any]]:
+        """Probe many URLs via :meth:`probe_url`, returning metadata in input order.
+
+        With ``concurrency <= 1`` the URLs are probed serially; otherwise up to
+        ``concurrency`` HEAD probes (capped at :data:`_MAX_PROBE_CONCURRENCY` and
+        the URL count) run on a thread pool. Output order always matches input
+        order regardless of completion order, and a per-URL failure is swallowed
+        (that URL reported not-live) so one dead probe never aborts the batch
+        (mission §一 "高效 / 准确").
+        """
+        items = [str(u) for u in urls]
+        if not items:
+            return []
+        workers = min(int(concurrency or 0), _MAX_PROBE_CONCURRENCY, len(items))
+        if workers <= 1:
+            return [self.probe_url(u) for u in items]
+        results: list[dict[str, Any]] = [
+            {"url": u, "status_code": 0, "content_type": "", "live": False, "output_kind": ""}
+            for u in items
+        ]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_idx = {pool.submit(self.probe_url, u): i for i, u in enumerate(items)}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception:
+                    pass  # keep the pre-seeded not-live placeholder
+        return results
+
     def seed_from_sitemap(
         self,
         sitemap_url: str,
@@ -301,6 +345,7 @@ class UrlSeeder:
         allowed_domains: Iterable[str] | None = None,
         keywords: object | None = None,
         live_only: bool = False,
+        probe_concurrency: int = _DEFAULT_PROBE_CONCURRENCY,
     ) -> list[str]:
         """BFS over ``sitemap_url`` (recursing into sitemap indexes) → page URLs.
 
@@ -308,7 +353,7 @@ class UrlSeeder:
         only seeds whose URL scores > 0 (``crawl_frontier.score_url``). Result is
         deduped, in document order, capped at ``max_urls``. ``live_only`` drops
         URLs that fail a :meth:`probe_url` HEAD check (no-op without a
-        ``head_fetcher``).
+        ``head_fetcher``), probed up to ``probe_concurrency`` at a time.
         """
         allow = {domain_of(str(d)) for d in (allowed_domains or [])}
         allow.discard("")
@@ -348,7 +393,8 @@ class UrlSeeder:
                 if len(pages) >= max_urls:
                     break
         if live_only and self.head_fetcher:
-            pages = [p for p in pages if self.probe_url(p)["live"]]
+            metas = self.probe_urls(pages, concurrency=probe_concurrency)
+            pages = [page for page, meta in zip(pages, metas) if meta["live"]]
         return pages
 
     def seed_from_robots(
@@ -360,6 +406,7 @@ class UrlSeeder:
         allowed_domains: Iterable[str] | None = None,
         keywords: object | None = None,
         live_only: bool = False,
+        probe_concurrency: int = _DEFAULT_PROBE_CONCURRENCY,
     ) -> list[str]:
         """Read ``robots.txt`` ``Sitemap:`` directives, then seed from each."""
         text = self._fetch_text(robots_url)
@@ -373,6 +420,7 @@ class UrlSeeder:
                 allowed_domains=allowed_domains,
                 keywords=keywords,
                 live_only=live_only,
+                probe_concurrency=probe_concurrency,
             ):
                 if page not in seen:
                     seen.add(page)
