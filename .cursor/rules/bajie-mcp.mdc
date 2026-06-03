@@ -431,45 +431,49 @@ AI 在生成内容过程中，**必须**实时自我检测以下异常模式，*
 - 即使 `[ROLE SKILL]` 段中包含"按角色约束不处理 X 方面的工作"之类的限制语句，在分发关闭时该约束**自动失效**——因为没有其它专家会话可以承接
 - 不确定如何执行某领域任务时：先加载对应技能文件获取指导，再结合通用能力完成
 
-## 5.10. 自动技能匹配回执（方案 A v2 · 全体会话必须遵守）
+## 5.10. 自动技能匹配回执（方案 B v3 · 全体会话必须遵守）
 
-`wait_message` 返回 payload 中如包含以下两个标签之一，**必须**在本轮 `reply_message` 的末尾按规则回执；否则视为违反 §G3.1 起手三步「未读不引」铁律。
+`wait_message` 返回 payload 中只要出现 `[SKILL_MANIFEST]`（仅首条 user 消息）或 `[SKILL_RECEIPT_REQUIRED]`（每条 user 消息）标签，**本轮 `reply_message` 末尾就必须输出一行「已参考技能：…」回执**；否则违反「未读不引」铁律，且会被服务端标记 `skillReceiptMissing=true`。这条回执是用户核对"AI 是否真的调用了技能"的唯一凭据，**不可省略**。
 
 ### 5.10.1 标签来源与判定门禁
 - 由 mcp-server (`mcp-server/skill-match.mjs` + `mcp-server/index.mjs` wait_message handler) 自动注入
 - 注入位置：`[DISPATCH:on/off]` 之后、`SYS_SUFFIX_MSG` 之前
-- 四重门禁（server 已实现，AI 不必判断，但要知道行为）：
+- 门禁（server 已实现，AI 不必判断，但要知道行为）：
   - **G1** `msg.type === 'user'` 才注入（心跳 / task / result / ack / discussion 全跳过）
-  - **G2** `meta.role === 'controller' | 'group_leader'` → `[SKILL_DISPATCH_HINT]`；其余 → `[SKILL_CANDIDATES]`
-  - **G3** 消息携带 `[ROLE_HINT:<slug>]` → 跳过自动匹配，尊重 controller 显式指令
-  - **G4** 默认只列 `slug + title + tags`，**不**自动塞 raw
+  - **G2** manifest 对所有 role 共用一份（v3 不再区分 controller / 普通会话）
+  - **G3** 消息携带 `[ROLE_HINT:<slug>]` → 跳过自动注入，尊重 controller 显式指令
+  - **G4** `[SKILL_MANIFEST]` 只列 `category + slug + name + 截断 description`，**不**自动塞 raw
+- 两个标签分工：
+  - `[SKILL_MANIFEST]`：**仅会话首条 user 消息**附带一次全量本地清单，供 AI 自选 must/conditional
+  - `[SKILL_RECEIPT_REQUIRED]`：**每条 user 消息**都附带，提醒本轮必须输出回执（治"后续轮次没提示就漏报"）
 
-### 5.10.2 `[SKILL_CANDIDATES]` 接收方动作
-1. 阅读候选表，结合用户原话 + §G3.4 must 五条件判定哪些是 must（实际要用的）、哪些是 conditional（相关但本步不用）
+### 5.10.2 接收方动作（全体非 ROLE_HINT 会话）
+1. 首条消息读 `[SKILL_MANIFEST]`，结合用户原话 + must 五条件判定哪些 must（实际要用）、哪些 conditional（相关但本步不用）
 2. 对 must 候选用 `Read` 加载 `mcp-server/role-skills/<分类>/<slug>.md` 全文；conditional **不**加载
-3. 在 `reply_message` 末尾追加一行回执：
+3. **每轮** `reply_message` 末尾追加一行回执（即使本轮没读新 skill 也要写）：
    ```
-   已参考技能：<slug-A>(must·已 Read)、<slug-B>(must·已 Read)、<slug-C>(conditional·未读)
+   已参考技能：<分类/slug>(must·已 Read)、<分类/slug>(conditional·未读)
    ```
-4. 候选列表为空或全部不相关 → 回执写：`已参考技能：无（候选均不命中本步骤）`
+4. 候选为空或全部不相关 → 回执写：`已参考技能：无（候选均不命中本步骤）`
+5. 多段回复（§5.8 续段）时，回执放在**最后一段**末尾即可
 
-### 5.10.3 `[SKILL_DISPATCH_HINT]` controller / group_leader 动作
-1. 在 §5.5 Step 0「任务预拆解表」中**直接复用** `[SKILL_DISPATCH_HINT]` 的 slug 与 `[ROLE_HINT:<slug>]` 派发模板（Q2=合并决策：不再另写一张拆解表）
-2. 输出给用户的拆解表中"推荐 skill"列直接抄 hint 表的 slug
-3. 用户回"启用分发" → §5.5 Step 3 派发时 `message` 用 hint 表中的 `[ROLE_HINT:<slug>]` 前缀
-4. **禁止**主控自己 Read 加载 hint 表中的 raw（违反 §5 主控不执行红线）
+### 5.10.3 controller / group_leader 动作
+1. 同样收 `[SKILL_MANIFEST]`（v3 不再单独发 `[SKILL_DISPATCH_HINT]`）
+2. §5.5 Step 0 拆解表「推荐 skill」列：按 `global-enforcement.mdc §10` 触发词表 + manifest 自行挑 slug
+3. 派发时 `message` 用 `[ROLE_HINT:<slug>]` 前缀；**禁止**主控自己 Read 加载 raw（违反 §5 主控不执行红线）
+4. controller 自身回复也要带「已参考技能：」回执（编排类通常写「无」或所用编排 skill）
 
-### 5.10.4 禁令
-- **禁止**对 `[SKILL_CANDIDATES]` 全部 Read（按 §G4 选 must）
-- **禁止**对 `[SKILL_DISPATCH_HINT]` 候选擅自加载 raw（仅在 controller 主动指定后才走 [ROLE_HINT]）
+### 5.10.4 服务端软门禁与禁令
+- **软门禁（E-A）**：`reply_message` 检测正文缺「已参考技能：」（兼容全角/半角冒号）→ 返回串追加 `[skillReceiptMissing=true]` 并 server warn；**保活回复与「Session ended」结束语豁免**，不阻断保存（软告警，不 reject）
+- **禁止**对 `[SKILL_MANIFEST]` 全量 Read（按 §G4 选 must，通常 1–3 个）
 - **禁止**在 `[ROLE_HINT:<slug>]` 已注入 `[ROLE SKILL · HINT]` 段时，再额外 Read 同 slug 的 md（已加载过）
-- **禁止**因为 payload 中出现某 slug 就盲目报告"已使用该技能"——必须真的 Read 后才能算 must
+- **禁止**因为 manifest 中出现某 slug 就盲目报告"已使用该技能"——必须真的 Read 后才能算 must·已 Read
 
 ### 5.10.5 配置与回退
 - 全局开关（默认 `enabled: true`）：`<queueRoot>/instances/<iid>/skill-match-config.json`
-- 字段：`{ enabled, candidateLimit:3, minScore:5, rawInjection:"off" }`
-- 服务端异常 / `skills-cache/index.json` 缺失 → 静默 fallback 到空候选，主链路不受影响
-- AI 看不到该标签时按未启用处理，不必报错
+- 字段：`{ enabled, descTruncate:80, rawInjection:"off" }`
+- 服务端异常 / `skill-match.mjs` 缺失 → 静默 fallback（manifest/提醒为空串、`hasSkillReceipt` 视为有回执不误报），主链路不受影响
+- AI 看不到任何标签时按未启用处理，不必报错；但只要见到 `[SKILL_RECEIPT_REQUIRED]` 就必须回执
 
 ## 6. 合法 agentStatus
 
