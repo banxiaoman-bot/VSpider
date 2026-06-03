@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import sys
 import threading
@@ -36,6 +37,7 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 # done; these drive carrying a prior run's progress back into a fresh DataFrame.
 _RESUME_DONE_STATUS = "成功"
 _URL_KEY_CANDIDATES = ("url", "链接", "网址", "链接地址", "link", "链接url")
+_STATUS_COLS = ("填报状态", "日志备注")
 
 
 def _emit_log(message: str, level: str = "info") -> None:
@@ -216,6 +218,37 @@ def _row_resume_key(df: pd.DataFrame) -> str:
     return ""
 
 
+def _content_columns(df: pd.DataFrame) -> list:
+    """Data columns used for content-hash row keys (excludes status / log cols)."""
+    return [c for c in df.columns if str(c).strip() not in _STATUS_COLS]
+
+
+def _row_content_hash(row, columns: list) -> str:
+    """Stable per-row content fingerprint over ``columns`` (NaN / blank -> '').
+
+    An order-independent resume key for tables without a URL-like column
+    (BATCH-RESUME2): two rows with identical data hash the same, so reordered /
+    inserted rows still match a prior run instead of falling back to fragile
+    positional matching.
+    """
+    parts: list[str] = []
+    for col in columns:
+        val = row.get(col, "")
+        try:
+            blank = bool(pd.isna(val))
+        except (TypeError, ValueError):
+            blank = False
+        if blank or val is None:
+            sval = ""
+        else:
+            sval = str(val).strip()
+            if sval.lower() in ("nan", "none", "nat"):
+                sval = ""
+        parts.append(sval)
+    raw = "\x1f".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def _merge_prior_progress(
     df: pd.DataFrame,
     prior_df: pd.DataFrame,
@@ -260,6 +293,29 @@ def _merge_prior_progress(
             df.at[index, "日志备注"] = done[key] or "上次已成功(续跑跳过)"
             resumed += 1
         return df, resumed
+
+    # Tier 2 (BATCH-RESUME2): content-hash matching when no usable URL key.
+    # Order-independent, so reordered / inserted rows still resume; falls through
+    # to positional only when the two frames' data columns differ.
+    df_content = _content_columns(df)
+    prior_content = _content_columns(prior_df)
+    if df_content and sorted(map(str, df_content)) == sorted(map(str, prior_content)):
+        prior_has_note = "日志备注" in prior_df.columns
+        done_hashes: dict[str, str] = {}
+        for _, prow in prior_df.iterrows():
+            if str(prow.get("填报状态", "")).strip() == _RESUME_DONE_STATUS:
+                h = _row_content_hash(prow, df_content)
+                done_hashes[h] = str(prow.get("日志备注", "") or "") if prior_has_note else ""
+        if done_hashes:
+            for index, row in df.iterrows():
+                if str(row.get("填报状态", "")).strip() == _RESUME_DONE_STATUS:
+                    continue
+                h = _row_content_hash(row, df_content)
+                if h in done_hashes:
+                    df.at[index, "填报状态"] = _RESUME_DONE_STATUS
+                    df.at[index, "日志备注"] = done_hashes[h] or "上次已成功(内容续跑跳过)"
+                    resumed += 1
+            return df, resumed
 
     prior_status = list(prior_df["填报状态"])
     prior_notes = (
