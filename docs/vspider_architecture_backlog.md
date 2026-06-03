@@ -898,6 +898,43 @@ Out of scope (deliberate, next slices):
   time, embedding/cosine chunking, exposing chunks via the planner contract.
 
 
+## Slice FITMD-4: focus query ranks + scores the chunks artifact
+
+Goal:
+
+- Close FITMD-3's named "query-rank at call time" gap (mission §一 "高效 / 精准").
+  `page_to_markdown`'s `type_value` is already the BM25 focus query used to fit the
+  markdown, but the persisted `markdown_chunks` jsonl ignored it: chunks were always
+  heading-order and unscored, so a downstream RAG / QA step had to re-score to find
+  the relevant slices. Make the chunk artifact query-aware. Additive + opt-in (no
+  query -> byte-identical to FITMD-3); no new action-schema field (reuses type_value).
+
+Add / change (page_to_markdown_action.py, +score_chunks import / +28 lines):
+
+- New `_chunk_records(chunks, query)` static helper. No query -> records stay in
+  document order with the original 4 keys (index/heading/word_count/text). With a
+  focus query -> records are reordered most-relevant-first (BM25 via FITMD-2's
+  `score_chunks`, stable on ties by original index) and each carries a rounded
+  `score`; `index` still reflects the original document position.
+- `execute()` builds chunk_records via the helper instead of an inline doc-order
+  comprehension. Markdown output / markdown_doc artifact unchanged.
+
+Acceptance:
+
+- `validate_y FITMD-4` (target -> npm build -> core -> full): target
+  `tests/test_page_to_markdown_chunks.py` -> **7 passed** (5 prior + 2 new: no-query
+  stays doc-order & unscored; focus query ranks Beta-first with descending scores)
+  -> `npm run build` ok -> core **102** -> **full 2542 passed, 2 skipped** (135s) ->
+  `[validate_y] success`. ReadLints clean; `test_page_to_markdown_handler.py` 8 +
+  `test_chunking.py` 11 unchanged.
+
+Out of scope (deliberate, next slices):
+
+- An action-schema field to pick chunk strategy / max_words / top_k / threshold at
+  call time; embedding/cosine chunking; exposing the ranked chunks through the
+  planner contract / output_contract resolver.
+
+
 ## Slice CRAWL-RESUME2: Anchor-preserving best-first resume
 
 Goal:
