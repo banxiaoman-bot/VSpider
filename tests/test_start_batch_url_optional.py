@@ -1,9 +1,12 @@
-"""OUT-4 regression: ``/api/start_batch`` must accept an empty
-``target_url`` and either infer it from the prompt or return a clean
-error -- never blow up with ``Field required``.
+"""OUT-4 / input_contract §一-B regression: ``/api/start_batch`` must accept an
+empty ``target_url``. It first tries to harvest a URL from the prompt; failing
+that it defers to the io_contract preflight, which resolves a search-engine
+entry (decision A: never hard-block a URL-less goal). It never blows up with
+``Field required``.
 
 These tests exercise the FastAPI endpoint via TestClient so the form
-validation and our new URL-inference branch are both covered.
+validation, the prompt-harvest branch, and the preflight entry-inference branch
+are all covered.
 """
 
 from __future__ import annotations
@@ -77,9 +80,13 @@ class TestStartBatchUrlOptional:
         assert body.get("status") == "success", body
         assert body.get("target_url") == "https://quotes.toscrape.com/"
 
-    def test_missing_target_url_and_no_prompt_url_returns_error(
+    def test_missing_target_url_and_no_prompt_url_infers_search_entry(
         self, client, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """input_contract §一-B: a URL-less goal is no longer hard-blocked at
+        the HTTP edge. The io_contract preflight resolves a search-engine entry
+        the agent can start from, and the response flags it as auto-inferred so
+        the frontend can let the user confirm / override."""
         import api_server as api
 
         monkeypatch.setattr(api, "_start_queue_workers", lambda bt: ([], {}))
@@ -91,9 +98,10 @@ class TestStartBatchUrlOptional:
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body.get("status") == "error"
-        msg = body.get("message", "")
-        assert "target_url" in msg or "URL" in msg
+        assert body.get("status") == "success", body
+        target_url = body.get("target_url") or ""
+        assert target_url.startswith("http"), body
+        assert body.get("target_url_auto_entry"), body
 
     def test_explicit_target_url_still_wins(
         self, client, monkeypatch: pytest.MonkeyPatch

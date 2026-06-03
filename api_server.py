@@ -2795,8 +2795,9 @@ async def start_batch(
     target_url: str = Form(
         "",
         description=(
-            "目标系统 URL（可选）。留空时会先尝试从 prompt/goal 中提取 "
-            "http(s) URL；提取不到再返回错误。"
+            "目标系统 URL（可选）。留空时先尝试从 prompt/goal 中提取 http(s) URL；"
+            "提取不到再由 io_contract preflight 推断入口（抽象目标退化为搜索引擎入口）。"
+            "响应中的 target_url_auto_entry 标记入口来源，供前端确认/覆盖。"
         ),
     ),
     prompt: str = Form("", description="自然语言 Prompt 指令"),
@@ -2866,6 +2867,7 @@ async def start_batch(
         }
 
     inferred_from_prompt = False
+    auto_entry_source = ""
     if not (target_url or "").strip():
         harvested = _harvest_urls_from_text(merged_prompt)
         if harvested:
@@ -2876,13 +2878,34 @@ async def start_batch(
                 target_url,
             )
         else:
-            return {
-                "status": "error",
-                "message": (
-                    "缺少 target_url，且未能从 prompt 中识别到 http(s):// 链接。"
-                    "请在表单中填写目标 URL，或在自然语言指令里直接写出网址。"
-                ),
-            }
+            resolved_entry = ""
+            try:
+                from visual_web_agent.io_contract import build_preflight as _build_preflight
+
+                _pf_entry = _build_preflight(merged_prompt)
+                resolved_entry = (_pf_entry.resolved_start_url or "").strip()
+                auto_entry_source = (
+                    _pf_entry.entry_suggestion.source
+                    if _pf_entry.entry_suggestion else "inferred"
+                )
+            except Exception as _pf_exc:
+                logger.warning("[start_batch] preflight 入口推断失败: %s", _pf_exc)
+                resolved_entry = ""
+                auto_entry_source = ""
+            if resolved_entry:
+                target_url = resolved_entry
+                logger.info(
+                    "[start_batch] target_url 缺省且 prompt 无链接，preflight 推断入口: %s (%s)",
+                    target_url, auto_entry_source or "inferred",
+                )
+            else:
+                return {
+                    "status": "error",
+                    "message": (
+                        "缺少 target_url，且无法从目标推断入口。"
+                        "请在表单中填写目标 URL，或在自然语言指令里直接写出网址。"
+                    ),
+                }
 
     normalized_target_url, target_url_error = _normalize_target_url(target_url)
     if target_url_error:
@@ -3057,6 +3080,7 @@ async def start_batch(
         "overwritten": existed,
         "file_size_kb": round(file_size_kb, 1),
         "target_url": target_url,
+        "target_url_auto_entry": auto_entry_source,
         "urls": extra_urls,
         "auth_profiles": auth_profiles.strip(),
         "vlm_model": vlm_options.get("model", ""),
