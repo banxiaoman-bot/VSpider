@@ -1251,3 +1251,53 @@ Out of scope (step 3):
 - Consuming `decision.completed_steps` / `from_turn` to actually skip already-done
   work on a resumed VLM run (non-deterministic replay); a `resume_run` action +
   prompt skill; surfacing resume state into `workflow_memory` / the planner.
+
+
+## Slice RUN-RESUME1 (step 3a): seed dedup state from the prior run on resume
+
+Goal:
+
+- Make `resume=True` runs actually *reuse* the prior run's extracted dataset:
+  rebuild the dedup seen-set + accepted row count from the last run for the same
+  `(goal, start_url)` so a resumed run skips already-captured rows instead of
+  re-emitting them (mission §一 "高效 — 能不重抓就不重抓"). Opt-in via
+  `constraints.resume`; default-off stays byte-identical (no seam runs).
+
+Add / change (5 commits cef43e4..576a134):
+
+- `run_resume_index.py` (new, data_plane / cef43e4) — `compute_resume_key`
+  (goal+start_url → stable 16-hex) + cross-run locator over
+  `runs/_resume_index.json` via `record_run` / `lookup_last_run`. Atomic
+  tmp + `os.replace`, tolerant reads, `base_dir` injectable.
+- `data_sanitizer.rebuild_seen_fingerprints` (+34 / fa9d866) — reuses
+  `_non_empty_values` + `_row_fingerprints` to reconstruct the dedup seen-set +
+  accepted count from prior rows. Pure, deterministic, no I/O.
+- `dataset_reader.py` (new, data_plane / 3575f00) — `read_dataset_rows` reads a
+  prior run's xlsx/csv/jsonl/json dataset back into row dicts (NaN/blank → ''
+  for fingerprint hygiene, aligned with attachment_adapters/rows.py). Tolerant:
+  `[]` on missing/corrupt/unsupported.
+- `resume_seed.py` (new, data_plane / 5defeb7) — orchestration façade:
+  `seed_seen_from_last_run` (index lookup → manifest dataset locate → reader →
+  rebuild) and `record_run_for_resume` (upsert this run + its latest dataset
+  path). Every fn degrades to a fresh run on error; `base_dir` injectable.
+- `main.py::run_agent` (+53 / 576a134, execution_kernel) — 3 guarded blocks gated
+  on `constraints.resume`: (1) seed seen-set + total row count from the prior
+  dataset before extraction, (2) register the run in `_resume_index.json` at
+  start (so a mid-run crash stays resumable), (3) finalize the entry (final
+  count + `completed`/`failed` status) at teardown. Each block try/except-wrapped
+  → resume off is inert, a seed mishap degrades to a fresh run. No contract
+  field changes.
+
+Acceptance:
+
+- Targeted (this session): `tests/test_run_resume_index.py` +
+  `tests/test_rebuild_seen_fingerprints.py` + `tests/test_dataset_reader.py` +
+  `tests/test_resume_seed.py` → **52 passed in 2.31s**. Diff +1084/-1 across 9
+  files (5 src + 4 test). Branch `feat/web-extraction-suite` @ `576a134`, pushed.
+
+Out of scope:
+
+- Consuming `decision.completed_steps` / `from_turn` to skip the VLM action replay
+  itself (non-deterministic); a `resume_run` action + prompt skill; surfacing
+  resume state into `workflow_memory` / the planner; a full `validate_y run-resume`
+  (npm build + core + full pytest) re-run.
