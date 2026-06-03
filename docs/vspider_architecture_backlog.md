@@ -1301,3 +1301,71 @@ Out of scope:
   itself (non-deterministic); a `resume_run` action + prompt skill; surfacing
   resume state into `workflow_memory` / the planner; a full `validate_y run-resume`
   (npm build + core + full pytest) re-run.
+
+## Slice RUN-RESUME1 (step 3): consume the resume decision + `resume_run` action
+
+Goal:
+
+- Close the step-2b / 3a "out of scope" gap: actually *consume* a resume decision
+  so a resumed run continues from where it left off instead of restarting. The VLM
+  loop is non-deterministic (no byte-for-byte replay), so two honest, human-like
+  mechanisms: (1) surface the resume state into `workflow_memory` + a natural-language
+  directive so the planner/VLM continues toward the remaining goal (re-establishing
+  nav/login when needed); (2) best-effort skip the leading already-completed planner
+  sub-goals. Plus a `resume_run` capability so the agent can consult "where did the
+  last run stop?" on demand. Default-off / inert on a fresh run (byte-identical when
+  resume is not active).
+
+Add (2 new modules):
+
+- `run_resume_consume.py` (new, data_plane, pure stdlib, duck-typed) — 4 helpers:
+  `plan_completed_step_labels(task_plan)` (record side: ordered descriptions of
+  `done` sub-goals), `resume_memory_payload(decision)` (build the `__resume_state`
+  payload), `build_resume_note(decision)` (CN "断点续跑" natural-language directive),
+  and `apply_completed_steps_to_plan(task_plan, completed_steps)` (best-effort skip —
+  exact normalized match on the *leading* run of sub-goals, advances `current_idx`,
+  marks them `done` + next `active`, never skips the final sub-goal, self-healing via
+  re-observation).
+- `resume_run_action.py` (new, operations_plane) — `resume_run` deterministic,
+  read-only handler shipped as its own module (workflow §三, not appended to the
+  oversized actions.py). Resolution order: `workflow_memory["__resume_state"]`
+  (loop-published) → the active run's `run_checkpoint.json` → fresh-task status. Writes
+  the result to `workflow_memory[memory_key or "resume_status"]` + mirrors it on the
+  RPA trail as evidence. No page mutation (works without a live page).
+
+Change (7 files, +117/-1):
+
+- `main.py::run_agent` (+47/-1, execution_kernel) — 2 guarded blocks: (1) right after
+  the step-2b `begin`, when `_run_ckpt.should_resume`, publish `__resume_state` +
+  `apply_completed_steps_to_plan(_task_plan, decision.completed_steps)`; (2) at the
+  per-turn `record`, feed `plan_completed_step_labels(_task_plan) or None` as
+  `completed_steps=` (the `or None` preserves a resumed ledger on turns with no newly
+  done sub-goal). Both try/except-wrapped → inert unless resume. Verified safe vs
+  `merge_task_plan_into_route` (reads only sub-goal descriptions, not
+  `current_idx`/status, so a post-merge skip cannot desync the route).
+- `action_registry.py` (+33) — register the `resume_run` ActionTool (capability=resume,
+  CN/EN aliases, tags, evidence, deterministic, read-only).
+- `actions.py` (+4) — import `resume_run_action` (mirrors the page_to_markdown wiring).
+- `capability_router.py` (+5) — `_RESUME_RE` regex + `resume_preferred` signal +
+  `resume_run` step in `_backend_plan`.
+- `prompt_skills.py` (+21) — `RESUME_RUN_SKILL` block + `SKILL_PROMPTS["resume_run"]`.
+- `prompts.py` (+7) — `_RESUME_RUN_TRIGGERS` (CN/EN) + skill activation in
+  `build_system_prompt`.
+- `vlm_client.py` (+1) — add `resume_run` to the `VSpiderAction` action literal.
+
+Acceptance:
+
+- `validate_y RUN-RESUME1` (target ×4 → npm build → core → full): target
+  `tests/test_run_resume_consume.py` + `tests/test_resume_run_action.py` +
+  `tests/test_resume_run_router.py` + `tests/test_resume_run_prompt.py` → **32 passed**
+  → `npm run build` ✓ → core **102 passed** → **full 2470 passed, 2 skipped** (140s)
+  → `[validate_y] success`. `py_compile main.py` OK, lint clean, `main.py` EOL (CRLF)
+  preserved. Diff +117/-1 across 7 changed files + 6 new (2 src + 4 test).
+
+Out of scope:
+
+- Fuzzy / semantic matching of completed-step labels (currently exact normalized
+  match); resuming the VLM's per-turn action replay byte-for-byte (intentionally
+  avoided — the agent re-observes each turn); cross-run resume across *different*
+  goals / start URLs.
+
