@@ -225,6 +225,47 @@ class SessionRouter:
         active = self.get_active(system_id)
         return bool(active is not None and active.session_id == expected)
 
+    async def launch_for_switch(
+        self,
+        session: BrowserSession,
+        url: str,
+        *,
+        user_data_dir: str = "",
+        full_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Launch a pooled target session under an isolated profile (E1c-3b-2b).
+
+        The async companion to :meth:`acquire_for_switch`: it starts the
+        acquired :class:`BrowserSession`'s browser on its own ``user_data_dir``
+        (so it never contends for the primary lease's persistent-context lock),
+        applies the subset of ``full_state`` belonging to the session's system,
+        and reads back the landed URL + applied cookie count as switch
+        evidence. A blank ``user_data_dir`` is passed through as ``None`` so the
+        browser falls back to the global profile. The active reactive-loop
+        handle is **not** rebound here -- that physical swap is the final slice.
+        """
+
+        result: dict[str, Any] = {
+            "session_id": session.session_id,
+            "system_id": session.system_id,
+            "launched": False,
+            "applied_cookies": 0,
+            "applied_origins": 0,
+            "final_url": "",
+        }
+        await session.browser.start(url, user_data_dir_override=user_data_dir or None)
+        result["launched"] = True
+        subset = self.storage_state_for_system(session.system_id, full_state)
+        context = getattr(session.browser, "_context", None)
+        if context is not None and (subset.get("cookies") or subset.get("origins")):
+            from .auth_manager import apply_storage_state_to_context
+
+            cookie_count, origin_count = await apply_storage_state_to_context(context, subset)
+            result["applied_cookies"] = int(cookie_count)
+            result["applied_origins"] = int(origin_count)
+        result["final_url"] = getattr(session.browser, "current_url", "") or ""
+        return result
+
     async def release_all(self, *, error: str = "") -> list[str]:
         if self.pool is not None:
             return await self.pool.release_run(self.run_id, error=error)

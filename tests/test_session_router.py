@@ -293,6 +293,83 @@ class TestSessionRouterReleaseAfterSwitch:
         assert pool.total_released == 1
 
 
+class _StubContext:
+    """Minimal Playwright-context stand-in: records the two calls
+    ``auth_manager.apply_storage_state_to_context`` makes."""
+
+    def __init__(self) -> None:
+        self.added_cookies: list[dict] = []
+        self.init_scripts: list[str] = []
+
+    async def add_cookies(self, cookies) -> None:
+        self.added_cookies.extend(cookies)
+
+    async def add_init_script(self, script) -> None:
+        self.init_scripts.append(script)
+
+
+class _StubLaunchBrowserEnv:
+    """Stub BrowserEnv whose ``start`` records the isolated-profile override
+    and simulates landing on a URL; ``_context`` drives the real apply code."""
+
+    def __init__(self, *, landed_url: str = "https://alpha.com/home") -> None:
+        self.started: list[dict] = []
+        self._context = _StubContext()
+        self.current_url = ""
+        self._landed_url = landed_url
+
+    async def start(self, url: str, *, user_data_dir_override=None) -> None:
+        self.started.append({"url": url, "user_data_dir_override": user_data_dir_override})
+        self.current_url = self._landed_url
+
+    async def close(self) -> None:
+        return None
+
+
+class TestSessionRouterLaunchForSwitch:
+    def test_launch_starts_isolated_profile_and_applies_subset(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(
+            to_system_id="system_1", from_system_id="system_2", full_state=_FULL_STATE
+        )
+        session = router.get_active("system_1")
+        result = _run(
+            router.launch_for_switch(
+                session,
+                "https://alpha.com/home",
+                user_data_dir="/tmp/sys_alpha",
+                full_state=_FULL_STATE,
+            )
+        )
+        assert result["launched"] is True
+        assert result["session_id"] == directive["session_id"]
+        assert result["applied_cookies"] == 1  # only the .alpha.com cookie in the subset
+        assert result["final_url"] == "https://alpha.com/home"
+        assert session.browser.started == [
+            {"url": "https://alpha.com/home", "user_data_dir_override": "/tmp/sys_alpha"}
+        ]
+        assert len(session.browser._context.added_cookies) == 1
+
+    def test_launch_without_state_applies_nothing(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        session = router.get_active("system_1")
+        result = _run(router.launch_for_switch(session, "https://alpha.com", full_state=None))
+        assert result["launched"] is True
+        assert result["applied_cookies"] == 0
+        assert session.browser._context.added_cookies == []
+
+    def test_launch_blank_user_data_dir_passes_none(self) -> None:
+        pool = BrowserSessionPool(env_factory=_StubLaunchBrowserEnv)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        session = router.get_active("system_1")
+        _run(router.launch_for_switch(session, "https://alpha.com", user_data_dir="", full_state=_FULL_STATE))
+        assert session.browser.started[0]["user_data_dir_override"] is None
+
+
 class TestBuildSessionRouter:
     def test_build_from_capability_route(self) -> None:
         route = {"workflow_graph": {"systems": _SYSTEMS}}
