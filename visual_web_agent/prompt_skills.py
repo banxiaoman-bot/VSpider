@@ -1144,9 +1144,30 @@ PAGE_TO_MARKDOWN_SKILL = """
 """.strip()
 
 
+RESUME_RUN_SKILL = """
+## Skill: Resume Run（断点续跑 / 接着上次继续）
+适用：用户说“续跑 / 断点续跑 / 接着上次 / 继续上次没抓完的 / resume / continue last run”，或本次为中断后的重启。
+
+何时用 resume_run：
+- 上一轮 run 中途崩溃 / 被中止，本次要接着上次进度继续，而不是从头重来。
+- 想先确认“上次做到哪了、已抓了多少条”再决定下一步。
+
+用法：
+1. action=resume_run，target_id=0。
+2. memory_key 选填：默认写到 resume_status；结果含 {resumed, from_turn, completed_steps, item_count, prior_status, note, source}。
+
+行为约定：
+1. 只读动作，不改页面：读取上次 run_checkpoint / 已发布的续跑状态并写回 memory。
+2. 若 resumed=true：已抓数据已去重，禁止重复输出；按 note 从剩余目标继续，必要时重新导航/登录恢复前置条件，但不要重复已完成的提取或操作。
+3. 若 resumed=false（无可续跑进度）：按全新任务从头执行。
+4. 已完成的子目标会被自动跳过（best-effort）；你只需聚焦当前 active 子目标。
+""".strip()
+
+
 SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
+    "resume_run": RESUME_RUN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,
     "feed_ad_filter": FEED_AD_FILTER_SKILL,

@@ -1015,6 +1015,11 @@ _PAGE_TO_MARKDOWN_TRIGGERS = (
     "reader mode", "readable", "clean text", "main content", "去噪正文",
     "喂给大模型", "喂大模型", "rag", "llm friendly", "llm-friendly", "page to markdown",
 )
+_RESUME_RUN_TRIGGERS = (
+    "续跑", "断点续跑", "断点续传", "接着上次", "继续上次", "上次没做完", "上次没完成",
+    "接着之前", "继续之前", "resume", "resume run", "continue last", "continue previous",
+    "pick up where", "left off",
+)
 
 
 def _looks_like_login_surface(browser_state: str) -> bool:
@@ -1133,6 +1138,8 @@ def build_system_prompt(
         skills.append("chat_entry")
     if _text_has_any(haystack, _PAGE_TO_MARKDOWN_TRIGGERS):
         skills.append("page_to_markdown")
+    if _text_has_any(haystack, _RESUME_RUN_TRIGGERS):
+        skills.append("resume_run")
     if _text_has_any(haystack, ("示例", "范例", "few-shot", "few shot")):
         skills.append("few_shot")
 

@@ -534,6 +534,39 @@ def build_default_action_registry() -> ActionRegistry:
         changes_state=False,
     ))
     register(ActionTool(
+        name="resume_run",
+        capability="resume",
+        description=(
+            "Read back where a prior / interrupted run left off (turn, completed "
+            "steps, rows already captured) from the run checkpoint or the resume "
+            "state the loop published, and surface it into memory so the agent "
+            "continues toward the remaining goal instead of restarting from "
+            "scratch. Already-captured rows are deduped on a resumed run. "
+            "Deterministic and read-only (no page mutation). Use when the user "
+            "asks to 续跑 / 断点续跑 / 接着上次 / continue the last run."
+        ),
+        actions=("resume_run",),
+        aliases=(
+            "resume",
+            "resume run",
+            "resume last",
+            "continue last",
+            "continue previous",
+            "pick up where",
+            "续跑",
+            "断点续跑",
+            "接着上次",
+            "继续上次",
+            "上次没做完",
+            "接着之前",
+            "继续之前",
+        ),
+        tags=("resume", "checkpoint", "control", "deterministic"),
+        evidence=("resumed", "from_turn", "completed_steps", "item_count"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
         name="chat_extract",
         capability="extract",
         description=(

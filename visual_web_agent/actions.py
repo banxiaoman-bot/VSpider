@@ -6521,3 +6521,7 @@ try:
     from . import page_to_markdown_action as _page_to_markdown_action  # noqa: F401
 except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
     import page_to_markdown_action as _page_to_markdown_action  # type: ignore  # noqa: F401
+try:
+    from . import resume_run_action as _resume_run_action  # noqa: F401
+except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
+    import resume_run_action as _resume_run_action  # type: ignore  # noqa: F401

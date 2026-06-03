@@ -37,6 +37,7 @@ _CHAT_RE = re.compile(r"\b(chatgpt|claude|kimi|deepseek|gemini|copilot|chat|ai a
 _FILE_RE = re.compile(r"\b(upload|download|file|excel|csv|xlsx)\b|上传|下载|文件|导入|导出", re.I)
 _CACHE_RE = re.compile(r"\b(cache|record|replay|debug|dev mode)\b|缓存|录制|回放|调试", re.I)
 _QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|metrics|checkpoint)\b|批量|队列|重试|恢复|续跑|断点|续传|暂停|指标|监控", re.I)
+_RESUME_RE = re.compile(r"\bresume\b|\bcontinue\s+(the\s+)?(last|previous|prior)\b|continue\s+where|left\s+off|pick\s+up\s+where|断点续跑|断点续传|接着上次|继续上次|上次没做完|上次没完成|接着之前|继续之前", re.I)
 _BROWSER_RE = re.compile(r"\b(click|scroll|hover|tab|cookie|storage|console|screenshot|browser|locator|selector|similar)\b|点击|滚动|悬停|标签页|浏览器|选择器|相似元素", re.I)
 _AUTH_RE = re.compile(r"\b(login|signin|auth|captcha|2fa|otp)\b|登录|认证|验证码|短信", re.I)
 
@@ -491,6 +492,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     file_io = bool(_FILE_RE.search(text))
     cache = bool(_CACHE_RE.search(text))
     queue = bool(_QUEUE_RE.search(text))
+    resume = bool(_RESUME_RE.search(text))
     browser_interaction = bool(_BROWSER_RE.search(text) or form or chat or file_io)
     auth = bool(_AUTH_RE.search(text))
     output_contract = strategy_context.get("output_contract") or infer_goal_output_contract(text)
@@ -505,6 +507,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "file_io": file_io,
         "cache_or_replay": cache,
         "queue_or_ops": queue,
+        "resume_preferred": resume,
         "browser_interaction": browser_interaction,
         "auth_or_captcha": auth,
         "visual_required": browser_interaction and not (api or crawl),
@@ -532,6 +535,8 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "item_pipeline", "post_processing", "Y28", ["GET /api/spider/{run_id}/items"], "Validate fields, required values, dedupe, empty rows, and pagination of extracted items.", "runtime_guards")
     if signals.get("markdown_preferred"):
         _add(plan, "page_to_markdown", "extraction", "Y-FITMD", ["ActionRegistry: page_to_markdown"], "Convert the current page into denoised LLM-friendly Markdown (readability denoise + density prune + numbered link references + optional BM25 focus query) for question-answering / RAG feeds instead of full-page screenshots.", "deterministic_router")
+    if signals.get("resume_preferred"):
+        _add(plan, "resume_run", "resume", "RUN-RESUME1", ["ActionRegistry: resume_run"], "Read the prior run checkpoint / resume state and continue from where the previous run left off (dedup already-captured rows, skip already-completed sub-goals) instead of restarting from scratch.", "deterministic_router")
     if signals.get("crawl") or (signals.get("structured") and signals.get("artifact_required")):
         _add(plan, "robots_throttle", "crawl_guard", "Y23", ["POST /api/robots/check", "POST /api/robots/reserve"], "Check robots/throttle before spidering or repeated domain fetches.", "runtime_guards")
         _add(plan, "spider_lite", "crawl_extract", "Y24", ["POST /api/spider/run", "GET /api/spider/{run_id}", "GET /api/spider/{run_id}/items"], "Use Spider Lite for multi-page structured extraction with selectors and item pipeline.", "deterministic_router")

@@ -10549,6 +10549,34 @@ async def run_agent(
         except Exception:
             _run_ckpt = None
 
+        # RUN-RESUME1 step 3: consume the resume decision -- surface it into
+        # memory (so the VLM/planner continues instead of restarting) and
+        # best-effort skip the leading already-completed sub-goals on the plan.
+        # Inert unless a resume was actually decided; never aborts the run.
+        if _run_ckpt is not None and _run_ckpt.should_resume:
+            try:
+                try:
+                    from .run_resume_consume import (
+                        apply_completed_steps_to_plan,
+                        resume_memory_payload,
+                    )
+                except ImportError:
+                    from run_resume_consume import (  # type: ignore[no-redef]
+                        apply_completed_steps_to_plan,
+                        resume_memory_payload,
+                    )
+                workflow_memory["__resume_state"] = resume_memory_payload(_run_ckpt.decision)
+                _resume_skipped = apply_completed_steps_to_plan(
+                    _task_plan, _run_ckpt.decision.completed_steps
+                )
+                if _resume_skipped:
+                    logger.info(
+                        "[RUN-RESUME] skipped %s already-completed sub-goal(s) on resume",
+                        _resume_skipped,
+                    )
+            except Exception as _resume_consume_err:
+                logger.debug("[RUN-RESUME] consume skipped: %s", _resume_consume_err)
+
         # RUN-RESUME1 step3a-wire-2b: register this run in the cross-launch resume
         # index up-front so a crash mid-run can still be resumed (the next launch
         # seeds from the prior run's dataset, located via its manifest). Inert
@@ -16920,8 +16948,25 @@ async def run_agent(
                 )
 
                 # RUN-RESUME1 step2b: persist a per-turn checkpoint (inert unless resume)
+                # step 3: also record the plan-anchored completed-step ledger so a
+                # later resume can skip them; (labels or None) preserves a prior
+                # resumed ledger when this run's plan has no done sub-goals yet.
                 if _run_ckpt is not None:
-                    _run_ckpt.record(step, item_count=_total_extracted_rows)
+                    _run_completed_steps = None
+                    if _run_ckpt.enabled:
+                        try:
+                            try:
+                                from .run_resume_consume import plan_completed_step_labels
+                            except ImportError:
+                                from run_resume_consume import plan_completed_step_labels  # type: ignore[no-redef]
+                            _run_completed_steps = plan_completed_step_labels(_task_plan) or None
+                        except Exception:
+                            _run_completed_steps = None
+                    _run_ckpt.record(
+                        step,
+                        item_count=_total_extracted_rows,
+                        completed_steps=_run_completed_steps,
+                    )
 
         else:
             # for-else: 循环正常结束（没有 break），说明达到最大步数
