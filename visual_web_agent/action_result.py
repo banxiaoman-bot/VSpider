@@ -8,12 +8,12 @@ handler to change at once.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
 def _utc_now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:

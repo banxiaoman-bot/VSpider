@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -68,7 +68,7 @@ def default_filename(*, produced_by: str, suffix: str) -> str:
     in the same run are still distinguishable inside the artifacts folder.
     """
     stem = (produced_by or "artifact").strip() or "artifact"
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    stamp = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S_%f")
     return safe_filename(f"{stem}_{stamp}", suffix=suffix)
 
 

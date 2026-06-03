@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ logger = logging.getLogger("vspider.events")
 
 
 def _utc_now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
 
 
 class EventStream:
