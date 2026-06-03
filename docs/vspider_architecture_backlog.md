@@ -1582,3 +1582,44 @@ Out of scope (deliberate, next slices):
   matching (rejected as too loose for a skip decision); matching non-leading
   (out-of-order) completed steps.
 
+
+## Slice SEED-NEXT: URL seeder HEAD→GET fallback + content-type→output_kind routing
+
+Goal:
+
+- Close CRAWL-SEED3's "HEAD→GET fallback for servers that reject HEAD" +
+  "content-type → output_kind routing" gaps (mission §一 "高效 / 准确"; §一-A output
+  contract). Some servers answer HEAD with 405 / 501, so a HEAD-only liveness probe
+  wrongly drops a live URL; and a probe that knows the content-type can already hint
+  the output_kind the run will produce. Both additive; the default path is unchanged.
+
+Add / change (url_seeder.py +110/-17, pure / stdlib):
+
+- `default_head_fetch` refactored over a shared `_urllib_probe(method=...)` helper;
+  when the HEAD status is 405 / 501 (`_HEAD_REJECTED_STATUSES`) it retries with a
+  `Range: bytes=0-0` GET so liveness + content-type resolve without downloading the
+  body. 200 / 404 / network-0 paths are byte-identical to before.
+- `content_type_to_output_kind(content_type)` — pure, tolerant (strips `;charset`,
+  lowercases): `image|video|audio/* -> media_*`; pdf / zip / 7z / rar / gzip / tar ->
+  media_pdf / media_archive; csv / xls(x) -> dataset_rows; json / jsonl / ndjson ->
+  dataset_records; html / xhtml -> html_snapshot; other text -> code_or_text; else
+  file_generic; "" -> "".
+- `UrlSeeder.probe_url` now also returns `output_kind` (inferred from the
+  content-type), so a liveness probe doubles as an output_contract hint.
+
+Acceptance:
+
+- `validate_y seed-next` (target → npm build → core → full): target
+  `tests/test_url_seeder_probe.py` → **22 passed** (11 prior + 11 new: HEAD 405/501
+  → GET fallback, Range header sent, 200 no-fallback; content_type mapping across
+  media / docs / data / charset / text / unknown / empty; probe_url surfaces
+  output_kind) → `npm run build` ✓ → core **102 passed** → **full 2532 passed, 2
+  skipped** (133s) → `[validate_y] success`. `py_compile` OK, lint clean. (probe_url
+  now carries an extra `output_kind` field — the one exact-match probe test updated.)
+
+Out of scope (deliberate, next slices):
+
+- GET-fallback on other reject codes (403 / 400 are ambiguous — auth vs method);
+  parallel probing; last-modified / size metadata scoring; wiring probe_url's
+  output_kind into the run's output_contract resolver.
+
