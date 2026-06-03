@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Protocol, runtime_checkable
@@ -192,6 +193,40 @@ def _discard_part(part_name: str, meta_path: Path | None) -> None:
             meta_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def gc_stale_parts(
+    dest: Any,
+    *,
+    ttl_seconds: float = 86400.0,
+    now: float | None = None,
+) -> int:
+    """Remove stale partial-download artifacts (``.part`` + ``.meta``) by TTL.
+
+    Scans ``dest`` for ``*.part`` files (both the resumable ``.{key}.part`` and
+    the legacy ``download.*.part`` tempfiles) plus their ``.meta`` sidecars, and
+    unlinks any whose mtime is older than ``ttl_seconds`` (default 24h). A
+    ``.part`` still being actively appended (recent mtime) is preserved so an
+    in-progress / resumable download is never clobbered (DL-GC1, mission §一-B
+    file governance: TTL + GC of unreferenced temp files). Returns the number of
+    files removed; tolerant -- a missing dir or unlink error never raises.
+    """
+    base = Path(dest)
+    if not base.is_dir():
+        return 0
+    cutoff = (now if now is not None else time.time()) - max(0.0, float(ttl_seconds))
+    removed = 0
+    for pattern in ("*.part", "*.part.meta"):
+        for path in base.glob(pattern):
+            try:
+                if not path.is_file():
+                    continue
+                if path.stat().st_mtime <= cutoff:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                continue
+    return removed
 
 
 def download_candidate(

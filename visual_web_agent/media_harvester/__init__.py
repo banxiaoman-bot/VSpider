@@ -34,6 +34,7 @@ from .downloader import (
     download_candidate,
     DEFAULT_TIMEOUT_S,
     DEFAULT_HEADERS,
+    gc_stale_parts,
 )
 from .harvester import (
     HarvestReport,
@@ -57,6 +58,7 @@ __all__ = [
     "download_candidate",
     "DEFAULT_TIMEOUT_S",
     "DEFAULT_HEADERS",
+    "gc_stale_parts",
     "HarvestReport",
     "harvest_to_run",
     "select_candidates_for_output_kind",

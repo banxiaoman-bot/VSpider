@@ -26,6 +26,7 @@ from .downloader import (
     DownloadOutcome,
     StreamingClient,
     download_candidate,
+    gc_stale_parts,
 )
 
 
@@ -130,6 +131,13 @@ def harvest_to_run(
     downloaded: list[DownloadOutcome] = []
     failed: list[DownloadOutcome] = []
     appended = 0
+
+    # DL-GC1: sweep stale .part/.meta from a prior interrupted harvest of this
+    # run before downloading (best-effort; recent/active parts are preserved).
+    try:
+        gc_stale_parts(artifacts_dir)
+    except Exception:
+        pass
 
     for candidate in selected:
         outcome = download_candidate(
