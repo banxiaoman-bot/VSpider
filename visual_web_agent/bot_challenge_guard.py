@@ -79,6 +79,10 @@ class BotChallengeState:
     hitl_count: int = 0
     last_vendor: str = ""
     max_hitl_per_run: int = 3
+    # PROXY-4b: per-run proxy-reroute budget (bounds IP churn when a flagged
+    # proxy keeps drawing challenges); consumed by browser_env.reroute_proxy_on_block.
+    reroute_count: int = 0
+    max_reroute_per_run: int = 3
 
 
 @dataclass

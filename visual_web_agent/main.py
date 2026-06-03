@@ -11102,6 +11102,24 @@ async def run_agent(
                                 logger.info("[BOT CHALLENGE] harvested auth profile: %s", _bc_hr.profile_name)
                         except Exception as _bc_harv_err:
                             logger.debug("[BOT CHALLENGE] auth harvest skipped: %s", _bc_harv_err)
+                    # PROXY-4b: when the block persists / the IP looks flagged, swap
+                    # to the next proxy and reload (policy + budget live downstream).
+                    try:
+                        _rerouted = await browser.reroute_proxy_on_block(
+                            getattr(browser, "current_url", "") or "",
+                            result=_bc_result,
+                            state=_bot_challenge_state,
+                            reason=f"bot challenge {_bc_result.vendor or 'block'}",
+                        )
+                    except Exception as _reroute_err:
+                        _rerouted = False
+                        logger.debug("[BOT CHALLENGE] proxy reroute skipped: %s", _reroute_err)
+                    if _rerouted:
+                        screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+                        input_descriptions = (
+                            "\n🛡️【Bot Challenge · 已切换代理并重载页面】\n"
+                            + (input_descriptions or "")
+                        )
                 except Exception as _bc_err:
                     logger.debug("[BOT CHALLENGE] step hook skipped: %s", _bc_err)
 

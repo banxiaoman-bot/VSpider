@@ -2228,8 +2228,18 @@ Object.defineProperty(navigator, 'languages', {
             return False
         if not should_rotate_on_challenge(result, state):
             return False
+        # PROXY-4b: bound reroutes per run so a permanently-flagged target can't
+        # spin the whole chain endlessly (state carries reroute_count + cap).
+        max_reroute = getattr(state, "max_reroute_per_run", None)
+        if max_reroute is not None and int(getattr(state, "reroute_count", 0) or 0) >= int(max_reroute):
+            return False
         before = (chain.current() or {}).get("server", "")
         chain.mark_failed()
+        if state is not None and hasattr(state, "reroute_count"):
+            try:
+                state.reroute_count += 1
+            except Exception:
+                pass
         after = (chain.current() or {}).get("server", "")
         logger.warning("[PROXY] reroute on block (%s): %s -> %s", reason, before, after)
         await self.restart(url, reason=f"proxy reroute: {reason}")
