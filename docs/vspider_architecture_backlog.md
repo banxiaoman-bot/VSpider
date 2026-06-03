@@ -1459,3 +1459,43 @@ Out of scope (deliberate, next slices):
   geo / sticky-session pools; per-proxy latency / bandwidth scoring; persisting
   proxy health across runs.
 
+
+## Slice BATCH-RESUME2: content-hash row keys for keyless batch resume
+
+Goal:
+
+- Close BATCH-RESUME1's "content-hash row keys for rows without a URL column" gap
+  (mission §一 "高效 — 能不重抓就不重抓"; §四 长批量最怕跑一半断). Before: a table
+  without a URL-like column fell back to *positional* resume matching, which
+  silently breaks the moment rows are reordered or inserted between runs. Now a
+  stable per-row content fingerprint matches prior successes order-independently;
+  positional stays only as a last resort when the two frames' columns differ. Pure
+  DataFrame, default path unchanged.
+
+Add / change (smart_batch_runner.py +56, pure):
+
+- `_row_content_hash(row, columns)` — order-independent sha256[:16] over a row's
+  data cells (NaN / 'nan' / 'none' / blank → '', so reloaded frames hash stably);
+  `_content_columns(df)` lists the data columns (excludes 填报状态 / 日志备注).
+- `_merge_prior_progress` gains a Tier-2 content-hash pass between the URL-key tier
+  and the positional fallback: when there is no usable URL key but the two frames
+  share the same data columns, carry prior 成功 rows by content hash (robust to
+  reorder / inserted rows; duplicate-content rows all resume idempotently). Falls
+  through to positional only when the schemas differ. Backward compatible — the 9
+  BATCH-RESUME1 tests stay green (their aligned data hashes the same as positional).
+
+Acceptance:
+
+- `validate_y batch-resume2` (target → npm build → core → full): target
+  `tests/test_batch_resume.py` → **16 passed** (9 prior + 7 new: reorder match,
+  inserted rows, multi-col carries-only-success, duplicate-content rows, positional
+  fallback on schema mismatch, hash order-independence + blank normalization,
+  content-columns exclusion) → `npm run build` ✓ → core **102 passed** → **full
+  2500 passed, 2 skipped** (135s) → `[validate_y] success`. `py_compile` OK, lint clean.
+
+Out of scope (deliberate, next slices):
+
+- A configurable hash-column allowlist / blocklist (e.g. ignore a volatile
+  timestamp column); persisting per-row keys in the result file; cross-file resume
+  keyed by content across different output paths.
+
