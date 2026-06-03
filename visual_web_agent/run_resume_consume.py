@@ -29,6 +29,8 @@ shapes so it stays trivially unit-testable and decoupled.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any
 
 __all__ = [
@@ -43,6 +45,47 @@ def _norm(value: Any) -> str:
     """Lowercase + whitespace-collapse a label for tolerant matching."""
 
     return " ".join(str(value or "").split()).strip().lower()
+
+
+_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _norm2(value: Any) -> str:
+    """Aggressive normalize for fuzzy matching: NFKC (full-width -> half-width),
+    lowercase, punctuation stripped, whitespace collapsed. Keeps word chars
+    (incl. CJK) so a re-worded plan still matches its recorded step labels.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or "")).lower()
+    text = _PUNCT_RE.sub(" ", text)
+    return " ".join(text.split()).strip()
+
+
+def _fuzzy_match(a: Any, b: Any) -> bool:
+    """Tolerant label match (RUN-RESUME1 step 5).
+
+    Conservative by design — exact normalized equality first (the step-3
+    behaviour), then full-width / case / punctuation / spacing-insensitive
+    equality, then a whitespace-squashed leading-prefix match so a slightly
+    re-worded or extended sub-goal ("搜索 python" vs "搜索 Python 并点开") still
+    resumes. Reordered or merely token-overlapping phrases never match, so a
+    wrong skip stays unlikely (and the agent re-observes each turn anyway).
+    """
+
+    if _norm(a) and _norm(a) == _norm(b):
+        return True
+    na, nb = _norm2(a), _norm2(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    sa, sb = na.replace(" ", ""), nb.replace(" ", "")
+    if not sa or not sb:
+        return False
+    if sa == sb:
+        return True
+    shorter, longer = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
+    return len(shorter) >= 4 and longer.startswith(shorter)
 
 
 def _get(decision: Any, key: str, default: Any) -> Any:
@@ -146,13 +189,15 @@ def apply_completed_steps_to_plan(task_plan: Any, completed_steps: list[str] | N
     if len(sub_goals) <= 1:
         return 0
 
-    done_set = {_norm(s) for s in completed_steps if _norm(s)}
-    if not done_set:
+    done = [s for s in completed_steps if _norm(s)]
+    if not done:
         return 0
 
     cap = len(sub_goals) - 1  # always keep at least the last sub-goal to execute
     skip = 0
-    while skip < cap and _norm(getattr(sub_goals[skip], "description", "")) in done_set:
+    while skip < cap and any(
+        _fuzzy_match(getattr(sub_goals[skip], "description", ""), label) for label in done
+    ):
         skip += 1
 
     if skip == 0:
