@@ -7359,6 +7359,10 @@ async def run_agent(
     # URL to surface real cross-system hops in the event stream. Stays
     # None (inert) if routing fails so the hot loop hook is a safe no-op.
     _run_system_tracker = None
+    # E1c-3a: pool-less session router; describes the BrowserSession a
+    # cross-system hop would switch to (decision + evidence). None (inert) when
+    # routing fails so the hot loop hook is a safe no-op.
+    _session_router = None
 
     def _check_stop(context: str) -> None:
         if stop_event and stop_event.is_set():
@@ -7496,6 +7500,15 @@ async def run_agent(
             _run_system_tracker = build_run_system_tracker(_capability_route)
         except Exception as _tracker_build_err:
             logger.debug("[RUN SYSTEM TRACKER] build skipped: %s", _tracker_build_err)
+        # E1c-3a: build a pool-less session router so a cross-system hop can
+        # describe the BrowserSession it would switch to. Decision + evidence
+        # only; the physical context swap is a later, flag-gated slice.
+        try:
+            from visual_web_agent.session_router import build_session_router
+
+            _session_router = build_session_router(_run_ts, _capability_route)
+        except Exception as _session_router_build_err:
+            logger.debug("[SESSION ROUTER] build skipped: %s", _session_router_build_err)
         _selected_tools = action_registry.select_for_goal(
             goal,
             strategy_context=_initial_strategy_context,
@@ -10649,6 +10662,25 @@ async def run_agent(
                             )
                         except Exception:
                             pass
+                        # E1c-3a: when cross-system switching is enabled, describe
+                        # the BrowserSession this hop would switch to and record it
+                        # as evidence. Default off -> zero behaviour change; the
+                        # physical context swap is a later slice.
+                        if (
+                            _session_router is not None
+                            and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
+                            in ("1", "true", "yes", "on")
+                        ):
+                            try:
+                                _switch = _session_router.plan_switch(
+                                    to_system_id=_sys_transition.to_system_id,
+                                    from_system_id=_sys_transition.from_system_id,
+                                    to_system_name=_sys_transition.to_system_name,
+                                )
+                                if _switch.get("should_switch"):
+                                    event_stream.emit("session_switch", **_switch)
+                            except Exception as _switch_err:
+                                logger.debug("[SESSION ROUTER] switch plan skipped: %s", _switch_err)
             except Exception as _sys_observe_err:
                 logger.debug("[RUN SYSTEM TRACKER] observe skipped: %s", _sys_observe_err)
 

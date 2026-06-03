@@ -143,6 +143,33 @@ class SessionRouter:
 
         return _get_active_session(self.run_id, system_id, auth_profile=profile)
 
+    def plan_switch(
+        self,
+        *,
+        to_system_id: str,
+        from_system_id: str = "",
+        to_system_name: str = "",
+    ) -> dict[str, Any]:
+        """Describe the session switch a cross-system hop implies (pure).
+
+        Returns a directive dict the reactive loop can record as evidence
+        (``session_switch`` event) and, in a later slice, act on. ``should_switch``
+        is False for a no-op hop (same system, or a blank target) so callers can
+        guard cheaply. No pool / browser side effects happen here.
+        """
+
+        target = str(to_system_id or "").strip()
+        should_switch = bool(target) and target != str(from_system_id or "").strip()
+        return {
+            "should_switch": should_switch,
+            "run_id": self.run_id,
+            "from_system_id": str(from_system_id or ""),
+            "to_system_id": target,
+            "to_system_name": str(to_system_name or "") or target,
+            "auth_profile": self.resolved_auth_profile(target) if should_switch else "auto",
+            "domain": self.plan.domain_for(target) if should_switch else "",
+        }
+
     async def release_all(self, *, error: str = "") -> list[str]:
         if self.pool is not None:
             return await self.pool.release_run(self.run_id, error=error)

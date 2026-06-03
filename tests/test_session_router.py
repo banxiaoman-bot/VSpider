@@ -160,6 +160,36 @@ class TestSessionRouterAcquire:
 # ---------------------------------------------------------------------------
 
 
+class TestSessionRouterPlanSwitch:
+    def test_plan_switch_describes_target_session(self) -> None:
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=_pool())
+        directive = router.plan_switch(
+            to_system_id="system_1", from_system_id="system_2", to_system_name="Alpha"
+        )
+        assert directive["should_switch"] is True
+        assert directive["run_id"] == "r1"
+        assert directive["from_system_id"] == "system_2"
+        assert directive["to_system_id"] == "system_1"
+        assert directive["to_system_name"] == "Alpha"
+        assert directive["auth_profile"] == "alpha_login"
+        assert directive["domain"] == "alpha.com"
+
+    def test_plan_switch_same_system_is_noop(self) -> None:
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=_pool())
+        directive = router.plan_switch(to_system_id="system_1", from_system_id="system_1")
+        assert directive["should_switch"] is False
+
+    def test_plan_switch_blank_target_is_noop(self) -> None:
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=_pool())
+        directive = router.plan_switch(to_system_id="", from_system_id="system_1")
+        assert directive["should_switch"] is False
+
+    def test_plan_switch_to_name_defaults_to_id(self) -> None:
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=_pool())
+        directive = router.plan_switch(to_system_id="system_2", from_system_id="system_1")
+        assert directive["to_system_name"] == "system_2"
+
+
 class TestBuildSessionRouter:
     def test_build_from_capability_route(self) -> None:
         route = {"workflow_graph": {"systems": _SYSTEMS}}
