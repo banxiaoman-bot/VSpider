@@ -170,6 +170,45 @@ class SessionRouter:
             "domain": self.plan.domain_for(target) if should_switch else "",
         }
 
+    def acquire_for_switch(
+        self,
+        *,
+        to_system_id: str,
+        from_system_id: str = "",
+        to_system_name: str = "",
+        full_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Pool-acquire the target session a cross-system hop needs (E1c-3b-1).
+
+        Extends :meth:`plan_switch` from a pure description to a real pool
+        acquisition: when ``should_switch`` is True the target
+        :class:`BrowserSession` is acquired (idempotent per
+        ``(run_id, system_id, auth_profile)`` triple) and the subset of
+        ``full_state`` belonging to the target domain is staged. The active
+        browser handle is **not** rebound here -- that physical context swap
+        is a later slice; this only proves the pool + storage_state path and
+        enriches the directive with ``session_id`` / ``staged`` /
+        ``cookie_count`` so the reactive loop can record it as evidence. A
+        no-op hop (same system / blank target) acquires nothing.
+        """
+
+        directive = self.plan_switch(
+            to_system_id=to_system_id,
+            from_system_id=from_system_id,
+            to_system_name=to_system_name,
+        )
+        directive["session_id"] = ""
+        directive["staged"] = False
+        directive["cookie_count"] = 0
+        if not directive["should_switch"]:
+            return directive
+        session = self.acquire(directive["to_system_id"])
+        subset = self.storage_state_for_system(directive["to_system_id"], full_state)
+        directive["session_id"] = session.session_id
+        directive["staged"] = True
+        directive["cookie_count"] = len(subset.get("cookies") or [])
+        return directive
+
     async def release_all(self, *, error: str = "") -> list[str]:
         if self.pool is not None:
             return await self.pool.release_run(self.run_id, error=error)

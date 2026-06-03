@@ -190,6 +190,50 @@ class TestSessionRouterPlanSwitch:
         assert directive["to_system_name"] == "system_2"
 
 
+class TestSessionRouterAcquireForSwitch:
+    def test_acquire_for_switch_pools_target_and_stages_state(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(
+            to_system_id="system_1",
+            from_system_id="system_2",
+            to_system_name="Alpha",
+            full_state=_FULL_STATE,
+        )
+        assert directive["should_switch"] is True
+        assert directive["staged"] is True
+        assert directive["session_id"]
+        assert directive["cookie_count"] == 1  # only the .alpha.com cookie survives the subset
+        assert directive["auth_profile"] == "alpha_login"
+        assert pool.total_acquired == 1
+
+    def test_acquire_for_switch_noop_acquires_nothing(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_1")
+        assert directive["should_switch"] is False
+        assert directive["staged"] is False
+        assert directive["session_id"] == ""
+        assert directive["cookie_count"] == 0
+        assert pool.total_acquired == 0
+
+    def test_acquire_for_switch_dedupes_repeat_hop(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        first = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        second = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        assert first["session_id"] == second["session_id"]
+        assert pool.total_acquired == 1
+
+    def test_acquire_for_switch_without_state_stages_zero_cookies(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        assert directive["staged"] is True
+        assert directive["session_id"]
+        assert directive["cookie_count"] == 0
+
+
 class TestBuildSessionRouter:
     def test_build_from_capability_route(self) -> None:
         route = {"workflow_graph": {"systems": _SYSTEMS}}
