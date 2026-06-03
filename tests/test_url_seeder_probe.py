@@ -10,6 +10,9 @@ Stub head fetcher (a plain dict map); no network.
 
 from __future__ import annotations
 
+import threading
+import time
+
 from visual_web_agent import url_seeder
 from visual_web_agent.spider_lite import FetchResult
 from visual_web_agent.url_seeder import (
@@ -231,3 +234,86 @@ def test_probe_url_surfaces_output_kind() -> None:
     meta = seeder.probe_url("https://e.com/pic")
     assert meta["output_kind"] == "media_image"
     assert meta["live"] is True
+
+
+# --- SEED-PARALLEL: probe_urls batch + parallel live_only -------------------
+
+def test_probe_urls_empty_returns_empty() -> None:
+    assert _seeder().probe_urls([]) == []
+
+
+def test_probe_urls_serial_preserves_order() -> None:
+    urls = ["https://e.com/live", "https://e.com/dead", "https://e.com/live"]
+    metas = _seeder().probe_urls(urls, concurrency=1)
+    assert [m["url"] for m in metas] == urls
+    assert [m["live"] for m in metas] == [True, False, True]
+
+
+def test_probe_urls_concurrency_below_one_runs_serially() -> None:
+    metas = _seeder().probe_urls(["https://e.com/live"], concurrency=0)
+    assert [m["live"] for m in metas] == [True]
+
+
+def test_probe_urls_parallel_preserves_input_order() -> None:
+    urls = [f"https://e.com/p{i}" for i in range(5)]
+    # Reverse delay: later URLs finish first, so order is preserved only if the
+    # implementation maps results back to the input index (not completion order).
+    delays = {u: (len(urls) - i) * 0.02 for i, u in enumerate(urls)}
+
+    def head(url: str) -> dict:
+        time.sleep(delays[url])
+        return {"status_code": 200, "content_type": "text/html"}
+
+    seeder = UrlSeeder(_get_fetch, head_fetcher=head)
+    metas = seeder.probe_urls(urls, concurrency=5)
+    assert [m["url"] for m in metas] == urls
+    assert all(m["live"] for m in metas)
+
+
+def test_probe_urls_actually_runs_in_parallel() -> None:
+    n = 4
+    # A Barrier of n only releases when all n probes are in flight at once; a
+    # serial implementation would block on the first wait() and time out.
+    barrier = threading.Barrier(n, timeout=5)
+
+    def head(url: str) -> dict:
+        barrier.wait()
+        return {"status_code": 200, "content_type": "text/html"}
+
+    seeder = UrlSeeder(_get_fetch, head_fetcher=head)
+    urls = [f"https://e.com/c{i}" for i in range(n)]
+    metas = seeder.probe_urls(urls, concurrency=n)
+    assert [m["live"] for m in metas] == [True] * n
+
+
+def test_probe_urls_parallel_swallows_errors() -> None:
+    def boom(url: str) -> dict:
+        raise RuntimeError("network down")
+
+    seeder = UrlSeeder(_get_fetch, head_fetcher=boom)
+    metas = seeder.probe_urls(["https://e.com/a", "https://e.com/b"], concurrency=2)
+    assert [m["live"] for m in metas] == [False, False]
+    assert [m["url"] for m in metas] == ["https://e.com/a", "https://e.com/b"]
+
+
+def test_seed_from_sitemap_live_only_parallel_drops_dead() -> None:
+    seeder = _seeder()
+    seeds = seeder.seed_from_sitemap(
+        "https://e.com/sitemap.xml", live_only=True, probe_concurrency=4
+    )
+    assert seeds == ["https://e.com/live"]
+
+
+def test_seed_from_robots_live_only_parallel_drops_dead() -> None:
+    def get_fetch(url: str) -> FetchResult:
+        bodies = {
+            "https://e.com/robots.txt": "Sitemap: https://e.com/sitemap.xml",
+            "https://e.com/sitemap.xml": URLSET,
+        }
+        return FetchResult(url=url, status_code=200, html=bodies.get(url, ""))
+
+    seeder = UrlSeeder(get_fetch, head_fetcher=_head_fetch)
+    seeds = seeder.seed_from_robots(
+        "https://e.com/robots.txt", live_only=True, probe_concurrency=4
+    )
+    assert seeds == ["https://e.com/live"]
