@@ -17,6 +17,7 @@ from visual_web_agent.proxy_chain import (
     build_chain_from_config,
     build_proxy_chain,
     parse_proxy,
+    should_rotate_on_challenge,
 )
 
 
@@ -149,3 +150,94 @@ def test_config_missing_attrs_safe() -> None:
     chain = build_chain_from_config(SimpleNamespace())
     assert len(chain) == 0
     assert chain.current() is None
+
+
+# --- PROXY-3: health scoring + quarantine ----------------------------------
+
+def test_mark_failed_single_advances_by_one() -> None:
+    # backward compat: one failure (default threshold 3) just advances, no quarantine
+    chain = build_proxy_chain(["a:1", "b:2", "c:3"])
+    assert chain.mark_failed()["server"] == "b:2"
+    assert chain.healthy_count() == 3
+
+
+def test_quarantine_after_threshold_skips_proxy() -> None:
+    chain = ProxyChain(["a:1", "b:2", "c:3"], quarantine_threshold=2)
+    chain.mark_failed({"server": "a:1"})  # a fail #1 -> advance to b
+    chain.mark_failed({"server": "a:1"})  # a fail #2 -> a quarantined
+    stats = {s["server"]: s for s in chain.stats()}
+    assert stats["a:1"]["quarantined"] is True
+    assert chain.healthy_count() == 2
+    assert chain.current()["server"] != "a:1"
+
+
+def test_report_success_clears_quarantine() -> None:
+    chain = ProxyChain(["a:1", "b:2"], quarantine_threshold=1)
+    chain.mark_failed({"server": "a:1"})  # a quarantined immediately
+    assert {s["server"]: s for s in chain.stats()}["a:1"]["quarantined"] is True
+    chain.report_success({"server": "a:1"})
+    s = {x["server"]: x for x in chain.stats()}["a:1"]
+    assert s["quarantined"] is False
+    assert s["consecutive_failures"] == 0
+    assert s["successes"] == 1
+
+
+def test_all_quarantined_resets_for_fresh_chance() -> None:
+    chain = ProxyChain(["a:1", "b:2"], quarantine_threshold=1)
+    chain.mark_failed({"server": "a:1"})  # a quarantined
+    chain.mark_failed({"server": "b:2"})  # b quarantined -> all -> reset
+    assert chain.healthy_count() == 2
+    assert chain.current() is not None
+
+
+def test_stats_shape_and_counts() -> None:
+    chain = ProxyChain(["a:1", "b:2"])
+    chain.report_success({"server": "a:1"})
+    chain.mark_failed({"server": "b:2"})
+    stats = {s["server"]: s for s in chain.stats()}
+    assert stats["a:1"]["successes"] == 1
+    assert stats["b:2"]["failures"] == 1
+    assert set(stats["a:1"]) == {
+        "server", "successes", "failures", "consecutive_failures", "quarantined",
+    }
+
+
+def test_empty_chain_health_ops_safe() -> None:
+    chain = build_proxy_chain([])
+    chain.report_success()  # no crash
+    assert chain.mark_failed() is None
+    assert chain.healthy_count() == 0
+    assert chain.stats() == []
+
+
+# --- PROXY-3: should_rotate_on_challenge policy ----------------------------
+
+def test_rotate_not_detected_is_false() -> None:
+    assert should_rotate_on_challenge(SimpleNamespace(detected=False, cleared=True)) is False
+
+
+def test_rotate_when_not_cleared() -> None:
+    result = SimpleNamespace(detected=True, cleared=False, action="hitl")
+    assert should_rotate_on_challenge(result) is True
+
+
+def test_rotate_on_max_hitl() -> None:
+    result = SimpleNamespace(detected=True, cleared=True, action="max_hitl")
+    assert should_rotate_on_challenge(result) is True
+
+
+def test_rotate_on_repeated_encounters() -> None:
+    result = SimpleNamespace(detected=True, cleared=True, action="passive_wait")
+    state = SimpleNamespace(encounter_count=3)
+    assert should_rotate_on_challenge(result, state, min_encounters=2) is True
+
+
+def test_no_rotate_single_cleared_encounter() -> None:
+    result = SimpleNamespace(detected=True, cleared=True, action="passive_wait")
+    state = SimpleNamespace(encounter_count=1)
+    assert should_rotate_on_challenge(result, state, min_encounters=2) is False
+
+
+def test_rotate_accepts_dict_inputs() -> None:
+    assert should_rotate_on_challenge({"detected": True, "cleared": False}) is True
+    assert should_rotate_on_challenge({"detected": False}) is False
