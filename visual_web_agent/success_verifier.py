@@ -43,7 +43,7 @@ def verify_route_success(
     if save_artifact_required:
         artifact_check = _check_artifact(artifact)
         checks.append(artifact_check)
-    template_check = _check_template(template, result, artifact)
+    template_check = _check_template(template, result, artifact, capability)
     if template_check is not None:
         checks.append(template_check)
     passed = all(bool(item.get("passed")) for item in checks)
@@ -88,14 +88,42 @@ def _route_template(route: dict[str, Any]) -> TaskTemplate | None:
     )
 
 
-def _check_template(template: TaskTemplate | None, result: dict[str, Any], artifact: dict[str, Any] | None) -> dict[str, Any] | None:
+# Family-specific template checks (api_replay / login / visual) only make
+# sense -- and may only veto -- when the executing capability belongs to that
+# template's family. A planner may *match* an api_replay template yet the run
+# may complete via a different deterministic capability (e.g. extractor_select)
+# that already satisfied count / fields / artifact; that must not be vetoed by
+# a check that reads a foreign result shape.
+_TEMPLATE_CAPABILITY_FAMILIES = {
+    "api_replay": frozenset({"api_replay", "network_intelligence"}),
+    "login_then_action": frozenset({"login_then_action", "auth_harvester", "browser_control"}),
+    "visual_recovery": frozenset({"visual_recovery", "browser_control"}),
+}
+
+
+def _check_template(
+    template: TaskTemplate | None,
+    result: dict[str, Any],
+    artifact: dict[str, Any] | None,
+    capability: str = "",
+) -> dict[str, Any] | None:
     if template is None:
         return None
     if template.task_type == "crawl_pagination":
-        observed = _observed_count("spider_lite", result) or _observed_count("generic_extractor", result)
+        # Count whatever the executing capability actually produced; fall back
+        # to spider / generic shapes for planner-driven runs that don't pass a
+        # capability.
+        observed = (
+            _observed_count(capability, result)
+            or _observed_count("spider_lite", result)
+            or _observed_count("generic_extractor", result)
+        )
         return {"name": "template_count", "passed": observed > 0, "observed": observed, "detail": "pagination yielded rows" if observed > 0 else "pagination yielded no rows"}
     if template.task_type == "export_artifact":
         return {"name": "template_artifact", "passed": _artifact_exists(artifact), "detail": "artifact present" if _artifact_exists(artifact) else "artifact missing"}
+    family = _TEMPLATE_CAPABILITY_FAMILIES.get(template.task_type)
+    if family is not None and capability and capability not in family:
+        return None
     if template.task_type == "api_replay":
         return {"name": "template_api", "passed": bool(result.get("response") or result.get("data") or result.get("items")), "detail": "api replay returned data" if bool(result.get("response") or result.get("data") or result.get("items")) else "api replay returned no data"}
     if template.task_type == "login_then_action":
