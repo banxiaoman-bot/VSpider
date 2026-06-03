@@ -1412,3 +1412,50 @@ Out of scope (deliberate, next slices):
   row keys for batch rows without a URL column; download `.part` TTL / disk-space GC;
   surfacing `constraints.resume` into the input_contract.json schema doc + a CLI flag.
 
+
+## Slice PROXY-3: proxy health scoring + rotate-on-block policy (pure)
+
+Goal:
+
+- Close PROXY-2's "per-context rotation on block + health scoring" gap, the pure
+  half (mission §一 "通用 / 遇阻即换路"; "智能遇阻即换路"). Before:
+  `ProxyChain.mark_failed()` just advanced the index — a bad proxy was retried on
+  the next cycle and there was no signal for "when does a bot-challenge mean the IP
+  is flagged?". Now the chain scores each proxy and quarantines repeat offenders,
+  and a pure policy decides when a challenge warrants rotation. The live
+  `browser_env` relaunch-on-block stays a separate slice (PROXY-4) — that file is
+  oversized (workflow §三) and Playwright fixes the proxy at launch.
+
+Add / change (proxy_chain.py +121/-3, pure):
+
+- `ProxyChain` gains health scoring: per-proxy `{successes, failures,
+  consecutive_failures, quarantined}`; `quarantine_threshold` (default 3) ctor arg;
+  `report_success()` (clears quarantine); `mark_failed()` now records the failure,
+  quarantines a proxy after N consecutive failures, and advances to the next
+  *healthy* (non-quarantined) proxy; `_advance_to_healthy` resets all quarantine
+  when the whole chain is exhausted (never stuck); `healthy_count()` + `stats()`
+  snapshot. Backward compatible — with the default threshold a single failure still
+  advances by one (the 17 PROXY-1/2 tests stay green).
+- `should_rotate_on_challenge(result, state, *, min_encounters=2)` — pure policy
+  duck-typed over `bot_challenge_guard.BotChallengeStepResult` / `BotChallengeState`:
+  rotate when a challenge was detected and (a) not cleared, (b) hit the HITL ceiling
+  (`max_hitl`), or (c) the same IP keeps getting challenged (`encounter_count >=`
+  `min_encounters`). Not-detected → never rotate.
+
+Acceptance:
+
+- `validate_y proxy-3` (target → npm build → core → full): target
+  `tests/test_proxy_chain.py` → **29 passed** (17 prior + 12 new: quarantine after
+  threshold, report_success clears, all-quarantined reset, stats shape, empty-chain
+  safe, single-failure backward-compat; policy not-detected / not-cleared / max_hitl
+  / repeated-encounters / single-cleared / dict-inputs) → `npm run build` ✓ → core
+  **102 passed** → **full 2493 passed, 2 skipped** (134s) → `[validate_y] success`.
+  `py_compile` OK, lint clean.
+
+Out of scope (deliberate, next slices):
+
+- PROXY-4: wire `should_rotate_on_challenge` + `mark_failed()` into a `browser_env`
+  re-route-on-block relaunch (touches the oversized substrate + run lifecycle);
+  geo / sticky-session pools; per-proxy latency / bandwidth scoring; persisting
+  proxy health across runs.
+
