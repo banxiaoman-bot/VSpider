@@ -233,6 +233,65 @@ class TestSessionRouterAcquireForSwitch:
         assert directive["session_id"]
         assert directive["cookie_count"] == 0
 
+    def test_acquire_for_switch_directive_carries_evidence_contract(self) -> None:
+        # Locks the directive keys the reactive loop emits as session_switch /
+        # session_switch_verified evidence (main.py hot-loop hook). A rename of
+        # any of these silently breaks that wiring, so guard the full key set.
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(
+            to_system_id="system_1", from_system_id="system_2", full_state=_FULL_STATE
+        )
+        for key in (
+            "should_switch",
+            "run_id",
+            "from_system_id",
+            "to_system_id",
+            "to_system_name",
+            "auth_profile",
+            "domain",
+            "session_id",
+            "staged",
+            "cookie_count",
+        ):
+            assert key in directive, f"missing evidence key: {key}"
+
+
+class TestSessionRouterConfirmActive:
+    def test_confirm_active_true_after_acquire(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        assert router.confirm_active("system_1", directive["session_id"]) is True
+
+    def test_confirm_active_false_when_never_acquired(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        assert router.confirm_active("system_1", "session_phantom") is False
+
+    def test_confirm_active_false_on_session_id_mismatch(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        assert router.confirm_active("system_1", "wrong_id") is False
+
+    def test_confirm_active_false_on_blank_id(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        assert router.confirm_active("system_1", "") is False
+
+
+class TestSessionRouterReleaseAfterSwitch:
+    def test_release_all_frees_session_acquired_for_switch(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        directive = router.acquire_for_switch(to_system_id="system_1", from_system_id="system_2")
+        released = _run(router.release_all())
+        assert directive["session_id"] in released
+        assert router.confirm_active("system_1", directive["session_id"]) is False
+        assert pool.total_released == 1
+
 
 class TestBuildSessionRouter:
     def test_build_from_capability_route(self) -> None:

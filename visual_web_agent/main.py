@@ -10662,25 +10662,51 @@ async def run_agent(
                             )
                         except Exception:
                             pass
-                        # E1c-3a: when cross-system switching is enabled, describe
-                        # the BrowserSession this hop would switch to and record it
-                        # as evidence. Default off -> zero behaviour change; the
-                        # physical context swap is a later slice.
+                        # E1c-3b: when cross-system switching is enabled, pool-acquire
+                        # the BrowserSession this hop targets, stage its storage_state
+                        # subset, and record both the switch + a readback verification
+                        # as evidence. Default off -> zero behaviour change; the active
+                        # browser handle is NOT rebound here (physical swap is a later
+                        # slice). Whole block is best-effort so it can never break the loop.
                         if (
                             _session_router is not None
                             and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
                             in ("1", "true", "yes", "on")
                         ):
                             try:
-                                _switch = _session_router.plan_switch(
+                                _switch_full_state = None
+                                try:
+                                    _switch_ctx = getattr(browser, "_context", None)
+                                    if _switch_ctx is not None:
+                                        _switch_full_state = await _switch_ctx.storage_state()
+                                except Exception as _switch_state_err:
+                                    logger.debug(
+                                        "[SESSION ROUTER] storage_state snapshot skipped: %s",
+                                        _switch_state_err,
+                                    )
+                                _switch = _session_router.acquire_for_switch(
                                     to_system_id=_sys_transition.to_system_id,
                                     from_system_id=_sys_transition.from_system_id,
                                     to_system_name=_sys_transition.to_system_name,
+                                    full_state=_switch_full_state,
                                 )
                                 if _switch.get("should_switch"):
                                     event_stream.emit("session_switch", **_switch)
+                                    if _switch.get("staged") and _session_router.confirm_active(
+                                        _switch.get("to_system_id", ""),
+                                        _switch.get("session_id", ""),
+                                    ):
+                                        event_stream.emit(
+                                            "session_switch_verified",
+                                            run_id=_switch.get("run_id", ""),
+                                            to_system_id=_switch.get("to_system_id", ""),
+                                            to_system_name=_switch.get("to_system_name", ""),
+                                            session_id=_switch.get("session_id", ""),
+                                            auth_profile=_switch.get("auth_profile", ""),
+                                            cookie_count=_switch.get("cookie_count", 0),
+                                        )
                             except Exception as _switch_err:
-                                logger.debug("[SESSION ROUTER] switch plan skipped: %s", _switch_err)
+                                logger.debug("[SESSION ROUTER] switch acquire skipped: %s", _switch_err)
             except Exception as _sys_observe_err:
                 logger.debug("[RUN SYSTEM TRACKER] observe skipped: %s", _sys_observe_err)
 
@@ -17139,6 +17165,25 @@ async def run_agent(
             browser_lease,
             error="" if _run_succeeded else "stopped_or_failed",
         )
+        # E1c-3b: release any cross-system BrowserSessions this run pooled via the
+        # session router (acquire_for_switch). Flag-gated so a feature-off run never
+        # touches the pool; a safe no-op (returns []) when nothing was acquired.
+        if (
+            _session_router is not None
+            and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            try:
+                _released_sessions = await _session_router.release_all(
+                    error="" if _run_succeeded else "stopped_or_failed",
+                )
+                if _released_sessions:
+                    logger.info(
+                        "[SESSION ROUTER] released %d pooled session(s)",
+                        len(_released_sessions),
+                    )
+            except Exception as _release_err:
+                logger.debug("[SESSION ROUTER] release_all skipped: %s", _release_err)
     return _run_succeeded
 
 

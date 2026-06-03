@@ -209,6 +209,22 @@ class SessionRouter:
         directive["cookie_count"] = len(subset.get("cookies") or [])
         return directive
 
+    def confirm_active(self, system_id: str, expected_session_id: str) -> bool:
+        """Readback: True iff the pool still holds ``expected_session_id`` live.
+
+        The cheap evidence check the reactive loop emits as
+        ``session_switch_verified`` right after :meth:`acquire_for_switch`:
+        it proves the acquired :class:`BrowserSession` is registered and
+        retrievable from the pool (not merely a returned object), guarding
+        session-id mismatch / eviction races. Pure pool lookup, no browser IO.
+        """
+
+        expected = str(expected_session_id or "").strip()
+        if not expected:
+            return False
+        active = self.get_active(system_id)
+        return bool(active is not None and active.session_id == expected)
+
     async def release_all(self, *, error: str = "") -> list[str]:
         if self.pool is not None:
             return await self.pool.release_run(self.run_id, error=error)
