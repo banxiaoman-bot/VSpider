@@ -26,7 +26,7 @@ try:
         ActionRegistry,
     )
     from .extraction_engine.fit_markdown import FitMarkdownResult, html_to_fit_markdown
-    from .extraction_engine.chunking import chunk_markdown
+    from .extraction_engine.chunking import chunk_markdown, score_chunks
 except ImportError:  # pragma: no cover - flat-layout fallback, mirrors actions.py
     from actions import (  # type: ignore[no-redef]
         ActionContext,
@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - flat-layout fallback, mirrors actions.
         FitMarkdownResult,
         html_to_fit_markdown,
     )
-    from extraction_engine.chunking import chunk_markdown  # type: ignore[no-redef]
+    from extraction_engine.chunking import chunk_markdown, score_chunks  # type: ignore[no-redef]
 
 
 @ActionRegistry.register("page_to_markdown")
@@ -69,10 +69,7 @@ class PageToMarkdownHandler(ActionHandler):
         output_path = (entry or {}).get("path", "")
 
         chunks = chunk_markdown(result.markdown, strategy="heading")
-        chunk_records = [
-            {"index": c.index, "heading": c.heading, "word_count": c.word_count, "text": c.text}
-            for c in chunks
-        ]
+        chunk_records = self._chunk_records(chunks, query)
         chunks_entry = self._persist_chunks(chunk_records, base_url=base_url)
         chunks_path = (chunks_entry or {}).get("path", "")
 
@@ -112,6 +109,36 @@ class PageToMarkdownHandler(ActionHandler):
             pass
 
         return None
+
+    @staticmethod
+    def _chunk_records(chunks: list, query: str) -> list[dict]:
+        """Serialize chunks to jsonl-ready dicts (FITMD-4 query-rank).
+
+        With no focus ``query`` the records stay in document order and carry no
+        ``score`` key (byte-identical to FITMD-3). With a focus query -- the same
+        ``type_value`` BM25 query already used to fit the markdown -- the records
+        are reordered most-relevant-first and each carries a rounded BM25
+        ``score``, so a downstream RAG / QA step can take the top chunks without
+        re-scoring (mission §一 "高效 / 精准"; closes FITMD-3's named "query-rank"
+        gap). ``index`` always reflects the original document position.
+        """
+        if not query:
+            return [
+                {"index": c.index, "heading": c.heading, "word_count": c.word_count, "text": c.text}
+                for c in chunks
+            ]
+        scores = score_chunks(chunks, query)
+        order = sorted(range(len(chunks)), key=lambda i: (-scores[i], i))
+        return [
+            {
+                "index": chunks[i].index,
+                "heading": chunks[i].heading,
+                "word_count": chunks[i].word_count,
+                "score": round(float(scores[i]), 4),
+                "text": chunks[i].text,
+            }
+            for i in order
+        ]
 
     @staticmethod
     def _persist(result: "FitMarkdownResult", *, base_url: str) -> Optional[dict]:
