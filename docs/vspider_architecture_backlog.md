@@ -1499,3 +1499,43 @@ Out of scope (deliberate, next slices):
   timestamp column); persisting per-row keys in the result file; cross-file resume
   keyed by content across different output paths.
 
+
+## Slice DL-GC1: stale download .part / .meta garbage collection
+
+Goal:
+
+- Close DL-RESUME1's "disk-space / TTL GC of stale .part files" gap (mission §一-B
+  file governance: TTL + GC of unreferenced temp files). The resumable downloader
+  leaves a stable `.{key}.part` + a `.meta` validator on disk when a download is
+  interrupted, plus `download.*.part` mkstemp tempfiles that can leak on a crash —
+  without a sweep they accumulate forever. Now a TTL sweep removes the stale ones
+  while preserving any part still being actively appended. Default path unchanged.
+
+Add / change (3 files, +45):
+
+- `media_harvester/downloader.py` (+35) — `gc_stale_parts(dest, *,
+  ttl_seconds=86400, now=None)`: scans `dest` for `*.part` (resumable `.{key}.part`
+  + legacy `download.*.part`) and `*.part.meta` sidecars and unlinks any with mtime
+  older than the TTL (default 24h); a recent / active part is preserved so an
+  in-progress / resumable download is never clobbered. Returns the count removed;
+  tolerant (missing dir / unlink error never raises). `now` injectable for tests.
+- `media_harvester/harvester.py` (+8) — `harvest_to_run` sweeps
+  `gc_stale_parts(artifacts_dir)` (best-effort, guarded) before the download loop,
+  so a prior interrupted harvest of the same run cleans up its leftovers.
+- `media_harvester/__init__.py` (+2) — re-export `gc_stale_parts`.
+
+Acceptance:
+
+- `validate_y dl-gc1` (target → npm build → core → full): target
+  `tests/test_download_gc.py` → **9 passed** (stale part+meta removed, fresh kept,
+  legacy download.*.part removed, non-.part artifacts untouched, TTL boundary via
+  now injection, custom-TTL window, missing-dir safe, mixed counts, str path) →
+  `npm run build` ✓ → core **102 passed** → **full 2509 passed, 2 skipped** (134s)
+  → `[validate_y] success`. `py_compile` OK, lint clean; CRLF preserved.
+
+Out of scope (deliberate, next slices):
+
+- A scheduled / background GC daemon (current sweep is on-harvest only); GC of the
+  content-addressed final artifacts themselves; cross-run global temp-dir GC;
+  honoring a configurable retention policy from run constraints.
+
