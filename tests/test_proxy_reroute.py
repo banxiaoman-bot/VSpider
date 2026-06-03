@@ -104,3 +104,32 @@ def test_no_reroute_without_chain(monkeypatch) -> None:
     )
     assert ok is False
     assert calls == []
+
+
+# --- PROXY-4b: per-run reroute budget -------------------------------------
+
+def test_bot_challenge_state_has_reroute_budget_fields() -> None:
+    from visual_web_agent.bot_challenge_guard import BotChallengeState
+
+    st = BotChallengeState()
+    assert st.reroute_count == 0
+    assert st.max_reroute_per_run == 3
+
+
+def test_reroute_respects_budget(monkeypatch) -> None:
+    from visual_web_agent.bot_challenge_guard import BotChallengeState
+
+    env, calls = _two_proxy_env(monkeypatch)
+    st = BotChallengeState(max_reroute_per_run=1)
+    r1 = asyncio.run(
+        env.reroute_proxy_on_block("https://t", result=_Result(True, cleared=False), state=st)
+    )
+    assert r1 is True
+    assert st.reroute_count == 1
+    # budget exhausted -> second block does not reroute / restart again
+    r2 = asyncio.run(
+        env.reroute_proxy_on_block("https://t", result=_Result(True, cleared=False), state=st)
+    )
+    assert r2 is False
+    assert st.reroute_count == 1
+    assert len(calls) == 1
