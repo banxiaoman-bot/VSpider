@@ -1497,6 +1497,48 @@ Out of scope (deliberate, next slices):
   proxy health across runs.
 
 
+## Slice PROXY-4a: browser-substrate proxy reroute mechanism
+
+Goal:
+
+- Close the browser-substrate half of PROXY-4 (mission §一 "通用 / 遇阻即换路";
+  "智能遇阻即换路"). PROXY-3 shipped the pure decision (`should_rotate_on_challenge`)
+  + health rotation (`mark_failed`), but nothing on the browser side consumed them:
+  the policy was dangling and `start()` rebuilt the chain on every `restart()`, which
+  reset rotation back to proxy 0 — so a reroute could never actually switch IPs. Add
+  the minimal, testable mechanism; the lifecycle *trigger* (PROXY-4b) stays out.
+
+Add / change (browser_env.py, +~55 lines — thin substrate touch, logic stays in
+`proxy_chain`):
+
+- `__init__` now seeds `self._proxy_chain = None`.
+- `_ensure_proxy_chain()` — build-once helper; `start()` calls it instead of an inline
+  `build_chain_from_config`, so the chain (and its `_idx` / quarantine state) survives
+  a `restart()` re-entry. First build is byte-identical to before.
+- `reroute_proxy_on_block(url, *, result, state, reason)` — consults
+  `should_rotate_on_challenge` (PROXY-3); when it says rotate AND a >1 proxy chain is
+  configured, `mark_failed()` advances to the next healthy proxy and `restart()`
+  relaunches with it (build-once chain carries the new `current()`). Returns True iff
+  a reroute happened. No-op (False) without a usable multi-proxy chain, so single /
+  no-proxy runs are unchanged. Nothing calls it yet (PROXY-4b), so zero behaviour change.
+
+Acceptance:
+
+- `validate_y PROXY-4a` (target -> npm build -> core -> full): target
+  `tests/test_proxy_reroute.py` -> **6 passed** (build-once caches first build;
+  rotation state survives; reroute rotates+restarts; policy-declines / single-proxy /
+  no-chain all no-op) -> `npm run build` ok -> core **102** -> **full 2548 passed, 2
+  skipped** (136s) -> `[validate_y] success`. ReadLints clean; `test_proxy_chain.py`
+  29 unchanged.
+
+Out of scope (deliberate, next slice):
+
+- PROXY-4b: actually call `reroute_proxy_on_block` from the bot-challenge handling
+  path (run lifecycle — when to trigger, retry budget, interaction with HITL /
+  human_guard); geo / sticky-session pools; per-proxy latency scoring; persisting
+  proxy health across runs.
+
+
 ## Slice BATCH-RESUME2: content-hash row keys for keyless batch resume
 
 Goal:
