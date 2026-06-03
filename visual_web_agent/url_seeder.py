@@ -40,6 +40,7 @@ __all__ = [
     "is_sitemap_index",
     "sitemap_urls_from_robots",
     "default_head_fetch",
+    "content_type_to_output_kind",
     "UrlSeeder",
 ]
 
@@ -149,22 +150,26 @@ def _normalize_head(resp: Any) -> tuple[int, str]:
     return status, str(content_type or "")
 
 
-def default_head_fetch(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
-    """Real stdlib HEAD probe → ``{"status_code", "content_type"}``.
+_HEAD_REJECTED_STATUSES = (405, 501)
 
-    Mirrors :func:`spider_lite.default_fetch` but issues an HTTP ``HEAD`` so a
-    URL's liveness + content-type are checked without downloading the body
-    (mission §一 "高效 — 能不重抓就不重抓"). HTTP error responses (404/500…)
-    keep their real status via :class:`urllib.error.HTTPError`; network / DNS
-    failures collapse to status ``0`` so :meth:`UrlSeeder.probe_url` treats them
-    as not-live. Pass as ``UrlSeeder(fetcher, head_fetcher=default_head_fetch)``.
-    """
-    req = Request(str(url), method="HEAD", headers={"User-Agent": "VSpider-UrlSeeder/1.0"})
+
+def _urllib_probe(
+    url: str,
+    *,
+    method: str,
+    timeout: float,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Issue ``method`` to ``url`` and read status + content-type (body unread)."""
+    headers = {"User-Agent": "VSpider-UrlSeeder/1.0"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = Request(str(url), method=method, headers=headers)
     try:
         with urlopen(req, timeout=timeout) as resp:
             status = int(getattr(resp, "status", 0) or getattr(resp, "code", 0) or 200)
-            headers = getattr(resp, "headers", None)
-            content_type = headers.get("content-type", "") if headers else ""
+            resp_headers = getattr(resp, "headers", None)
+            content_type = resp_headers.get("content-type", "") if resp_headers else ""
             return {"status_code": status, "content_type": str(content_type or "")}
     except HTTPError as exc:
         content_type = ""
@@ -176,6 +181,75 @@ def default_head_fetch(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
         return {"status_code": int(getattr(exc, "code", 0) or 0), "content_type": str(content_type)}
     except Exception:
         return {"status_code": 0, "content_type": ""}
+
+
+def default_head_fetch(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """Real stdlib HEAD probe → ``{"status_code", "content_type"}``.
+
+    Mirrors :func:`spider_lite.default_fetch` but issues an HTTP ``HEAD`` so a
+    URL's liveness + content-type are checked without downloading the body
+    (mission §一 "高效 — 能不重抓就不重抓"). HTTP error responses (404/500…)
+    keep their real status via :class:`urllib.error.HTTPError`; network / DNS
+    failures collapse to status ``0`` so :meth:`UrlSeeder.probe_url` treats them
+    as not-live.
+
+    SEED-NEXT: servers that reject ``HEAD`` (405 / 501) are retried with a
+    ``Range: bytes=0-0`` ``GET`` so liveness + content-type are still resolved
+    without downloading the body. Pass as
+    ``UrlSeeder(fetcher, head_fetcher=default_head_fetch)``.
+    """
+    result = _urllib_probe(url, method="HEAD", timeout=timeout)
+    if int(result.get("status_code") or 0) in _HEAD_REJECTED_STATUSES:
+        return _urllib_probe(
+            url, method="GET", timeout=timeout, extra_headers={"Range": "bytes=0-0"}
+        )
+    return result
+
+
+_CONTENT_TYPE_OUTPUT_KIND = {
+    "application/pdf": "media_pdf",
+    "application/zip": "media_archive",
+    "application/x-zip-compressed": "media_archive",
+    "application/x-7z-compressed": "media_archive",
+    "application/x-rar-compressed": "media_archive",
+    "application/gzip": "media_archive",
+    "application/x-tar": "media_archive",
+    "text/csv": "dataset_rows",
+    "application/csv": "dataset_rows",
+    "application/vnd.ms-excel": "dataset_rows",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "dataset_rows",
+    "application/json": "dataset_records",
+    "application/jsonl": "dataset_records",
+    "application/x-ndjson": "dataset_records",
+    "text/html": "html_snapshot",
+    "application/xhtml+xml": "html_snapshot",
+}
+
+
+def content_type_to_output_kind(content_type: Any) -> str:
+    """Map a response ``Content-Type`` to an ``output_contract`` output_kind.
+
+    Pure + tolerant (strips ``;charset=…`` params, lowercases). ``image/* ->
+    media_image``, ``video/* -> media_video``, ``audio/* -> media_audio``; known
+    document / data MIMEs map per :data:`_CONTENT_TYPE_OUTPUT_KIND`; other
+    ``text/* -> code_or_text``; everything else -> ``file_generic``; empty -> "".
+    """
+    ct = str(content_type or "").split(";", 1)[0].strip().lower()
+    if not ct:
+        return ""
+    main = ct.split("/", 1)[0]
+    if main == "image":
+        return "media_image"
+    if main == "video":
+        return "media_video"
+    if main == "audio":
+        return "media_audio"
+    mapped = _CONTENT_TYPE_OUTPUT_KIND.get(ct)
+    if mapped:
+        return mapped
+    if main == "text":
+        return "code_or_text"
+    return "file_generic"
 
 
 class UrlSeeder:
@@ -196,12 +270,15 @@ class UrlSeeder:
             return ""
 
     def probe_url(self, url: str) -> dict[str, Any]:
-        """HEAD-probe ``url`` → ``{url, status_code, content_type, live}``.
+        """HEAD-probe ``url`` → ``{url, status_code, content_type, live, output_kind}``.
 
-        ``live`` is ``200 <= status < 400``. With no ``head_fetcher`` (or on any
-        error) the URL is reported not-live with status ``0``.
+        ``live`` is ``200 <= status < 400``; ``output_kind`` is inferred from the
+        content-type (output_contract.v1). With no ``head_fetcher`` (or on any
+        error) the URL is reported not-live with status ``0`` and empty kind.
         """
-        out: dict[str, Any] = {"url": str(url), "status_code": 0, "content_type": "", "live": False}
+        out: dict[str, Any] = {
+            "url": str(url), "status_code": 0, "content_type": "", "live": False, "output_kind": "",
+        }
         if not self.head_fetcher:
             return out
         try:
@@ -212,6 +289,7 @@ class UrlSeeder:
         out["status_code"] = status
         out["content_type"] = content_type
         out["live"] = 200 <= status < 400
+        out["output_kind"] = content_type_to_output_kind(content_type)
         return out
 
     def seed_from_sitemap(
