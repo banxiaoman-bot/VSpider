@@ -1539,6 +1539,46 @@ Out of scope (deliberate, next slice):
   proxy health across runs.
 
 
+## Slice PROXY-4b: wire proxy reroute into the bot-challenge lifecycle
+
+Goal:
+
+- Close PROXY-4a's deferred half — actually *call* the reroute mechanism from the
+  agent loop so a flagged IP triggers a real IP swap (mission §一 "智能 / 遇阻即换路").
+  The agent already runs `handle_bot_challenge_step` each step (passive_wait → captcha
+  solver → HITL); now, after that recovery chain, consult the proxy policy and reroute
+  when the IP still looks blocked — last resort *after* HITL, never instead of it.
+
+Add / change (3 layers, minimal footprint — heavy logic stays in proxy_chain / browser_env):
+
+- `bot_challenge_guard.BotChallengeState` (+2 pure fields): `reroute_count` +
+  `max_reroute_per_run=3` — the per-run IP-swap budget.
+- `browser_env.reroute_proxy_on_block` enforces the budget: when `state` carries
+  `max_reroute_per_run`, a reroute past the cap is refused; each reroute bumps
+  `state.reroute_count`. `state=None` (other callers) keeps the old unbounded behaviour.
+- `main.py` bot-challenge block (1 call): after the existing recovery, calls
+  `browser.reroute_proxy_on_block(browser.current_url, result=_bc_result, state=_bot_challenge_state)`.
+  The pure `should_rotate_on_challenge` (PROXY-3) decides (not cleared / max_hitl /
+  encounter ≥ 2); on a real reroute the browser restarts on the new proxy and the step
+  re-screenshots so the next turn re-perceives the fresh IP. No proxy chain (the common
+  case) → no-op, so default runs are unchanged.
+
+Acceptance:
+
+- `validate_y PROXY-4b` (target → npm build → core → full): target
+  `tests/test_proxy_reroute.py` → **8 passed** (6 prior + 2 new: BotChallengeState
+  budget fields default 0/3; reroute refused once `reroute_count` hits the cap, only one
+  restart) → `npm run build` ok → core **102** → **full 2550 passed, 2 skipped** (135s)
+  → `[validate_y] success`. `py_compile` (main/browser_env/bot_challenge_guard) OK;
+  ReadLints clean; `test_proxy_chain.py` 29 + `test_bot_challenge_extras.py` unchanged.
+
+Out of scope (deliberate, next slices):
+
+- Rotate *before* escalating to HITL (avoid bugging the human first); geo /
+  sticky-session pools; per-proxy latency / bandwidth scoring; persisting proxy health
+  across runs; surfacing reroute events into the run manifest / event_stream.
+
+
 ## Slice BATCH-RESUME2: content-hash row keys for keyless batch resume
 
 Goal:
