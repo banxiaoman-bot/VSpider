@@ -198,6 +198,7 @@ async def maybe_run_media_harvest(
     base_dir: str | Path | None = None,
     max_items: int | None = 200,
     max_bytes_per_item: int | None = 100_000_000,
+    resume: bool = False,
 ) -> MediaHarvestHookResult:
     """Run media_harvester as a deterministic fast path when applicable.
 
@@ -252,6 +253,7 @@ async def maybe_run_media_harvest(
             base_dir=base_dir,
             max_items=max_items,
             max_bytes_per_item=max_bytes_per_item,
+            resume=resume,
         )
     except Exception as exc:
         return MediaHarvestHookResult(

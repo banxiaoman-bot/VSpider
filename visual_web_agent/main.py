@@ -7580,6 +7580,7 @@ async def run_agent(
                 capability_route=_capability_route,
                 run_id=_run_ts,
                 goal=goal,
+                resume=bool((run_constraints or {}).get("resume")),
             )
             if _media_hook_result.triggered:
                 event_stream.emit(

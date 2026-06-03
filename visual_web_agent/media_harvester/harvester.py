@@ -95,12 +95,16 @@ def harvest_to_run(
     produced_by: str = "media_harvester",
     step_id: str = "",
     extra_headers: dict[str, str] | None = None,
+    resume: bool = False,
 ) -> HarvestReport:
     """Download every candidate matching ``output_kind`` and append to manifest.
 
     ``base_dir`` overrides the default ``runs/`` root (useful for tests).
     ``client`` lets callers inject a custom streaming HTTP client (or a
     fake) instead of the default ``httpx.Client``.
+
+    ``resume=True`` threads HTTP Range / If-Range resume into each download
+    (DL-RESUME1); default ``False`` keeps the legacy single-pass behaviour.
     """
 
     run_path = run_dir(run_id, base_dir=base_dir)
@@ -135,6 +139,7 @@ def harvest_to_run(
             timeout=timeout,
             extra_headers=extra_headers,
             max_bytes=max_bytes_per_item,
+            resume=resume,
         )
         if not outcome.ok:
             failed.append(outcome)

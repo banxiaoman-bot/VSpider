@@ -54,6 +54,7 @@ const proxyServer = ref('')
 const proxyUsername = ref('')
 const proxyPassword = ref('')
 const batchMaxRuns = ref(0)
+const resumeEnabled = ref(false)
 const captchaSolverEnabled = ref(false)
 const captchaSolverProvider = ref('')
 const selectedAuthProfiles = ref([])
@@ -3369,6 +3370,7 @@ const submitTask = async () => {
     proxyUsername: proxyUsername.value,
     proxyPassword: proxyPassword.value,
     maxRuns: batchMaxRuns.value,
+    resume: resumeEnabled.value,
   })
   appendConstraintsToFormData(formData, constraints)
   if (selectedModel.value !== 'backend-default') {
@@ -3729,6 +3731,16 @@ onUnmounted(() => {
               :disabled="isRunning"
               class="full-width"
             />
+            <label>断点续跑（resume）</label>
+            <el-switch
+              v-model="resumeEnabled"
+              :disabled="isRunning"
+              active-text="开"
+              inactive-text="关"
+            />
+            <p class="file-status">
+              开启后：跳过上次已完成的行 / 步骤 / 已下载字节（batch / run / 媒体下载统一生效）
+            </p>
             <p class="file-status">
               Captcha Solver：
               <span :class="captchaSolverEnabled ? 'solver-on' : 'solver-off'">

@@ -18,6 +18,7 @@ export function buildTaskConstraints({
   proxyUsername = '',
   proxyPassword = '',
   maxRuns = 0,
+  resume = false,
 } = {}) {
   const constraints = {}
   const server = String(proxyServer || '').trim()
@@ -31,6 +32,9 @@ export function buildTaskConstraints({
   const runs = Number.parseInt(String(maxRuns || ''), 10)
   if (Number.isFinite(runs) && runs > 0) {
     constraints.max_runs = runs
+  }
+  if (resume) {
+    constraints.resume = true
   }
   return Object.keys(constraints).length ? constraints : null
 }
