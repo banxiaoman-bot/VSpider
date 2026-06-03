@@ -1781,3 +1781,48 @@ Out of scope (deliberate, next slices):
   rate limiting / politeness delay between probes; retry-with-backoff on transient 5xx;
   surfacing probe metadata (output_kind / content-type) into the seeded frontier scoring.
 
+
+## Slice E1C-3B: cross-system physical session switch (acquire -> launch -> rebind -> release)
+
+Goal:
+
+- Mission §一-B cross_system: when a run hops between systems (workflow_graph
+  `cross_system` risk_flag) the reactive loop should really switch the active
+  BrowserEnv to the target system's isolated context, not just navigate within one
+  shared browser. Build the substrate + a flag-gated physical swap on top of the
+  E1c-1/2/3a SessionRouter, fully additive (`VSPIDER_CROSS_SYSTEM_SWITCH` default
+  off -> byte-identical single-system behaviour).
+
+Add / change (all behind the flag; 6 commits fe9ad79..2064766):
+
+- 3b-1 `SessionRouter.acquire_for_switch` (session_router.py): pool-acquire the target
+  session (idempotent per run/system/auth) + stage the target-domain storage_state
+  subset; directive enriched with session_id / staged / cookie_count.
+- 3b-2 reactive-loop wiring (main.py hot-loop hook + finally): snapshot live
+  storage_state, acquire_for_switch, emit `session_switch` + a `confirm_active` readback
+  `session_switch_verified`; flag-gated `release_all()` in the run finally (acquire never
+  leaks).
+- 3b-2a `BrowserEnv.start(user_data_dir_override=...)` + new pure `browser_profile.py`
+  `resolve_user_data_dir`: per-system isolated Chromium profile so two persistent contexts
+  never collide on launch_persistent_context's single-instance lock.
+- 3b-2b `SessionRouter.launch_for_switch`: async-start the target session on its isolated
+  profile, apply the system's storage_state subset, read back final_url + cookie/origin
+  counts.
+- 3b-2c `SessionRouter.activate_switch` + `_launched` guard + main.py rebind: a forward hop
+  launches the target session once and rebinds the loop-local `browser` handle (closures
+  follow via Python cell capture -- verified, no value-capture sites); a hop back to the
+  home system rebinds to the primary lease; emit `session_switch_activated`.
+
+Acceptance:
+
+- Per-slice TDD (red -> green) + `validate_y E1c-3b-{1,2,2a,2b,2c}` each four gates green
+  (target -> npm build -> core -> full). Router suite 21 -> 38; new pure browser_profile
+  suite 5. Full suite 2588 -> 2610 passed, 2 skipped. ReadLints clean.
+
+Out of scope (deliberate, next slices):
+
+- Path-2 navigation-layer interception (intercept A->B nav so A's page is truly preserved,
+  vs path-1's post-hoc rebind); switch-back restoring A's exact page state; profile-dir
+  GC/TTL; folding `VSPIDER_CROSS_SYSTEM_SWITCH` + pool caps into a single
+  `cross_system_config`; an `_env_flag` helper to de-dup the inline truthy env parse.
+
