@@ -39,6 +39,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+import urllib.request
 from typing import Callable, Iterable, List, Optional
 from urllib.parse import urlsplit
 
@@ -47,23 +48,32 @@ __all__ = [
     "check_url",
     "is_url_allowed",
     "allow_private_default",
+    "build_guarded_opener",
+    "guard_httpx_request",
 ]
 
 # Schemes the server is ever allowed to fetch. Everything else (file, ftp,
 # gopher, data, about, javascript, ...) is an SSRF / local-file vector.
 _ALLOWED_SCHEMES = frozenset({"http", "https"})
 
-# Hostnames that are always unsafe regardless of DNS (offline-safe blocklist):
-# loopback aliases + cloud-metadata service names.
-_BLOCKED_HOSTNAMES = frozenset(
+# Cloud-metadata service hostnames: ALWAYS unsafe, even with allow_private
+# (the metadata endpoint is never a legitimate scrape target).
+_METADATA_HOSTNAMES = frozenset(
+    {
+        "metadata",
+        "metadata.google.internal",
+        "metadata.goog",
+    }
+)
+
+# Loopback aliases: unsafe by default but permitted under ``allow_private``
+# (an operator may intentionally crawl a local dev server).
+_LOOPBACK_HOSTNAMES = frozenset(
     {
         "localhost",
         "localhost.localdomain",
         "ip6-localhost",
         "ip6-loopback",
-        "metadata",
-        "metadata.google.internal",
-        "metadata.goog",
     }
 )
 
@@ -104,18 +114,30 @@ def _default_resolver(host: str) -> List[str]:
     return out
 
 
-def _hostname_is_statically_blocked(host: str) -> bool:
-    """True for loopback aliases / metadata hostnames (no DNS needed)."""
+def _hostname_block_reason(host: str, *, allow_private: bool = False) -> Optional[str]:
+    """Reason a hostname is statically unsafe (no DNS), or ``None`` if allowed.
+
+    Cloud-metadata hostnames are always blocked; loopback aliases (``localhost``,
+    ``*.localhost`` ...) are blocked unless ``allow_private`` is set.
+    """
     h = str(host or "").strip().rstrip(".").lower()
     if not h:
-        return True
-    if h in _BLOCKED_HOSTNAMES:
-        return True
-    return h.endswith(".localhost")
+        return "empty host"
+    if h in _METADATA_HOSTNAMES:
+        return "cloud-metadata hostname"
+    if h in _LOOPBACK_HOSTNAMES or h.endswith(".localhost"):
+        return None if allow_private else "loopback hostname"
+    return None
 
 
-def _ip_is_blocked(ip: str) -> bool:
-    """True when ``ip`` is any non-public address (or unparseable)."""
+def _ip_is_blocked(ip: str, *, allow_private: bool = False) -> bool:
+    """True when ``ip`` is unsafe to fetch (or unparseable).
+
+    Link-local (cloud metadata ``169.254.0.0/16`` / ``fe80::/10``), reserved,
+    multicast and unspecified addresses are ALWAYS blocked. Loopback and private
+    (RFC1918 / ULA) addresses are blocked unless ``allow_private`` is set, so an
+    operator opting into LAN scraping still cannot reach the metadata endpoint.
+    """
     try:
         addr = ipaddress.ip_address(str(ip).split("%", 1)[0])
     except ValueError:
@@ -124,14 +146,18 @@ def _ip_is_blocked(ip: str) -> bool:
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:
         addr = mapped
-    return bool(
-        addr.is_private
-        or addr.is_loopback
-        or addr.is_link_local
-        or addr.is_reserved
-        or addr.is_multicast
-        or addr.is_unspecified
-    )
+    # Loopback is an opt-in tier; check it before the reserved tier because
+    # Python also flags ``::1`` as reserved (it sits in ``::/8``).
+    if addr.is_loopback:
+        return not allow_private
+    # Always-blocked tiers (even under allow_private): link-local (cloud
+    # metadata 169.254.0.0/16, fe80::/10), reserved, multicast, unspecified.
+    if addr.is_link_local or addr.is_reserved or addr.is_multicast or addr.is_unspecified:
+        return True
+    # Private (RFC1918 / ULA) is opt-in.
+    if not allow_private and addr.is_private:
+        return True
+    return False
 
 
 def check_url(
@@ -166,22 +192,22 @@ def check_url(
 
     if allow_private is None:
         allow_private = allow_private_default()
-    if allow_private:
-        return
 
     # A literal-IP host is checked directly (no DNS) -- catches the textbook
-    # payloads regardless of any resolution policy.
+    # payloads regardless of any resolution policy. Cloud-metadata / link-local
+    # stay blocked even under allow_private.
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
         literal = None
     if literal is not None:
-        if _ip_is_blocked(str(literal)):
+        if _ip_is_blocked(str(literal), allow_private=allow_private):
             raise UrlGuardError(f"blocked address: {host}")
         return
 
-    # Hostname: static blocklist always applies (offline-safe).
-    if _hostname_is_statically_blocked(host):
+    # Hostname: static blocklist (offline-safe). Metadata names are always
+    # blocked; loopback aliases are blocked unless allow_private.
+    if _hostname_block_reason(host, allow_private=allow_private):
         raise UrlGuardError(f"blocked host: {host}")
 
     if resolve_dns is None:
@@ -197,7 +223,7 @@ def check_url(
     if not addrs:
         raise UrlGuardError(f"no addresses resolved for {host}")
     for addr in addrs:
-        if _ip_is_blocked(addr):
+        if _ip_is_blocked(addr, allow_private=allow_private):
             raise UrlGuardError(f"blocked address: {host} -> {addr}")
 
 
@@ -214,3 +240,52 @@ def is_url_allowed(
         return True
     except UrlGuardError:
         return False
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib redirect handler that re-runs :func:`check_url` on every hop.
+
+    ``urlopen`` follows 3xx automatically; without re-validation a public URL can
+    bounce the fetch onto an internal host (``302 -> http://169.254.169.254/``).
+    """
+
+    def __init__(
+        self,
+        *,
+        resolver: Optional[Resolver] = None,
+        allow_private: Optional[bool] = None,
+    ) -> None:
+        super().__init__()
+        self._resolver = resolver
+        self._allow_private = allow_private
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        check_url(newurl, resolver=self._resolver, allow_private=self._allow_private)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def build_guarded_opener(
+    *,
+    resolver: Optional[Resolver] = None,
+    allow_private: Optional[bool] = None,
+) -> urllib.request.OpenerDirector:
+    """Build a urllib opener that SSRF-checks the initial URL *and* every redirect.
+
+    Pair with an explicit :func:`check_url` on the initial URL for a clear error
+    at call time; the opener then guarantees no redirect hop escapes the policy.
+    """
+    return urllib.request.build_opener(
+        _GuardedRedirectHandler(resolver=resolver, allow_private=allow_private)
+    )
+
+
+def guard_httpx_request(request: object) -> None:
+    """httpx ``request`` event-hook: SSRF-check every outgoing hop.
+
+    httpx fires ``request`` hooks once per redirect (inside
+    ``_send_handling_redirects``), so registering this validates the initial URL
+    and each redirect target before the socket is opened. Raises
+    :class:`UrlGuardError` to abort an unsafe hop (callers surface it as a failed
+    outcome).
+    """
+    check_url(str(getattr(request, "url", "")))

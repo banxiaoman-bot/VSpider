@@ -46,6 +46,30 @@ class TestUrlSeederWiring:
         assert meta["status_code"] == 0
 
 
+class TestApiReplayWiring:
+    # replay_candidate(fetcher=None) takes the real-network path; a blocked
+    # literal IP must fail closed (no socket, no DNS) as a clean blocked result.
+    def test_replay_blocks_metadata_url(self):
+        from visual_web_agent import api_replay
+
+        result = api_replay.replay_candidate(
+            run_id="ssrf_probe",
+            candidate={"endpoint": "http://169.254.169.254/latest/meta-data/", "method": "GET"},
+        )
+        assert result["http_ok"] is False
+        assert result["status"] == "blocked_url"
+
+    def test_replay_blocks_private_url(self):
+        from visual_web_agent import api_replay
+
+        result = api_replay.replay_candidate(
+            run_id="ssrf_probe2",
+            candidate={"endpoint": "http://10.0.0.1/admin", "method": "GET"},
+        )
+        assert result["http_ok"] is False
+        assert result["status"] == "blocked_url"
+
+
 class TestDownloaderWiring:
     # No tmp_path fixture: the guard short-circuits before any mkdir, so the
     # dest dir must never be created -- which we assert directly. (Also dodges

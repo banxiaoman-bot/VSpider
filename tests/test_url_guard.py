@@ -177,3 +177,32 @@ class TestAllowPrivateOptIn:
         # explicit param wins regardless of env
         assert is_url_allowed("http://10.1.2.3/x", allow_private=True) is True
         assert is_url_allowed("http://10.1.2.3/x", allow_private=False) is False
+
+
+class TestAllowPrivateStillBlocksMetadata:
+    """allow_private opts into loopback / LAN but NEVER cloud metadata / link-local.
+
+    The metadata endpoint (169.254.169.254 / fe80::/10 / metadata.* hostnames)
+    is never a legitimate scrape target, so even an operator who explicitly
+    enables private-network scraping must not be able to reach it (SSRF crown
+    jewel). Loopback / RFC1918 stay reachable under the opt-in.
+    """
+
+    def test_metadata_literal_blocked_even_with_allow_private(self):
+        assert is_url_allowed("http://169.254.169.254/latest/meta-data/", allow_private=True) is False
+
+    def test_link_local_v6_blocked_even_with_allow_private(self):
+        assert is_url_allowed("http://[fe80::1]/x", allow_private=True) is False
+
+    def test_metadata_hostname_blocked_even_with_allow_private(self):
+        assert is_url_allowed("http://metadata.google.internal/x", allow_private=True) is False
+
+    def test_metadata_blocked_under_allow_private_env(self, monkeypatch):
+        monkeypatch.setenv("VSPIDER_ALLOW_PRIVATE_URLS", "1")
+        assert is_url_allowed("http://169.254.169.254/x") is False
+        # ...but loopback IS reachable under the same opt-in
+        assert is_url_allowed("http://127.0.0.1/x") is True
+
+    def test_loopback_still_allowed_with_allow_private(self):
+        assert is_url_allowed("http://127.0.0.1/x", allow_private=True) is True
+        assert is_url_allowed("http://[::1]/x", allow_private=True) is True

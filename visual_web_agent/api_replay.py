@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .artifact_manager import artifact_url, register_artifact, resolve_artifact_path
+from .url_guard import UrlGuardError, check_url
 
 
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
@@ -121,6 +122,24 @@ def _write_jsonl_artifact(run_id: str, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _blocked_replay_result(rid: str, plan: dict[str, Any], method: str, reason: str) -> dict[str, Any]:
+    """SSRF-blocked replay result, shaped like a clean http failure (no socket)."""
+    return {
+        "status": "blocked_url",
+        "http_ok": False,
+        "run_id": rid,
+        "http_status": 0,
+        "method": method,
+        "content_type": "",
+        "plan": plan,
+        "row_count": 0,
+        "rows": [],
+        "error": reason,
+        "artifact": {"path": "", "url": ""},
+        "sample": [],
+    }
+
+
 def replay_candidate(
     *,
     run_id: str,
@@ -155,6 +174,13 @@ def replay_candidate(
     if fetcher is not None:
         raw_status, raw_headers, raw_body = fetcher(url, req_headers, timeout_s, method, body)
     else:
+        # SSRF guard: validate the target host before opening any socket so a
+        # captured candidate URL can't point the server at an internal /
+        # cloud-metadata address (mission §一-3 通用: one guard, every fetch).
+        try:
+            check_url(url)
+        except UrlGuardError as exc:
+            return _blocked_replay_result(rid, plan, method, f"blocked_url: {exc}")
         request = urllib.request.Request(
             url,
             data=body_bytes if method == "POST" else None,

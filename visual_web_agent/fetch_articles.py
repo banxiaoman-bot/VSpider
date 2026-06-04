@@ -19,6 +19,11 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+try:  # SSRF guard import works whether run as a package module or a script
+    from visual_web_agent.url_guard import is_url_allowed
+except ImportError:  # pragma: no cover - script run from inside the package dir
+    from url_guard import is_url_allowed
+
 # ── 请求头（模拟普通浏览器，避免被拒） ────────────────────────────
 HEADERS = {
     "User-Agent": (
@@ -158,6 +163,10 @@ def _extract_first_result_url(html: str) -> str:
 
 def _fetch_article_body(article_url: str) -> str:
     """访问文章页面，提取 <p> 段落文本，返回前 400 字。"""
+    # SSRF guard: article URLs come from search results (untrusted); refuse
+    # internal / loopback / cloud-metadata targets before issuing the request.
+    if not is_url_allowed(article_url, resolve_dns=True):
+        return ""
     try:
         resp = requests.get(article_url, headers=HEADERS, timeout=10, allow_redirects=True)
         resp.encoding = resp.apparent_encoding or "utf-8"
