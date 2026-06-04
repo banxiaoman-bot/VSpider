@@ -269,6 +269,61 @@ class TestSessionRouterPlanGotoInterception:
             assert key in directive, f"missing interception key: {key}"
 
 
+class TestSessionRouterShouldRenavigate:
+    """Pure decision (A2): after a cross-system switch rebinds to the target
+    browser, should the reactive loop re-run goto on it, or is it already on
+    the requested URL? Skipping the re-nav when already-there preserves the
+    target system's exact page state -- the home page on a switch-back, and the
+    freshly-launched target on a forward first hop (no double navigation).
+    Trailing-slash + fragment insensitive, query-significant. Pure."""
+
+    def _router(self) -> SessionRouter:
+        return SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=_pool())
+
+    def test_identical_url_does_not_renavigate(self) -> None:
+        router = self._router()
+        assert (
+            router.should_renavigate("https://alpha.com/page1", "https://alpha.com/page1")
+            is False
+        )
+
+    def test_trailing_slash_difference_does_not_renavigate(self) -> None:
+        router = self._router()
+        assert (
+            router.should_renavigate("https://alpha.com/page1/", "https://alpha.com/page1")
+            is False
+        )
+
+    def test_fragment_difference_does_not_renavigate(self) -> None:
+        router = self._router()
+        assert (
+            router.should_renavigate("https://alpha.com/p#a", "https://alpha.com/p#b") is False
+        )
+
+    def test_different_path_renavigates(self) -> None:
+        router = self._router()
+        assert (
+            router.should_renavigate("https://alpha.com/page1", "https://alpha.com/page2")
+            is True
+        )
+
+    def test_different_query_renavigates(self) -> None:
+        # query carries page state -> a different query is a different page.
+        router = self._router()
+        assert (
+            router.should_renavigate("https://alpha.com/p?tab=1", "https://alpha.com/p?tab=2")
+            is True
+        )
+
+    def test_blank_target_does_not_renavigate(self) -> None:
+        router = self._router()
+        assert router.should_renavigate("https://alpha.com/p", "") is False
+
+    def test_blank_current_renavigates(self) -> None:
+        router = self._router()
+        assert router.should_renavigate("", "https://beta.com/x") is True
+
+
 class TestSessionRouterAcquireForSwitch:
     def test_acquire_for_switch_pools_target_and_stages_state(self) -> None:
         pool = _pool()

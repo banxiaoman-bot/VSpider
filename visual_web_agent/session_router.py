@@ -63,6 +63,15 @@ def _host_of(url: Any) -> str:
     return host.strip().lower()
 
 
+def _norm_url(url: Any) -> str:
+    """URL normalized for same-page comparison: fragment dropped, trailing
+    slash stripped (query kept -- it carries page state). Pure.
+    """
+
+    raw = str(url or "").strip().split("#", 1)[0]
+    return raw.rstrip("/")
+
+
 @dataclass
 class SystemAuthPlan:
     """Per-system auth-profile + domain lookup built from planned systems.
@@ -253,6 +262,26 @@ class SessionRouter:
             "auth_profile": self.resolved_auth_profile(chosen) if should_intercept else "auto",
             "domain": self.plan.domain_for(chosen) if should_intercept else "",
         }
+
+    def should_renavigate(self, current_url: str, target_url: str) -> bool:
+        """After a switch rebinds to the target browser, is a goto still needed?
+
+        Returns False when the target browser is already on ``target_url``
+        (trailing-slash / fragment insensitive) so the reactive loop skips the
+        re-navigation and preserves the page's exact state -- the home page on a
+        switch-back, and the freshly-launched target on a forward first hop
+        (which ``launch_for_switch`` already navigated). A blank target needs no
+        nav (False); a blank / unknown current is navigated to be safe (True).
+        Pure -- no pool / browser.
+        """
+
+        target = str(target_url or "").strip()
+        if not target:
+            return False
+        current = str(current_url or "").strip()
+        if not current:
+            return True
+        return _norm_url(current) != _norm_url(target)
 
     def acquire_for_switch(
         self,
