@@ -435,6 +435,36 @@ class TestSaveRunDataset:
         assert merged["container"] == "csv"
         assert merged["output_kind"] == "dataset_rows"
 
+    def test_resolve_output_contract_media_kind_is_not_blind_xlsx(self) -> None:
+        """mission §一-A: a media task must never be forced into xlsx. When the
+        contract carries a media ``output_kind`` but no explicit container, the
+        default must follow the kind (files_folder), not a blind xlsx."""
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "media_image"})
+        assert merged["container"] == "files_folder"
+
+    def test_resolve_output_contract_answer_text_is_inline(self) -> None:
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "answer_text"})
+        assert merged["container"] == "inline_text"
+
+    def test_resolve_output_contract_dataset_rows_keeps_xlsx_policy(self) -> None:
+        """Pure tabular small dataset still defaults to xlsx -- this is the
+        sanctioned kind->container policy (default_container_for_kind), not the
+        old blind hard-coded default."""
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "dataset_rows"})
+        assert merged["container"] == "xlsx"
+
+    def test_resolve_output_contract_explicit_container_wins_over_kind(self) -> None:
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "media_image", "container": "zip"})
+        assert merged["container"] == "zip"
+
     def test_save_run_dataset_honors_container(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers.dispatch import save_run_dataset
 

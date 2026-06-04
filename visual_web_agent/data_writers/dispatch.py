@@ -138,9 +138,23 @@ def resolve_output_contract(*contracts: dict[str, Any] | None) -> dict[str, Any]
         for key, value in contract.items():
             if value not in (None, ""):
                 merged[key] = value
-    merged.setdefault("container", "xlsx")
     merged.setdefault("output_kind", "dataset_rows")
     merged.setdefault("mode", "default")
+    # mission §一-A: never blind-default to xlsx. Derive the container from the
+    # output_kind policy (default_container_for_kind) so a media / answer task
+    # without an explicit container lands as files_folder / inline_text instead
+    # of being forced into a spreadsheet. dataset_rows still maps to xlsx -- but
+    # by the sanctioned kind->container policy, not a hard-coded default.
+    if not merged.get("container"):
+        try:
+            from ..io_contract.output_contract import default_container_for_kind
+        except (ImportError, ValueError):
+            from visual_web_agent.io_contract.output_contract import (
+                default_container_for_kind,
+            )
+        merged["container"] = default_container_for_kind(
+            str(merged.get("output_kind") or "dataset_rows")
+        )
     return merged
 
 
