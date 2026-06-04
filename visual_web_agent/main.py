@@ -6121,6 +6121,9 @@ def _compact_rpa_trail(trail: list[dict]) -> list[dict]:
             and sorted(prev.get("required_memory_keys") or []) == sorted(cur.get("required_memory_keys") or [])
             and prev.get("x_norm") == cur.get("x_norm")
             and prev.get("y_norm") == cur.get("y_norm")
+            # Cross-system: identical actions in different planned systems are
+            # NOT the same step -- merging them would drop a system hop.
+            and (prev.get("system_id") or "") == (cur.get("system_id") or "")
         )
 
     for step in trail:
@@ -6345,11 +6348,93 @@ def _mark_rpa_cache_failure(path: Path, payload: dict, error_msg: str = "") -> d
     return updated
 
 
+async def _replay_switch_system(
+    browser: "BrowserEnv",
+    session_router,
+    *,
+    to_system_id: str,
+    from_system_id: str = "",
+    url: str = "",
+    home_browser=None,
+    home_system_id: str = "",
+    user_data_dir_base: str = "",
+):
+    """Switch the active browser to ``to_system_id`` mid RPA replay (RPA-XSYS).
+
+    Mirrors the reactive loop's cross-system goto consumer: snapshot the current
+    context's storage_state, ask the router for a switch directive, activate it
+    (launch / rebind the target system's isolated pooled session), then land the
+    rebound browser on ``url`` only if it isn't already there (A2: preserves the
+    target's exact page state on a switch-back). Best-effort -- any failure
+    returns the inputs unchanged so replay proceeds on the current browser.
+
+    Returns ``(browser, home_browser, home_system_id)``: the (possibly new)
+    active browser plus the home-system bookkeeping the caller threads forward.
+    """
+    try:
+        full_state = None
+        try:
+            _ctx = getattr(browser, "_context", None)
+            if _ctx is not None:
+                full_state = await _ctx.storage_state()
+        except Exception as _state_err:
+            logger.debug("[RPA REPLAY] x-sys storage_state skipped: %s", _state_err)
+
+        switch = session_router.acquire_for_switch(
+            to_system_id=to_system_id,
+            from_system_id=from_system_id,
+            full_state=full_state,
+        )
+        if not switch.get("should_switch"):
+            return browser, home_browser, home_system_id
+
+        if home_browser is None:
+            home_browser = browser
+            home_system_id = from_system_id or ""
+
+        target_browser = await session_router.activate_switch(
+            switch,
+            url=url,
+            user_data_dir_base=user_data_dir_base,
+            full_state=full_state,
+            home_system_id=home_system_id,
+            home_browser=home_browser,
+        )
+        if target_browser is not None and target_browser is not browser:
+            browser = target_browser
+            try:
+                browser._session_router = session_router
+            except Exception:
+                pass
+            logger.info(
+                "[RPA REPLAY] cross-system switch -> %s (session=%s)",
+                switch.get("to_system_id", ""),
+                switch.get("session_id", ""),
+            )
+
+        try:
+            _page = getattr(browser, "_page", None)
+            _current = getattr(browser, "current_url", "") or ""
+            if _page is not None and url and session_router.should_renavigate(_current, url):
+                await _page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                _stable = getattr(browser, "_wait_for_page_stable", None)
+                if _stable is not None:
+                    await _stable()
+        except Exception as _nav_err:
+            logger.debug("[RPA REPLAY] x-sys landing nav skipped: %s", _nav_err)
+
+        return browser, home_browser, home_system_id
+    except Exception as _switch_err:
+        logger.debug("[RPA REPLAY] cross-system switch skipped: %s", _switch_err)
+        return browser, home_browser, home_system_id
+
+
 async def _replay_rpa(
     browser: "BrowserEnv",
     trail: list[dict],
     workflow_memory: dict | None = None,
     vlm: "VLMClient | None" = None,
+    session_router=None,
 ) -> bool:
     """
     极速 RPA 回放：直接用 XPath/坐标执行缓存动作，完全跳过 VLM。
@@ -6367,6 +6452,12 @@ async def _replay_rpa(
     except ImportError:
         import semantic_macros as _semantic_macros  # type: ignore[no-redef]
 
+    # RPA-XSYS: auto-thread the run's SessionRouter off the browser when not
+    # passed explicitly. main.py attaches browser._session_router ONLY when
+    # VSPIDER_CROSS_SYSTEM_SWITCH is on, so flag off -> None -> no switching.
+    if session_router is None:
+        session_router = getattr(browser, "_session_router", None)
+
     compacted_trail = _compact_rpa_trail(trail)
     if len(compacted_trail) != len(trail):
         logger.info(
@@ -6375,10 +6466,60 @@ async def _replay_rpa(
 
     _RPA_TIMEOUT = 5000  # 每步最长等待 5s，防止卡死
 
+    # ── Cross-system RPA replay state (RPA-XSYS) ──────────────────────
+    # Track the active planned system; a step whose system_id differs gets a
+    # physical browser switch before it replays. All inert when router None.
+    _xsys_current_system = ""
+    _xsys_home_browser = None
+    _xsys_home_system = ""
+    _xsys_udd_base = ""
+    if session_router is not None:
+        try:
+            _xsys_current_system = session_router.system_for_url(
+                getattr(browser, "current_url", "") or ""
+            )
+        except Exception:
+            _xsys_current_system = ""
+        try:
+            try:
+                from . import config as _xsys_cfg
+            except ImportError:
+                import config as _xsys_cfg  # type: ignore[no-redef]
+            _xsys_udd_base = getattr(_xsys_cfg, "BROWSER_USER_DATA_DIR", "") or ""
+        except Exception:
+            _xsys_udd_base = ""
+
     for idx, step in enumerate(compacted_trail):
         act = step.get("action")
         step_label = f"Step {idx + 1}/{len(compacted_trail)} ({act})"
         try:
+            # Cross-system replay hop: switch the active browser before this
+            # step runs if it belongs to a different planned system.
+            if session_router is not None:
+                _step_system = str(step.get("system_id") or "").strip()
+                if _step_system and _step_system != _xsys_current_system:
+                    if act == "goto":
+                        _hop_url = (
+                            step.get("url_template") or step.get("url")
+                            or step.get("type_value_template")
+                            or step.get("type_value") or ""
+                        )
+                    else:
+                        _hop_url = getattr(browser, "current_url", "") or ""
+                    _hop_url = _resolve_replay_template(str(_hop_url), workflow_memory)
+                    browser, _xsys_home_browser, _xsys_home_system = (
+                        await _replay_switch_system(
+                            browser,
+                            session_router,
+                            to_system_id=_step_system,
+                            from_system_id=_xsys_current_system,
+                            url=_hop_url,
+                            home_browser=_xsys_home_browser,
+                            home_system_id=_xsys_home_system,
+                            user_data_dir_base=_xsys_udd_base,
+                        )
+                    )
+                    _xsys_current_system = _step_system
             page = browser._page
             if page is None or page.is_closed():
                 raise RuntimeError("no active page available for cached replay")

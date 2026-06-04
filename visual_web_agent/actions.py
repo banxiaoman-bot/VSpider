@@ -218,6 +218,19 @@ class ActionContext(BaseModel):
             step["type_value_template"] = self.rpa_template_value
         if self.action.action == "goto" and self.rpa_template_value:
             step["url_template"] = self.rpa_template_value
+        # Cross-system RPA replay (Slice RPA-XSYS): stamp the planned system
+        # the step ran in so _replay_rpa can switch the active browser to it
+        # before replaying. Only when a session_router is attached (i.e.
+        # VSPIDER_CROSS_SYSTEM_SWITCH on) -> no key, byte-identical, when off.
+        if self.session_router is not None:
+            try:
+                _sys_id = self.session_router.system_for_url(
+                    getattr(self.browser, "current_url", "") or ""
+                )
+                if _sys_id:
+                    step.setdefault("system_id", _sys_id)
+            except Exception:
+                pass
         # G3: stamp trace_id once per RPA trail entry (don't clobber a
         # caller-provided override, hence setdefault).
         step.setdefault("trace_id", self.trace_id)
