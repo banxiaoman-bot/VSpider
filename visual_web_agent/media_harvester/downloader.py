@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Protocol, runtime_checkable
 
 from visual_web_agent.upload_store import sniff_mime_and_ext
+from visual_web_agent.url_guard import UrlGuardError, check_url
 
 from .candidates import MediaCandidate, classify_url
 
@@ -247,6 +248,16 @@ def download_candidate(
     that conforms to :class:`StreamingClient` is acceptable (great for
     tests).
     """
+
+    try:
+        check_url(candidate.url)  # SSRF guard: never stream from private/metadata hosts
+    except UrlGuardError as exc:
+        return DownloadOutcome(
+            ok=False,
+            candidate=candidate,
+            final_kind=candidate.kind,
+            error=f"blocked_url: {exc}",
+        )
 
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)

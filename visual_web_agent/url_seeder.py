@@ -35,6 +35,7 @@ from urllib.request import Request, urlopen
 
 from visual_web_agent.crawl_frontier import normalize_keywords, score_url
 from visual_web_agent.spider_lite import domain_of, normalize_url
+from visual_web_agent.url_guard import UrlGuardError, check_url
 
 __all__ = [
     "parse_sitemap_locs",
@@ -170,6 +171,10 @@ def _urllib_probe(
     extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Issue ``method`` to ``url`` and read status + content-type (body unread)."""
+    try:
+        check_url(url)  # SSRF guard: a blocked host probes as not-live (status 0)
+    except UrlGuardError:
+        return {"status_code": 0, "content_type": ""}
     headers = {"User-Agent": "VSpider-UrlSeeder/1.0"}
     if extra_headers:
         headers.update(extra_headers)

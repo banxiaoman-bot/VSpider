@@ -15,6 +15,7 @@ from visual_web_agent.extraction_engine import generic
 from visual_web_agent.page_cache import PageCacheMissError, PageResponseCache
 from visual_web_agent.robots_policy import RobotsPolicyManager
 from visual_web_agent.crawl_frontier import build_frontier, normalize_keywords
+from visual_web_agent.url_guard import check_url
 
 
 @dataclass
@@ -505,6 +506,7 @@ def _crawl_strategy(payload: dict[str, Any]) -> str:
 
 
 def default_fetch(url: str) -> FetchResult:
+    check_url(url)  # SSRF guard: reject private/loopback/metadata hosts + non-http schemes
     req = Request(str(url), headers={"User-Agent": "VSpider-SpiderLite/1.0"})
     with urlopen(req, timeout=15) as resp:
         raw = resp.read(2_000_000)
