@@ -46,6 +46,7 @@ from .clarification import (
     detect_input_clarifications,
 )
 from .preflight import Preflight, build_preflight
+from .entry_llm import make_entry_llm, entry_llm_from_config
 from .protocol import RunOutputProtocol
 from .runtime import (
     clear_current_run,
@@ -103,6 +104,8 @@ __all__ = [
     "detect_input_clarifications",
     "Preflight",
     "build_preflight",
+    "make_entry_llm",
+    "entry_llm_from_config",
     "RunOutputProtocol",
     "INPUT_CONTRACT_FILENAME",
     "OUTPUT_CONTRACT_FILENAME",

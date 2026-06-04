@@ -2881,8 +2881,16 @@ async def start_batch(
             resolved_entry = ""
             try:
                 from visual_web_agent.io_contract import build_preflight as _build_preflight
+                from visual_web_agent.io_contract.entry_llm import entry_llm_from_config
 
-                _pf_entry = _build_preflight(merged_prompt)
+                # §一-B #2: inject the semantic LLM so a URL-less goal resolves to a
+                # real site the model picks (entry_suggestion.source == "llm"),
+                # not just the deterministic search fallback. Run off the event
+                # loop since the sync client makes a blocking completion call.
+                _entry_llm = entry_llm_from_config()
+                _pf_entry = await asyncio.to_thread(
+                    _build_preflight, merged_prompt, llm=_entry_llm
+                )
                 resolved_entry = (_pf_entry.resolved_start_url or "").strip()
                 auto_entry_source = (
                     _pf_entry.entry_suggestion.source

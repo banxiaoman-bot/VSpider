@@ -123,6 +123,37 @@ class TestStartBatchUrlOptional:
         assert body.get("status") == "success", body
         assert body.get("target_url") == "https://primary.example/"
 
+    def test_url_less_goal_uses_semantic_entry_llm(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """input_contract §一-B #2: a URL-less goal must let the semantic LLM
+        pick a real start site (entry_suggestion.source == "llm"), wired into
+        the ``/api/start_batch`` main entry -- not silently degrade to the Bing
+        search fallback. We stub ``entry_llm_from_config`` so the model
+        "returns" a concrete site; the resolved target_url must be that site."""
+        import api_server as api
+
+        monkeypatch.setattr(api, "_start_queue_workers", lambda bt: ([], {}))
+        monkeypatch.setattr(api, "_task_snapshot", lambda: {"running": False, "in_cooldown": False})
+
+        import visual_web_agent.io_contract.entry_llm as el
+
+        monkeypatch.setattr(
+            el, "entry_llm_from_config",
+            lambda: (lambda _prompt: "https://www.zhihu.com"),
+            raising=True,
+        )
+
+        resp = client.post(
+            "/api/start_batch",
+            data={"prompt": "到知乎找一篇深度学习入门的高赞回答"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("status") == "success", body
+        assert (body.get("target_url") or "").startswith("https://www.zhihu.com"), body
+        assert body.get("target_url_auto_entry"), body
+
     def test_multiple_prompt_urls_become_extras_when_inferred(
         self, client, monkeypatch: pytest.MonkeyPatch
     ) -> None:

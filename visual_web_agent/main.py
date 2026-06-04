@@ -7103,13 +7103,21 @@ async def run_agent(
     _preflight = None
     try:
         from .io_contract import build_preflight as _build_preflight
+        from .io_contract.entry_llm import entry_llm_from_config
 
-        _preflight = _build_preflight(
+        # §一-B #2: feed the semantic LLM so a URL-less goal resolves to a
+        # model-picked start site (source "llm"), not just the search fallback.
+        # Off-loop: the sync entry client only makes a blocking call when no
+        # start_url was supplied.
+        _entry_llm = entry_llm_from_config()
+        _preflight = await asyncio.to_thread(
+            _build_preflight,
             goal or "",
             start_url=start_url or "",
             upload_file=upload_file or "",
             auth_profiles=auth_profiles or "",
             constraints=run_constraints or None,
+            llm=_entry_llm,
         )
         if not (start_url or "").strip() and _preflight.resolved_start_url:
             start_url = _preflight.resolved_start_url
