@@ -3775,6 +3775,7 @@ Object.defineProperty(navigator, 'languages', {
             page=page,
             rpa_required_keys=rpa_required_keys,
             rpa_template_value=rpa_template_value,
+            session_router=getattr(self, "_session_router", None),
         )
         try:
             handler_result = await handler.execute(ctx)

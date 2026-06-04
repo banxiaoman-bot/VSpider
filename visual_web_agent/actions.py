@@ -192,6 +192,13 @@ class ActionContext(BaseModel):
     rpa_required_keys: list[str] = []
     rpa_template_value: str = ""
 
+    # Cross-system session routing service (A1, Path-2). browser_env threads
+    # the run's SessionRouter here ONLY when VSPIDER_CROSS_SYSTEM_SWITCH is on
+    # (main.py attaches it to the browser), so GotoHandler can decide
+    # pre-navigation whether a goto is a cross-system hop. None (flag off /
+    # single-system run) -> handlers behave exactly as before.
+    session_router: Any = None
+
     # G3: 关联 ID — 每个 ActionContext 实例自动获得一个 8 字符的 trace_id，
     # 由 with_rpa_meta() 自动盖章到每条 RPA trail 条目上，方便前端把
     # 「同一次 VLM 决策产生的多条动作」聚合成一组。
@@ -377,6 +384,34 @@ class GotoHandler(ActionHandler):
             raise ActionExecutionError(
                 "goto 动作缺少目标 URL，请在 type_value 中填写完整的 URL。"
             )
+
+        # 🌐 跨系统 goto 前置拦截（A1, Path-2）：开关开时 main.py 才把
+        # session_router 经 ActionContext 传入；若目标 URL 属于另一个已规划 system，
+        # 则**不**在当前页执行 page.goto（保留当前 system 页面），改在 browser 上
+        # 记 _pending_cross_system_goto 指令交给反应式循环 acquire→launch→rebind 到
+        # 目标 system 的隔离 session 再导航。session_router 为 None（开关关 / 单系统）
+        # → 整段跳过，goto 行为字节不变。
+        _xsys_router = getattr(ctx, "session_router", None)
+        if _xsys_router is not None:
+            _xsys_directive = None
+            try:
+                _xsys_from = _xsys_router.system_for_url(
+                    getattr(browser, "current_url", "") or ""
+                )
+                _xsys_directive = _xsys_router.plan_goto_interception(url, _xsys_from)
+            except Exception as _xsys_err:
+                logger.debug(f"[GOTO X-SYS] interception plan skipped: {_xsys_err}")
+            if _xsys_directive and _xsys_directive.get("should_intercept"):
+                browser._pending_cross_system_goto = _xsys_directive
+                _xsys_notice = (
+                    f"[CROSS-SYSTEM GOTO] 目标属于另一系统 "
+                    f"({_xsys_directive.get('to_system_id')})，已拦截以保留当前页面；"
+                    f"反应式循环将切换到目标系统的隔离会话再导航。"
+                )
+                if not browser._tab_switch_notice:
+                    browser._tab_switch_notice = _xsys_notice
+                logger.info(f"{_xsys_notice} url={url[:80]}")
+                return None
 
         # 🛡️ 多标签页 goto 智能拦截器
         url_clean = url.split("?")[0].rstrip("/")
