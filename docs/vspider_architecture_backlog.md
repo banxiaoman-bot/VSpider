@@ -1950,3 +1950,45 @@ Out of scope (deliberate, next slices):
   sweeper thread (runs once at start); per-system keep-set wiring from the live pool;
   folding the flag + TTL + pool caps into `cross_system_config`; the `_env_flag` helper.
 
+
+## Slice CROSS-SYSTEM-CONFIG: fold the inline cross-system env parses into one entry
+
+Goal:
+
+- Mission §四 contracts / §一-B cross_system: the cross-system feature's env knobs were
+  parsed inline and duplicated -- five copies of
+  `os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH","").strip().lower() in ("1","true","yes","on")`
+  plus an inline `VSPIDER_PROFILE_TTL_HOURS` float-parse in `main.py`, and two clamped
+  `_env_int` pool-cap reads in `browser_session_pool`. Fold them into one pure leaf
+  module so every gate reads the same rule. Pure refactor: the default-off path stays
+  byte-identical (every accessor is a live env read, same timing as the old inline parse).
+
+Add / change:
+
+- cross_system_config.py (new, pure leaf -- imports only stdlib): generic helpers
+  `env_flag` (verbatim of the truthy parse) / `env_int` (verbatim of pool `_env_int`) /
+  `env_float` (verbatim of the TTL parse); named accessors `cross_system_enabled()` /
+  `profile_ttl_hours()` / `session_pool_caps()`; immutable `CrossSystemConfig.from_env()`
+  snapshot for callers wanting one object.
+- main.py: the five flag gates -> `cross_system_enabled()`; the GC TTL parse ->
+  `profile_ttl_hours()` (helpers imported once at run-function scope, before all gates).
+- browser_session_pool.py: `_resolve_default_pool` -> `session_pool_caps()`; `_env_int`
+  kept as a thin alias delegating to `cross_system_config.env_int` (single source of
+  truth, signature preserved for any caller/test).
+
+Acceptance:
+
+- TDD red->green. New `tests/test_cross_system_config.py` (38: env_flag truthy/blank/
+  case/non-truthy; env_int clamp hi/lo/garbage/in-range; env_float zero-kept/blank/
+  garbage; named accessors + caps clamp; CrossSystemConfig from_env defaults/overrides/
+  frozen).
+- `validate_y cross-system-config` four gates green: target 53 -> npm build -> core 102
+  -> full 2640 -> 2678 passed, 2 skipped (142.50s). py_compile + ReadLints clean on
+  cross_system_config / main / browser_session_pool.
+
+Out of scope (deliberate, next slices):
+
+- a frozen run-scoped snapshot threaded through the loop (accessors stay live-read to
+  preserve byte-identical timing); migrating non-cross-system env reads to the same
+  helper; cross-system RPA replay.
+
