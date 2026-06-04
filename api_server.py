@@ -989,6 +989,12 @@ def request_stop_current_task() -> tuple[bool, str]:
 
 _API_LOOP: asyncio.AbstractEventLoop | None = None
 
+# Strong refs to fire-and-forget background tasks. asyncio keeps only a *weak*
+# reference to a task, so a task with no other reference can be garbage-collected
+# mid-flight -- silently dropping the log/broadcast it was sending. Hold each task
+# here until it finishes (see CPython asyncio docs on create_task).
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
 
 def _schedule(coro: Coroutine[Any, Any, Any]) -> None:
     """
@@ -1009,7 +1015,9 @@ def _schedule(coro: Coroutine[Any, Any, Any]) -> None:
         current = None
 
     if current is loop:
-        loop.create_task(coro)
+        task = loop.create_task(coro)
+        _BACKGROUND_TASKS.add(task)
+        task.add_done_callback(_BACKGROUND_TASKS.discard)
     else:
         asyncio.run_coroutine_threadsafe(coro, loop)
 
