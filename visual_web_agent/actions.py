@@ -5953,6 +5953,50 @@ class SwitchTabHandler(ActionHandler):
 #                          upload / save_to_memory）
 # ════════════════════════════════════════════════════════════════
 
+def _persist_extracted_link(target_id: object, extracted_url: str) -> str:
+    """Persist one extracted link honoring the active run's output_contract
+    container (run-scoped), instead of a blind CWD ``output_links.xlsx``
+    (mission §一-A: never default to Excel). Returns the written path, or ``""``
+    when no run is active (so unit/test envs never litter the CWD).
+    """
+    try:
+        from .io_contract import (
+            current_base_dir,
+            current_run_id,
+            read_output_contract,
+        )
+        from .data_writers import save_run_dataset
+    except ImportError:  # pragma: no cover - standalone import fallback
+        from io_contract import (  # type: ignore[no-redef]
+            current_base_dir,
+            current_run_id,
+            read_output_contract,
+        )
+        from data_writers import save_run_dataset  # type: ignore[no-redef]
+
+    run_id = current_run_id()
+    if not run_id:
+        return ""
+    base = current_base_dir()
+    try:
+        contract = read_output_contract(run_id, base_dir=base)
+    except Exception:
+        contract = None
+    try:
+        return save_run_dataset(
+            {"target_id": target_id, "url": extracted_url},
+            run_id=run_id,
+            output_contract=contract,
+            produced_by="extract_link",
+            filename_hint="extract_link",
+            source_url=str(extracted_url or ""),
+            base_dir=base,
+        )
+    except Exception as exc:  # pragma: no cover - never break the action loop
+        logger.warning("[EXTRACT_LINK] contract-aware save failed: %s", exc)
+        return ""
+
+
 @ActionRegistry.register("extract_link")
 class ExtractLinkHandler(ActionHandler):
     async def execute(self, ctx: ActionContext) -> Optional["Page"]:
@@ -5980,14 +6024,7 @@ class ExtractLinkHandler(ActionHandler):
                     f"\n\033[1;32m[LINK EXTRACTED]\033[0m "
                     f"\033[36m{extracted_url}\033[0m\n"
                 )
-                try:
-                    from .data_manager import save_to_excel
-                except ImportError:
-                    from data_manager import save_to_excel
-                save_to_excel(
-                    {"target_id": target_id, "url": extracted_url},
-                    "output_links.xlsx",
-                )
+                _persist_extracted_link(target_id, extracted_url)
             else:
                 logger.warning(
                     f"[EXTRACT_LINK] No URL found in data-som-url for element #{target_id}"
