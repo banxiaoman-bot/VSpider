@@ -500,3 +500,41 @@ class TestSaveRunDataset:
         )
         assert path.endswith("tips.xlsx")
         assert Path(path).exists()
+
+
+# ---------------------------------------------------------------------------
+# OUTPUT-DEFAULT-2: safe_filename must not double a pre-existing extension.
+# A filename_hint carrying an extension (e.g. main.py's _vlm_output =
+# "output_<ts>.xlsx") previously produced "output_<ts>.xlsx.csv" for a csv
+# container -- a wrong/misleading extension that buries the real container and
+# violates mission §一-A (output must reflect output_contract.container).
+# ---------------------------------------------------------------------------
+
+class TestSafeFilenameExtension:
+    def test_strips_known_extension_before_applying_suffix(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        assert safe_filename("output_123.xlsx", suffix=".csv") == "output_123.csv"
+        assert safe_filename("xhr_2026.xlsx", suffix=".jsonl") == "xhr_2026.jsonl"
+
+    def test_does_not_double_same_extension(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        assert safe_filename("output_123.xlsx", suffix=".xlsx") == "output_123.xlsx"
+
+    def test_extensionless_stem_unchanged(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        assert safe_filename("clean_stem", suffix=".jsonl") == "clean_stem.jsonl"
+
+    def test_preserves_non_extension_trailing_dot_token(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        # 'v1.2_data' ends with a token that is NOT a known file extension -> kept
+        assert safe_filename("v1.2_data", suffix=".csv") == "v1.2_data.csv"
+
+    def test_no_suffix_keeps_existing_name(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        # without a suffix the helper must not strip anything (back-compat)
+        assert safe_filename("report.csv") == "report.csv"

@@ -44,6 +44,16 @@ from visual_web_agent.io_contract import (
 
 _SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z._-]+")
 
+# Extensions a ``filename_hint`` may legitimately carry. When the caller asks
+# for a different ``suffix`` (the writer's container extension) we strip one of
+# these off the stem first so the on-disk name reflects the contract container
+# rather than a stale hint (mission §一-A: never bury the real container under a
+# leftover ``.xlsx``).
+_KNOWN_ARTIFACT_EXTS = frozenset({
+    "xlsx", "xls", "xlsm", "csv", "tsv", "json", "jsonl",
+    "md", "markdown", "html", "htm", "txt", "parquet",
+})
+
 
 def safe_filename(stem: str, *, suffix: str = "", default: str = "artifact") -> str:
     """Return a filesystem-safe filename composed of ``stem`` + ``suffix``.
@@ -51,12 +61,18 @@ def safe_filename(stem: str, *, suffix: str = "", default: str = "artifact") -> 
     - Strips disallowed characters
     - Falls back to ``default`` when stem becomes empty
     - Always preserves the leading dot of ``suffix`` if provided
+    - When ``suffix`` is given and the stem already ends with a known artifact
+      extension, that extension is replaced (not doubled): ``safe_filename(
+      "output_1.xlsx", suffix=".csv") -> "output_1.csv"``.
     """
     base = _SAFE_NAME_RE.sub("_", str(stem or "").strip("._- ")) or default
     base = base.strip("._-") or default
     if suffix:
         if not suffix.startswith("."):
             suffix = "." + suffix
+        head, _dot, tail = base.rpartition(".")
+        if head and tail.lower() in _KNOWN_ARTIFACT_EXTS:
+            base = head
         return base + suffix
     return base
 
