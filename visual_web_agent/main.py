@@ -7597,6 +7597,44 @@ async def run_agent(
                 browser._session_router = _session_router
         except Exception as _xsys_attach_err:
             logger.debug("[SESSION ROUTER] attach skipped: %s", _xsys_attach_err)
+        # E1c profile GC: when cross-system switching is on, sweep stale per-
+        # system isolated Chromium profile dirs (sys_*) left by past runs before
+        # this run launches new ones. TTL via VSPIDER_PROFILE_TTL_HOURS (default
+        # 24h); bounded to sys_* under the configured base; best-effort. Flag off
+        # -> never runs. Active profiles keep a fresh mtime, so a concurrent run's
+        # dirs survive the TTL cutoff.
+        try:
+            if (
+                os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            ):
+                from visual_web_agent.browser_profile import gc_profile_dirs as _gc_profiles
+                try:
+                    from . import config as _gc_cfg
+                except ImportError:
+                    import config as _gc_cfg
+                try:
+                    _gc_ttl_hours = float(os.getenv("VSPIDER_PROFILE_TTL_HOURS", "24") or 24)
+                except (TypeError, ValueError):
+                    _gc_ttl_hours = 24.0
+                _gc_removed = _gc_profiles(
+                    getattr(_gc_cfg, "BROWSER_USER_DATA_DIR", "") or "",
+                    ttl_seconds=_gc_ttl_hours * 3600.0,
+                )
+                if _gc_removed:
+                    event_stream.emit(
+                        "profile_gc",
+                        removed=_gc_removed,
+                        count=len(_gc_removed),
+                        ttl_hours=_gc_ttl_hours,
+                    )
+                    logger.info(
+                        "[PROFILE GC] removed %d stale profile dir(s): %s",
+                        len(_gc_removed),
+                        _gc_removed,
+                    )
+        except Exception as _gc_err:
+            logger.debug("[PROFILE GC] skipped: %s", _gc_err)
         # ── E2: media harvester deterministic fast path ──────────────
         # When capability_router has decided this run wants media
         # (output_kind=media_image/video/audio/pdf/archive or
