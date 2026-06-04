@@ -1912,3 +1912,41 @@ Out of scope (deliberate, next slices):
   changes; profile-dir GC/TTL; folding the flag + pool caps into `cross_system_config`;
   an `_env_flag` helper to de-dup the three inline truthy env parses.
 
+
+## Slice PROFILE-GC: TTL garbage-collection of cross-system isolated profile dirs
+
+Goal:
+
+- E1c-3b launches each non-home system on its own Chromium profile at
+  `<BROWSER_USER_DATA_DIR>/sys_<system_id>` (so persistent contexts don't collide on
+  the single-instance lock). Across many runs these `sys_*` dirs accumulate on disk
+  unbounded (mission §一 "简便" / governance, mirroring §一-B temp_uploads TTL+GC).
+  Sweep stale ones before a run launches new ones. Behind VSPIDER_CROSS_SYSTEM_SWITCH
+  (default off -> never runs).
+
+Add / change:
+
+- browser_profile.py: pure `select_stale_profile_dirs(entries, *, ttl_seconds, now,
+  keep=())` picks the `sys_*` dirs older than the TTL and not in `keep` (only `sys_*`
+  are ever eligible; the primary profile and non-sys entries are untouchable; ttl<=0
+  disables; input order kept). Bounded IO `gc_profile_dirs(base_dir, *, ttl_seconds,
+  now=None, keep=(), dry_run=False)` lists immediate sub-dirs, delegates selection to
+  the pure fn, and shutil.rmtree's the stale ones best-effort (per-dir failure
+  swallowed). Blank / missing base -> no-op.
+- main.py: at run start (flag-gated), GC `<BROWSER_USER_DATA_DIR>` with the TTL from
+  VSPIDER_PROFILE_TTL_HOURS (default 24h) and emit a `profile_gc` event when any dir
+  is removed. Active profiles keep a fresh mtime so a concurrent run survives the cut.
+
+Acceptance:
+
+- TDD red->green. test_browser_profile.py 5 -> 15 (6 pure select: stale / fresh /
+  non-sys / keep / ttl<=0 / order; 4 IO gc via tmp_path: removes-only-stale-sys /
+  dry-run / keep / blank-or-missing-base). `validate_y profile-gc` four gates green,
+  full 2630 -> 2640 passed, 2 skipped. py_compile + ReadLints clean.
+
+Out of scope (deliberate, next slices):
+
+- size-based caps (only mtime TTL here); GC of the primary profile; a background
+  sweeper thread (runs once at start); per-system keep-set wiring from the live pool;
+  folding the flag + TTL + pool caps into `cross_system_config`; the `_env_flag` helper.
+
