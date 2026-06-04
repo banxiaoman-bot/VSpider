@@ -7514,6 +7514,12 @@ async def run_agent(
             _session_router = build_session_router(_run_ts, _capability_route)
         except Exception as _session_router_build_err:
             logger.debug("[SESSION ROUTER] build skipped: %s", _session_router_build_err)
+        # E1c cross-system config: single entry for the flag + TTL parses folded
+        # from the previously-inline env reads (cross_system_config.v1).
+        from visual_web_agent.cross_system_config import (
+            cross_system_enabled as _xsys_enabled,
+            profile_ttl_hours as _xsys_profile_ttl_hours,
+        )
         _selected_tools = action_registry.select_for_goal(
             goal,
             strategy_context=_initial_strategy_context,
@@ -7591,8 +7597,7 @@ async def run_agent(
         try:
             if (
                 _session_router is not None
-                and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
-                in ("1", "true", "yes", "on")
+                and _xsys_enabled()
             ):
                 browser._session_router = _session_router
         except Exception as _xsys_attach_err:
@@ -7604,17 +7609,14 @@ async def run_agent(
         # -> never runs. Active profiles keep a fresh mtime, so a concurrent run's
         # dirs survive the TTL cutoff.
         try:
-            if (
-                os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
-                in ("1", "true", "yes", "on")
-            ):
+            if _xsys_enabled():
                 from visual_web_agent.browser_profile import gc_profile_dirs as _gc_profiles
                 try:
                     from . import config as _gc_cfg
                 except ImportError:
                     import config as _gc_cfg
                 try:
-                    _gc_ttl_hours = float(os.getenv("VSPIDER_PROFILE_TTL_HOURS", "24") or 24)
+                    _gc_ttl_hours = _xsys_profile_ttl_hours()
                 except (TypeError, ValueError):
                     _gc_ttl_hours = 24.0
                 _gc_removed = _gc_profiles(
@@ -10727,8 +10729,7 @@ async def run_agent(
                         # slice). Whole block is best-effort so it can never break the loop.
                         if (
                             _session_router is not None
-                            and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
-                            in ("1", "true", "yes", "on")
+                            and _xsys_enabled()
                         ):
                             try:
                                 _switch_full_state = None
@@ -10818,8 +10819,7 @@ async def run_agent(
                 if (
                     _pending_xsys
                     and _session_router is not None
-                    and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
-                    in ("1", "true", "yes", "on")
+                    and _xsys_enabled()
                 ):
                     browser._pending_cross_system_goto = None
                     _xsys_url = _pending_xsys.get("target_url", "") or ""
@@ -17370,8 +17370,7 @@ async def run_agent(
         # touches the pool; a safe no-op (returns []) when nothing was acquired.
         if (
             _session_router is not None
-            and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
-            in ("1", "true", "yes", "on")
+            and _xsys_enabled()
         ):
             try:
                 _released_sessions = await _session_router.release_all(

@@ -40,6 +40,11 @@ try:
 except ImportError:  # pragma: no cover - script-style import fallback
     from browser_env import BrowserEnv  # type: ignore[no-redef]
 
+try:
+    from .cross_system_config import env_int, session_pool_caps
+except ImportError:  # pragma: no cover - script-style import fallback
+    from cross_system_config import env_int, session_pool_caps  # type: ignore[no-redef]
+
 
 VERSION = "browser_session_pool.v1"
 
@@ -48,11 +53,9 @@ _VALID_SESSION_STATES = frozenset({"active", "idle", "released", "failed"})
 
 
 def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 64) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except Exception:
-        value = default
-    return max(min_value, min(max_value, value))
+    # Folded into cross_system_config.env_int (single source of truth); kept as a
+    # thin alias so existing call sites / tests using this name stay valid.
+    return env_int(name, default, min_value=min_value, max_value=max_value)
 
 
 def _normalize_triple(run_id: str, system_id: str, auth_profile: str) -> tuple[str, str, str]:
@@ -292,8 +295,7 @@ class BrowserSessionPool:
 
 
 def _resolve_default_pool() -> BrowserSessionPool:
-    per_run = _env_int("VSPIDER_SESSION_POOL_PER_RUN", 4, min_value=1, max_value=16)
-    total = _env_int("VSPIDER_SESSION_POOL_TOTAL", 16, min_value=1, max_value=64)
+    per_run, total = session_pool_caps()
     return BrowserSessionPool(
         max_sessions_per_run=per_run,
         max_total_sessions=total,
