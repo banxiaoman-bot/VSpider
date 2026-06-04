@@ -1992,3 +1992,49 @@ Out of scope (deliberate, next slices):
   preserve byte-identical timing); migrating non-cross-system env reads to the same
   helper; cross-system RPA replay.
 
+
+## Slice RPA-XSYS: cross-system RPA replay (system-aware fast-path replay)
+
+Goal:
+
+- Mission §一-B cross_system / §二 execution_kernel: the RPA fast-path replay
+  (`_replay_rpa`) drove every cached step on a single `browser._page`, so a trail
+  spanning >1 planned system (recorded after A1/A2 cross-system goto) replayed the
+  B-system steps on A's page and failed. Make replay system-aware: tag each cached
+  step with the planned system it ran in, and switch the active browser to a step's
+  system before replaying it -- reusing the same router acquire->activate->rebind path
+  the reactive loop already uses. Flag-gated on the run's SessionRouter (attached only
+  when VSPIDER_CROSS_SYSTEM_SWITCH is on) -> byte-identical when off.
+
+Add / change:
+
+- actions.py `ActionContext.with_rpa_meta`: when a `session_router` is attached, stamp
+  `step["system_id"] = session_router.system_for_url(browser.current_url)` (setdefault,
+  never clobbers an override). Router absent / unplanned URL -> no key.
+- main.py `_compact_rpa_trail._same_step`: also compare `system_id`, so two identical
+  actions in different systems are NOT merged (a merge would drop a system hop).
+- main.py `_replay_switch_system` (new async helper): snapshot storage_state, ask the
+  router for a switch directive (`acquire_for_switch`), `activate_switch` (launch/rebind
+  the target system's isolated pooled session), land on the hop URL only if
+  `should_renavigate` (A2 page-state preserve). Best-effort: any failure returns the
+  inputs unchanged so replay proceeds on the current browser.
+- main.py `_replay_rpa`: new `session_router=None` param (auto-threaded off
+  `browser._session_router` when omitted -> no hot call-site edits); track the active
+  system; before each step whose `system_id` differs, call `_replay_switch_system` and
+  rebind the local `browser`. All inert when router is None.
+
+Acceptance:
+
+- TDD red->green. New `tests/test_rpa_cross_system_replay.py` (8: with_rpa_meta stamp /
+  no-router / unplanned-url + override; compact keeps-cross-system / merges-same-system;
+  replay switches-at-boundary / no-switch-same-system / no-router-never-switches).
+- `validate_y rpa-xsys` four gates green: target 8 -> npm build -> core 102 -> full
+  2678 -> 2686 passed, 2 skipped (138.55s). py_compile + ReadLints clean on main /
+  actions / the new test.
+
+Out of scope (deliberate, next slices):
+
+- re-emitting `session_switch` events into the run event_stream during replay (the
+  helper logs only); partial-replay (`_replay_ready_rpa_steps`) system-boundary cursor
+  accounting; per-system workflow_memory isolation during replay.
+
