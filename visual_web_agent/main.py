@@ -7583,6 +7583,20 @@ async def run_agent(
         # 启动浏览器并导航
         await browser.start(start_url)
         await _recover_active_page("after browser.start")
+        # E1c-A1 (path 2): when cross-system switching is enabled, thread the
+        # run's SessionRouter onto the browser so browser_env passes it into
+        # each ActionContext and GotoHandler can intercept a cross-system goto
+        # before it navigates the current page. Flag off -> never attached ->
+        # ctx.session_router stays None -> goto behaviour is byte-identical.
+        try:
+            if (
+                _session_router is not None
+                and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            ):
+                browser._session_router = _session_router
+        except Exception as _xsys_attach_err:
+            logger.debug("[SESSION ROUTER] attach skipped: %s", _xsys_attach_err)
         # ── E2: media harvester deterministic fast path ──────────────
         # When capability_router has decided this run wants media
         # (output_kind=media_image/video/audio/pdf/archive or
@@ -10754,6 +10768,93 @@ async def run_agent(
                                 logger.debug("[SESSION ROUTER] switch acquire skipped: %s", _switch_err)
             except Exception as _sys_observe_err:
                 logger.debug("[RUN SYSTEM TRACKER] observe skipped: %s", _sys_observe_err)
+
+            # E1c-A1 (path 2): consume a pre-navigation cross-system goto the
+            # GotoHandler intercepted this step. The current system's page was
+            # deliberately NOT navigated (state preserved); here we physically
+            # switch to the target system's isolated session, land it on the
+            # intercepted URL, and rebind the loop handle. Best-effort + flag
+            # gated; default off -> _pending is never set so this never runs.
+            try:
+                _pending_xsys = getattr(browser, "_pending_cross_system_goto", None)
+                if (
+                    _pending_xsys
+                    and _session_router is not None
+                    and os.getenv("VSPIDER_CROSS_SYSTEM_SWITCH", "").strip().lower()
+                    in ("1", "true", "yes", "on")
+                ):
+                    browser._pending_cross_system_goto = None
+                    _xsys_url = _pending_xsys.get("target_url", "") or ""
+                    _xsys_full_state = None
+                    try:
+                        _xsys_ctx = getattr(browser, "_context", None)
+                        if _xsys_ctx is not None:
+                            _xsys_full_state = await _xsys_ctx.storage_state()
+                    except Exception as _xsys_state_err:
+                        logger.debug("[SESSION ROUTER] x-sys storage_state skipped: %s", _xsys_state_err)
+                    _xsys_switch = _session_router.acquire_for_switch(
+                        to_system_id=_pending_xsys.get("to_system_id", ""),
+                        from_system_id=_pending_xsys.get("from_system_id", ""),
+                        to_system_name=_pending_xsys.get("to_system_name", ""),
+                        full_state=_xsys_full_state,
+                    )
+                    if _xsys_switch.get("should_switch"):
+                        event_stream.emit("session_switch", **_xsys_switch)
+                        if _home_browser is None:
+                            _home_browser = browser
+                            _home_system_id = _pending_xsys.get("from_system_id", "") or ""
+                        try:
+                            from . import config as _xsys_cfg
+                        except ImportError:
+                            import config as _xsys_cfg
+                        _xsys_target_browser = await _session_router.activate_switch(
+                            _xsys_switch,
+                            url=_xsys_url,
+                            user_data_dir_base=getattr(_xsys_cfg, "BROWSER_USER_DATA_DIR", "") or "",
+                            full_state=_xsys_full_state,
+                            home_system_id=_home_system_id,
+                            home_browser=_home_browser,
+                        )
+                        if (
+                            _xsys_target_browser is not None
+                            and _xsys_target_browser is not browser
+                        ):
+                            browser = _xsys_target_browser
+                            try:
+                                browser._session_router = _session_router
+                            except Exception:
+                                pass
+                            event_stream.emit(
+                                "session_switch_activated",
+                                run_id=_xsys_switch.get("run_id", ""),
+                                to_system_id=_xsys_switch.get("to_system_id", ""),
+                                to_system_name=_xsys_switch.get("to_system_name", ""),
+                                session_id=_xsys_switch.get("session_id", ""),
+                                via="goto_interception",
+                            )
+                        # Land the now-active target-system browser on the URL
+                        # the goto requested (covers a revisit, where
+                        # activate_switch reuses the handle without navigating).
+                        try:
+                            _xsys_page = getattr(browser, "_page", None)
+                            if _xsys_page is not None and _xsys_url:
+                                await _xsys_page.goto(
+                                    _xsys_url, wait_until="domcontentloaded", timeout=30000
+                                )
+                                await browser._wait_for_page_stable()
+                        except Exception as _xsys_nav_err:
+                            logger.debug("[SESSION ROUTER] x-sys goto nav skipped: %s", _xsys_nav_err)
+                        # Prime the tracker so next step's observe sees no
+                        # phantom A->B transition (avoids path-1 double-firing).
+                        try:
+                            if _run_system_tracker is not None:
+                                _run_system_tracker.observe(
+                                    getattr(browser, "current_url", "") or _xsys_url, step=step
+                                )
+                        except Exception:
+                            pass
+            except Exception as _pending_xsys_err:
+                logger.debug("[SESSION ROUTER] pending cross-system goto skipped: %s", _pending_xsys_err)
 
             # ── 本轮日志收集状态 ──────────────────────────────────────────
             _log_screenshot_path: str | None = None
