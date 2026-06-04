@@ -1826,3 +1826,54 @@ Out of scope (deliberate, next slices):
   GC/TTL; folding `VSPIDER_CROSS_SYSTEM_SWITCH` + pool caps into a single
   `cross_system_config`; an `_env_flag` helper to de-dup the inline truthy env parse.
 
+
+## Slice A1-1: navigation-layer cross-system goto interception (path-2, preserve A)
+
+Goal:
+
+- Mission §一 "准确": E1c-3b's path-1 physical switch is *post-hoc* -- GotoHandler
+  runs `page.goto(url)` on the home page first (clobbering system A's page), then the
+  reactive loop's `run_system_tracker.observe` detects the A->B hop and rebinds, so a
+  switch *back* to A finds the home browser already navigated away. A1 moves the
+  decision *before* navigation: when a goto targets a different planned system the home
+  page is NOT navigated (its state is preserved) and the loop switches to B's isolated
+  session instead. Fully additive behind `VSPIDER_CROSS_SYSTEM_SWITCH` (default off ->
+  session_router never threaded -> byte-identical goto).
+
+Add / change (3 layers, all flag-gated):
+
+- session_router.py (pure: +`_host_of` / `system_for_url` / `plan_goto_interception`):
+  `system_for_url` resolves a URL to a planned system by host / longest-domain match;
+  `plan_goto_interception(target_url, current_system_id)` returns a directive whose
+  `should_intercept` is True only for a *known* target system differing from a *known*
+  current system (blank current = first nav establishing home, same-system, and
+  unknown-domain all fall through to a normal goto). No pool / browser.
+- actions.py: ActionContext gains a `session_router` field; GotoHandler, before its
+  multi-tab interceptor, plans the interception and -- on should_intercept -- records
+  `browser._pending_cross_system_goto`, pushes a `_tab_switch_notice`, and returns
+  WITHOUT running `page.goto` (home page preserved).
+- browser_env.py: threads `session_router=getattr(self,"_session_router",None)` into
+  every ActionContext.
+- main.py: attaches `_session_router` to the browser after start (flag-gated only); a
+  new hot-loop consumer (after the observe block) drains `_pending_cross_system_goto`,
+  reuses acquire_for_switch -> activate_switch -> rebind, lands the target browser on
+  the URL, and primes the tracker so path-1 doesn't re-fire the same hop next step.
+
+Acceptance:
+
+- TDD red->green per layer. New pure suite `TestSessionRouterPlanGotoInterception` (8) +
+  stub-frame `tests/test_goto_cross_system.py` (5: intercept-not-navigate; same-system /
+  no-router / unknown-domain / blank-current all normal goto). `test_session_router.py`
+  38 -> 46. py_compile + ReadLints clean on session_router / actions / browser_env / main.
+- `validate_y a1-1` (target = both new files -> npm build -> core -> full): target ok ->
+  `npm run build` ok -> core ok -> **full 2610 -> 2623 passed, 2 skipped** (140.69s) ->
+  `[validate_y] success`.
+
+Out of scope (deliberate, next slices):
+
+- switch-back restoring A's exact page state; the first forward hop double-navigates
+  (launch_for_switch's start + the consumer's goto) -- only the revisit path strictly
+  needs the consumer goto; profile-dir GC/TTL; folding the flag + pool caps into
+  `cross_system_config`; an `_env_flag` helper to de-dup the now-three inline truthy env
+  parses; cross-system RPA replay of an intercepted goto.
+
