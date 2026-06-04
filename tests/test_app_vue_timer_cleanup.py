@@ -49,3 +49,14 @@ def test_onunmounted_still_clears_known_timers(app_src: str) -> None:
     assert "reconnectTimer" in block
     assert "_chipClickTimer" in block
     assert "socket" in block
+
+
+def test_onunmounted_clears_final_answer_copy_timer(app_src: str) -> None:
+    # F1: copyFinalAnswerToClipboard schedules a reset-to-'idle' timer; it is now
+    # stored in finalAnswerCopyTimer and must be cancelled on unmount so the
+    # callback can't write finalAnswerCopyState on a detached component.
+    block = _onunmounted_block(app_src)
+    assert "finalAnswerCopyTimer" in block, (
+        "onUnmounted must clear finalAnswerCopyTimer so the copy-feedback reset "
+        "can't fire after the component is gone"
+    )

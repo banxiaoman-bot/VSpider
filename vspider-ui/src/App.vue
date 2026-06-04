@@ -410,6 +410,7 @@ const FINAL_ANSWER_COLLAPSE_THRESHOLD = 600 // 字符数；> 阈值默认折叠
 const FINAL_ANSWER_COLLAPSED_PREVIEW = 480  // 折叠时只渲染前 N 个字符
 const finalAnswerExpanded = ref(false)
 const finalAnswerCopyState = ref('idle') // 'idle' | 'ok' | 'err'
+let finalAnswerCopyTimer = null // F1: reset-to-idle debounce; cleared on unmount
 
 const finalAnswerCharCount = computed(() => (finalAnswerText.value || '').length)
 const finalAnswerLineCount = computed(() => {
@@ -464,7 +465,11 @@ const copyFinalAnswerToClipboard = async () => {
   } catch (e) {
     finalAnswerCopyState.value = 'err'
   } finally {
-    setTimeout(() => {
+    // F1: keep a handle so onUnmounted can cancel this reset; otherwise the
+    // callback fires on a detached component (writes finalAnswerCopyState).
+    if (finalAnswerCopyTimer) clearTimeout(finalAnswerCopyTimer)
+    finalAnswerCopyTimer = setTimeout(() => {
+      finalAnswerCopyTimer = null
       finalAnswerCopyState.value = 'idle'
     }, 1600)
   }
@@ -3479,6 +3484,12 @@ onUnmounted(() => {
   if (outputContractPreviewTimer) {
     clearTimeout(outputContractPreviewTimer)
     outputContractPreviewTimer = null
+  }
+  // F1: cancel the pending copy-feedback reset so it can't write
+  // finalAnswerCopyState on a detached component after unmount.
+  if (finalAnswerCopyTimer) {
+    clearTimeout(finalAnswerCopyTimer)
+    finalAnswerCopyTimer = null
   }
   // T: drop the global keyboard listener so HMR / route changes don't
   // leave a zombie listener behind (would crash trying to use closed-
