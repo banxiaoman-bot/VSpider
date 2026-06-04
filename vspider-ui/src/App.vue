@@ -3473,6 +3473,13 @@ onUnmounted(() => {
     clearTimeout(_chipClickTimer)
     _chipClickTimer = null
   }
+  // U: cancel the pending output-contract preview debounce so its callback
+  // can't fire after unmount (it issues a fetch and writes refs on a now
+  // detached component).
+  if (outputContractPreviewTimer) {
+    clearTimeout(outputContractPreviewTimer)
+    outputContractPreviewTimer = null
+  }
   // T: drop the global keyboard listener so HMR / route changes don't
   // leave a zombie listener behind (would crash trying to use closed-
   // over refs).
