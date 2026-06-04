@@ -1877,3 +1877,38 @@ Out of scope (deliberate, next slices):
   `cross_system_config`; an `_env_flag` helper to de-dup the now-three inline truthy env
   parses; cross-system RPA replay of an intercepted goto.
 
+
+## Slice A2: switch-back preserves the target system's exact page state
+
+Goal:
+
+- A1-1's reactive-loop consumer ALWAYS re-ran goto on the rebound target browser,
+  which (a) on a switch-back to home re-navigated the home page A1 had deliberately
+  preserved -- destroying its exact in-page state -- and (b) on a forward first hop
+  double-navigated (launch_for_switch's start + the consumer's goto). A2 makes the
+  re-navigation conditional so an already-there browser is left untouched. Still fully
+  behind VSPIDER_CROSS_SYSTEM_SWITCH (default off -> consumer never runs).
+
+Add / change:
+
+- session_router.py (pure): `_norm_url` (drop fragment, strip trailing slash, keep
+  query) + `should_renavigate(current_url, target_url)` -> False when the target
+  browser is already on the URL (preserve exact state), True otherwise (blank target
+  -> False; blank / unknown current -> True).
+- main.py: the consumer's goto is now guarded by `should_renavigate`; when the nav is
+  skipped it emits `session_switch_page_preserved` evidence instead of re-navigating.
+
+Acceptance:
+
+- TDD red->green. New pure suite `TestSessionRouterShouldRenavigate` (7: identical /
+  trailing-slash / fragment -> no nav; different path / query -> nav; blank target ->
+  no nav; blank current -> nav). `test_session_router.py` 46 -> 53.
+- `validate_y a2` (target -> npm build -> core -> full): all four gates green, full
+  2623 -> 2630 passed, 2 skipped. py_compile + ReadLints clean.
+
+Out of scope (deliberate, next slices):
+
+- restoring scroll / form / JS state across a genuine reload when the URL actually
+  changes; profile-dir GC/TTL; folding the flag + pool caps into `cross_system_config`;
+  an `_env_flag` helper to de-dup the three inline truthy env parses.
+
