@@ -10833,15 +10833,31 @@ async def run_agent(
                                 via="goto_interception",
                             )
                         # Land the now-active target-system browser on the URL
-                        # the goto requested (covers a revisit, where
-                        # activate_switch reuses the handle without navigating).
+                        # the goto requested -- but only if it isn't already
+                        # there (A2): skipping the re-nav preserves the target's
+                        # exact page state (home page on a switch-back; the
+                        # freshly-launched target on a forward first hop, which
+                        # launch_for_switch already navigated -> no double nav).
                         try:
                             _xsys_page = getattr(browser, "_page", None)
-                            if _xsys_page is not None and _xsys_url:
+                            _xsys_cur = getattr(browser, "current_url", "") or ""
+                            if (
+                                _xsys_page is not None
+                                and _xsys_url
+                                and _session_router.should_renavigate(_xsys_cur, _xsys_url)
+                            ):
                                 await _xsys_page.goto(
                                     _xsys_url, wait_until="domcontentloaded", timeout=30000
                                 )
                                 await browser._wait_for_page_stable()
+                            elif _xsys_url:
+                                event_stream.emit(
+                                    "session_switch_page_preserved",
+                                    run_id=_xsys_switch.get("run_id", ""),
+                                    to_system_id=_xsys_switch.get("to_system_id", ""),
+                                    to_system_name=_xsys_switch.get("to_system_name", ""),
+                                    url=_xsys_url,
+                                )
                         except Exception as _xsys_nav_err:
                             logger.debug("[SESSION ROUTER] x-sys goto nav skipped: %s", _xsys_nav_err)
                         # Prime the tracker so next step's observe sees no
