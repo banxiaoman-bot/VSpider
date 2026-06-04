@@ -6358,6 +6358,7 @@ async def _replay_switch_system(
     home_browser=None,
     home_system_id: str = "",
     user_data_dir_base: str = "",
+    event_stream=None,
 ):
     """Switch the active browser to ``to_system_id`` mid RPA replay (RPA-XSYS).
 
@@ -6388,6 +6389,17 @@ async def _replay_switch_system(
         if not switch.get("should_switch"):
             return browser, home_browser, home_system_id
 
+        # 留痕 (mission §三/§四): mirror the reactive-loop goto consumer's
+        # session_switch evidence so a cross-system hop during fast-path
+        # replay is recorded in the run event_stream, not only the log.
+        # Inner-guarded so an emit hiccup never aborts the switch;
+        # event_stream None (flag off / no stream) -> no event.
+        if event_stream is not None:
+            try:
+                event_stream.emit("session_switch", **switch)
+            except Exception:
+                pass
+
         if home_browser is None:
             home_browser = browser
             home_system_id = from_system_id or ""
@@ -6404,8 +6416,21 @@ async def _replay_switch_system(
             browser = target_browser
             try:
                 browser._session_router = session_router
+                browser._event_stream = event_stream
             except Exception:
                 pass
+            if event_stream is not None:
+                try:
+                    event_stream.emit(
+                        "session_switch_activated",
+                        run_id=switch.get("run_id", ""),
+                        to_system_id=switch.get("to_system_id", ""),
+                        to_system_name=switch.get("to_system_name", ""),
+                        session_id=switch.get("session_id", ""),
+                        via="rpa_replay",
+                    )
+                except Exception:
+                    pass
             logger.info(
                 "[RPA REPLAY] cross-system switch -> %s (session=%s)",
                 switch.get("to_system_id", ""),
@@ -6435,6 +6460,7 @@ async def _replay_rpa(
     workflow_memory: dict | None = None,
     vlm: "VLMClient | None" = None,
     session_router=None,
+    event_stream=None,
 ) -> bool:
     """
     极速 RPA 回放：直接用 XPath/坐标执行缓存动作，完全跳过 VLM。
@@ -6457,6 +6483,12 @@ async def _replay_rpa(
     # VSPIDER_CROSS_SYSTEM_SWITCH is on, so flag off -> None -> no switching.
     if session_router is None:
         session_router = getattr(browser, "_session_router", None)
+    # RPA-XSYS-EVT: auto-thread the run event_stream off the browser when
+    # not passed, so cross-system replay hops emit session_switch evidence.
+    # main.py attaches browser._event_stream alongside _session_router
+    # (flag-gated) -> flag off -> None -> no events, byte-identical.
+    if event_stream is None:
+        event_stream = getattr(browser, "_event_stream", None)
 
     compacted_trail = _compact_rpa_trail(trail)
     if len(compacted_trail) != len(trail):
@@ -6517,6 +6549,7 @@ async def _replay_rpa(
                             home_browser=_xsys_home_browser,
                             home_system_id=_xsys_home_system,
                             user_data_dir_base=_xsys_udd_base,
+                            event_stream=event_stream,
                         )
                     )
                     _xsys_current_system = _step_system
@@ -7741,6 +7774,10 @@ async def run_agent(
                 and _xsys_enabled()
             ):
                 browser._session_router = _session_router
+                # RPA-XSYS-EVT: expose the run event_stream so fast-path
+                # replay (_replay_rpa -> _replay_switch_system) emits
+                # session_switch evidence. Flag off -> never attached.
+                browser._event_stream = event_stream
         except Exception as _xsys_attach_err:
             logger.debug("[SESSION ROUTER] attach skipped: %s", _xsys_attach_err)
         # E1c profile GC: when cross-system switching is on, sweep stale per-
@@ -11001,6 +11038,7 @@ async def run_agent(
                             browser = _xsys_target_browser
                             try:
                                 browser._session_router = _session_router
+                                browser._event_stream = event_stream
                             except Exception:
                                 pass
                             event_stream.emit(
@@ -17536,6 +17574,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
+            '  python main.py --goal "查一下今天的金价"   # url 省略，自动从 goal 推断入口\n'
             '  python main.py --url "http://192.168.1.100/login" --goal "Login and query data"\n'
             '  python main.py --url "https://example.com" --goal "Find contact page"\n'
             '  python main.py --url "http://10.0.0.1" --goal "Login" --user-data-dir ./browser_data'
@@ -17543,8 +17582,9 @@ def main():
     )
     parser.add_argument(
         "--url",
-        required=True,
-        help="Target webpage starting URL",
+        required=False,
+        default="",
+        help="Target webpage starting URL (optional; inferred from --goal via preflight when omitted)",
     )
     parser.add_argument(
         "--goal",
