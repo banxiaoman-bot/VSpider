@@ -41,6 +41,28 @@ def _clean_profile(value: Any) -> str:
     return profile or "auto"
 
 
+def _host_of(url: Any) -> str:
+    """Lowercased host of a URL, sans userinfo / port (pure, stdlib).
+
+    Tolerant of scheme-less input (``alpha.com/x``) and junk -> "". Used to
+    resolve a goto target / current URL to a planned system by domain match.
+    """
+
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw and not raw.startswith("//"):
+        raw = "//" + raw
+    try:
+        from urllib.parse import urlsplit
+
+        netloc = urlsplit(raw).netloc
+    except Exception:
+        return ""
+    host = netloc.rsplit("@", 1)[-1].split(":", 1)[0]
+    return host.strip().lower()
+
+
 @dataclass
 class SystemAuthPlan:
     """Per-system auth-profile + domain lookup built from planned systems.
@@ -171,6 +193,65 @@ class SessionRouter:
             "to_system_name": str(to_system_name or "") or target,
             "auth_profile": self.resolved_auth_profile(target) if should_switch else "auto",
             "domain": self.plan.domain_for(target) if should_switch else "",
+        }
+
+    def system_for_url(self, url: str) -> str:
+        """Resolve a URL to a planned ``system_id`` by host/domain match (pure).
+
+        Matches the URL's host against each planned system's declared domain
+        (exact host or sub-domain of it); the longest matching domain wins so a
+        more specific system beats a broader one. Returns "" when no planned
+        system claims the host (or the URL is blank / unparseable), so a caller
+        treats an unknown destination as a normal same-context navigation. No
+        pool / browser side effects.
+        """
+
+        host = _host_of(url)
+        if not host:
+            return ""
+        best_id = ""
+        best_len = -1
+        for system_id in self.plan.known_system_ids():
+            domain = self.plan.domain_for(system_id)
+            if not domain:
+                continue
+            if (host == domain or host.endswith("." + domain)) and len(domain) > best_len:
+                best_id = system_id
+                best_len = len(domain)
+        return best_id
+
+    def plan_goto_interception(
+        self, target_url: str, current_system_id: str = ""
+    ) -> dict[str, Any]:
+        """Pre-navigation directive for a goto (A1, Path-2 -- pure).
+
+        Decides whether a ``goto`` to ``target_url`` is a cross-system hop that
+        the reactive loop should intercept *before* ``page.goto`` runs (so the
+        current system's page is preserved instead of being clobbered then
+        rebound post-hoc as in path-1). ``should_intercept`` is True only when
+        ``target_url`` resolves to a *known* planned system that differs from a
+        *known* ``current_system_id``; a blank current system (the first
+        navigation, which establishes home), a same-system goto, and an
+        unknown-domain goto all return False so they fall through to a normal
+        ``page.goto`` -- byte-identical behaviour when the cross-system flag is
+        off. The directive mirrors :meth:`plan_switch`'s evidence keys plus
+        ``should_intercept`` / ``target_url`` so the handler + loop share one
+        contract. No pool / browser side effects.
+        """
+
+        to_system = self.system_for_url(target_url)
+        current = str(current_system_id or "").strip()
+        should_intercept = bool(to_system) and bool(current) and to_system != current
+        chosen = to_system if should_intercept else ""
+        return {
+            "should_intercept": should_intercept,
+            "run_id": self.run_id,
+            "target_url": str(target_url or ""),
+            "from_system_id": current,
+            "to_system_id": chosen,
+            "to_system_name": chosen,
+            "auth_profile": self.resolved_auth_profile(chosen) if should_intercept else "auto",
+            "domain": self.plan.domain_for(chosen) if should_intercept else "",
         }
 
     def acquire_for_switch(

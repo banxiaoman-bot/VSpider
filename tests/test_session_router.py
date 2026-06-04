@@ -190,6 +190,85 @@ class TestSessionRouterPlanSwitch:
         assert directive["to_system_name"] == "system_2"
 
 
+class TestSessionRouterPlanGotoInterception:
+    """Pure pre-navigation directive (A1, Path-2): resolve a goto target URL to
+    a planned system and decide whether the reactive loop should intercept the
+    navigation as a cross-system hop *before* page.goto runs (so the current
+    system's page is preserved). Pure -- no pool / browser -- so it is
+    stub-frame regressable per workflow rule §四. Only a *known* target system
+    that differs from a *known* current system intercepts; the first navigation
+    (blank current), same-system, and unknown-domain gotos fall through to a
+    normal page.goto."""
+
+    def _router(self) -> SessionRouter:
+        return SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=_pool())
+
+    def test_system_for_url_resolves_planned_domain(self) -> None:
+        router = self._router()
+        assert router.system_for_url("https://alpha.com/dashboard") == "system_1"
+        assert router.system_for_url("https://beta.com/list?x=1") == "system_2"
+
+    def test_system_for_url_matches_subdomain(self) -> None:
+        router = self._router()
+        assert router.system_for_url("https://app.beta.com/x") == "system_2"
+
+    def test_system_for_url_blank_for_unknown_or_empty(self) -> None:
+        router = self._router()
+        assert router.system_for_url("https://example.org/x") == ""
+        assert router.system_for_url("") == ""
+
+    def test_cross_system_goto_should_intercept(self) -> None:
+        router = self._router()
+        directive = router.plan_goto_interception(
+            "https://beta.com/page", current_system_id="system_1"
+        )
+        assert directive["should_intercept"] is True
+        assert directive["to_system_id"] == "system_2"
+        assert directive["from_system_id"] == "system_1"
+        assert directive["target_url"] == "https://beta.com/page"
+        assert directive["domain"] == "beta.com"
+        assert directive["auth_profile"] == "auto"  # system_2 declares auto
+
+    def test_same_system_goto_not_intercepted(self) -> None:
+        router = self._router()
+        directive = router.plan_goto_interception(
+            "https://alpha.com/other", current_system_id="system_1"
+        )
+        assert directive["should_intercept"] is False
+        assert directive["to_system_id"] == ""
+
+    def test_unknown_domain_not_intercepted(self) -> None:
+        router = self._router()
+        directive = router.plan_goto_interception(
+            "https://example.org/x", current_system_id="system_1"
+        )
+        assert directive["should_intercept"] is False
+        assert directive["to_system_id"] == ""
+
+    def test_blank_current_system_not_intercepted(self) -> None:
+        # The first navigation establishes the home system; never intercept it.
+        router = self._router()
+        directive = router.plan_goto_interception("https://beta.com", current_system_id="")
+        assert directive["should_intercept"] is False
+
+    def test_directive_carries_interception_contract(self) -> None:
+        # Lock the keys the GotoHandler + hot-loop consume. A rename silently
+        # breaks the pre-nav interception wiring, so guard the full key set.
+        router = self._router()
+        directive = router.plan_goto_interception("https://beta.com", current_system_id="system_1")
+        for key in (
+            "should_intercept",
+            "run_id",
+            "target_url",
+            "from_system_id",
+            "to_system_id",
+            "to_system_name",
+            "auth_profile",
+            "domain",
+        ):
+            assert key in directive, f"missing interception key: {key}"
+
+
 class TestSessionRouterAcquireForSwitch:
     def test_acquire_for_switch_pools_target_and_stages_state(self) -> None:
         pool = _pool()
