@@ -31,11 +31,11 @@ from html.parser import HTMLParser
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from visual_web_agent.crawl_frontier import normalize_keywords, score_url
 from visual_web_agent.spider_lite import domain_of, normalize_url
-from visual_web_agent.url_guard import UrlGuardError, check_url
+from visual_web_agent.url_guard import UrlGuardError, build_guarded_opener, check_url
 
 __all__ = [
     "parse_sitemap_locs",
@@ -180,7 +180,7 @@ def _urllib_probe(
         headers.update(extra_headers)
     req = Request(str(url), method=method, headers=headers)
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with build_guarded_opener().open(req, timeout=timeout) as resp:
             status = int(getattr(resp, "status", 0) or getattr(resp, "code", 0) or 200)
             resp_headers = getattr(resp, "headers", None)
             content_type = resp_headers.get("content-type", "") if resp_headers else ""

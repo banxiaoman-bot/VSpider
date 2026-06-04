@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Iterator, Protocol, runtime_checkable
 
 from visual_web_agent.upload_store import sniff_mime_and_ext
-from visual_web_agent.url_guard import UrlGuardError, check_url
+from visual_web_agent.url_guard import UrlGuardError, check_url, guard_httpx_request
 
 from .candidates import MediaCandidate, classify_url
 
@@ -123,6 +123,7 @@ def _httpx_client(timeout: float, follow_redirects: bool = True) -> StreamingCli
         timeout=timeout,
         follow_redirects=follow_redirects,
         headers=dict(DEFAULT_HEADERS),
+        event_hooks={"request": [guard_httpx_request]},
     )
 
 

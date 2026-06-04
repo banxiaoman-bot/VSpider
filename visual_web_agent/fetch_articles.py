@@ -161,14 +161,35 @@ def _extract_first_result_url(html: str) -> str:
     return ""
 
 
+def _guarded_get(url: str, *, headers: dict, timeout: float, max_redirects: int = 5):
+    """``requests.get`` that re-checks every redirect hop against the SSRF guard.
+
+    ``requests`` follows 3xx itself, so a public article URL could bounce the
+    fetch onto an internal / cloud-metadata host. Follow manually, validating
+    each hop with :func:`is_url_allowed`; return ``None`` once a hop is blocked
+    (the caller then yields an empty body).
+    """
+    current = url
+    for _ in range(max_redirects + 1):
+        if not is_url_allowed(current, resolve_dns=True):
+            return None
+        resp = requests.get(current, headers=headers, timeout=timeout, allow_redirects=False)
+        location = resp.headers.get("location") if resp.is_redirect else None
+        if location:
+            current = requests.compat.urljoin(current, location)
+            continue
+        return resp
+    return None
+
+
 def _fetch_article_body(article_url: str) -> str:
     """访问文章页面，提取 <p> 段落文本，返回前 400 字。"""
-    # SSRF guard: article URLs come from search results (untrusted); refuse
-    # internal / loopback / cloud-metadata targets before issuing the request.
-    if not is_url_allowed(article_url, resolve_dns=True):
-        return ""
+    # SSRF guard (initial + every redirect hop): article URLs come from
+    # search results (untrusted) and can 30x onto internal targets.
     try:
-        resp = requests.get(article_url, headers=HEADERS, timeout=10, allow_redirects=True)
+        resp = _guarded_get(article_url, headers=HEADERS, timeout=10)
+        if resp is None:
+            return ""
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
         # 移除 script/style/导航干扰

@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .artifact_manager import artifact_url, register_artifact, resolve_artifact_path
-from .url_guard import UrlGuardError, check_url
+from .url_guard import UrlGuardError, build_guarded_opener, check_url
 
 
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
@@ -188,7 +188,7 @@ def replay_candidate(
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout_s) as resp:
+            with build_guarded_opener().open(request, timeout=timeout_s) as resp:
                 raw_status = int(getattr(resp, "status", 0) or 0)
                 raw_headers = dict(resp.headers.items())
                 raw_body = resp.read()
