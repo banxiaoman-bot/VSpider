@@ -33,7 +33,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlparse, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request
 from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +103,7 @@ try:
     from .judge import TaskJudge, JudgeConfig
     from .loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
     from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
+    from .url_guard import build_guarded_opener, check_url
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
@@ -164,6 +165,7 @@ except ImportError:
     from judge import TaskJudge, JudgeConfig
     from loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
     from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
+    from url_guard import build_guarded_opener, check_url
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -1377,7 +1379,8 @@ def _load_rpa_challenge_rows(download_url: str, total_rounds: int) -> list[dict[
                 "Referer": "https://rpachallenge.com/",
             },
         )
-        with urlopen(request, timeout=20) as response:
+        check_url(target_url)  # SSRF guard: page-supplied download_url can urljoin onto an internal host
+        with build_guarded_opener().open(request, timeout=20) as response:
             cache_path.write_bytes(response.read())
 
     if cache_path.suffix.lower() == ".csv":
@@ -1449,7 +1452,8 @@ def _load_public_google_sheet_rows(sheet_url: str, row_limit: int) -> list[dict[
             "Referer": sheet_url,
         },
     )
-    with urlopen(request, timeout=20) as response:
+    check_url(export_url)  # SSRF guard (+redirect hop): export_url derives from user sheet_url
+    with build_guarded_opener().open(request, timeout=20) as response:
         raw = response.read()
     text = raw.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))

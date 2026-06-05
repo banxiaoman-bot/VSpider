@@ -89,3 +89,28 @@ class TestDownloaderWiring:
         assert outcome.ok is False
         assert "blocked_url" in outcome.error
         assert not dest.exists()
+
+
+class TestMainFetchWiring:
+    # main.py pulls a page-supplied RPA xlsx (download_url) and a user-supplied
+    # Google Sheet export server-side; both must route through url_guard.
+    # ``urljoin`` lets an absolute download_url escape the default base onto an
+    # internal host -- a textbook SSRF -- so the guard must fire before any socket.
+    def test_rpa_challenge_rows_blocks_internal_download_url(self):
+        from visual_web_agent import main as main_mod
+
+        with pytest.raises(UrlGuardError):
+            main_mod._load_rpa_challenge_rows("http://169.254.169.254/x.xlsx", 1)
+
+    def test_rpa_challenge_rows_blocks_non_http_scheme(self):
+        from visual_web_agent import main as main_mod
+
+        with pytest.raises(UrlGuardError):
+            main_mod._load_rpa_challenge_rows("file:///etc/passwd", 1)
+
+    def test_main_fetch_sites_use_guarded_opener(self):
+        # Pin the wiring: a refactor must not silently revert to raw urlopen
+        # (which would also drop the redirect-hop guard).
+        src = Path("visual_web_agent/main.py").read_text(encoding="utf-8")
+        assert src.count("build_guarded_opener().open(") >= 2
+        assert "with urlopen(" not in src

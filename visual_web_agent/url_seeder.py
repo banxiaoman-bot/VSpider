@@ -163,6 +163,17 @@ _MAX_PROBE_CONCURRENCY = 32
 _DEFAULT_PROBE_CONCURRENCY = 8
 
 
+def urlopen(req, timeout=None):
+    """SSRF-guarded ``urlopen`` seam for HEAD/GET liveness probes.
+
+    Routes through :func:`url_guard.build_guarded_opener` so a 3xx can't bounce
+    a probe onto an internal host. Kept module-level and named ``urlopen`` so
+    ``_urllib_probe`` reads naturally and tests can monkeypatch
+    ``url_seeder.urlopen`` to inject fake responses.
+    """
+    return build_guarded_opener().open(req, timeout=timeout)
+
+
 def _urllib_probe(
     url: str,
     *,
@@ -180,7 +191,7 @@ def _urllib_probe(
         headers.update(extra_headers)
     req = Request(str(url), method=method, headers=headers)
     try:
-        with build_guarded_opener().open(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             status = int(getattr(resp, "status", 0) or getattr(resp, "code", 0) or 200)
             resp_headers = getattr(resp, "headers", None)
             content_type = resp_headers.get("content-type", "") if resp_headers else ""
