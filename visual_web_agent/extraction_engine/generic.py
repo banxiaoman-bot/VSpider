@@ -11,7 +11,7 @@ from typing import Any
 from visual_web_agent.artifact_manager import artifact_url, register_artifact, resolve_artifact_path
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 _FIELD_RE = re.compile(r"[^0-9A-Za-z_\u4e00-\u9fff]+")
 _CARD_HINT_RE = re.compile(r"(?:card|item|product|result|row|entry|article|list)", re.I)
 _CSS_ATTR_PSEUDO_RE = re.compile(r"::attr\(([^)]+)\)\s*$", re.I)

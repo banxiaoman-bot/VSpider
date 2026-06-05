@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 _RUN_STATUS = {"queued", "running", "paused", "succeeded", "failed", "stopped", "error"}
 _TERMINAL_STATUS = {"succeeded", "failed", "stopped", "error"}
 

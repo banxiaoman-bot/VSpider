@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 _VOLATILE_QUERY_KEYS = {
     "_",
     "t",

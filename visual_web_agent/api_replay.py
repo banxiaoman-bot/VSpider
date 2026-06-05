@@ -13,7 +13,7 @@ from .artifact_manager import artifact_url, register_artifact, resolve_artifact_
 from .url_guard import UrlGuardError, build_guarded_opener, check_url
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 _PAGE_KEYS = {"page", "p", "current", "offset", "cursor"}
 _LIMIT_KEYS = {"limit", "size", "page_size", "pageSize", "per_page"}
 

@@ -31,7 +31,7 @@ from .output_contract import OutputContract, OutputPrediction
 from .manifest import Manifest, ManifestItem, append_item, new_manifest
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 
 
 INPUT_CONTRACT_FILENAME = "input_contract.json"

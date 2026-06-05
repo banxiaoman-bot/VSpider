@@ -40,10 +40,11 @@ class TestRunDir:
         assert (d / ARTIFACTS_DIRNAME).exists()
 
     def test_invalid_run_id_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError):
-            run_dir("../escape", base_dir=tmp_path)
-        with pytest.raises(ValueError):
-            run_dir("", base_dir=tmp_path)
+        # run_id is a single path component; "." / ".." must never traverse,
+        # and path separators / dotted ids are rejected outright.
+        for bad in ("../escape", "", "..", ".", "a.b", "x/y", "..\\x"):
+            with pytest.raises(ValueError):
+                run_dir(bad, base_dir=tmp_path)
 
 
 class TestInputContractIO:

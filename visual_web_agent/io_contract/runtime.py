@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 
 
 _STATE: dict[str, Any] = {

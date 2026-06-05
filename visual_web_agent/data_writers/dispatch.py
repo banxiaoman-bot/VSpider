@@ -58,7 +58,7 @@ CONTAINER_TO_WRITER: dict[str, WriterFn] = {
 }
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 
 
 def save_artifact(
