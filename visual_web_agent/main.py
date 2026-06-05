@@ -103,7 +103,7 @@ try:
     from .judge import TaskJudge, JudgeConfig
     from .loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
     from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
-    from .url_guard import build_guarded_opener, check_url
+    from .url_guard import UrlGuardError, build_guarded_opener, check_url
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
@@ -165,7 +165,7 @@ except ImportError:
     from judge import TaskJudge, JudgeConfig
     from loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
     from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
-    from url_guard import build_guarded_opener, check_url
+    from url_guard import UrlGuardError, build_guarded_opener, check_url
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -1358,6 +1358,27 @@ def _parse_rpa_challenge_total_rounds(text: str) -> int:
     if m:
         return max(1, int(m.group(1)))
     return _RPA_CHALLENGE_TOTAL_ROUNDS
+
+
+def _guard_vlm_endpoint_override(url: str, *, label: str) -> str:
+    """SSRF-guard a user-supplied VLM / semantic ``base_url`` override.
+
+    The OpenAI client fetches this endpoint server-side *with the configured
+    API key in the Authorization header*, so an attacker-supplied override
+    (api_server Form ``vlm_base_url`` / ``semantic_base_url`` -> vlm_options ->
+    runtime_config) is both an SSRF and a credential-exfil vector. The prior
+    SSRF-GUARD slices only covered the scraping fetchers, not this endpoint.
+
+    ``allow_private=True`` keeps the common local-LLM endpoints usable (the
+    shipped default is ``http://localhost:8000/v1``) while still blocking the
+    cloud-metadata endpoint / link-local addresses / non-http(s) schemes,
+    which are never a legitimate model endpoint.
+    """
+    try:
+        check_url(url, allow_private=True)
+    except UrlGuardError as exc:
+        raise UrlGuardError(f"unsafe {label} override ({url!r}): {exc}") from exc
+    return url
 
 
 def _load_rpa_challenge_rows(download_url: str, total_rounds: int) -> list[dict[str, str]]:
@@ -7057,11 +7078,15 @@ async def run_agent(
         if vlm_options.get("semantic_model"):
             _cfg.VLM_SEMANTIC_MODEL_NAME = str(vlm_options["semantic_model"])
         if vlm_options.get("semantic_base_url"):
-            _cfg.VLM_SEMANTIC_API_BASE = str(vlm_options["semantic_base_url"])
+            _cfg.VLM_SEMANTIC_API_BASE = _guard_vlm_endpoint_override(
+                str(vlm_options["semantic_base_url"]), label="semantic_base_url"
+            )
         if vlm_options.get("semantic_api_key"):
             _cfg.VLM_SEMANTIC_API_KEY = str(vlm_options["semantic_api_key"])
         if vlm_options.get("base_url"):
-            _cfg.VLM_API_BASE = str(vlm_options["base_url"])
+            _cfg.VLM_API_BASE = _guard_vlm_endpoint_override(
+                str(vlm_options["base_url"]), label="base_url"
+            )
         if vlm_options.get("api_key"):
             _cfg.VLM_API_KEY = str(vlm_options["api_key"])
         if vlm_options.get("temperature") is not None:

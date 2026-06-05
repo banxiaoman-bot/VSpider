@@ -114,3 +114,45 @@ class TestMainFetchWiring:
         src = Path("visual_web_agent/main.py").read_text(encoding="utf-8")
         assert src.count("build_guarded_opener().open(") >= 2
         assert "with urlopen(" not in src
+
+
+class TestVlmEndpointOverrideGuard:
+    # The OpenAI client fetches the VLM/semantic ``base_url`` server-side WITH the
+    # configured API key in the Authorization header. A user-supplied override
+    # (api_server Form ``vlm_base_url`` / ``semantic_base_url`` -> vlm_options ->
+    # runtime_config.VLM_API_BASE) is therefore both an SSRF and a credential-exfil
+    # vector. ``allow_private=True`` keeps local-LLM endpoints usable (the shipped
+    # default is ``http://localhost:8000/v1``) while still blocking the
+    # cloud-metadata endpoint / link-local / non-http(s) schemes.
+    def test_blocks_metadata_endpoint(self):
+        from visual_web_agent import main as main_mod
+
+        with pytest.raises(UrlGuardError):
+            main_mod._guard_vlm_endpoint_override("http://169.254.169.254/v1", label="base_url")
+
+    def test_blocks_non_http_scheme(self):
+        from visual_web_agent import main as main_mod
+
+        with pytest.raises(UrlGuardError):
+            main_mod._guard_vlm_endpoint_override("file:///etc/passwd", label="base_url")
+
+    def test_allows_local_llm_default(self):
+        # The shipped default endpoint is a loopback local-LLM server; it must
+        # stay usable (allow_private=True) or every default install breaks.
+        from visual_web_agent import main as main_mod
+
+        url = "http://localhost:8000/v1"
+        assert main_mod._guard_vlm_endpoint_override(url, label="base_url") == url
+
+    def test_allows_public_endpoint(self):
+        from visual_web_agent import main as main_mod
+
+        url = "https://api.openai.com/v1"
+        assert main_mod._guard_vlm_endpoint_override(url, label="semantic_base_url") == url
+
+    def test_override_application_is_guarded(self):
+        # Pin the wiring: both the base_url and semantic_base_url overrides must
+        # route through the guard so a refactor can't reintroduce a raw assignment.
+        src = Path("visual_web_agent/main.py").read_text(encoding="utf-8")
+        assert "_cfg.VLM_API_BASE = _guard_vlm_endpoint_override(" in src
+        assert "_cfg.VLM_SEMANTIC_API_BASE = _guard_vlm_endpoint_override(" in src
