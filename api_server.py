@@ -1535,12 +1535,29 @@ app.include_router(create_capability_router(CapabilityApiDeps(
 )))
 
 
+def _ws_origin_allowed(origin: str) -> bool:
+    # WebSockets bypass CORS, so guard /ws/logs with the same allowlist as the
+    # HTTP CORS layer (VSPIDER_CORS_ORIGINS). A missing Origin header indicates a
+    # non-browser client (tests / native ws), which is allowed.
+    allow_origins = _build_cors_kwargs(os.getenv("VSPIDER_CORS_ORIGINS", ""))["allow_origins"]
+    if "*" in allow_origins:
+        return True
+    if not origin:
+        return True
+    return origin in allow_origins
+
+
 @app.websocket("/ws/logs")
 async def ws_logs(websocket: WebSocket) -> None:
     """
     前端通过此 WebSocket 接收实时日志、截图和 done 事件。
     客户端发送的任何消息都忽略，仅用于保活。
     """
+    origin = websocket.headers.get("origin", "")
+    if not _ws_origin_allowed(origin):
+        logger.warning("[WS] reject cross-origin /ws/logs: origin=%r", origin)
+        await websocket.close(code=1008)
+        return
     await manager.connect(websocket)
     try:
         await manager.send_log("✅ VSpider 已连接，等待任务下发...", level="info")

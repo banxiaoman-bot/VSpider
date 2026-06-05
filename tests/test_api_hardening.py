@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -90,3 +92,31 @@ class TestQueueStateSecretScrub:
         })
         opts = snap["execution_queue"][0]["vlm_options"]
         assert opts.get("api_key", "") == ""
+
+
+class TestWsOriginGuard:
+    def test_default_allows_localhost_blocks_evil(self, api, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("VSPIDER_CORS_ORIGINS", raising=False)
+        assert api._ws_origin_allowed("http://localhost:5173") is True
+        assert api._ws_origin_allowed("http://127.0.0.1:8000") is True
+        assert api._ws_origin_allowed("http://evil.example") is False
+
+    def test_missing_origin_allowed(self, api, monkeypatch: pytest.MonkeyPatch) -> None:
+        # non-browser clients (tests / native ws) send no Origin header
+        monkeypatch.delenv("VSPIDER_CORS_ORIGINS", raising=False)
+        assert api._ws_origin_allowed("") is True
+
+    def test_wildcard_env_allows_any(self, api, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VSPIDER_CORS_ORIGINS", "*")
+        assert api._ws_origin_allowed("http://evil.example") is True
+
+    def test_explicit_allowlist_env(self, api, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("VSPIDER_CORS_ORIGINS", "https://app.example")
+        assert api._ws_origin_allowed("https://app.example") is True
+        assert api._ws_origin_allowed("http://localhost:5173") is False
+
+    def test_ws_logs_wiring_pinned(self) -> None:
+        # Pin the wiring so a refactor cannot silently drop the origin gate.
+        src = Path("api_server.py").read_text(encoding="utf-8")
+        assert "_ws_origin_allowed(origin)" in src
+        assert "websocket.close(code=1008)" in src
