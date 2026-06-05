@@ -2038,3 +2038,51 @@ Out of scope (deliberate, next slices):
   helper logs only); partial-replay (`_replay_ready_rpa_steps`) system-boundary cursor
   accounting; per-system workflow_memory isolation during replay.
 
+
+## Slice SSRF-GUARD: server-side outbound URL guard (SSRF defense across all fetchers)
+
+Reference: mission §一 准确/通用 (one guard, every fetch site); web SSRF (OWASP A10).
+
+Goal:
+
+- VSpider fetches user / sitemap / API-supplied URLs server-side (`spider_lite`,
+  `url_seeder`, `media_harvester`, `api_replay`, `fetch_articles`, `main.py` RPA/Sheet
+  fetchers). Without a guard a crafted URL can point the server at internal-only targets
+  -- loopback `127.0.0.1`, RFC1918 (`10/8`, `172.16/12`, `192.168/16`), link-local
+  `169.254.0.0/16` (cloud-metadata `169.254.169.254`), IPv6 `::1` / `fc00::/7` -- or a
+  non-HTTP scheme (`file://`, `gopher://`, `data:`). Centralise one SSRF guard and route
+  every server-side fetch (and every redirect hop) through it.
+
+Add / change:
+
+- `url_guard.py` (new, pure leaf -- stdlib only): `check_url(url)` raises `UrlGuardError`
+  / `is_url_allowed(url)` -> bool. Policy (secure-by-default, offline-safe): scheme must
+  be http/https; literal private/loopback/link-local/reserved/multicast/unspecified IPs
+  rejected with no DNS; static hostname blocklist (`localhost`, `*.localhost`, cloud-
+  metadata names); optional DNS resolution (injectable `resolver` / `VSPIDER_SSRF_RESOLVE_DNS=1`)
+  rejects a public name that resolves to a private address (DNS-rebinding). Escape hatch
+  `VSPIDER_ALLOW_PRIVATE_URLS=1` for local dev (the metadata endpoint stays blocked even
+  then). `_GuardedRedirectHandler` + `build_guarded_opener` re-check every urllib 3xx hop;
+  `guard_httpx_request` is an httpx `request` event-hook that checks every hop.
+- Wiring landed across four linear commits: `spider_lite` / `url_seeder` /
+  `media_harvester` (SSRF-GUARD-1); `api_replay` & `fetch_articles` + harden `url_guard`
+  (SSRF-GUARD-2); redirect-hop guard into all auto-following fetchers (SSRF-GUARD-3);
+  `main.py` RPA/Sheet fetchers + `url_seeder` probe (SSRF-GUARD-4).
+
+Acceptance:
+
+- Targeted: `test_url_guard.py` + `test_url_guard_wiring.py` + `test_url_guard_redirect.py`
+  = 70 passed. Full suite 2785 passed, 2 skipped, 1 deselected (135.73s) -- green
+  (exit 0).
+- Code-health / multi-agent pollution audit clean: a single `url_guard.py` module, the
+  guard API defined exactly once, all six fetcher call-sites import the one module
+  (no self-rolled guard), no merge-conflict markers, four linear commits SSRF-GUARD-1..4
+  on `feat/web-extraction-suite`, no cross-branch divergence (`HEAD..master=0`), clean
+  working tree.
+
+Out of scope (deliberate, next slices):
+
+- DNS resolution on by default (kept opt-in so the offline test-suite stays hermetic);
+  a per-call allow-list of sanctioned internal hosts; an SSRF guard for browser-context
+  navigations (this slice covers the server-side python fetchers, not Playwright
+  `page.goto`); rate-limit / response size-cap on guarded fetches.
