@@ -64,7 +64,8 @@ def test_save_and_load_queue_snapshot(local_tmp_path: Path) -> None:
     assert "vlm_options" not in loaded["queue"][0]
     assert loaded["execution_queue"][0]["task_id"] == "t2"
     assert loaded["execution_queue"][0]["file_path"] == "private.xlsx"
-    assert loaded["execution_queue"][0]["vlm_options"]["api_key"] == "secret"
+    # secret is masked before the snapshot is persisted to disk
+    assert loaded["execution_queue"][0]["vlm_options"]["api_key"] == "***"
 
     public = queue_state.load_public_snapshot(base_dir=local_tmp_path)
     assert public is not None

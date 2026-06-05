@@ -868,7 +868,11 @@ def recover_queued_tasks() -> dict[str, Any]:
             "filename": str(item.get("filename") or ""),
             "file_size_kb": float(item.get("file_size_kb") or 0.0),
             "vlm_model_type": str(item.get("vlm_model_type") or "vl"),
-            "vlm_options": dict(item.get("vlm_options") or {}),
+            "vlm_options": {
+                k: v
+                for k, v in dict(item.get("vlm_options") or {}).items()
+                if not ("api_key" in str(k).lower() and str(v) == "***")
+            },
             "status": "queued",
             "running": False,
             "created_at": item.get("created_at") or time.time(),
@@ -1477,12 +1481,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_DEFAULT_CORS_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+)
+
+
+def _build_cors_kwargs(origins_raw: str) -> dict[str, Any]:
+    # Resolve CORS allow_origins/credentials from VSPIDER_CORS_ORIGINS. Default =
+    # localhost dev (5173) + same-origin API (8000). A comma list is an explicit
+    # allowlist. Literal "*" re-enables wildcard but forces allow_credentials=False,
+    # since browsers reject "*" together with credentials.
+    raw = (origins_raw or "").strip()
+    if raw == "*":
+        return {"allow_origins": ["*"], "allow_credentials": False}
+    if raw:
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        return {"allow_origins": origins, "allow_credentials": True}
+    return {"allow_origins": list(_DEFAULT_CORS_ORIGINS), "allow_credentials": True}
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    **_build_cors_kwargs(os.getenv("VSPIDER_CORS_ORIGINS", "")),
 )
 
 
@@ -3367,6 +3392,17 @@ async def health() -> dict:
     }
 
 
+def _resolve_api_bind() -> tuple[str, int]:
+    # Bind localhost-only by default; opt into network exposure via env so the
+    # single-machine flow keeps working without implicit 0.0.0.0 exposure.
+    host = (os.getenv("VSPIDER_API_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        port = int((os.getenv("VSPIDER_API_PORT") or "8000").strip() or "8000")
+    except ValueError:
+        port = 8000
+    return host, port
+
+
 if __name__ == "__main__":
     reload_enabled = _env_flag("VSPIDER_API_RELOAD", default=False)
     _reload_pattern = lambda *parts: Path(*parts).as_posix()
@@ -3387,9 +3423,15 @@ if __name__ == "__main__":
         _reload_pattern("output_*.xlsx"),
     ]
 
+    _bind_host, _bind_port = _resolve_api_bind()
+    logger.info(
+        "[startup] API binding to %s:%s (override via VSPIDER_API_HOST / VSPIDER_API_PORT)",
+        _bind_host,
+        _bind_port,
+    )
     uvicorn_kwargs: dict[str, Any] = {
-        "host": "0.0.0.0",
-        "port": 8000,
+        "host": _bind_host,
+        "port": _bind_port,
         "log_level": "info",
         "reload": reload_enabled,
     }

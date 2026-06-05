@@ -76,6 +76,19 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _scrub_secret_options(vlm_options: Any) -> dict[str, Any]:
+    # Mask api_key-bearing fields before the snapshot is written to disk, mirroring
+    # run_registry._sanitize_vlm_options so runs/queue/state.json never carries raw
+    # secrets. Recovery treats the "***" sentinel as absent and falls back to env.
+    out: dict[str, Any] = {}
+    for key, value in dict(vlm_options or {}).items():
+        if "api_key" in str(key).lower() and value not in (None, ""):
+            out[str(key)] = "***"
+        else:
+            out[str(key)] = _json_safe(value)
+    return out
+
+
 def _execution_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(task, dict):
         return None
@@ -94,7 +107,7 @@ def _execution_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
         "filename": task.get("filename", ""),
         "file_size_kb": task.get("file_size_kb", 0.0),
         "vlm_model_type": task.get("vlm_model_type", "vl"),
-        "vlm_options": _json_safe(task.get("vlm_options") or {}),
+        "vlm_options": _scrub_secret_options(task.get("vlm_options")),
         "created_at": task.get("created_at"),
         "queued_at": task.get("queued_at"),
         "started_at": task.get("started_at"),

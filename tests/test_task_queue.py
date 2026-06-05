@@ -68,8 +68,10 @@ def test_enqueue_task_creates_queued_registry(api_with_tmp_registry, local_tmp_p
     assert persisted["queue"][0]["task_id"] == item["task_id"]
     assert "execution_queue" in persisted
     assert persisted["execution_queue"][0]["task_id"] == item["task_id"]
-    assert persisted["execution_queue"][0]["vlm_options"]["api_key"] == "secret"
+    assert persisted["execution_queue"][0]["vlm_options"]["api_key"] == "***"
     assert "vlm_options" not in persisted["queue"][0]
+    raw_state = api_server._queue_state.queue_state_path().read_text(encoding="utf-8")
+    assert "secret" not in raw_state
 
     rec = api_server._run_registry.load_run(item["task_id"], base_dir=local_tmp_path)
     assert rec is not None
@@ -763,7 +765,10 @@ def test_recover_queued_tasks_prefers_execution_queue_payload(api_with_tmp_regis
     assert restored["target_url"] == "https://full.example.com"
     assert restored["file_path"] == "temp_uploads/input.xlsx"
     assert restored["auth_profiles"] == "admin"
-    assert restored["vlm_options"]["api_key"] == "secret"
+    # api_key is masked on disk then dropped on recovery (a per-run secret never
+    # survives a restart); non-secret overrides like temperature still round-trip.
+    assert "api_key" not in restored["vlm_options"]
+    assert restored["vlm_options"]["temperature"] == 0.1
 
 
 def test_task_queue_recover_api(api_with_tmp_registry, local_tmp_path: Path) -> None:
