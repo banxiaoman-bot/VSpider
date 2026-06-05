@@ -18,6 +18,7 @@ All writes use a temp-file + ``os.replace`` to avoid partial files on crash.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -100,6 +101,30 @@ def _read_json(target: Path) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _redact_input_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Mask secrets before input_contract.json is written to disk: api_key (vlm /
+    # semantic model overrides) and proxy_password. In-memory InputContract objects
+    # keep the real values; only the persisted record is masked, mirroring the
+    # run_registry / queue_state secret handling.
+    if not isinstance(payload, dict):
+        return payload
+    redacted = copy.deepcopy(payload)
+    overrides = redacted.get("model_overrides")
+    if isinstance(overrides, dict):
+        for section in ("vlm", "semantic"):
+            sec = overrides.get(section)
+            if isinstance(sec, dict):
+                for key in list(sec):
+                    if "api_key" in str(key).lower() and sec[key] not in (None, ""):
+                        sec[key] = "***"
+    cons = redacted.get("constraints")
+    if isinstance(cons, dict):
+        for key in list(cons):
+            if "password" in str(key).lower() and cons[key] not in (None, ""):
+                cons[key] = "***"
+    return redacted
+
+
 def write_input_contract(
     run_id: str,
     contract: InputContract | dict[str, Any],
@@ -107,6 +132,7 @@ def write_input_contract(
     base_dir: str | Path | None = None,
 ) -> Path:
     payload = contract.to_dict() if isinstance(contract, InputContract) else dict(contract or {})
+    payload = _redact_input_contract_payload(payload)
     target = run_dir(run_id, base_dir=base_dir) / INPUT_CONTRACT_FILENAME
     _atomic_write_json(target, payload)
     return target
@@ -166,7 +192,7 @@ def ensure_input_contract_skeleton(
         constraints=constraints or None,
         source=source,
     )
-    _atomic_write_json(target, contract.to_dict())
+    _atomic_write_json(target, _redact_input_contract_payload(contract.to_dict()))
     return target
 
 

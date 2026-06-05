@@ -63,6 +63,37 @@ class TestInputContractIO:
     def test_read_missing_returns_none(self, tmp_path: Path) -> None:
         assert read_input_contract("nonexistent", base_dir=tmp_path) is None
 
+    def test_secrets_masked_on_disk_but_not_in_object(self, tmp_path: Path) -> None:
+        c = build_input_contract(
+            goal="hello",
+            target_url="https://a.com",
+            vlm_options={"api_key": "vlm-secret", "semantic_api_key": "sem-secret"},
+            constraints={"proxy_server": "http://p:3128", "proxy_password": "proxy-secret"},
+        )
+        write_input_contract("run_sec", c, base_dir=tmp_path)
+        raw = (tmp_path / "run_sec" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        assert "vlm-secret" not in raw
+        assert "sem-secret" not in raw
+        assert "proxy-secret" not in raw
+        assert "***" in raw
+        assert "http://p:3128" in raw  # non-secret survives
+        # the in-memory object still holds the real secrets
+        assert c.model_overrides.vlm["api_key"] == "vlm-secret"
+        assert c.constraints.proxy_password == "proxy-secret"
+
+    def test_skeleton_also_masks_secrets(self, tmp_path: Path) -> None:
+        ensure_input_contract_skeleton(
+            "run_sk",
+            goal="g",
+            target_url="https://a.com",
+            vlm_options={"api_key": "k-secret"},
+            constraints={"proxy_password": "p-secret"},
+            base_dir=tmp_path,
+        )
+        raw = (tmp_path / "run_sk" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        assert "k-secret" not in raw
+        assert "p-secret" not in raw
+
 
 class TestOutputContractIO:
     def test_write_and_read_round_trip(self, tmp_path: Path) -> None:
