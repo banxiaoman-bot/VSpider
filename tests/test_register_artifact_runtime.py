@@ -38,7 +38,12 @@ def test_register_artifact_uses_current_run(monkeypatch: pytest.MonkeyPatch) -> 
 
         src = root / "hello.txt"
         src.write_text("manifest hook", encoding="utf-8")
-        am.register_artifact(src, kind="file_generic", produced_by="test")
+        am.register_artifact(
+            src,
+            kind="file_generic",
+            produced_by="test",
+            extra={"row_count": 3},
+        )
         clear_current_run()
 
         run_artifact = root / run_id / "artifacts" / "hello.txt"
@@ -49,8 +54,58 @@ def test_register_artifact_uses_current_run(monkeypatch: pytest.MonkeyPatch) -> 
         items = payload.get("items") or []
         assert items
         assert items[-1]["produced_by"] == "test"
+        assert items[-1]["extra"]["row_count"] == 3
         assert str(items[-1].get("path") or "").replace("\\", "/").endswith(
             f"{run_id}/artifacts/hello.txt"
+        )
+    finally:
+        clear_current_run()
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_register_download_artifact_records_download_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    from visual_web_agent import artifact_manager as am
+    from visual_web_agent.io_contract import (
+        MANIFEST_FILENAME,
+        clear_current_run,
+        ensure_contract_skeleton,
+        set_current_run,
+    )
+
+    root = Path(__file__).resolve().parents[1] / "workspace" / f"pytest-download-{uuid.uuid4().hex[:8]}"
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        monkeypatch.setattr(am, "artifact_root", lambda: root)
+        monkeypatch.setattr(
+            "api_server.broadcast_new_artifact",
+            lambda _p: None,
+            raising=False,
+        )
+
+        run_id = "run_download_smoke"
+        ensure_contract_skeleton(run_id, base_dir=root)
+        set_current_run(run_id, base_dir=root)
+
+        src = root / "photo.jpg"
+        src.write_bytes(b"fake image")
+        am.register_download_artifact(
+            src,
+            source_url="https://example.com/photo.jpg",
+            mime="image/jpeg",
+            produced_by="browser_action",
+            step_id="download_image",
+        )
+        clear_current_run()
+
+        payload = json.loads((root / run_id / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+        item = payload["items"][-1]
+        assert item["kind"] == "media_image"
+        assert item["mime"] == "image/jpeg"
+        assert item["source_url"] == ["https://example.com/photo.jpg"]
+        assert item["produced_by"] == "browser_action"
+        assert item["step_id"] == "download_image"
+        assert str(item.get("path") or "").replace("\\", "/").endswith(
+            f"{run_id}/artifacts/photo.jpg"
         )
     finally:
         clear_current_run()

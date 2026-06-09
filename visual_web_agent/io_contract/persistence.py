@@ -29,6 +29,7 @@ from typing import Any, Iterable
 from .input_contract import InputContract, build_input_contract
 from .output_contract import OutputContract, OutputPrediction
 from .manifest import Manifest, ManifestItem, append_item, new_manifest
+from ..secret_redaction import redact_secret_mapping
 
 
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
@@ -102,10 +103,9 @@ def _read_json(target: Path) -> dict[str, Any] | None:
 
 
 def _redact_input_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    # Mask secrets before input_contract.json is written to disk: api_key (vlm /
-    # semantic model overrides) and proxy_password. In-memory InputContract objects
-    # keep the real values; only the persisted record is masked, mirroring the
-    # run_registry / queue_state secret handling.
+    # Mask secrets before input_contract.json is written to disk. In-memory
+    # InputContract objects keep the real values; only the persisted record is
+    # masked, mirroring the run_registry / queue_state secret handling.
     if not isinstance(payload, dict):
         return payload
     redacted = copy.deepcopy(payload)
@@ -119,9 +119,7 @@ def _redact_input_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
                         sec[key] = "***"
     cons = redacted.get("constraints")
     if isinstance(cons, dict):
-        for key in list(cons):
-            if "password" in str(key).lower() and cons[key] not in (None, ""):
-                cons[key] = "***"
+        redacted["constraints"] = redact_secret_mapping(cons)
     return redacted
 
 

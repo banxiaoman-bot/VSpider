@@ -57,6 +57,7 @@ def infer_goal_output_contract(
     goal: str,
     *,
     target_count: int | None = None,
+    target_pages: int | None = None,
     requested_fields: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Infer whether the user primarily wants an answer or a saved dataset."""
@@ -68,6 +69,8 @@ def infer_goal_output_contract(
     if requested_fields:
         structured_artifact = True
     if target_count is not None and target_count > 0 and structured_artifact:
+        structured_artifact = True
+    if target_pages is not None and target_pages > 0:
         structured_artifact = True
 
     answer_required = bool(_ANSWER_OUTPUT_RE.search(text))
@@ -103,6 +106,7 @@ def infer_goal_output_mode(
     goal: str,
     *,
     target_count: int | None = None,
+    target_pages: int | None = None,
     requested_fields: list[str] | tuple[str, ...] | None = None,
 ) -> str:
     """Return the high-level output mode for callers that only need a string."""
@@ -110,6 +114,7 @@ def infer_goal_output_mode(
         infer_goal_output_contract(
             goal,
             target_count=target_count,
+            target_pages=target_pages,
             requested_fields=requested_fields,
         ).get("mode")
         or "default"
@@ -121,6 +126,7 @@ def infer_goal_strategy_context(
     *,
     url: str = "",
     target_count: int | None = None,
+    target_pages: int | None = None,
     requested_fields: list[str] | tuple[str, ...] | None = None,
     data_shape: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -133,6 +139,7 @@ def infer_goal_strategy_context(
     output_contract = infer_goal_output_contract(
         goal,
         target_count=target_count,
+        target_pages=target_pages,
         requested_fields=requested_fields,
     )
     output_mode = str(output_contract.get("mode") or "default")
@@ -167,6 +174,8 @@ def infer_goal_strategy_context(
             _append_unique(reasons, "goal_has_row_target")
         if requested_fields:
             _append_unique(reasons, "goal_has_requested_fields")
+    if target_pages is not None and target_pages > 0:
+        add("extract", "goal_has_page_target", action="next_page", mode="extract_fast_path")
 
     chat_like = bool(
         re.search(
@@ -245,6 +254,7 @@ def infer_goal_strategy_context(
         "preferred_modes": preferred_modes,
         "fallback_order": list(dict.fromkeys(fallback_order)),
         "target_count": target_count,
+        "target_pages": target_pages,
         "requested_fields": list(requested_fields or []),
         "output_mode": output_mode,
         "output_contract": output_contract,

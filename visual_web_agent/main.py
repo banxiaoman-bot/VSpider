@@ -61,7 +61,7 @@ try:
     )
     from .artifact_manager import resolve_artifact_path
     from .trajectory_logger import HtmlLogger
-    from .action_result import ActionResult
+    from .action_result import ActionResult, action_result_evidence_parts
     from .action_registry import build_default_action_registry
     from .capability_router import route_task as route_capabilities_for_task
     from .browser_state import BrowserStateSnapshot
@@ -123,7 +123,7 @@ except ImportError:
     )
     from artifact_manager import resolve_artifact_path
     from trajectory_logger import HtmlLogger
-    from action_result import ActionResult
+    from action_result import ActionResult, action_result_evidence_parts
     from action_registry import build_default_action_registry
     from capability_router import route_task as route_capabilities_for_task
     from browser_state import BrowserStateSnapshot
@@ -300,6 +300,76 @@ def _record_run_start(
     _RUN_ID = rid or None
     _RUN_STARTED_AT = float(started_at) if started_at is not None else time.time()
     _RUN_GOAL = (goal or None)
+
+
+def _ensure_run_registry_record(
+    *,
+    run_id: str,
+    start_url: str,
+    goal: str,
+    upload_file: str = "",
+    auth_profiles: str | None = None,
+    vlm_options: dict | None = None,
+    run_constraints: dict | None = None,
+) -> bool:
+    """Create a registry row for direct ``run_agent`` callers if missing.
+
+    API/queue callers create their parent run before invoking ``run_agent``.
+    This helper only owns records it creates, so it never overwrites queue state.
+    """
+
+    rid = str(run_id or "").strip()
+    if not rid:
+        return False
+    try:
+        try:
+            from . import run_registry as _run_registry
+        except ImportError:
+            import run_registry as _run_registry  # type: ignore[no-redef]
+
+        if _run_registry.load_run(rid) is not None:
+            return False
+        upload = Path(upload_file) if upload_file else None
+        _run_registry.create_run(
+            run_id=rid,
+            target_url=start_url or "",
+            prompt=goal or "",
+            mode="direct",
+            filename=upload.name if upload is not None else "",
+            file_size_kb=round((upload.stat().st_size / 1024), 1)
+            if upload is not None and upload.exists()
+            else 0.0,
+            auth_profiles=auth_profiles or "",
+            vlm_model=str((vlm_options or {}).get("model") or ""),
+            semantic_model=str((vlm_options or {}).get("semantic_model") or ""),
+            vlm_model_type=str((vlm_options or {}).get("model_type") or "vl"),
+            vlm_options=vlm_options or None,
+            constraints=run_constraints or None,
+            status="running",
+        )
+        return True
+    except Exception as exc:
+        logger.debug("[RUN REGISTRY] direct record skipped for %s: %s", rid, exc)
+        return False
+
+
+def _complete_owned_run_registry_record(
+    run_id: str,
+    *,
+    owned: bool,
+    success: bool,
+    stopped: bool = False,
+) -> None:
+    if not owned:
+        return
+    try:
+        try:
+            from . import run_registry as _run_registry
+        except ImportError:
+            import run_registry as _run_registry  # type: ignore[no-redef]
+        _run_registry.complete_run(run_id, success=success, stopped=stopped)
+    except Exception as exc:
+        logger.debug("[RUN REGISTRY] direct record complete skipped for %s: %s", run_id, exc)
 
 
 def _record_run_step(step: int) -> None:
@@ -7005,6 +7075,54 @@ def _apply_runtime_overrides(args) -> None:
             logger.info(f"[VIEWPORT] Runtime override from prompt: {width}x{height}")
 
 
+def _parse_cli_json_object(parser: argparse.ArgumentParser, raw: str, option_name: str) -> dict:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        parser.error(f"{option_name} must be valid JSON: {exc}")
+    if not isinstance(parsed, dict):
+        parser.error(f"{option_name} must be a JSON object")
+    return parsed
+
+
+def _build_cli_run_constraints(parser: argparse.ArgumentParser, args: argparse.Namespace) -> dict | None:
+    constraints = _parse_cli_json_object(
+        parser,
+        getattr(args, "run_constraints_json", ""),
+        "--run-constraints-json",
+    )
+    if bool(getattr(args, "resume", False)):
+        constraints["resume"] = True
+    return constraints or None
+
+
+def _build_cli_vlm_options(args: argparse.Namespace) -> dict | None:
+    options: dict[str, Any] = {}
+    field_map = {
+        "vlm_model": "model",
+        "semantic_model": "semantic_model",
+        "vlm_model_type": "model_type",
+        "vlm_base_url": "base_url",
+        "vlm_api_key": "api_key",
+        "semantic_base_url": "semantic_base_url",
+        "semantic_api_key": "semantic_api_key",
+    }
+    for attr, key in field_map.items():
+        value = getattr(args, attr, "")
+        if isinstance(value, str):
+            value = value.strip()
+        if value not in ("", None):
+            options[key] = value
+    if getattr(args, "vlm_temperature", None) is not None:
+        options["temperature"] = float(args.vlm_temperature)
+    if getattr(args, "vlm_max_tokens", None) is not None:
+        options["max_tokens"] = int(args.vlm_max_tokens)
+    return options or None
+
+
 def _resolve_action_tool_metadata(
     action_registry,
     action_name: str,
@@ -7054,6 +7172,7 @@ async def run_agent(
     vlm_options: dict | None = None,
     run_constraints: dict | None = None,
     prompt_images: list[str] | None = None,
+    run_id: str = "",
 ) -> bool:
     """
     Agent 核心运转循环。
@@ -7066,6 +7185,8 @@ async def run_agent(
         xhr_pattern: 精准截胡 URL 关键词（--xhr-pattern 参数）。
                      非空时开启"混合调度主引擎"：
                      一旦拦截到匹配 URL 的 API 响应，立即保存数据并终止 VLM 循环。
+        run_id:     可选外部 run id。API/批处理传入时会作为 runs/<run_id>/、
+                    HTML log、event stream、manifest 的统一标识。
     """
     from datetime import datetime
 
@@ -7105,8 +7226,14 @@ async def run_agent(
     _prompt_images = list(prompt_images or [])
     _last_prompt_image_url: str | None = None
 
-    # 每次运行生成独立的带时间戳文件名，避免多次运行数据混在一起
-    _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Prefer the caller-provided run_id so API task ids, run contracts, logs,
+    # and artifacts all point at the same runs/<id>/ directory. Standalone CLI
+    # calls still get a timestamp id.
+    _caller_run_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(run_id or "").strip()).strip("_")
+    _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    if _caller_run_id:
+        _run_ts = _caller_run_id
+    _registry_record_owned = False
     # L: open per-run phase event jsonl right after run_ts is known so
     # every broadcast_phase call from this run lands in logs/phase_<ts>.jsonl
     try:
@@ -7167,6 +7294,16 @@ async def run_agent(
     except Exception as _pf_err:
         logger.warning("[PREFLIGHT] skipped: %s", _pf_err)
 
+    _registry_record_owned = _ensure_run_registry_record(
+        run_id=_run_ts,
+        start_url=start_url or "",
+        goal=goal or "",
+        upload_file=upload_file or "",
+        auth_profiles=auth_profiles or "",
+        vlm_options=vlm_options or None,
+        run_constraints=run_constraints or None,
+    )
+
     # OUT-3: materialize runs/<_run_ts>/{input_contract.json,output_contract.json,
     # manifest.json,artifacts/} skeleton up-front so any writer / harvester that
     # fires during this run lands beside a real contract instead of an empty
@@ -7183,10 +7320,15 @@ async def run_agent(
             target_url=start_url or "",
             file_path=upload_file or "",
             auth_profiles=auth_profiles or "",
+            vlm_options=vlm_options or None,
             constraints=run_constraints or None,
             source="cli",
         )
-        _initial_oc = infer_output_contract(goal or "")
+        _initial_requested_fields = _parse_goal_requested_fields(goal or "")
+        _initial_oc = infer_output_contract(
+            goal or "",
+            requested_fields=_initial_requested_fields,
+        )
         write_output_contract(_run_ts, _initial_oc)
         _initial_output_contract = _initial_oc.to_dict()
         logger.info(
@@ -12010,7 +12152,9 @@ async def run_agent(
                             output_contract=_goal_output_contract,
                             output_mode=_goal_output_mode,
                             total_extracted_rows=_total_extracted_rows,
+                            total_pages=len(_extracted_page_keys),
                             goal_target_count=_parse_goal_target_count(goal),
+                            goal_target_pages=_parse_goal_target_pages(goal),
                             pagination_exhausted=_pagination_exhausted,
                             manifest_items=load_manifest_items_for_run(_run_ts),
                             workflow_memory=workflow_memory,
@@ -13076,7 +13220,9 @@ async def run_agent(
                             output_contract=_goal_output_contract,
                             output_mode=_goal_output_mode,
                             total_extracted_rows=_total_extracted_rows,
+                            total_pages=len(_extracted_page_keys),
                             goal_target_count=_goal_target,
+                            goal_target_pages=_parse_goal_target_pages(goal),
                             pagination_exhausted=_pagination_exhausted,
                             manifest_items=load_manifest_items_for_run(_run_ts),
                             workflow_memory=workflow_memory,
@@ -16143,6 +16289,9 @@ async def run_agent(
                         len(browser._context.pages) if browser._context else 0
                     )
                     _pre_url = browser.current_url
+                    _pre_download_path = str(
+                        getattr(browser, "last_download_path", "") or ""
+                    )
                     _pre_click_is_pagination_candidate = False
                     _pre_form_submit_target: dict | None = None
                     _pre_form_submit_validation: dict | None = None
@@ -16881,6 +17030,23 @@ async def run_agent(
                                 _outcome_parts.append(
                                     f"tooltip={_hover_tooltip_text[:120]!r}"
                                 )
+                        _post_download_path = str(
+                            getattr(browser, "last_download_path", "") or ""
+                        )
+                        _new_download_path = (
+                            _post_download_path
+                            if _post_download_path and _post_download_path != _pre_download_path
+                            else ""
+                        )
+                        _outcome_parts.extend(
+                            action_result_evidence_parts(
+                                getattr(browser, "_last_action_result", None),
+                                download_path=_new_download_path,
+                                download_name=str(
+                                    getattr(browser, "last_download_name", "") or ""
+                                ) if _new_download_path else "",
+                            )
+                        )
                         vlm.annotate_last_result("✅ " + " | ".join(_outcome_parts))
 
                         if await _finish_if_xhr_target_reached(f"after action={action}"):
@@ -17530,6 +17696,12 @@ async def run_agent(
                 _clear_current_run()
             except Exception:
                 pass
+        try:
+            from api_server import set_phase_log_run_id as _set_phase_run
+
+            _set_phase_run(None)
+        except Exception:
+            pass
         # RUN-RESUME1 step2b: clear checkpoint on success / persist failed otherwise
         try:
             if _run_ckpt is not None:
@@ -17575,6 +17747,12 @@ async def run_agent(
             success=_run_succeeded,
             reason="completed" if _run_succeeded else "stopped_or_failed",
             metadata=_run_end_metadata,
+        )
+        _complete_owned_run_registry_record(
+            _run_ts,
+            owned=_registry_record_owned,
+            success=_run_succeeded,
+            stopped=bool(stop_event and stop_event.is_set()),
         )
         html_logger.finalize()
         await release_browser(
@@ -17653,9 +17831,68 @@ def main():
         help="Strict constraints and rules for the agent",
     )
     parser.add_argument(
+        "--run-constraints-json",
+        default="",
+        help="Structured run constraints JSON object (for example: '{\"resume\": true, \"max_runs\": 3}')",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Enable opt-in resume behavior via input_contract.constraints.resume",
+    )
+    parser.add_argument(
         "--output",
         default="",
         help="Output requirements for extracted data",
+    )
+    parser.add_argument(
+        "--vlm-model",
+        default="",
+        help="Runtime VLM model override",
+    )
+    parser.add_argument(
+        "--semantic-model",
+        default="",
+        help="Runtime semantic/text model override",
+    )
+    parser.add_argument(
+        "--vlm-model-type",
+        choices=("vl", "text"),
+        default="",
+        help="Runtime VLM model type override",
+    )
+    parser.add_argument(
+        "--vlm-temperature",
+        type=float,
+        default=None,
+        help="Runtime VLM temperature override",
+    )
+    parser.add_argument(
+        "--vlm-max-tokens",
+        type=int,
+        default=None,
+        help="Runtime VLM max_tokens override",
+    )
+    parser.add_argument(
+        "--vlm-base-url",
+        default="",
+        help="Runtime VLM base URL override",
+    )
+    parser.add_argument(
+        "--vlm-api-key",
+        default="",
+        help="Runtime VLM API key override",
+    )
+    parser.add_argument(
+        "--semantic-base-url",
+        default="",
+        help="Runtime semantic/text base URL override",
+    )
+    parser.add_argument(
+        "--semantic-api-key",
+        default="",
+        help="Runtime semantic/text API key override",
     )
     parser.add_argument(
         "--xhr",
@@ -17702,6 +17939,8 @@ def main():
         full_goal += f"\n\n【操作约束与限制】\n{args.constraints}"
     if args.output:
         full_goal += f"\n\n【输出要求】\n{args.output}"
+    run_constraints = _build_cli_run_constraints(parser, args)
+    vlm_options = _build_cli_vlm_options(args)
 
     logger.info("VSpider - Visual Web Agent starting...")
     logger.info(f"Assembled Full Goal:\n{full_goal}")
@@ -17713,6 +17952,9 @@ def main():
             upload_file=args.upload_file,
             xhr_pattern=args.xhr_pattern,
             require_login=args.require_login,
+            auth_profiles=args.auth_profiles,
+            vlm_options=vlm_options,
+            run_constraints=run_constraints,
         )
     )
 

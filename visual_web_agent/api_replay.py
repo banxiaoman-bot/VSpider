@@ -110,7 +110,7 @@ def build_replay_plan(
     }
 
 
-def _write_jsonl_artifact(run_id: str, rows: list[dict[str, Any]]) -> Path:
+def _write_jsonl_artifact(run_id: str, rows: list[dict[str, Any]], *, source_url: str = "") -> Path:
     rid = _safe_run_id(run_id)
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = resolve_artifact_path(f"api_replay_{rid}_{ts}.jsonl", subdir="api_replay")
@@ -118,8 +118,36 @@ def _write_jsonl_artifact(run_id: str, rows: list[dict[str, Any]]) -> Path:
     with path.open("w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-    register_artifact(path)
+    extra: dict[str, Any] = {"row_count": len(rows)}
+    fields = _row_fields(rows)
+    if fields:
+        extra["fields"] = fields
+    try:
+        register_artifact(
+            path,
+            run_id=rid,
+            kind="dataset_records",
+            mime="application/x-ndjson",
+            source_url=source_url,
+            produced_by="api_replay",
+            step_id="network_replay",
+            extra=extra,
+        )
+    except TypeError:
+        register_artifact(path)
     return path
+
+
+def _row_fields(rows: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            text = str(key or "").strip()
+            if text and text not in out:
+                out.append(text)
+    return out
 
 
 def _blocked_replay_result(rid: str, plan: dict[str, Any], method: str, reason: str) -> dict[str, Any]:
@@ -208,7 +236,7 @@ def replay_candidate(
     except Exception:
         parsed = None
     rows = _extract_rows(parsed) if parsed is not None else []
-    artifact_path = _write_jsonl_artifact(rid, rows) if (rows and http_ok) else None
+    artifact_path = _write_jsonl_artifact(rid, rows, source_url=url) if (rows and http_ok) else None
     return {
         "status": "success" if http_ok else "http_error",
         "http_ok": http_ok,

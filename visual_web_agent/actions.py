@@ -34,7 +34,7 @@ try:
     from .vlm_client import VSpiderAction
     from .browser_env import ActionExecutionError
     from .auth_vault import SecretResolutionError, resolve_env_placeholders
-    from .artifact_manager import register_artifact
+    from .artifact_manager import register_download_artifact
     from .page_data_controller import DATA_SIGNATURE_JS, pagination_moved
     from .chat_answer_extractor import clean_chat_answer_text, extract_chat_answer
     from .chat_send_locator import find_send_button as _chat_find_send_button
@@ -42,7 +42,7 @@ except ImportError:
     from vlm_client import VSpiderAction
     from browser_env import ActionExecutionError
     from auth_vault import SecretResolutionError, resolve_env_placeholders
-    from artifact_manager import register_artifact
+    from artifact_manager import register_download_artifact
     from page_data_controller import DATA_SIGNATURE_JS, pagination_moved
     from chat_answer_extractor import clean_chat_answer_text, extract_chat_answer
     from chat_send_locator import find_send_button as _chat_find_send_button
@@ -6082,7 +6082,13 @@ class DownloadImageHandler(ActionHandler):
                     f"\033[36m{filepath.resolve()}\033[0m\n"
                 )
                 logger.info(f"[DOWNLOAD_IMAGE] Saved local: {filepath.resolve()}")
-                register_artifact(filepath)
+                register_download_artifact(
+                    filepath,
+                    source_url=abs_url,
+                    mime=content_type,
+                    produced_by="browser_action",
+                    step_id="download_image",
+                )
             else:
                 logger.warning(
                     f"[DOWNLOAD_IMAGE] No URL found for element #{target_id}"

@@ -29,6 +29,7 @@ import CapabilityTraceList from './components/CapabilityTraceList.vue'
 import CapabilityRuntimePanel from './components/CapabilityRuntimePanel.vue'
 import CapabilityAlignmentCard from './components/CapabilityAlignmentCard.vue'
 import CapabilityEfficiencyPanel from './components/CapabilityEfficiencyPanel.vue'
+import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
 import {
@@ -36,6 +37,7 @@ import {
   ATTACHMENT_HINT,
   appendConstraintsToFormData,
   authProfileOptionLabel,
+  buildAuthoritativeUrlsPayload,
   buildTaskConstraints,
   isBotChallengeReason,
   validateTaskInput,
@@ -84,6 +86,8 @@ const humanInterventionReason = ref('')
 const activeBottomTab = ref('terminal')
 const artifactList = ref([])
 const hasNewArtifacts = ref(false)
+const runHistoryRefreshToken = ref(0)
+const hasNewRuns = ref(false)
 const browserRuntimeStatus = ref(null)
 const browserRuntimeLoading = ref(false)
 
@@ -720,6 +724,10 @@ const connectWebSocket = () => {
         isRunning.value = false
         isHumanInterventionRequired.value = false
         fetchBrowserRuntimeStatus()
+        runHistoryRefreshToken.value += 1
+        if (activeBottomTab.value !== 'runs') {
+          hasNewRuns.value = true
+        }
         const text = payload.message || (payload.success ? '任务执行完成' : '任务执行结束')
         await appendLog(`[DONE] ${text}`)
 
@@ -3074,7 +3082,7 @@ const copyPhaseJson = async () => {
 
 // Tab name lookup for Ctrl+1..6 — kept here so the help dialog can use
 // it as a single source of truth.
-const TAB_ORDER = ['terminal', 'timeline', 'capability', 'final', 'artifacts', 'failed']
+const TAB_ORDER = ['terminal', 'timeline', 'capability', 'final', 'artifacts', 'runs', 'failed']
 
 // Switch active tab + apply the same badge-clearing side effects the
 // el-tabs @tab-change handler does, since direct assignment to the model
@@ -3083,6 +3091,7 @@ const setActiveBottomTab = (name) => {
   if (!TAB_ORDER.includes(name)) return
   activeBottomTab.value = name
   if (name === 'artifacts') hasNewArtifacts.value = false
+  if (name === 'runs') hasNewRuns.value = false
   if (name === 'final') hasNewFinalAnswer.value = false
   if (name === 'timeline') {
     hasNewPhase.value = false
@@ -3365,10 +3374,13 @@ const submitTask = async () => {
   fetchBrowserRuntimeStatus()
 
   const formData = new FormData()
-  formData.append('target_url', url.value.trim())
+  const normalizedTargetUrl = url.value.trim()
+  const normalizedExtraUrls = extraUrls.value.trim()
+  formData.append('target_url', normalizedTargetUrl)
   formData.append('goal', prompt.value.trim())
-  if (extraUrls.value.trim()) {
-    formData.append('urls', extraUrls.value.trim())
+  const authoritativeUrls = buildAuthoritativeUrlsPayload(normalizedTargetUrl, normalizedExtraUrls)
+  if (normalizedExtraUrls || (!normalizedTargetUrl && authoritativeUrls.length)) {
+    formData.append('urls', JSON.stringify(authoritativeUrls))
   }
   const constraints = buildTaskConstraints({
     proxyServer: proxyServer.value,
@@ -3868,6 +3880,7 @@ onUnmounted(() => {
           class="bottom-tabs"
           @tab-change="(name) => {
             if (name === 'artifacts') hasNewArtifacts = false
+            if (name === 'runs') hasNewRuns = false
             if (name === 'final') hasNewFinalAnswer = false
             if (name === 'capability') hasNewCapability = false
             if (name === 'timeline') {
@@ -5276,6 +5289,19 @@ onUnmounted(() => {
           </el-tab-pane>
 
           <!-- K3: Failed runs drawer — post-mortem list with HTML log jump -->
+          <el-tab-pane name="runs">
+            <template #label>
+              <el-badge :is-dot="hasNewRuns" class="artifact-badge">
+                <span>Runs</span>
+              </el-badge>
+            </template>
+            <RunRegistryPanel
+              :refresh-token="runHistoryRefreshToken"
+              @loaded="() => { if (activeBottomTab === 'runs') hasNewRuns = false }"
+              @open-detail="hasNewRuns = false"
+            />
+          </el-tab-pane>
+
           <el-tab-pane name="failed">
             <template #label>
               <el-badge :is-dot="hasNewFailures" class="artifact-badge">

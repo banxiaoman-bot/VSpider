@@ -221,8 +221,10 @@ COMPLETION_PROMPT = """
 - 每轮先看历史和当前子目标，避免把已经完成的步骤重做。
 - 如果页面已经是结果页、成功页、确认页或目标状态，直接 done 或 subgoal_status=completed。
 - 连续两轮页面无变化时，不要重复同一动作；换元素、等待、滚动、关闭遮挡或 ask_human。
-- 任务要求保存、下载、导出时，底层会把 extract/download 产物登记到 artifacts；不要为了“落盘”
-  反复提取同一批数据。
+- 任务要求保存、下载、导出时，目标不是口头说明“已保存”，而是让产物进入当前 run 的
+  `runs/<run_id>/manifest.json` / `artifacts/`。底层会把 extract/download/原生文件下载登记为 artifact。
+- done 前必须能从历史或动作结果看到 artifact 路径、download_completed、manifest 记录或等价完成信号；
+  如果刚点完导出但还没有完成信号，先 wait 一轮。不要编造文件名，也不要为了“落盘”反复提取同一批数据。
 
 🛡️【验收优先纪律（Verify-Before-Act）— 所有任务通用】
 在输出任何 action 之前，必须先完成"状态验收"三问：
@@ -260,6 +262,8 @@ EXTRACT_SKILL = """
 8. 跨页/懒加载：当前页提取后优先 next_page；没有分页控件时再 smooth_scroll/scroll 加载新数据。
    若没有新数据或已到末尾，用 done 收束，不要无限翻页。
 9. 若页面有原生“导出/下载 Excel/CSV/PDF”按钮且符合目标，优先点击导出或下载。
+10. 对结构化或大批量数据，优先相信原生导出、网络/API 拦截、api_replay 或结构化 extractor 的产物；
+    只有这些不可用时，才用 VLM 逐行读屏作为兜底。
 """.strip()
 
 
@@ -269,8 +273,9 @@ BULK_EXTRACT_SKILL = """
 
 大批量提取时按以下优先级行动：
 1. 原生导出优先：先找“导出 Excel / 下载 CSV / Export / Download / 报表导出”等按钮。
-   如果按钮存在且符合目标，点击它；等待下载完成后 done。不要再逐页视觉提取。
+   如果按钮存在且符合目标，点击它；等待下载完成或 artifact/manifest 证据出现后 done。不要再逐页视觉提取。
 2. 网络/API 数据优先于视觉读屏：如果翻页会触发接口数据，正常点击分页即可，底层会尝试登记下载或拦截数据。
+   当历史显示 API/dataset artifact 已写入 manifest，或已到达目标数量/末页，即可 done。
 3. 当前 URL 锁定：除非用户明确要求切换分类、栏目或另一个页面，批量提取期间不要点击站点导航、文档目录、
    示例列表、顶部/左侧/底部菜单。若当前页面处于 loading 或表格尚未渲染，先 wait；若数据在下方，滚动主体区。
    不要因为一眼没看到表格就跳到其它示例页或全局导航页。
@@ -889,8 +894,11 @@ SEMANTIC_MAPPING_SKILL = """
 
 DOWNLOAD_SKILL = """
 ## Skill: Artifacts / Downloads
-- extract 成功后，系统会自动合并并保存结构化数据。
-- 点击下载、导出、download_image 或文件下载事件后，后端会登记 artifact。
+- extract 成功后，系统会自动合并结构化数据，并登记到当前 run 的 manifest/artifacts。
+- 点击下载、导出、download_image 或文件下载事件后，后端会登记 artifact，并写入
+  `runs/<run_id>/manifest.json` / `artifacts/`。
+- done 前确认动作结果或历史里有 artifact path、download_completed、manifest item 或等价输出证据。
+- 不要把聊天里的文件名、截图文字或口头总结当成已交付文件；没有证据时 wait 或继续触发正确下载/导出动作。
 - 不要为了文件列表面板可见而重复下载同一文件。
 """.strip()
 

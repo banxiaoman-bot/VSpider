@@ -6,6 +6,9 @@ import re
 from typing import Any
 
 
+_PAGE_COUNT_RE = re.compile(r"(?:\bfirst\s+|\btop\s+|\u524d\s*)?(\d+)\s*(?:\u9875|pages?)", re.I)
+
+
 _ROW_COUNT_RE = re.compile(r"(\d+)\s*条")
 _URL_HINT_RE = re.compile(
     r"(?:url|网址|链接).{0,20}(?:含|包含|匹配|match|含\s*[`'\"]?)([^`'\"；。\n]+)",
@@ -27,6 +30,8 @@ def parse_exit_criteria(text: str, *, description: str = "") -> list[dict[str, A
 
     for match in _ROW_COUNT_RE.finditer(blob):
         criteria.append({"type": "row_count", "target": int(match.group(1))})
+    for match in _PAGE_COUNT_RE.finditer(blob):
+        criteria.append({"type": "page_count", "target": int(match.group(1))})
 
     url_match = _URL_HINT_RE.search(blob)
     if url_match:
@@ -87,6 +92,7 @@ def evaluate_exit_criteria(
     criteria: list[dict[str, Any]] | None,
     *,
     total_extracted_rows: int = 0,
+    total_pages: int = 0,
     current_url: str = "",
     workflow_memory: dict[str, Any] | None = None,
     last_action: str = "",
@@ -108,6 +114,10 @@ def evaluate_exit_criteria(
             target = int(item.get("target") or 0)
             passed = total_extracted_rows >= target > 0
             detail = f"rows={total_extracted_rows} target={target}"
+        elif kind == "page_count":
+            target = int(item.get("target") or 0)
+            passed = total_pages >= target > 0
+            detail = f"pages={total_pages} target={target}"
         elif kind == "url_contains":
             needle = str(item.get("value") or "").strip().lower()
             passed = bool(needle) and needle in str(current_url or "").lower()

@@ -34,7 +34,7 @@ from playwright_stealth import Stealth
 try:
     from . import config
     from .auth_manager import apply_storage_state_to_context, load_auth_profiles
-    from .artifact_manager import artifact_root, register_artifact
+    from .artifact_manager import artifact_root, register_download_artifact
     from .action_result import ActionResult
     from .browser_profile import resolve_user_data_dir
     from .data_manager import save_intercepted_data
@@ -43,7 +43,7 @@ try:
 except ImportError:
     import config
     from auth_manager import apply_storage_state_to_context, load_auth_profiles
-    from artifact_manager import artifact_root, register_artifact
+    from artifact_manager import artifact_root, register_download_artifact
     from action_result import ActionResult
     from browser_profile import resolve_user_data_dir
     from data_manager import save_intercepted_data
@@ -4140,7 +4140,12 @@ Object.defineProperty(navigator, 'languages', {
             
             print(f"\n✅ [底层拦截] 成功拦截文件下载并静默保存至: \033[36m{final_path.resolve()}\033[0m\n")
             logger.info(f"[DOWNLOAD INTERCEPT] Saved native file: {final_path.resolve()}")
-            register_artifact(final_path)
+            register_download_artifact(
+                final_path,
+                source_url=str(getattr(download, "url", "") or ""),
+                produced_by="browser_download",
+                step_id="native_download",
+            )
         except Exception as e:
             logger.error(f"[DOWNLOAD INTERCEPT] Failed to save file: {e}")
 

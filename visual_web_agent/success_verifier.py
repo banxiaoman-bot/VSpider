@@ -4,6 +4,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from visual_web_agent.io_contract.output_contract import (
+    normalize_output_fields,
+    output_contract_fields,
+)
 from visual_web_agent.task_templates import TaskTemplate
 
 
@@ -125,7 +129,14 @@ def _check_template(
     if family is not None and capability and capability not in family:
         return None
     if template.task_type == "api_replay":
-        return {"name": "template_api", "passed": bool(result.get("response") or result.get("data") or result.get("items")), "detail": "api replay returned data" if bool(result.get("response") or result.get("data") or result.get("items")) else "api replay returned no data"}
+        ok = bool(
+            result.get("response")
+            or result.get("data")
+            or result.get("items")
+            or result.get("rows")
+            or _observed_count("api_replay", result) > 0
+        )
+        return {"name": "template_api", "passed": ok, "detail": "api replay returned data" if ok else "api replay returned no data"}
     if template.task_type == "login_then_action":
         ok = bool(result.get("authenticated") or result.get("login_ok") or result.get("action_result"))
         return {"name": "template_login", "passed": ok, "detail": "login/action succeeded" if ok else "login/action not confirmed"}
@@ -158,20 +169,25 @@ def _target_count(route: dict[str, Any], payload: dict[str, Any]) -> int | None:
 
 def _required_fields(route: dict[str, Any], payload: dict[str, Any]) -> list[str]:
     values: list[Any] = []
-    if payload.get("required_fields") is not None:
-        values = _as_list(payload.get("required_fields"))
-    elif isinstance(payload.get("item_pipeline"), dict) and payload["item_pipeline"].get("required_fields") is not None:
-        values = _as_list(payload["item_pipeline"].get("required_fields"))
-    elif payload.get("requested_fields") is not None:
-        values = _as_list(payload.get("requested_fields"))
-    else:
-        values = _as_list((route.get("strategy_context") or {}).get("requested_fields"))
-    out: list[str] = []
-    for item in values:
-        text = str(item or "").strip()
-        if text and text not in out:
-            out.append(text)
-    return out
+    values.extend(_as_list(payload.get("required_fields")))
+    values.extend(_as_list(payload.get("requested_fields")))
+    if isinstance(payload.get("item_pipeline"), dict):
+        values.extend(output_contract_fields(payload["item_pipeline"]))
+
+    if isinstance(payload.get("output_contract"), dict):
+        values.extend(output_contract_fields(payload["output_contract"]))
+
+    route_contract = route.get("output_contract")
+    if isinstance(route_contract, dict):
+        values.extend(output_contract_fields(route_contract))
+
+    strategy = route.get("strategy_context") if isinstance(route.get("strategy_context"), dict) else {}
+    strategy_contract = strategy.get("output_contract") if isinstance(strategy.get("output_contract"), dict) else None
+    values.extend(output_contract_fields(strategy_contract))
+    values.extend(_as_list(strategy.get("requested_fields")))
+    values.extend(_as_list(strategy.get("required_fields")))
+
+    return normalize_output_fields(values)
 
 
 def _observed_count(capability: str, result: dict[str, Any]) -> int:

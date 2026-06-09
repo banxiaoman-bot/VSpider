@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ._base import (
+    dataset_extra,
     default_filename,
     finalize_file_artifact,
     run_artifacts_dir,
@@ -71,6 +72,7 @@ def write_markdown(
     extra: dict[str, Any] | None = None,
     base_dir: str | Path | None = None,
 ) -> dict[str, Any]:
+    rows: list[dict[str, Any]] | None = None
     if isinstance(data, str):
         body_text = data
     else:
@@ -87,15 +89,16 @@ def write_markdown(
     )
     target = artifacts / filename
     target.write_bytes(body)
+    kind = output_kind or "dataset_rows"
 
     return finalize_file_artifact(
         run_id=run_id,
         path=target,
-        kind=output_kind or "dataset_rows",
+        kind=kind,
         mime="text/markdown",
         produced_by=produced_by,
         step_id=step_id,
         source_url=source_url,
-        extra=extra,
+        extra=dataset_extra(extra, output_kind=kind, rows=rows),
         base_dir=base_dir,
     )

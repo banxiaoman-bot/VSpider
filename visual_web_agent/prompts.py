@@ -232,14 +232,14 @@ If the current page is already the main/dashboard/business page, execute the use
 
 ### 优先级 1：寻找"原生导出"（最优解）
 - **判断**：扫描页面，是否存在"导出"、"下载"、"导出Excel"、"Export"、"Download"等相关按钮？
-- **动作**：如果存在，请**绝对优先**执行 `click` 点击该按钮！点击后执行 `done`。底层代码会自动接管文件下载并保存到本地。
+- **动作**：如果存在，请**绝对优先**执行 `click` 点击该按钮！点击后等待下载完成、artifact 路径或 manifest 记录等完成信号，再执行 `done`。底层代码会自动接管文件下载并保存到本地。
 - **thought 示例**：`"页面右上角序号12是'导出Excel'按钮，优先使用原生导出。"`
 
 ### 优先级 2：寻找"翻页"（XHR 拦截流）
 - **判断**：如果没有导出按钮，或者导出按钮不可用，请观察页面底部是否有"下一页"、">"、"Next"、"加载更多"等分页组件？
 - **动作**：如果存在分页，请执行 `click` 点击下一页按钮。**绝对不要**使用 `extract` 动作去逐行读取表格里的文本！你只负责一直点"下一页"，直到按钮置灰/消失/到达末页，最后执行 `done`。底层网络拦截器会自动把每一页的 API 返回数据存入 Excel。
 - **thought 示例**：`"当前第3页/共10页，没有导出按钮，点击下一页让底层拦截数据。"`
-- **结束条件**：当"下一页"按钮置灰不可点击、或页面显示"已是最后一页"、或已到达末页时，执行 `done` 结束任务。
+- **结束条件**：当"下一页"按钮置灰不可点击、页面显示"已是最后一页"、已到达末页，或历史中出现 API/dataset artifact 写入 manifest 的证据时，执行 `done` 结束任务。
 
 ### 优先级 3：视觉"逐行提取"（兜底解）
 - **判断**：如果既没有"导出"按钮，也没有"翻页"（通常说明这只是一页极少量的数据，比如个位数行，或者是单条详情页）。
@@ -1196,13 +1196,18 @@ def build_user_message(
         parts.append(
             "## Output intent\n"
             "The user is asking for structured data or a saved artifact. Use extract/download/export "
-            "when the target rows or file are visible, and keep rows aligned to the requested fields.\n"
+            "when the target rows or file are visible, and keep rows aligned to the requested fields. "
+            "Prefer native export, network/API replay, or a structured extractor over visual row reading "
+            "when available. Finish with action=done only after the action/history shows an artifact path, "
+            "download_completed, manifest item, or equivalent output evidence for this run; do not invent "
+            "filenames or treat a textual summary as the saved artifact.\n"
         )
     elif _output_mode == "mixed":
         parts.append(
             "## Output intent\n"
             "The user wants both an answer and a saved/structured result. Capture the requested facts "
-            "cleanly and avoid unrelated page lists or search-result noise.\n"
+            "cleanly and avoid unrelated page lists or search-result noise. If a saved result is required, "
+            "finish only after artifact/download/manifest evidence exists for this run.\n"
         )
     # ── 历史骑脸前置：把"已完成的操作 + 结果"紧贴在终极目标下方 ─────────────
     # 旧位置（AX Tree 之后）被长文本稀释，VLM 容易忽略；

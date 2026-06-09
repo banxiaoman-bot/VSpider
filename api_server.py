@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Coroutine
 from urllib.parse import urlparse
@@ -397,6 +398,73 @@ def _retry_vlm_options_from_run(run: dict[str, Any]) -> dict[str, Any]:
     return options
 
 
+def _drop_redacted_secret_values(mapping: Any) -> dict[str, Any]:
+    restored: dict[str, Any] = {}
+    for key, value in dict(mapping or {}).items():
+        lowered = str(key).lower()
+        is_secret = any(part in lowered for part in ("api_key", "password", "secret", "token"))
+        if is_secret and str(value) == "***":
+            continue
+        restored[str(key)] = value
+    return restored
+
+
+def _retry_input_contract(run_id: str) -> dict[str, Any]:
+    try:
+        bundle = _load_run_contract_bundle(run_id)
+    except Exception:
+        return {}
+    contract = bundle.get("input_contract") if isinstance(bundle, dict) else None
+    return contract if isinstance(contract, dict) else {}
+
+
+def _input_contract_urls(contract: dict[str, Any]) -> list[str]:
+    urls = contract.get("urls") if isinstance(contract, dict) else []
+    out: list[str] = []
+    for item in urls or []:
+        if isinstance(item, dict):
+            value = str(item.get("url") or "").strip()
+        else:
+            value = str(item or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _url_identity(value: str) -> str:
+    return str(value or "").strip().lower().rstrip("/")
+
+
+def _input_contract_extra_urls(contract_urls: list[str], target_url: str) -> list[str]:
+    target_key = _url_identity(target_url)
+    out: list[str] = []
+    for url in contract_urls:
+        if not url:
+            continue
+        if target_key and _url_identity(url) == target_key:
+            continue
+        if url not in out:
+            out.append(url)
+    return out
+
+
+def _input_contract_auth_profiles(contract: dict[str, Any]) -> str:
+    profiles = contract.get("auth_profiles") if isinstance(contract, dict) else []
+    if isinstance(profiles, str):
+        return profiles.strip()
+    if isinstance(profiles, list):
+        return ",".join(str(p).strip() for p in profiles if str(p).strip())
+    return ""
+
+
+def _input_contract_primary_attachment(contract: dict[str, Any]) -> dict[str, Any]:
+    attachments = contract.get("attachments") if isinstance(contract, dict) else []
+    for item in attachments or []:
+        if isinstance(item, dict) and (item.get("path") or item.get("filename")):
+            return item
+    return {}
+
+
 def _public_task_item(task: dict[str, Any], *, position: int | None = None) -> dict[str, Any]:
     item = {
         "task_id": task.get("task_id"),
@@ -685,6 +753,10 @@ def _enqueue_task(
             semantic_model=semantic_model,
             vlm_model_type=vlm_model_type,
             vlm_options=vlm_options,
+            urls=list(urls or []),
+            constraints=dict(constraints or {}),
+            upload_sha256=upload_sha256,
+            upload_mime=upload_mime,
             status="queued",
         )
     except Exception as exc:
@@ -786,34 +858,67 @@ def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:
     source_status = str(run.get("status") or "").lower()
     if source_status not in _RETRYABLE_RUN_STATUS:
         return False, f"run status is not retryable: {source_status or 'unknown'}", {"source": run}
-    target_url = str(run.get("target_url") or "").strip()
-    prompt = str(run.get("prompt") or "").strip()
+    input_contract = _retry_input_contract(rid)
+    contract_urls = _input_contract_urls(input_contract)
+    target_url = str(run.get("target_url") or "").strip() or (contract_urls[0] if contract_urls else "")
+    prompt = str(run.get("prompt") or "").strip() or str(input_contract.get("goal") or "").strip()
     if not target_url or not prompt:
         return False, "run is missing target_url or prompt", {"source": run}
 
-    mode = str(run.get("mode") or "single")
-    filename = str(run.get("filename") or "")
+    contract_attachment = _input_contract_primary_attachment(input_contract)
+    attachment_path = str(contract_attachment.get("path") or "").strip()
+    mode = str(run.get("mode") or ("batch" if contract_attachment else "single"))
+    filename = (
+        str(run.get("filename") or "").strip()
+        or str(contract_attachment.get("filename") or "").strip()
+        or (Path(attachment_path).name if attachment_path else "")
+    )
+    file_size_kb = float(run.get("file_size_kb") or 0.0)
+    if not file_size_kb and contract_attachment.get("size"):
+        try:
+            file_size_kb = float(contract_attachment.get("size") or 0.0) / 1024.0
+        except Exception:
+            file_size_kb = 0.0
+    upload_sha256 = str(run.get("upload_sha256") or contract_attachment.get("sha256") or "")
+    upload_mime = str(run.get("upload_mime") or contract_attachment.get("mime") or "")
     file_path = ""
-    if mode == "batch" and filename:
-        candidate = TEMP_UPLOAD_DIR / filename
-        if candidate.exists() and candidate.is_file():
-            file_path = str(candidate)
-        else:
+    if mode == "batch" and (filename or attachment_path):
+        candidates: list[Path] = []
+        if filename:
+            candidates.append(TEMP_UPLOAD_DIR / filename)
+        if attachment_path:
+            candidates.append(Path(attachment_path))
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                file_path = str(candidate)
+                break
+        if not file_path:
             return False, "batch retry file is missing", {"source": run}
+
+    retry_urls = [str(u) for u in (run.get("urls") or []) if str(u or "")]
+    if not retry_urls:
+        retry_urls = _input_contract_extra_urls(contract_urls, target_url)
+    retry_constraints = _drop_redacted_secret_values(run.get("constraints"))
+    if not retry_constraints:
+        retry_constraints = _drop_redacted_secret_values(input_contract.get("constraints"))
 
     item, should_start_worker = _enqueue_task(
         target_url=target_url,
         prompt=prompt,
         file_path=file_path,
-        auth_profiles=str(run.get("auth_profiles") or ""),
+        auth_profiles=str(run.get("auth_profiles") or "").strip() or _input_contract_auth_profiles(input_contract),
         vlm_model=str(run.get("vlm_model") or ""),
         semantic_model=str(run.get("semantic_model") or ""),
         vlm_text_only=str(run.get("vlm_model_type") or "").lower() == "text",
         mode=mode,
         filename=filename,
-        file_size_kb=float(run.get("file_size_kb") or 0.0),
+        file_size_kb=file_size_kb,
         vlm_model_type=str(run.get("vlm_model_type") or "vl"),
         vlm_options=_retry_vlm_options_from_run(run),
+        urls=retry_urls,
+        constraints=retry_constraints,
+        upload_sha256=upload_sha256,
+        upload_mime=upload_mime,
     )
     try:
         _run_registry.update_run(
@@ -868,11 +973,11 @@ def recover_queued_tasks() -> dict[str, Any]:
             "filename": str(item.get("filename") or ""),
             "file_size_kb": float(item.get("file_size_kb") or 0.0),
             "vlm_model_type": str(item.get("vlm_model_type") or "vl"),
-            "vlm_options": {
-                k: v
-                for k, v in dict(item.get("vlm_options") or {}).items()
-                if not ("api_key" in str(k).lower() and str(v) == "***")
-            },
+            "vlm_options": _drop_redacted_secret_values(item.get("vlm_options")),
+            "urls": [str(u) for u in (item.get("urls") or []) if str(u or "")],
+            "upload_sha256": str(item.get("upload_sha256") or ""),
+            "upload_mime": str(item.get("upload_mime") or ""),
+            "constraints": _drop_redacted_secret_values(item.get("constraints")),
             "status": "queued",
             "running": False,
             "created_at": item.get("created_at") or time.time(),
@@ -1103,6 +1208,10 @@ def broadcast_status(status: str, **payload: Any) -> None:
 # build accurate per-step duration histograms).
 _PHASE_LOG_LOCK = threading.Lock()
 _PHASE_LOG_PATH: Path | None = None
+_PHASE_LOG_CONTEXT: ContextVar[Path | None] = ContextVar(
+    "vspider_phase_log_path",
+    default=None,
+)
 
 
 def set_phase_log_run_id(run_id: str | None) -> None:
@@ -1118,24 +1227,28 @@ def set_phase_log_run_id(run_id: str | None) -> None:
     with _PHASE_LOG_LOCK:
         if not run_id:
             _PHASE_LOG_PATH = None
+            _PHASE_LOG_CONTEXT.set(None)
             return
         try:
             log_dir = Path("logs")
             log_dir.mkdir(parents=True, exist_ok=True)
-            _PHASE_LOG_PATH = log_dir / f"phase_{run_id}.jsonl"
-            if not _PHASE_LOG_PATH.exists():
-                _PHASE_LOG_PATH.touch()
+            path = log_dir / f"phase_{run_id}.jsonl"
+            _PHASE_LOG_PATH = path
+            _PHASE_LOG_CONTEXT.set(path)
+            if not path.exists():
+                path.touch()
         except Exception as e:
             logging.getLogger("api_server").warning(
                 "set_phase_log_run_id failed: %s", e,
             )
             _PHASE_LOG_PATH = None
+            _PHASE_LOG_CONTEXT.set(None)
 
 
 def _persist_phase_event(payload: dict[str, Any]) -> None:
     """Append one phase event to the active jsonl. Best-effort; failures
     must NOT break the live broadcast path."""
-    path = _PHASE_LOG_PATH
+    path = _PHASE_LOG_CONTEXT.get() or _PHASE_LOG_PATH
     if path is None:
         return
     try:
@@ -1814,8 +1927,64 @@ def _write_capability_execute_artifact(payload: dict[str, Any], result: dict[str
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    register_artifact(path)
+    _register_capability_execute_trace_artifact(path, payload)
     return {"path": str(path), "url": artifact_url(path)}
+
+
+def _capability_payload_text(payload: Any, keys: tuple[str, ...], *, _depth: int = 0) -> str:
+    if _depth > 6:
+        return ""
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+        for value in payload.values():
+            found = _capability_payload_text(value, keys, _depth=_depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _capability_payload_text(value, keys, _depth=_depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def _register_capability_report_artifact(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    produced_by: str,
+    step_id: str,
+) -> None:
+    raw_run_id = _capability_payload_text(payload, ("run_id", "trace_id"))
+    run_manifest_id = re.sub(r"[^0-9A-Za-z_-]+", "_", raw_run_id).strip("_")
+    if not run_manifest_id:
+        register_artifact(path)
+        return
+    source_url = _capability_payload_text(payload, ("url", "target_url", "start_url"))
+    try:
+        register_artifact(
+            path,
+            run_id=run_manifest_id,
+            kind="log",
+            mime="application/json",
+            source_url=source_url,
+            produced_by=produced_by,
+            step_id=step_id,
+        )
+    except TypeError:
+        register_artifact(path)
+
+
+def _register_capability_execute_trace_artifact(path: Path, payload: dict[str, Any]) -> None:
+    _register_capability_report_artifact(
+        path,
+        payload,
+        produced_by="capability_execute",
+        step_id="trace_artifact",
+    )
 
 
 def _capability_failure_fixture_source(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1858,7 +2027,12 @@ def _write_efficiency_feedback_replay_artifact(report: dict[str, Any], payload: 
     path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/efficiency_feedback_replays")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    register_artifact(path)
+    _register_capability_report_artifact(
+        path,
+        payload,
+        produced_by="efficiency_feedback_replay",
+        step_id="replay_report",
+    )
     return {"path": str(path), "url": artifact_url(path)}
 
 
@@ -1869,7 +2043,12 @@ def _write_efficiency_feedback_replay_batch_artifact(report: dict[str, Any], pay
     path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/efficiency_feedback_replay_batches")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    register_artifact(path)
+    _register_capability_report_artifact(
+        path,
+        payload,
+        produced_by="efficiency_feedback_replay",
+        step_id="replay_batch_report",
+    )
     return {"path": str(path), "url": artifact_url(path)}
 
 
@@ -2002,7 +2181,12 @@ def _write_capability_failure_fixture_artifact(fixture: dict[str, Any], payload:
     path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/failure_fixtures")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(fixture, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    register_artifact(path)
+    _register_capability_report_artifact(
+        path,
+        payload,
+        produced_by="capability_failure_fixture",
+        step_id="failure_fixture",
+    )
     return {"path": str(path), "url": artifact_url(path)}
 
 
@@ -2014,7 +2198,12 @@ def _write_capability_failure_fixture_replay_artifact(report: dict[str, Any], pa
     path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/failure_fixture_replays")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    register_artifact(path)
+    _register_capability_report_artifact(
+        path,
+        payload,
+        produced_by="capability_failure_fixture_replay",
+        step_id="replay_report",
+    )
     return {"path": str(path), "url": artifact_url(path)}
 
 
@@ -2025,7 +2214,12 @@ def _write_capability_failure_fixture_replay_batch_artifact(report: dict[str, An
     path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/failure_fixture_replay_batches")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    register_artifact(path)
+    _register_capability_report_artifact(
+        path,
+        payload,
+        produced_by="capability_failure_fixture_replay",
+        step_id="replay_batch_report",
+    )
     return {"path": str(path), "url": artifact_url(path)}
 
 
@@ -2653,7 +2847,10 @@ async def get_robots_policy(domain: str) -> dict:
 @app.post("/api/spider/run", summary="运行轻量 Spider 爬取（Y24）")
 async def run_spider_lite(payload: dict[str, Any] = Body(...)) -> dict:
     try:
-        result = _spider_lite.run(payload)
+        run_payload = dict(payload or {})
+        run_payload.setdefault("persist_run_contracts", True)
+        run_payload.setdefault("source", "api")
+        result = _spider_lite.run(run_payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -2864,8 +3061,8 @@ async def start_batch(
     semantic_api_key: str = Form("", description="Runtime semantic/text API key override"),
     urls: str = Form(
         "",
-        description="Optional extra start URLs (JSON array, or comma/newline separated). "
-                    "target_url is always the first entry.",
+        description="Optional authoritative start URLs (JSON array, or comma/newline separated). "
+                    "When supplied, urls overrides target_url.",
     ),
     file: UploadFile | None = File(
         None,
@@ -2918,7 +3115,36 @@ async def start_batch(
 
     inferred_from_prompt = False
     auto_entry_source = ""
-    if not (target_url or "").strip():
+    urls_raw = urls if isinstance(urls, str) else ""
+    explicit_urls: list[str] = []
+    explicit_url_errors: list[str] = []
+    if urls_raw.strip():
+        try:
+            from visual_web_agent.io_contract import parse_urls_field as _parse_urls_field
+        except Exception:
+            _parse_urls_field = None  # type: ignore[assignment]
+        if _parse_urls_field is None:
+            explicit_url_errors.append("urls parser unavailable")
+        else:
+            for spec in _parse_urls_field(urls_raw):
+                norm, err = _normalize_target_url(spec.url)
+                if err:
+                    explicit_url_errors.append(f"{spec.url}: {err}")
+                    continue
+                if norm and norm not in explicit_urls:
+                    explicit_urls.append(norm)
+        if not explicit_urls and not explicit_url_errors:
+            explicit_url_errors.append("no valid URLs supplied")
+        if explicit_url_errors:
+            return {
+                "status": "error",
+                "message": "Invalid urls: " + "; ".join(explicit_url_errors),
+            }
+
+    if explicit_urls:
+        target_url = explicit_urls[0]
+
+    if not explicit_urls and not (target_url or "").strip():
         harvested = _harvest_urls_from_text(merged_prompt)
         if harvested:
             target_url = harvested[0]
@@ -2973,33 +3199,13 @@ async def start_batch(
         }
     target_url = normalized_target_url
 
-    extra_urls: list[str] = []
-    extra_url_errors: list[str] = []
-    urls_raw = urls if isinstance(urls, str) else ""
-    if not urls_raw.strip() and inferred_from_prompt:
+    extra_urls: list[str] = list(explicit_urls[1:]) if explicit_urls else []
+    if not explicit_urls and inferred_from_prompt:
         prompt_urls = _harvest_urls_from_text(merged_prompt)
         for candidate in prompt_urls[1:]:
             norm, err = _normalize_target_url(candidate)
             if not err and norm and norm != target_url and norm not in extra_urls:
                 extra_urls.append(norm)
-    if urls_raw.strip():
-        try:
-            from visual_web_agent.io_contract import parse_urls_field as _parse_urls_field
-        except Exception:
-            _parse_urls_field = None  # type: ignore[assignment]
-        if _parse_urls_field is not None:
-            for spec in _parse_urls_field(urls_raw):
-                norm, err = _normalize_target_url(spec.url)
-                if err:
-                    extra_url_errors.append(f"{spec.url}: {err}")
-                    continue
-                if norm and norm != target_url and norm not in extra_urls:
-                    extra_urls.append(norm)
-    if extra_url_errors:
-        return {
-            "status": "error",
-            "message": "Invalid urls: " + "; ".join(extra_url_errors),
-        }
 
     vlm_options: dict[str, Any] = {
         "model": vlm_model.strip(),
@@ -3366,6 +3572,103 @@ async def replay_run_network_candidate(
     return result
 
 
+def _read_json_file_if_present(path: Path) -> dict[str, Any] | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_run_contract_bundle(run_id: str) -> dict[str, Any]:
+    """Read run-scoped contracts without creating missing run directories."""
+
+    try:
+        rid = _run_registry._safe_run_id(run_id)  # type: ignore[attr-defined]
+    except Exception:
+        return {
+            "input_contract": None,
+            "output_contract": None,
+            "manifest": None,
+            "summary": {
+                "has_input_contract": False,
+                "has_output_contract": False,
+                "has_manifest": False,
+                "manifest_items": 0,
+                "child_runs": 0,
+            },
+            "paths": {},
+        }
+
+    try:
+        from visual_web_agent.io_contract import persistence as _io_persistence
+
+        runs_root = _io_persistence.default_runs_root()
+        run_path = runs_root / rid
+        read_paths = {
+            "input_contract": run_path / _io_persistence.INPUT_CONTRACT_FILENAME,
+            "output_contract": run_path / _io_persistence.OUTPUT_CONTRACT_FILENAME,
+            "manifest": run_path / _io_persistence.MANIFEST_FILENAME,
+            "artifacts_dir": run_path / _io_persistence.ARTIFACTS_DIRNAME,
+        }
+        paths = {
+            "input_contract": f"runs/{rid}/{_io_persistence.INPUT_CONTRACT_FILENAME}",
+            "output_contract": f"runs/{rid}/{_io_persistence.OUTPUT_CONTRACT_FILENAME}",
+            "manifest": f"runs/{rid}/{_io_persistence.MANIFEST_FILENAME}",
+            "artifacts_dir": f"runs/{rid}/{_io_persistence.ARTIFACTS_DIRNAME}",
+        }
+    except Exception:
+        return {
+            "input_contract": None,
+            "output_contract": None,
+            "manifest": None,
+            "summary": {
+                "has_input_contract": False,
+                "has_output_contract": False,
+                "has_manifest": False,
+                "manifest_items": 0,
+                "child_runs": 0,
+            },
+            "paths": {},
+        }
+
+    input_contract = _read_json_file_if_present(read_paths["input_contract"])
+    output_contract = _read_json_file_if_present(read_paths["output_contract"])
+    manifest = _read_json_file_if_present(read_paths["manifest"])
+
+    items = manifest.get("items") if isinstance(manifest, dict) else []
+    item_list = [item for item in (items or []) if isinstance(item, dict)] if isinstance(items, list) else []
+    child_runs = [
+        item for item in item_list
+        if isinstance(item.get("extra"), dict)
+        and item.get("extra", {}).get("entry_type") == "child_run"
+    ]
+    artifacts_dir = read_paths["artifacts_dir"]
+    artifact_count = 0
+    if artifacts_dir.exists() and artifacts_dir.is_dir():
+        try:
+            artifact_count = sum(1 for p in artifacts_dir.rglob("*") if p.is_file())
+        except Exception:
+            artifact_count = 0
+
+    return {
+        "input_contract": input_contract,
+        "output_contract": output_contract,
+        "manifest": manifest,
+        "summary": {
+            "has_input_contract": input_contract is not None,
+            "has_output_contract": output_contract is not None,
+            "has_manifest": manifest is not None,
+            "manifest_items": len(item_list),
+            "child_runs": len(child_runs),
+            "artifacts": artifact_count,
+        },
+        "paths": paths,
+    }
+
+
 @app.get("/api/runs/{run_id}", summary="读取单个任务运行记录")
 async def get_run(run_id: str) -> dict:
     rec = _run_registry.load_run(run_id)
@@ -3374,6 +3677,7 @@ async def get_run(run_id: str) -> dict:
     return {
         "status": "success",
         "run": rec,
+        "contracts": _load_run_contract_bundle(run_id),
     }
 
 

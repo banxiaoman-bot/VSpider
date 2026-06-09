@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 import shutil
 from pathlib import Path
 from urllib.parse import quote
@@ -151,6 +152,7 @@ def register_artifact(
     source_url: str = "",
     produced_by: str = "",
     step_id: str = "",
+    extra: dict | None = None,
 ) -> None:
     """Broadcast a freshly produced artifact + (optionally) record it in the
     per-run ``manifest.json``.
@@ -213,6 +215,7 @@ def register_artifact(
                     source_url=source_url,
                     produced_by=produced_by or "register_artifact",
                     step_id=step_id,
+                    extra=extra or {},
                     base_dir=base_dir,
                 )
             except Exception:
@@ -220,3 +223,50 @@ def register_artifact(
     except Exception:
         pass
 
+
+def artifact_kind_for_path(path: str | Path, *, mime: str = "") -> str:
+    resolved = Path(path)
+    guessed_mime = str(mime or mimetypes.guess_type(str(resolved))[0] or "").split(";")[0].lower()
+    suffix = resolved.suffix.lower()
+    if guessed_mime.startswith("image/"):
+        return "media_image"
+    if guessed_mime.startswith("video/"):
+        return "media_video"
+    if guessed_mime.startswith("audio/"):
+        return "media_audio"
+    if guessed_mime == "application/pdf" or suffix == ".pdf":
+        return "media_pdf"
+    if guessed_mime in {
+        "application/zip",
+        "application/x-7z-compressed",
+        "application/x-gzip",
+        "application/gzip",
+        "application/x-tar",
+    } or suffix in {".zip", ".7z", ".gz", ".tgz", ".tar"}:
+        return "media_archive"
+    if guessed_mime in {"text/html", "application/xhtml+xml"} or suffix in {".html", ".htm"}:
+        return "html_snapshot"
+    return "file_generic"
+
+
+def register_download_artifact(
+    path: str | Path,
+    *,
+    source_url: str = "",
+    mime: str = "",
+    produced_by: str = "browser_download",
+    step_id: str = "download",
+) -> None:
+    resolved = Path(path)
+    guessed_mime = str(mime or mimetypes.guess_type(str(resolved))[0] or "")
+    try:
+        register_artifact(
+            resolved,
+            kind=artifact_kind_for_path(resolved, mime=guessed_mime),
+            mime=guessed_mime,
+            source_url=source_url,
+            produced_by=produced_by,
+            step_id=step_id,
+        )
+    except TypeError:
+        register_artifact(resolved)

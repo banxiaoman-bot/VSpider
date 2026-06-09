@@ -171,14 +171,62 @@ def _collect_artifacts(source: dict[str, Any], result: dict[str, Any], events: l
     for item in _as_list(source.get("artifacts")):
         if isinstance(item, dict):
             artifacts.append(dict(item))
+    for item in _collect_manifest_artifacts(source, result):
+        artifacts.append(item)
     seen: set[str] = set()
+    seen_index: dict[str, int] = {}
     out: list[dict[str, Any]] = []
     for artifact in artifacts:
         key = str(artifact.get("path") or artifact.get("url") or artifact.get("name") or artifact)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(artifact)
+        if not key:
+            continue
+        if key in seen:
+            _merge_artifact_metadata(out[seen_index[key]], artifact)
+            continue
+        seen.add(key)
+        seen_index[key] = len(out)
+        out.append(artifact)
     return out
+
+
+def _collect_manifest_artifacts(source: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+
+    def _items_from(container: dict[str, Any]) -> list[Any]:
+        out: list[Any] = []
+        out.extend(_as_list(container.get("manifest_items")))
+        manifest = container.get("manifest")
+        if isinstance(manifest, dict):
+            out.extend(_as_list(manifest.get("items")))
+        contracts = container.get("contracts")
+        if isinstance(contracts, dict):
+            contract_manifest = contracts.get("manifest")
+            if isinstance(contract_manifest, dict):
+                out.extend(_as_list(contract_manifest.get("items")))
+        return out
+
+    for container in (source, result):
+        for item in _items_from(container):
+            if isinstance(item, dict):
+                artifact = dict(item)
+                artifact.setdefault("evidence_source", "manifest")
+                artifacts.append(artifact)
+    return artifacts
+
+
+def _merge_artifact_metadata(target: dict[str, Any], incoming: dict[str, Any]) -> None:
+    if target.get("kind") and incoming.get("kind") and target.get("kind") != incoming.get("kind"):
+        target.setdefault("manifest_kind", incoming.get("kind"))
+    for key, value in incoming.items():
+        if key == "kind":
+            continue
+        if key == "source_url":
+            merged = _dedupe(_as_list(target.get("source_url")) + _as_list(value))
+            if merged:
+                target["source_url"] = merged
+            continue
+        if key not in target or target.get(key) in (None, "", [], {}):
+            target[key] = value
 
 
 def _failure_bundle(source: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:

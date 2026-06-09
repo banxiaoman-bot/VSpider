@@ -130,6 +130,8 @@ class TestCsvWriter:
         assert target_item["step_id"] == "3"
         assert target_item["size"] == len(body)
         assert target_item["sha256"] == hashlib.sha256(body).hexdigest()
+        assert target_item["extra"]["row_count"] == 2
+        assert target_item["extra"]["fields"] == ["title", "url", "score"]
 
     def test_csv_extension_is_csv(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers import save_artifact
@@ -170,6 +172,8 @@ class TestJsonlWriter:
         manifest = _read_manifest(tmp_path, "run_jsonl")
         target = next(it for it in manifest["items"] if it["mime"].startswith("application/"))
         assert target["mime"] == "application/x-ndjson"
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +195,10 @@ class TestJsonWriter:
         parsed = json.loads(body)
         assert isinstance(parsed, list) and len(parsed) == 2
         assert parsed[0]["title"] == "First"
+        manifest = _read_manifest(tmp_path, "run_json")
+        target = next(it for it in manifest["items"] if it["kind"] == "dataset_records")
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
     def test_writes_single_record_when_given_dict(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers import save_artifact
@@ -227,6 +235,10 @@ class TestMarkdownWriter:
         assert "| title |" in body or "| title " in body
         assert "First" in body
         assert "---" in body
+        manifest = _read_manifest(tmp_path, "run_md")
+        target = next(it for it in manifest["items"] if it["kind"] == "dataset_rows")
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
     def test_writes_plain_markdown_for_string(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers import save_artifact
@@ -363,6 +375,8 @@ class TestXlsxWriter:
         assert target["mime"] == (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +448,17 @@ class TestSaveRunDataset:
         )
         assert merged["container"] == "csv"
         assert merged["output_kind"] == "dataset_rows"
+
+    def test_resolve_output_contract_normalizes_field_aliases(self) -> None:
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract(
+            {"output_kind": "dataset_rows", "required_fields": ["title"]},
+            {"requested_fields": "title, price"},
+        )
+        assert merged["fields"] == ["title", "price"]
+        assert merged["required_fields"] == ["title", "price"]
+        assert merged["requested_fields"] == ["title", "price"]
 
     def test_resolve_output_contract_media_kind_is_not_blind_xlsx(self) -> None:
         """mission §一-A: a media task must never be forced into xlsx. When the

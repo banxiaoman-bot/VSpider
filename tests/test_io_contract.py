@@ -35,6 +35,9 @@ from visual_web_agent.io_contract.output_contract import (
     OutputContract,
     default_container_for_kind,
     infer_output_contract,
+    normalize_output_contract_dict,
+    normalize_output_fields,
+    output_contract_fields,
 )
 from visual_web_agent.io_contract.manifest import (
     Manifest,
@@ -219,17 +222,13 @@ class TestRunOutputProtocol:
         assert c.urls[0].url == "https://a.com"
         assert c.urls[0].role == "start"
 
-    def test_urls_field_wins_but_target_url_merges(self) -> None:
+    def test_urls_field_overrides_target_url(self) -> None:
         c = build_input_contract(
             goal="x",
             target_url="https://legacy.com",
             urls=["https://a.com", "https://b.com"],
         )
-        assert [u.url for u in c.urls] == [
-            "https://legacy.com",
-            "https://a.com",
-            "https://b.com",
-        ]
+        assert [u.url for u in c.urls] == ["https://a.com", "https://b.com"]
 
     def test_dedup_target_url_already_present(self) -> None:
         c = build_input_contract(
@@ -272,6 +271,22 @@ class TestRunOutputProtocol:
         assert d["vlm"]["model"] == "m1"
         assert d["semantic"]["model"] == "m2"
         assert d["vlm"]["temperature"] == 0.1
+
+    def test_constraints_preserve_runtime_extras(self) -> None:
+        c = build_input_contract(
+            goal="x",
+            constraints={
+                "max_runs": 3,
+                "resume": True,
+                "proxy_chain": ["http://p1", "http://p2"],
+                "proxy_strategy": "round_robin",
+            },
+        )
+        d = c.constraints.to_dict()
+        assert d["max_runs"] == 3
+        assert d["resume"] is True
+        assert d["proxy_chain"] == ["http://p1", "http://p2"]
+        assert d["proxy_strategy"] == "round_robin"
 
     def test_to_dict_stable_keys(self) -> None:
         c = build_input_contract(goal="x", target_url="https://a.com")
@@ -443,6 +458,33 @@ class TestInferOutputContract:
         c = infer_output_contract("下载所有图片和视频")
         assert c.output_kind == "mixed"
         assert "multiple_media_kinds" in c.reasons
+
+
+    def test_requested_fields_are_canonical_contract_fields(self) -> None:
+        c = infer_output_contract(
+            "export data",
+            requested_fields=["Title", "title", "price", "url"],
+        )
+        payload = c.to_dict()
+        assert payload["fields"] == ["Title", "price", "url"]
+        assert payload["required_fields"] == ["Title", "price", "url"]
+        assert payload["requested_fields"] == ["Title", "price", "url"]
+        assert output_contract_fields(payload) == ["Title", "price", "url"]
+
+    def test_normalize_output_fields_merges_legacy_aliases(self) -> None:
+        payload = normalize_output_contract_dict({
+            "output_kind": "dataset_rows",
+            "required_fields": ["title", "price"],
+            "requested_fields": "price, url",
+        })
+        assert normalize_output_fields(["title"], "Title", "price, url") == [
+            "title",
+            "price",
+            "url",
+        ]
+        assert payload["fields"] == ["title", "price", "url"]
+        assert payload["required_fields"] == ["title", "price", "url"]
+        assert payload["requested_fields"] == ["title", "price", "url"]
 
 
 class TestDefaultContainerForKind:

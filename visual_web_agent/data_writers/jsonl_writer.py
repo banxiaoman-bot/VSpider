@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ._base import (
+    dataset_extra,
     default_filename,
     finalize_file_artifact,
     run_artifacts_dir,
@@ -46,9 +47,10 @@ def write_jsonl(
     else:
         iter_rows = [data]
 
+    records = [_coerce_record(row) for row in iter_rows]
     lines = [
-        json.dumps(_coerce_record(row), ensure_ascii=False, sort_keys=False)
-        for row in iter_rows
+        json.dumps(row, ensure_ascii=False, sort_keys=False)
+        for row in records
     ]
     body = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
@@ -60,15 +62,16 @@ def write_jsonl(
     )
     target = artifacts / filename
     target.write_bytes(body)
+    kind = output_kind or "dataset_records"
 
     return finalize_file_artifact(
         run_id=run_id,
         path=target,
-        kind=output_kind or "dataset_records",
+        kind=kind,
         mime="application/x-ndjson",
         produced_by=produced_by,
         step_id=step_id,
         source_url=source_url,
-        extra=extra,
+        extra=dataset_extra(extra, output_kind=kind, rows=records),
         base_dir=base_dir,
     )

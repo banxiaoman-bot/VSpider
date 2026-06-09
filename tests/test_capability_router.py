@@ -112,6 +112,39 @@ def test_capability_router_covers_full_structured_crawl_stack() -> None:
     assert route["output_contract"]["reasons"].count("model_predicted_output_kind") == 1
 
 
+def test_capability_router_uses_agent_strategy_field_parser() -> None:
+    route = route_task(
+        "提取 Name, Position, Office 字段",
+        url="https://example.com/table",
+    )
+
+    assert route["output_contract"]["fields"] == ["Name", "Position", "Office"]
+    assert route["output_contract"]["required_fields"] == ["Name", "Position", "Office"]
+    assert route["output_contract"]["requested_fields"] == ["Name", "Position", "Office"]
+
+
+def test_capability_router_uses_agent_strategy_target_count_parser_without_url_field_noise() -> None:
+    route = route_task(
+        "Extract top 120 records with fields title, url",
+        url="https://example.com/table",
+    )
+
+    assert route["strategy_context"]["target_count"] == 120
+    assert route["output_contract"]["container"] == "jsonl"
+    assert route["output_contract"]["fields"] == ["title", "url"]
+
+
+def test_capability_router_uses_agent_strategy_page_target_parser() -> None:
+    route = route_task(
+        "extract first 3 pages of products with fields title, price",
+        url="https://example.com/products",
+    )
+
+    assert route["strategy_context"]["target_pages"] == 3
+    assert "goal_has_page_target" in route["strategy_context"]["reasons"]
+    assert "next_page" in route["strategy_context"]["preferred_actions"]
+
+
 def test_capability_router_surfaces_failure_repair_feedback() -> None:
     route = route_task(
         "打开页面并点击按钮",
@@ -1283,6 +1316,80 @@ def test_route_executor_runs_spider_when_network_allowed(_artifact_tmp) -> None:
     assert result["result"]["items"][0]["value"] == "Alpha"
 
 
+def test_route_executor_uses_target_pages_as_spider_max_pages() -> None:
+    class RecordingSpider:
+        def __init__(self) -> None:
+            self.payload = {}
+
+        def run(self, payload: dict) -> dict:
+            self.payload = dict(payload)
+            return {
+                "status": "success",
+                "page_count": payload["max_pages"],
+                "item_count": 1,
+                "items": [{"value": "Alpha"}],
+                "artifact": None,
+            }
+
+    spider = RecordingSpider()
+    result = execute_route({
+        "goal": "extract first 2 pages of quote text",
+        "url": "https://example.com/",
+        "allow_network": True,
+        "extract": {"selector": ".quote .text::text"},
+        "run_id": "route_spider_pages",
+    }, spider_lite=spider)
+
+    attempt = next(item for item in result["attempts"] if item["capability"] == "spider_lite")
+    assert spider.payload["max_pages"] == 2
+    assert attempt["target_pages"] == 2
+    assert attempt["page_count"] == 2
+
+
+def test_route_executor_prefers_api_replay_candidate_before_spider(monkeypatch, _artifact_tmp) -> None:
+    from visual_web_agent import api_replay as api_replay_mod
+
+    monkeypatch.setattr(api_replay_mod, "resolve_artifact_path", lambda filename, subdir="": _artifact_tmp / subdir / filename)
+    monkeypatch.setattr(api_replay_mod, "register_artifact", lambda path: None)
+    monkeypatch.setattr(api_replay_mod, "artifact_url", lambda path: "/download/" + Path(path).name)
+
+    class RecordingSpider:
+        called = False
+
+        def run(self, payload: dict) -> dict:
+            self.called = True
+            return {"status": "success", "page_count": 1, "item_count": 1, "items": [{"value": "spider"}]}
+
+    spider = RecordingSpider()
+
+    def fake_fetcher(url: str, headers: dict, timeout_s: float, method: str, body: str):
+        assert url == "https://api.example.com/items?page=1&limit=2"
+        return 200, {"content-type": "application/json"}, json.dumps({
+            "data": [
+                {"id": 1, "title": "A"},
+                {"id": 2, "title": "B"},
+            ]
+        })
+
+    result = execute_route({
+        "goal": "Extract top 2 records from API",
+        "url": "https://example.com/list",
+        "allow_network": True,
+        "network_candidates": [
+            {"endpoint": "https://api.example.com/items?page=*&limit=*", "method": "GET", "score": 9},
+        ],
+        "api_replay_fetcher": fake_fetcher,
+        "run_id": "route_api_replay",
+    }, spider_lite=spider)
+
+    attempt = next(item for item in result["attempts"] if item["capability"] == "api_replay")
+    assert result["status"] == "completed"
+    assert result["capability"] == "api_replay"
+    assert result["result"]["row_count"] == 2
+    assert attempt["target_count"] == 2
+    assert spider.called is False
+
+
 def test_success_verifier_rejects_missing_required_fields() -> None:
     route = route_task("提取 2 条商品数据，字段: title, price")
     verification = verify_route_success(
@@ -1299,6 +1406,52 @@ def test_success_verifier_rejects_missing_required_fields() -> None:
 
     assert verification["passed"] is False
     assert "required_fields" in [item["name"] for item in verification["checks"]]
+
+
+def test_success_verifier_reads_output_contract_fields() -> None:
+    verification = verify_route_success(
+        {
+            "output_contract": {
+                "output_kind": "dataset_rows",
+                "fields": ["Title", "title", "price"],
+            },
+        },
+        capability="generic_extractor",
+        result={
+            "row_count": 1,
+            "rows": [{"title": "A"}],
+        },
+    )
+
+    assert verification["passed"] is False
+    assert verification["required_fields"] == ["Title", "price"]
+    fields_check = next(item for item in verification["checks"] if item["name"] == "required_fields")
+    assert fields_check["missing_examples"][0]["missing"] == ["price"]
+
+
+def test_success_verifier_merges_payload_and_contract_field_aliases() -> None:
+    verification = verify_route_success(
+        {
+            "strategy_context": {
+                "output_contract": {
+                    "output_kind": "dataset_records",
+                    "required_fields": ["title", "price"],
+                },
+                "requested_fields": ["url"],
+            },
+        },
+        capability="generic_extractor",
+        result={
+            "row_count": 1,
+            "rows": [{"title": "A", "price": "10", "url": "https://x"}],
+        },
+        payload={"requested_fields": "price, rating"},
+    )
+
+    assert verification["passed"] is False
+    assert verification["required_fields"] == ["price", "rating", "title", "url"]
+    fields_check = next(item for item in verification["checks"] if item["name"] == "required_fields")
+    assert fields_check["missing_examples"][0]["missing"] == ["rating"]
 
 
 def test_route_executor_export_goal_requires_artifact(monkeypatch) -> None:
@@ -1475,13 +1628,17 @@ def test_capability_router_api_wiring(_artifact_tmp) -> None:
 
 def test_capability_execute_can_write_trace_artifact(monkeypatch, _artifact_tmp) -> None:
     import api_server
+    from visual_web_agent.artifact_manager import register_artifact as real_register_artifact
+    from visual_web_agent.io_contract import persistence as _persistence
 
     temp_root = Path(__file__).resolve().parent / ".tmp_capability_router" / uuid.uuid4().hex
+    runs_root = temp_root / "runs"
     temp_root.mkdir(parents=True, exist_ok=True)
     try:
         monkeypatch.setattr(api_server, "resolve_artifact_path", lambda filename, subdir="": temp_root / subdir / filename)
-        monkeypatch.setattr(api_server, "register_artifact", lambda path: None)
+        monkeypatch.setattr(api_server, "register_artifact", real_register_artifact)
         monkeypatch.setattr(api_server, "artifact_url", lambda path: "/download/" + Path(path).name)
+        monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
 
         client = TestClient(api_server.app)
         resp = client.post(
@@ -1498,6 +1655,7 @@ def test_capability_execute_can_write_trace_artifact(monkeypatch, _artifact_tmp)
         result = resp.json()["result"]
         artifact = result["trace_artifact"]
         doc = json.loads(Path(artifact["path"]).read_text(encoding="utf-8"))
+        manifest = json.loads((runs_root / "cap-trace-api" / "manifest.json").read_text(encoding="utf-8"))
 
         assert resp.status_code == 200
         assert result["status"] == "completed"
@@ -1510,6 +1668,114 @@ def test_capability_execute_can_write_trace_artifact(monkeypatch, _artifact_tmp)
         assert doc["result"]["runtime_summary"]["after"]["preflight_status"] in {"pass", "warn"}
         assert doc["result"]["runtime_drift"]["version"] == "browser_runtime_drift.v1"
         assert doc["result"]["runtime_issue_summary"]["version"] == "browser_runtime_issue_summary.v1"
+        assert manifest["items"][0]["kind"] == "log"
+        assert manifest["items"][0]["produced_by"] == "capability_execute"
+        assert manifest["items"][0]["step_id"] == "trace_artifact"
+        assert manifest["items"][0]["mime"] == "application/json"
+    finally:
+        shutil.rmtree(temp_root.parent, ignore_errors=True)
+
+
+def test_capability_diagnostic_artifacts_register_run_manifest(monkeypatch, _artifact_tmp) -> None:
+    import api_server
+    from visual_web_agent.artifact_manager import register_artifact as real_register_artifact
+    from visual_web_agent.io_contract import persistence as _persistence
+
+    temp_root = Path(__file__).resolve().parent / ".tmp_capability_router" / uuid.uuid4().hex
+    runs_root = temp_root / "runs"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    run_id = "cap-diagnostics-api"
+    source_url = "https://example.com/form"
+    source_payload = {
+        "source": {
+            "type": "capability_execute_trace",
+            "request": {"run_id": run_id, "url": source_url},
+        },
+        "name": "diagnostic report",
+    }
+    fixture_payload = {"fixture": {}, "name": "fixture replay report"}
+    fixture_batch_payload = {"fixtures": [], "name": "fixture replay batch report"}
+    efficiency_report = {
+        "version": "efficiency_correlation_report.v1",
+        "source": "efficiency_correlation",
+        "status": "suboptimal",
+        "alignment": {
+            "recommended_path": "api_replay",
+            "executed_path": "browser_action",
+            "rank_gap": 4,
+            "skip_browser": True,
+        },
+        "failed_checks": ["executed_matches_recommended"],
+        "root_causes": ["executed_path_more_expensive_than_recommendation"],
+        "recommended_action": "prefer_api_replay_before_browser_action",
+    }
+    failure_bundle = {
+        "version": "capability_execute_failure_bundle.v1",
+        "source": "capability_execute",
+        "primary_failure": "selector_missing",
+        "failure_category": "target_resolution",
+        "capability": "browser_control",
+        "action": "click",
+        "recommended_actions": ["refresh_browser_snapshot"],
+        "action_trace": {
+            "version": "browser_action_trace.v1",
+            "action": "click",
+            "warning_codes": ["action_failed", "selector_missing"],
+            "target": {"selector": "#submit"},
+            "action_ref": {"selector": "#submit"},
+        },
+        "action_issue_summary": {
+            "version": "browser_action_issue_summary.v1",
+            "status": "error",
+            "issues": [{"source": "warning_codes", "code": "selector_missing"}],
+        },
+    }
+    fixture = build_capability_failure_regression_fixture({
+        "type": "capability_execute_trace",
+        "request": {"goal": "点击提交", "url": source_url, "run_id": run_id},
+        "result": {"status": "error", "completed": False, "capability": "browser_control", "failure_bundle": failure_bundle},
+    }, name="selector missing diagnostic")
+    fixture_payload["fixture"] = fixture
+    fixture_batch_payload["fixtures"] = [fixture]
+
+    try:
+        monkeypatch.setattr(api_server, "resolve_artifact_path", lambda filename, subdir="": temp_root / subdir / filename)
+        monkeypatch.setattr(api_server, "register_artifact", real_register_artifact)
+        monkeypatch.setattr(api_server, "artifact_url", lambda path: "/download/" + Path(path).name)
+        monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+
+        api_server._write_efficiency_feedback_replay_artifact(
+            replay_efficiency_feedback({"goal": "提取商品列表", "url": source_url, "efficiency_correlation_report": efficiency_report}),
+            source_payload,
+        )
+        api_server._write_efficiency_feedback_replay_batch_artifact(
+            {"version": "efficiency_feedback_replay_batch_report.v1", "passed": True, "items": []},
+            source_payload,
+        )
+        api_server._write_capability_failure_fixture_artifact(fixture, source_payload)
+        api_server._write_capability_failure_fixture_replay_artifact(
+            replay_capability_failure_fixture(fixture),
+            fixture_payload,
+        )
+        api_server._write_capability_failure_fixture_replay_batch_artifact(
+            replay_capability_failure_fixtures([fixture]),
+            fixture_batch_payload,
+        )
+        manifest = json.loads((runs_root / run_id / "manifest.json").read_text(encoding="utf-8"))
+        observed = {(item["produced_by"], item["step_id"]): item for item in manifest["items"]}
+
+        assert {
+            ("efficiency_feedback_replay", "replay_report"),
+            ("efficiency_feedback_replay", "replay_batch_report"),
+            ("capability_failure_fixture", "failure_fixture"),
+            ("capability_failure_fixture_replay", "replay_report"),
+            ("capability_failure_fixture_replay", "replay_batch_report"),
+        } <= set(observed)
+        for item in observed.values():
+            assert item["kind"] == "log"
+            assert item["mime"] == "application/json"
+            assert item["source_url"] == [source_url]
+            assert str(runs_root / run_id / "artifacts") in item["path"]
     finally:
         shutil.rmtree(temp_root.parent, ignore_errors=True)
 

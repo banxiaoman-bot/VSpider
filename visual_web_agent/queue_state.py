@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .secret_redaction import redact_secret_mapping
+
 
 SCHEMA_VERSION = 2
 
@@ -89,6 +91,10 @@ def _scrub_secret_options(vlm_options: Any) -> dict[str, Any]:
     return out
 
 
+def _scrub_secret_mapping(value: Any) -> dict[str, Any]:
+    return redact_secret_mapping(_json_safe(value))
+
+
 def _execution_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(task, dict):
         return None
@@ -108,6 +114,10 @@ def _execution_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
         "file_size_kb": task.get("file_size_kb", 0.0),
         "vlm_model_type": task.get("vlm_model_type", "vl"),
         "vlm_options": _scrub_secret_options(task.get("vlm_options")),
+        "urls": _json_safe(task.get("urls") or []),
+        "upload_sha256": task.get("upload_sha256", ""),
+        "upload_mime": task.get("upload_mime", ""),
+        "constraints": _scrub_secret_mapping(task.get("constraints")),
         "created_at": task.get("created_at"),
         "queued_at": task.get("queued_at"),
         "started_at": task.get("started_at"),

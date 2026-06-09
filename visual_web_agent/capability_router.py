@@ -6,6 +6,11 @@ from urllib.parse import urlparse
 
 from visual_web_agent.action_ref import action_ref_schema
 from visual_web_agent.action_registry import build_default_action_registry
+from visual_web_agent.agent_strategy import (
+    parse_goal_requested_fields,
+    parse_goal_target_count,
+    parse_goal_target_pages,
+)
 from visual_web_agent.browser_pool import build_browser_runtime_preflight, get_browser_runtime_status
 from visual_web_agent.capability_manifest import summarize_capabilities
 from visual_web_agent.crawl_efficiency import build_crawl_efficiency_plan
@@ -229,11 +234,13 @@ def route_task(
     else:
         route_context = dict(context or {})
     target_count = _parse_target_count(text)
-    requested_fields = _parse_requested_fields(text)
+    target_pages = _parse_target_pages(goal)
+    requested_fields = _parse_requested_fields(goal)
     strategy_context = infer_goal_strategy_context(
         goal,
         url=url,
         target_count=target_count,
+        target_pages=target_pages,
         requested_fields=requested_fields,
         data_shape=route_context.get("data_shape"),
     )
@@ -653,30 +660,15 @@ def _step(capability: str, condition: str) -> dict[str, Any]:
 
 
 def _parse_target_count(text: str) -> int | None:
-    m = re.search(r"(?:前|top\s*)\s*(\d+)\s*(?:条|个|项|页|rows?|items?)?", text, re.I)
-    if not m:
-        m = re.search(r"(\d+)\s*(?:条|个|项|rows?|items?)", text, re.I)
-    if not m:
-        return None
-    try:
-        value = int(m.group(1))
-        return value if value > 0 else None
-    except Exception:
-        return None
+    return parse_goal_target_count(text)
+
+
+def _parse_target_pages(text: str) -> int | None:
+    return parse_goal_target_pages(text)
 
 
 def _parse_requested_fields(text: str) -> list[str]:
-    m = re.search(r"(?:fields?|字段|列)[:：]\s*([^。；;\n]+)", text, re.I)
-    if not m:
-        return []
-    raw = m.group(1)
-    parts = re.split(r"[,，、/|]\s*", raw)
-    out: list[str] = []
-    for part in parts:
-        value = part.strip(" []()（）\"'")
-        if value and value not in out:
-            out.append(value)
-    return out[:20]
+    return parse_goal_requested_fields(text)[:20]
 
 
 def _first_url(text: str) -> str:

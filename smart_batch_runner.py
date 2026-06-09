@@ -11,7 +11,9 @@ import pandas as pd
 
 from visual_web_agent.artifact_manager import register_artifact, resolve_artifact_path
 from visual_web_agent.io_contract import (
+    append_manifest_item,
     build_input_contract,
+    ensure_contract_skeleton,
     infer_output_contract,
     write_input_contract,
     write_output_contract,
@@ -364,10 +366,19 @@ def _persist_io_contracts_safe(
                 "size": fp.stat().st_size if fp.exists() else 0,
             })
 
+        all_urls: list[str] = []
+        if target_url:
+            all_urls.append(str(target_url))
+        for url in urls or []:
+            u = str(url or "").strip()
+            if u and u not in all_urls:
+                all_urls.append(u)
+
+        ensure_contract_skeleton(run_id)
         contract = build_input_contract(
             goal=goal or "",
-            target_url=target_url or "",
-            urls=urls or [],
+            target_url="",
+            urls=all_urls,
             attachments=attachments,
             auth_profiles=auth_profiles or "",
             vlm_options=vlm_options or {},
@@ -385,6 +396,44 @@ def _persist_io_contracts_safe(
         )
     except Exception as exc:
         _emit_log(f"⚠️ [IO Contract] persist failed: {exc}", level="warn")
+
+
+def _record_child_run_to_parent(parent_run_id: str, payload: dict[str, object]) -> None:
+    """Best-effort parent manifest entry for a URL/row child run."""
+
+    parent = str(parent_run_id or payload.get("parent_run_id") or "").strip()
+    child = str(payload.get("child_run_id") or "").strip()
+    if not parent or not child or parent == child:
+        return
+    try:
+        child_kind = str(payload.get("child_kind") or "child").strip() or "child"
+        index = int(payload.get("index") or 0)
+        total = int(payload.get("total") or 0)
+        extra: dict[str, object] = {
+            "entry_type": "child_run",
+            "child_run_id": child,
+            "child_kind": child_kind,
+            "index": index,
+            "total": total,
+            "success": bool(payload.get("success")),
+        }
+        for key in ("start_url", "row_no", "project_no", "error"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                extra[key] = value
+
+        ensure_contract_skeleton(parent)
+        append_manifest_item(
+            parent,
+            kind="log",
+            path=f"runs/{child}/manifest.json",
+            source_url=str(payload.get("start_url") or ""),
+            produced_by="batch_orchestrator",
+            step_id=f"{child_kind}_{index:04d}" if index else child_kind,
+            extra=extra,
+        )
+    except Exception as exc:
+        _emit_log(f"[IO Contract] child run manifest append failed: {exc}", level="warn")
 
 
 async def run_smart_batch(
@@ -489,6 +538,8 @@ async def run_smart_batch(
                 vlm_options=vlm_options or None,
                 upload_file=upload_path_for_agent or "",
                 constraints=run_constraints,
+                run_id=run_id,
+                on_child_run=lambda payload: _record_child_run_to_parent(run_id, payload),
                 emit_log=lambda msg, level="info": _emit_log(msg, level=level),
             )
             success = ok_count == total_runs and total_runs > 0
@@ -586,6 +637,8 @@ async def run_smart_batch(
         emit_log=lambda msg, level="info": _emit_log(msg, level=level),
         constraints=run_constraints,
         inter_row_sleep_s=1.0,
+        run_id=run_id,
+        on_child_run=lambda payload: _record_child_run_to_parent(run_id, payload),
     )
 
     if stop_event and stop_event.is_set():

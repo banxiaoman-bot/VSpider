@@ -12,6 +12,14 @@ from urllib.request import Request
 
 from visual_web_agent.artifact_manager import artifact_url, register_artifact, resolve_artifact_path
 from visual_web_agent.extraction_engine import generic
+from visual_web_agent import run_registry as _run_registry
+from visual_web_agent.io_contract import (
+    build_input_contract,
+    ensure_contract_skeleton,
+    infer_output_contract,
+    write_input_contract,
+    write_output_contract,
+)
 from visual_web_agent.page_cache import PageCacheMissError, PageResponseCache
 from visual_web_agent.robots_policy import RobotsPolicyManager
 from visual_web_agent.crawl_frontier import build_frontier, normalize_keywords
@@ -73,6 +81,137 @@ class _LinkParser(HTMLParser):
 
 
 Fetcher = Callable[[str], FetchResult | dict[str, Any] | str]
+
+
+def _spider_goal(config: dict[str, Any]) -> str:
+    return str(config.get("goal") or "Spider Lite crawl")
+
+
+def _spider_persistence_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("persist_run_contracts") or config.get("persist_contracts"))
+
+
+def _spider_contract_base_dir(config: dict[str, Any]) -> str:
+    return str(config.get("contracts_base_dir") or config.get("base_dir") or "").strip()
+
+
+def _spider_constraints(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "max_pages": config.get("max_pages"),
+        "max_depth": config.get("max_depth"),
+        "follow_links": config.get("follow_links"),
+        "robots_txt_obey": config.get("robots_txt_obey"),
+        "delay_seconds": config.get("delay_seconds"),
+        "crawl_strategy": config.get("crawl_strategy"),
+        "cache_mode": config.get("cache_mode"),
+        "export": config.get("export"),
+        "export_format": config.get("export_format"),
+    }
+
+
+def _persist_spider_run_start(config: dict[str, Any]) -> bool:
+    """Best-effort contracts + registry entry for API-visible spider runs."""
+
+    if not _spider_persistence_enabled(config):
+        return False
+    run_id = str(config.get("run_id") or "").strip()
+    if not run_id:
+        return False
+    base_dir = _spider_contract_base_dir(config) or None
+    goal = _spider_goal(config)
+    start_urls = list(config.get("start_urls") or [])
+    try:
+        ensure_contract_skeleton(run_id, base_dir=base_dir)
+        input_contract = build_input_contract(
+            goal=goal,
+            urls=start_urls,
+            constraints=_spider_constraints(config),
+            source="spider_lite",
+        )
+        write_input_contract(run_id, input_contract, base_dir=base_dir)
+        output_contract = infer_output_contract(
+            goal,
+            user_explicit_kind="dataset_records",
+            user_explicit_container="jsonl",
+        )
+        write_output_contract(run_id, output_contract, base_dir=base_dir)
+    except Exception:
+        pass
+
+    try:
+        if _run_registry.load_run(run_id) is not None:
+            return False
+        _run_registry.create_run(
+            run_id=run_id,
+            target_url=start_urls[0] if start_urls else "",
+            prompt=goal,
+            mode="spider_lite",
+            urls=start_urls,
+            constraints=_spider_constraints(config),
+            status="running",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _complete_spider_registry(run_id: str, *, owned: bool, success: bool, error: str = "") -> None:
+    if not owned:
+        return
+    try:
+        _run_registry.complete_run(run_id, success=success, error=error)
+    except Exception:
+        pass
+
+
+def _register_spider_artifact(path: Path, run: dict[str, Any], *, feed_format: str) -> None:
+    config = run.get("config") if isinstance(run.get("config"), dict) else {}
+    if not _spider_persistence_enabled(config):
+        register_artifact(path)
+        return
+    run_id = str(run.get("run_id") or config.get("run_id") or "").strip()
+    source_url = ""
+    starts = run.get("start_urls") if isinstance(run.get("start_urls"), list) else []
+    if starts:
+        source_url = str(starts[0] or "")
+    mime = "application/x-ndjson" if feed_format == "jsonl" else "application/json"
+    extra: dict[str, Any] = {
+        "row_count": int(run.get("item_count") or len(run.get("items") or [])),
+    }
+    fields = _spider_item_fields(run)
+    if fields:
+        extra["fields"] = fields
+    try:
+        register_artifact(
+            path,
+            run_id=run_id,
+            kind="dataset_records",
+            mime=mime,
+            source_url=source_url,
+            produced_by="spider_lite",
+            step_id="feed_export",
+            extra=extra,
+        )
+    except TypeError:
+        register_artifact(path)
+
+
+def _spider_item_fields(run: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    pipeline = run.get("item_pipeline") if isinstance(run.get("item_pipeline"), dict) else {}
+    for field in pipeline.get("fields") or []:
+        add(field)
+    for item in run.get("items") or []:
+        if isinstance(item, dict):
+            for key in item.keys():
+                add(key)
+    return out
 
 
 class SpiderLiteManager:
@@ -153,7 +292,7 @@ class SpiderLiteManager:
                 }, ensure_ascii=False, separators=(",", ":")),
                 encoding="utf-8",
             )
-        register_artifact(path)
+        _register_spider_artifact(path, run, feed_format=feed_format)
         artifact = {"path": str(path), "url": artifact_url(path), "format": feed_format, "count": len(items)}
         run["artifact"] = artifact
         return artifact
@@ -162,6 +301,7 @@ class SpiderLiteManager:
         config = self._config(payload)
         self._apply_sitemap_seeds(config)
         run_id = config["run_id"]
+        registry_owned = _persist_spider_run_start(config)
         created_at = time.time()
         result: dict[str, Any] = {
             "run_id": run_id,
@@ -246,6 +386,7 @@ class SpiderLiteManager:
                 format=str(config.get("export_format") or "jsonl"),
                 filename=str(config.get("export_filename") or ""),
             )
+        _complete_spider_registry(run_id, owned=registry_owned, success=True)
         return result
 
     def cache_state(self, session_id: str = "default") -> dict[str, Any]:
@@ -459,6 +600,7 @@ class SpiderLiteManager:
         run_id = str(payload.get("run_id") or f"spider_{uuid.uuid4().hex[:12]}")
         return {
             "run_id": run_id,
+            "goal": str(payload.get("goal") or payload.get("prompt") or "").strip(),
             "start_urls": start_urls,
             "allowed_domains": allowed_domains,
             "max_depth": max(0, min(int(payload.get("max_depth") or 0), 10)),
@@ -480,6 +622,8 @@ class SpiderLiteManager:
             "seed_sitemap": seed_sitemap,
             "resume_state_path": str(payload.get("resume_state_path") or payload.get("resume_state") or "").strip(),
             "checkpoint_every": max(1, min(int(payload.get("checkpoint_every") or 1), 1000)),
+            "persist_run_contracts": bool(payload.get("persist_run_contracts") or payload.get("persist_contracts")),
+            "contracts_base_dir": str(payload.get("contracts_base_dir") or payload.get("base_dir") or "").strip(),
         }
 
     def _item_pipeline_config(self, payload: dict[str, Any]) -> dict[str, Any]:

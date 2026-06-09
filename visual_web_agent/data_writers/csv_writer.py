@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ._base import (
+    dataset_extra,
     default_filename,
     finalize_file_artifact,
     run_artifacts_dir,
@@ -86,15 +87,16 @@ def write_csv(
     )
     target = artifacts / filename
     target.write_bytes(body)
+    kind = output_kind or "dataset_rows"
 
     return finalize_file_artifact(
         run_id=run_id,
         path=target,
-        kind=output_kind or "dataset_rows",
+        kind=kind,
         mime="text/csv",
         produced_by=produced_by,
         step_id=step_id,
         source_url=source_url,
-        extra=extra,
+        extra=dataset_extra(extra, output_kind=kind, rows=rows, fields=columns),
         base_dir=base_dir,
     )

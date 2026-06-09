@@ -13,6 +13,7 @@ CAPABILITY_TRACE_LIST = ROOT / "vspider-ui" / "src" / "components" / "Capability
 CAPABILITY_RUNTIME_PANEL = ROOT / "vspider-ui" / "src" / "components" / "CapabilityRuntimePanel.vue"
 CAPABILITY_ALIGNMENT_CARD = ROOT / "vspider-ui" / "src" / "components" / "CapabilityAlignmentCard.vue"
 CAPABILITY_EFFICIENCY_PANEL = ROOT / "vspider-ui" / "src" / "components" / "CapabilityEfficiencyPanel.vue"
+RUN_REGISTRY_PANEL = ROOT / "vspider-ui" / "src" / "components" / "RunRegistryPanel.vue"
 
 
 @pytest.fixture(scope="module")
@@ -48,6 +49,11 @@ def alignment_card_src() -> str:
 @pytest.fixture(scope="module")
 def efficiency_panel_src() -> str:
     return CAPABILITY_EFFICIENCY_PANEL.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def run_registry_panel_src() -> str:
+    return RUN_REGISTRY_PANEL.read_text(encoding="utf-8")
 
 
 def test_capability_trace_helpers_are_extracted(app_src: str, trace_utils_src: str) -> None:
@@ -127,6 +133,18 @@ def test_capability_efficiency_panel_component_is_used(app_src: str, efficiency_
     assert "Efficiency Correlation" in efficiency_panel_src
     assert 'class="capability-crawl-efficiency-candidate"' in efficiency_panel_src
     assert ".capability-efficiency-correlation-card" in efficiency_panel_src
+
+
+def test_run_registry_panel_component_is_used(app_src: str, run_registry_panel_src: str) -> None:
+    assert "import RunRegistryPanel from './components/RunRegistryPanel.vue'" in app_src
+    assert "<RunRegistryPanel" in app_src
+    assert "name=\"runs\"" in app_src
+    assert "runHistoryRefreshToken" in app_src
+    assert "apiFetch('/api/runs?limit=50')" in run_registry_panel_src
+    assert "apiFetch(`/api/runs/${encodeURIComponent(row.run_id)}`)" in run_registry_panel_src
+    assert "contracts.value.input_contract" in run_registry_panel_src
+    assert "contracts.value.output_contract" in run_registry_panel_src
+    assert "contracts.value.manifest" in run_registry_panel_src
 
 
 def test_app_keeps_capability_state_and_api_flow(app_src: str) -> None:

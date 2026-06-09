@@ -590,5 +590,24 @@ def export_jsonl(result: dict[str, Any], *, run_id: str = "manual") -> dict[str,
     with path.open("w", encoding="utf-8", newline="\n") as fh:
         for row in rows:
             fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-    register_artifact(path)
+    if rid in {"manual", "route_executor"}:
+        register_artifact(path)
+    else:
+        source_url = str(result.get("source_url") or result.get("url") or "")
+        try:
+            register_artifact(
+                path,
+                run_id=rid,
+                kind="dataset_records",
+                mime="application/x-ndjson",
+                source_url=source_url,
+                produced_by="generic_extractor",
+                step_id="export_jsonl",
+                extra={
+                    "row_count": len(rows),
+                    "fields": list(result.get("fields") or []),
+                },
+            )
+        except TypeError:
+            register_artifact(path)
     return {"path": str(path), "url": artifact_url(path)}

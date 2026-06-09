@@ -95,6 +95,16 @@ def _is_array_json_payload(sample: bytes | None) -> bool:
     return head.startswith(b"[") or head.startswith(b"\n[")
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -163,9 +173,10 @@ class Constraints:
     proxy_server: str = ""
     proxy_username: str = ""
     proxy_password: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "max_runs": int(self.max_runs or 0),
             "rate_limit_qps": float(self.rate_limit_qps or 0.0),
             "allow_cross_system": bool(self.allow_cross_system),
@@ -174,6 +185,11 @@ class Constraints:
             "proxy_username": str(self.proxy_username or ""),
             "proxy_password": str(self.proxy_password or ""),
         }
+        for key, value in (self.extra or {}).items():
+            skey = str(key)
+            if skey and skey not in payload:
+                payload[skey] = _json_safe(value)
+        return payload
 
 
 @dataclass
@@ -595,15 +611,15 @@ def build_input_contract(
 ) -> InputContract:
     """Build a normalized :class:`InputContract` from raw API form-style inputs.
 
-    ``target_url`` is treated as a legacy alias for ``urls=[{url}]``. When both
-    are supplied, ``urls`` wins and ``target_url`` is merged in only if absent.
+    ``target_url`` is treated as a legacy alias for ``urls=[{url}]``. When
+    ``urls`` contains entries, it is authoritative and ``target_url`` is ignored.
     """
 
     goal_text = (goal or "").strip()
 
     url_specs: list[UrlSpec] = parse_urls_field(urls)
     tu = (target_url or "").strip()
-    if tu and not any(u.url == tu for u in url_specs):
+    if not url_specs and tu:
         url_specs.insert(0, UrlSpec(url=tu, role="start"))
 
     if not url_specs:
@@ -664,6 +680,16 @@ def build_input_contract(
     )
 
     cons = constraints or {}
+    known_constraint_keys = {
+        "max_runs", "rate_limit_qps", "allow_cross_system", "max_steps",
+        "proxy_server", "proxy", "proxy_username", "proxy_user",
+        "proxy_password", "proxy_pass",
+    }
+    constraint_extra = {
+        str(k): _json_safe(v)
+        for k, v in cons.items()
+        if str(k) not in known_constraint_keys and v is not None
+    }
     constraint_obj = Constraints(
         max_runs=int(cons.get("max_runs") or 0),
         rate_limit_qps=float(cons.get("rate_limit_qps") or 0.0),
@@ -672,6 +698,7 @@ def build_input_contract(
         proxy_server=str(cons.get("proxy_server") or cons.get("proxy") or ""),
         proxy_username=str(cons.get("proxy_username") or cons.get("proxy_user") or ""),
         proxy_password=str(cons.get("proxy_password") or cons.get("proxy_pass") or ""),
+        extra=constraint_extra,
     )
 
     return InputContract(

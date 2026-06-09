@@ -18,6 +18,33 @@ from visual_web_agent.concurrency_config import (
 RunAgentFn = Callable[..., Awaitable[bool]]
 EmitLogFn = Callable[[str, str], None]
 SaveProgressFn = Callable[[], None]
+ChildRunCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit_child_run(callback: ChildRunCallback | None, payload: dict[str, Any]) -> None:
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except Exception:
+        return
+
+
+def child_run_id(parent_run_id: str, *, kind: str, index: int, total: int | None = None) -> str:
+    """Return a stable child run id for parallel sub-runs.
+
+    Single start-url runs keep the parent id so API task_id == runs/<id>. Multi
+    URL and row-level runs get deterministic suffixes to avoid log/manifest
+    collisions under asyncio.gather.
+    """
+
+    parent = str(parent_run_id or "").strip()
+    if not parent:
+        return ""
+    if kind == "url" and int(total or 0) <= 1:
+        return parent
+    safe_kind = "row" if kind == "row" else "url"
+    return f"{parent}_{safe_kind}{int(index) + 1:04d}"
 
 
 async def run_start_urls_parallel(
@@ -31,6 +58,8 @@ async def run_start_urls_parallel(
     vlm_options: dict | None,
     upload_file: str = "",
     constraints: dict[str, Any] | None = None,
+    run_id: str = "",
+    on_child_run: ChildRunCallback | None = None,
     emit_log: EmitLogFn,
 ) -> tuple[int, int]:
     """Run one agent per start URL (up to concurrency cap). Returns (ok, total)."""
@@ -44,6 +73,7 @@ async def run_start_urls_parallel(
             auth_profiles=auth_profiles,
             vlm_options=vlm_options,
             upload_file=upload_file or "",
+            run_id=child_run_id(run_id, kind="url", index=0, total=len(start_urls)),
         )
         return (1 if ok else 0, 1)
 
@@ -73,6 +103,7 @@ async def run_start_urls_parallel(
             results.append(False)
             return
         async with sem:
+            child_id = child_run_id(run_id, kind="url", index=index, total=len(start_urls))
             if stop_event and stop_event.is_set():
                 results.append(False)
                 return
@@ -85,8 +116,21 @@ async def run_start_urls_parallel(
                     auth_profiles=auth_profiles,
                     vlm_options=vlm_options,
                     upload_file=upload_file or "",
+                    run_id=child_id,
                 )
                 results.append(bool(ok))
+                _emit_child_run(
+                    on_child_run,
+                    {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_id,
+                        "child_kind": "url",
+                        "index": index + 1,
+                        "total": len(start_urls),
+                        "start_url": url,
+                        "success": bool(ok),
+                    },
+                )
                 level = "info" if ok else "error"
                 emit_log(
                     f"{'✅' if ok else '❌'} [子 run {index + 1}] 完成",
@@ -94,6 +138,19 @@ async def run_start_urls_parallel(
                 )
             except Exception as exc:
                 results.append(False)
+                _emit_child_run(
+                    on_child_run,
+                    {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_id,
+                        "child_kind": "url",
+                        "index": index + 1,
+                        "total": len(start_urls),
+                        "start_url": url,
+                        "success": False,
+                        "error": str(exc),
+                    },
+                )
                 emit_log(f"❌ [子 run {index + 1}] 异常: {exc}", "error")
 
     await asyncio.gather(*[_one(i, u) for i, u in enumerate(start_urls)])
@@ -116,6 +173,8 @@ async def run_batch_rows_parallel(
     emit_log: EmitLogFn,
     constraints: dict[str, Any] | None = None,
     inter_row_sleep_s: float = 0.0,
+    run_id: str = "",
+    on_child_run: ChildRunCallback | None = None,
 ) -> tuple[int, int]:
     """Process spreadsheet rows with optional parallelism. Returns (ok, total)."""
 
@@ -142,6 +201,7 @@ async def run_batch_rows_parallel(
             row = df.loc[index]
             project_no = str(row.get("项目编号", "未知")).strip() or "未知"
             goal = render_goal(prompt, normalize_row(row))
+            child_id = child_run_id(run_id, kind="row", index=row_no - 1)
             emit_log("=" * 48, "info")
             emit_log(
                 f"▶️ 开始处理第 {row_no}/{total} 行 | 项目编号={project_no}",
@@ -154,6 +214,20 @@ async def run_batch_rows_parallel(
                     stop_event=stop_event,
                     auth_profiles=auth_profiles,
                     vlm_options=vlm_options,
+                    run_id=child_id,
+                )
+                _emit_child_run(
+                    on_child_run,
+                    {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_id,
+                        "child_kind": "row",
+                        "index": row_no,
+                        "total": total,
+                        "row_no": row_no,
+                        "project_no": project_no,
+                        "success": bool(ok),
+                    },
                 )
                 if ok:
                     df.at[index, "填报状态"] = "成功"
@@ -168,6 +242,20 @@ async def run_batch_rows_parallel(
                 df.at[index, "填报状态"] = "失败"
                 df.at[index, "日志备注"] = f"异常: {str(exc)[:200]}"
                 emit_log(f"❌ 第 {row_no} 行处理失败: {exc}", "error")
+                _emit_child_run(
+                    on_child_run,
+                    {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_id,
+                        "child_kind": "row",
+                        "index": row_no,
+                        "total": total,
+                        "row_no": row_no,
+                        "project_no": project_no,
+                        "success": False,
+                        "error": str(exc),
+                    },
+                )
             finally:
                 save_progress()
                 if inter_row_sleep_s > 0:
@@ -203,6 +291,7 @@ async def run_batch_rows_parallel(
         row = df.loc[index]
         project_no = str(row.get("项目编号", "未知")).strip() or "未知"
         goal = render_goal(prompt, normalize_row(row))
+        child_id = child_run_id(run_id, kind="row", index=row_no - 1)
         async with sem:
             if stop_event and stop_event.is_set():
                 return
@@ -217,6 +306,20 @@ async def run_batch_rows_parallel(
                     stop_event=stop_event,
                     auth_profiles=auth_profiles,
                     vlm_options=vlm_options,
+                    run_id=child_id,
+                )
+                _emit_child_run(
+                    on_child_run,
+                    {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_id,
+                        "child_kind": "row",
+                        "index": row_no,
+                        "total": total,
+                        "row_no": row_no,
+                        "project_no": project_no,
+                        "success": bool(ok),
+                    },
                 )
                 async with lock:
                     if ok:
@@ -230,6 +333,20 @@ async def run_batch_rows_parallel(
                         emit_log(f"❌ 第 {row_no} 行处理失败", "error")
                     save_progress()
             except Exception as exc:
+                _emit_child_run(
+                    on_child_run,
+                    {
+                        "parent_run_id": run_id,
+                        "child_run_id": child_id,
+                        "child_kind": "row",
+                        "index": row_no,
+                        "total": total,
+                        "row_no": row_no,
+                        "project_no": project_no,
+                        "success": False,
+                        "error": str(exc),
+                    },
+                )
                 async with lock:
                     df.at[index, "填报状态"] = "失败"
                     df.at[index, "日志备注"] = f"异常: {str(exc)[:200]}"

@@ -44,6 +44,15 @@ def test_save_and_load_queue_snapshot(local_tmp_path: Path) -> None:
                 "prompt": "collect queued",
                 "file_path": "private.xlsx",
                 "vlm_options": {"api_key": "secret"},
+                "urls": ["https://extra.example.org"],
+                "constraints": {
+                    "max_runs": 2,
+                    "proxy_password": "secret-pass",
+                    "proxy_server": "http://queue-user:queue-pass@proxy.example:3128",
+                    "proxy_chain": ["chain-user:chain-pass@proxy2.example:8080"],
+                },
+                "upload_sha256": "abc123",
+                "upload_mime": "text/csv",
             }
         ],
     }
@@ -64,13 +73,27 @@ def test_save_and_load_queue_snapshot(local_tmp_path: Path) -> None:
     assert "vlm_options" not in loaded["queue"][0]
     assert loaded["execution_queue"][0]["task_id"] == "t2"
     assert loaded["execution_queue"][0]["file_path"] == "private.xlsx"
+    assert loaded["execution_queue"][0]["urls"] == ["https://extra.example.org"]
+    assert loaded["execution_queue"][0]["constraints"]["max_runs"] == 2
+    assert loaded["execution_queue"][0]["constraints"]["proxy_password"] == "***"
+    assert loaded["execution_queue"][0]["constraints"]["proxy_server"] == "http://proxy.example:3128"
+    assert loaded["execution_queue"][0]["constraints"]["proxy_chain"] == ["proxy2.example:8080"]
+    assert loaded["execution_queue"][0]["upload_sha256"] == "abc123"
+    assert loaded["execution_queue"][0]["upload_mime"] == "text/csv"
     # secret is masked before the snapshot is persisted to disk
     assert loaded["execution_queue"][0]["vlm_options"]["api_key"] == "***"
+    raw_state = queue_state.queue_state_path(local_tmp_path).read_text(encoding="utf-8")
+    assert "secret-pass" not in raw_state
+    assert "queue-user" not in raw_state
+    assert "queue-pass" not in raw_state
+    assert "chain-user" not in raw_state
+    assert "chain-pass" not in raw_state
 
     public = queue_state.load_public_snapshot(base_dir=local_tmp_path)
     assert public is not None
     assert "execution_queue" not in public
     assert "vlm_options" not in public["queue"][0]
+    assert "constraints" not in public["queue"][0]
 
 
 def test_load_missing_snapshot_returns_none(local_tmp_path: Path) -> None:

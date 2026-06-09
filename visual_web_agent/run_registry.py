@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .secret_redaction import redact_secret_mapping
+
 
 _RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 _RUN_STATUS = {"queued", "running", "paused", "succeeded", "failed", "stopped", "error"}
@@ -71,6 +73,10 @@ def _sanitize_vlm_options(vlm_options: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _sanitize_secret_mapping(value: dict[str, Any] | None) -> dict[str, Any]:
+    return redact_secret_mapping(value, drop_empty=True)
+
+
 def _derive_paths(run_id: str) -> dict[str, str]:
     rid = str(run_id or "").strip()
     return {
@@ -102,6 +108,10 @@ def create_run(
     semantic_model: str = "",
     vlm_model_type: str = "vl",
     vlm_options: dict[str, Any] | None = None,
+    urls: list[str] | None = None,
+    constraints: dict[str, Any] | None = None,
+    upload_sha256: str = "",
+    upload_mime: str = "",
     status: str = "running",
     base_dir: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -125,6 +135,10 @@ def create_run(
         "semantic_model": str(semantic_model or ""),
         "vlm_model_type": str(vlm_model_type or "vl"),
         "vlm_options": _sanitize_vlm_options(vlm_options),
+        "urls": [str(u) for u in (urls or []) if str(u or "")],
+        "constraints": _sanitize_secret_mapping(constraints),
+        "upload_sha256": str(upload_sha256 or ""),
+        "upload_mime": str(upload_mime or ""),
         "created_at": ts,
         "started_at": ts if st == "running" else None,
         "finished_at": None,

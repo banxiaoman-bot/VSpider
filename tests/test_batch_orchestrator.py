@@ -35,6 +35,15 @@ class TestConcurrencyConfig:
         assert cc.resolve_start_url_concurrency() == 1
 
 
+class TestRunIdRouting:
+    def test_child_run_id_keeps_single_url_parent(self) -> None:
+        assert bo.child_run_id("task_1", kind="url", index=0, total=1) == "task_1"
+
+    def test_child_run_id_suffixes_parallel_children(self) -> None:
+        assert bo.child_run_id("task_1", kind="url", index=1, total=3) == "task_1_url0002"
+        assert bo.child_run_id("task_1", kind="row", index=4) == "task_1_row0005"
+
+
 class _FakeBrowser:
     async def close(self) -> None:
         return None
@@ -71,10 +80,10 @@ class TestBatchOrchestrator:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("VSPIDER_START_URL_CONCURRENCY", "1")
-        calls: list[str] = []
+        calls: list[tuple[str, str]] = []
 
         async def fake_run(**kwargs: Any) -> bool:
-            calls.append(str(kwargs.get("start_url")))
+            calls.append((str(kwargs.get("start_url")), str(kwargs.get("run_id"))))
             return True
 
         ok, total = asyncio.run(
@@ -86,23 +95,28 @@ class TestBatchOrchestrator:
                 stop_event=None,
                 auth_profiles=None,
                 vlm_options=None,
+                run_id="task_root",
                 emit_log=lambda *_a, **_k: None,
             )
         )
 
         assert total == 2
         assert ok == 2
-        assert calls == ["https://a.test", "https://b.test"]
+        assert calls == [
+            ("https://a.test", "task_root_url0001"),
+            ("https://b.test", "task_root_url0002"),
+        ]
 
     def test_start_urls_parallel_when_concurrency_gt_one(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("VSPIDER_START_URL_CONCURRENCY", "2")
         monkeypatch.setenv("VSPIDER_BROWSER_MAX_CONTEXTS", "2")
-        calls: list[str] = []
+        calls: list[tuple[str, str]] = []
+        events: list[dict[str, Any]] = []
 
         async def fake_run(**kwargs: Any) -> bool:
-            calls.append(str(kwargs.get("start_url")))
+            calls.append((str(kwargs.get("start_url")), str(kwargs.get("run_id"))))
             await asyncio.sleep(0.01)
             return True
 
@@ -115,13 +129,24 @@ class TestBatchOrchestrator:
                 stop_event=None,
                 auth_profiles=None,
                 vlm_options=None,
+                run_id="task_parallel",
+                on_child_run=events.append,
                 emit_log=lambda *_a, **_k: None,
             )
         )
 
         assert total == 2
         assert ok == 2
-        assert sorted(calls) == ["https://a.test", "https://b.test"]
+        assert sorted(calls) == [
+            ("https://a.test", "task_parallel_url0001"),
+            ("https://b.test", "task_parallel_url0002"),
+        ]
+        assert sorted(event["child_run_id"] for event in events) == [
+            "task_parallel_url0001",
+            "task_parallel_url0002",
+        ]
+        assert all(event["child_kind"] == "url" for event in events)
+        assert all(event["success"] is True for event in events)
 
     def test_batch_rows_parallel_respects_concurrency(
         self, monkeypatch: pytest.MonkeyPatch
@@ -130,13 +155,16 @@ class TestBatchOrchestrator:
         monkeypatch.setenv("VSPIDER_BROWSER_MAX_CONTEXTS", "2")
         active = 0
         peak = 0
+        run_ids: list[str] = []
+        events: list[dict[str, Any]] = []
         lock = asyncio.Lock()
 
-        async def fake_run(**_kwargs: Any) -> bool:
+        async def fake_run(**kwargs: Any) -> bool:
             nonlocal active, peak
             async with lock:
                 active += 1
                 peak = max(peak, active)
+                run_ids.append(str(kwargs.get("run_id")))
             await asyncio.sleep(0.05)
             async with lock:
                 active -= 1
@@ -158,6 +186,8 @@ class TestBatchOrchestrator:
                 normalize_row=lambda row: {k: str(v) for k, v in row.items()},
                 save_progress=lambda: saved.append(1),
                 emit_log=lambda *_a, **_k: None,
+                run_id="task_rows",
+                on_child_run=events.append,
             )
         )
 
@@ -165,6 +195,17 @@ class TestBatchOrchestrator:
         assert ok == 3
         assert peak <= 2
         assert len(saved) >= 3
+        assert sorted(run_ids) == [
+            "task_rows_row0001",
+            "task_rows_row0002",
+            "task_rows_row0003",
+        ]
+        assert sorted(event["child_run_id"] for event in events) == [
+            "task_rows_row0001",
+            "task_rows_row0002",
+            "task_rows_row0003",
+        ]
+        assert all(event["child_kind"] == "row" for event in events)
 
     def test_batch_rows_honors_stop_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("VSPIDER_BATCH_ROW_CONCURRENCY", "1")

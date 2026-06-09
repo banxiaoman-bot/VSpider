@@ -85,7 +85,7 @@ def build_default_capability_manifest() -> dict[str, CapabilitySpec]:
             layer="operations_plane",
             description="Tracks task lifecycle, final status, run metadata, and historical run lookup.",
             endpoints=("GET /api/runs", "GET /api/runs/{run_id}"),
-            output_schema={"runs": "list", "status": "str"},
+            output_schema={"runs": "list", "run": "dict", "contracts": "dict", "status": "str"},
             deterministic=True,
             changes_state=False,
             owner="runtime_guards",

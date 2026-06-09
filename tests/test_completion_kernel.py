@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from visual_web_agent.completion_kernel import (
     evaluate_completion,
+    load_manifest_items_for_run,
     maybe_short_circuit_decision,
 )
 
@@ -53,6 +54,156 @@ def test_media_complete_when_manifest_has_items() -> None:
     assert result["status"] == "complete"
 
 
+def test_dataset_manifest_complete_when_no_explicit_row_target() -> None:
+    result = evaluate_completion(
+        goal="导出当前表格",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_records", "container": "jsonl"},
+        manifest_items=[
+            {"kind": "dataset_records", "path": "runs/x/artifacts/data.jsonl"},
+        ],
+    )
+    assert result["status"] == "complete"
+    assert "dataset_manifest_ready" in result["reasons"]
+    assert "dataset_manifest:dataset_records" in result["evidence"]
+
+
+def test_dataset_manifest_waits_for_row_target_without_count_evidence() -> None:
+    result = evaluate_completion(
+        goal="导出前20条数据",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_rows", "container": "xlsx"},
+        goal_target_count=20,
+        total_extracted_rows=0,
+        manifest_items=[
+            {"kind": "dataset_rows", "path": "runs/x/artifacts/data.xlsx"},
+        ],
+    )
+    assert result["status"] == "continue"
+    assert "manifest_ready" in result["reasons"]
+    assert "dataset_manifest_ready" not in result["reasons"]
+
+
+def test_dataset_manifest_row_count_can_satisfy_explicit_target() -> None:
+    result = evaluate_completion(
+        goal="导出前20条数据",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_rows", "container": "xlsx"},
+        goal_target_count=20,
+        manifest_items=[
+            {
+                "kind": "dataset_rows",
+                "path": "runs/x/artifacts/data.xlsx",
+                "extra": {"row_count": 20},
+            },
+        ],
+    )
+    assert result["status"] == "complete"
+    assert "dataset_manifest_ready" in result["reasons"]
+
+
+def test_page_target_complete_when_pages_meet_target() -> None:
+    result = evaluate_completion(
+        goal="extract first 3 pages",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_records", "container": "jsonl"},
+        total_pages=3,
+        goal_target_pages=3,
+    )
+
+    assert result["status"] == "complete"
+    assert "extract_page_target_met" in result["reasons"]
+    assert "extract_pages:3/3" in result["evidence"]
+    assert any(item["name"] == "extract_page_target" and item["passed"] for item in result["checks"])
+
+
+def test_dataset_manifest_waits_for_page_target_until_pages_meet_target() -> None:
+    result = evaluate_completion(
+        goal="extract first 3 pages",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_records", "container": "jsonl"},
+        total_pages=1,
+        goal_target_pages=3,
+        manifest_items=[
+            {"kind": "dataset_records", "path": "runs/x/artifacts/data.jsonl"},
+        ],
+    )
+
+    assert result["status"] == "continue"
+    assert "manifest_ready" in result["reasons"]
+    assert "dataset_manifest_ready" not in result["reasons"]
+
+
+def test_dataset_manifest_requires_contract_fields() -> None:
+    result = evaluate_completion(
+        goal="export title and price",
+        output_mode="artifact",
+        output_contract={
+            "output_kind": "dataset_rows",
+            "container": "csv",
+            "fields": ["title", "price"],
+        },
+        goal_target_count=2,
+        total_extracted_rows=2,
+        manifest_items=[
+            {
+                "kind": "dataset_rows",
+                "path": "runs/x/artifacts/data.csv",
+                "extra": {"row_count": 2, "fields": ["title"]},
+            },
+        ],
+    )
+    assert result["status"] == "continue"
+    assert "manifest_ready" in result["reasons"]
+    assert "dataset_manifest_ready" not in result["reasons"]
+    field_check = next(item for item in result["checks"] if item["name"] == "manifest_dataset_fields")
+    assert field_check["passed"] is False
+    assert field_check["missing"] == ["price"]
+
+
+def test_dataset_manifest_fields_from_route_can_satisfy_completion() -> None:
+    result = evaluate_completion(
+        goal="export requested fields",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_records", "container": "jsonl"},
+        capability_route={
+            "strategy_context": {
+                "requested_fields": ["title", "price"],
+            },
+        },
+        manifest_items=[
+            {
+                "kind": "dataset_records",
+                "path": "runs/x/artifacts/data.jsonl",
+                "extra": {"row_count": 2, "fields": ["Title", "price"]},
+            },
+        ],
+    )
+    assert result["status"] == "complete"
+    assert "dataset_manifest_ready" in result["reasons"]
+    assert "manifest_fields:title,price" in result["evidence"]
+
+
+def test_load_manifest_items_for_run_reads_manifest_dataclass(tmp_path) -> None:
+    from visual_web_agent.io_contract.persistence import append_manifest_item
+
+    append_manifest_item(
+        "run_load_manifest",
+        kind="dataset_records",
+        path=str(tmp_path / "run_load_manifest" / "artifacts" / "data.jsonl"),
+        size=12,
+        sha256="abc",
+        extra={"row_count": 1, "fields": ["title"]},
+        base_dir=tmp_path,
+    )
+
+    items = load_manifest_items_for_run("run_load_manifest", base_dir=tmp_path)
+    assert len(items) == 1
+    assert items[0]["kind"] == "dataset_records"
+    assert items[0]["extra"]["row_count"] == 1
+    assert items[0]["extra"]["fields"] == ["title"]
+
+
 def test_continue_when_extract_below_target() -> None:
     result = evaluate_completion(
         goal="提取50条",
@@ -77,6 +228,22 @@ def test_short_circuit_scroll_when_already_complete() -> None:
     assert out["short_circuit"] is True
     assert out["decision"]["action"] == "done"
     assert out["decision"].get("__completion_kernel")
+
+
+def test_short_circuit_wait_when_dataset_manifest_ready() -> None:
+    decision = {"action": "wait", "target_id": 0, "thought": "等待导出完成"}
+    out = maybe_short_circuit_decision(
+        decision,
+        goal="导出当前表格",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_records", "container": "jsonl"},
+        manifest_items=[
+            {"kind": "dataset_records", "path": "runs/x/artifacts/data.jsonl"},
+        ],
+    )
+    assert out["short_circuit"] is True
+    assert out["decision"]["action"] == "done"
+    assert "dataset_manifest:dataset_records" in out["evaluation"]["evidence"]
 
 
 def test_no_short_circuit_for_terminal_actions() -> None:

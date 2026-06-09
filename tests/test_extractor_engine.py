@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import uuid
 from pathlib import Path
@@ -125,6 +126,34 @@ def test_export_jsonl(monkeypatch: pytest.MonkeyPatch, local_tmp_path: Path) -> 
     assert path.exists()
     assert artifact["url"].startswith("/download/extract_extract_run_")
     assert path.read_text(encoding="utf-8").strip() == '{"id":1,"name":"Alice"}'
+
+
+def test_export_jsonl_registers_run_manifest(monkeypatch: pytest.MonkeyPatch, local_tmp_path: Path) -> None:
+    import api_server
+    from visual_web_agent.artifact_manager import register_artifact as real_register_artifact
+    from visual_web_agent.io_contract import persistence as _persistence
+
+    artifact_root = local_tmp_path / "artifacts"
+    runs_root = local_tmp_path / "runs"
+    run_id = "extract_manifest_run"
+    monkeypatch.setattr(generic, "resolve_artifact_path", lambda filename, subdir="": artifact_root / subdir / filename)
+    monkeypatch.setattr(generic, "register_artifact", real_register_artifact)
+    monkeypatch.setattr(generic, "artifact_url", lambda path: "/download/" + Path(path).name)
+    monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+    monkeypatch.setattr(api_server, "broadcast_new_artifact", lambda _path: None)
+
+    result = generic.extract([{"id": 1, "name": "Alice"}])
+    generic.export_jsonl(result, run_id=run_id)
+    manifest = json.loads((runs_root / run_id / "manifest.json").read_text(encoding="utf-8"))
+    item = manifest["items"][0]
+
+    assert item["kind"] == "dataset_records"
+    assert item["mime"] == "application/x-ndjson"
+    assert item["produced_by"] == "generic_extractor"
+    assert item["step_id"] == "export_jsonl"
+    assert item["extra"]["row_count"] == 1
+    assert item["extra"]["fields"] == ["id", "name"]
+    assert str(runs_root / run_id / "artifacts") in item["path"]
 
 
 def test_api_extractor_run_endpoint() -> None:

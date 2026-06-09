@@ -13,6 +13,7 @@ run_agent（让下游 preflight 去推断入口）。
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -83,3 +84,68 @@ def test_cli_explicit_url_still_passed(main_module, monkeypatch: pytest.MonkeyPa
     m.main()
 
     assert captured.get("url") == "https://example.com"
+
+
+def test_cli_threads_runtime_options(main_module, monkeypatch: pytest.MonkeyPatch) -> None:
+    m = main_module
+    captured: dict[str, object] = {}
+
+    def _fake_run_agent(url, goal, **kwargs):
+        captured["url"] = url
+        captured["goal"] = goal
+        captured["kwargs"] = kwargs
+
+        async def _noop():
+            return True
+
+        return _noop()
+
+    monkeypatch.setattr(m, "run_agent", _fake_run_agent, raising=True)
+    monkeypatch.setattr(m.asyncio, "run", _consume, raising=True)
+    if hasattr(m, "_apply_runtime_overrides"):
+        monkeypatch.setattr(m, "_apply_runtime_overrides", lambda args: None, raising=True)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--url", "https://example.com",
+            "--goal", "collect",
+            "--auth-profiles", "admin",
+            "--run-constraints-json", '{"max_runs": 2}',
+            "--resume",
+            "--vlm-model", "vision-model",
+            "--semantic-model", "semantic-model",
+            "--vlm-model-type", "text",
+            "--vlm-temperature", "0.2",
+            "--vlm-max-tokens", "1024",
+            "--vlm-base-url", "https://vlm.example/v1",
+            "--semantic-base-url", "https://semantic.example/v1",
+        ],
+        raising=True,
+    )
+
+    m.main()
+
+    kwargs = captured.get("kwargs")
+    assert isinstance(kwargs, dict)
+    assert kwargs["auth_profiles"] == "admin"
+    assert kwargs["run_constraints"] == {"max_runs": 2, "resume": True}
+    assert kwargs["vlm_options"] == {
+        "model": "vision-model",
+        "semantic_model": "semantic-model",
+        "model_type": "text",
+        "base_url": "https://vlm.example/v1",
+        "semantic_base_url": "https://semantic.example/v1",
+        "temperature": 0.2,
+        "max_tokens": 1024,
+    }
+
+
+def test_run_agent_input_contract_skeleton_records_vlm_options() -> None:
+    src = (Path(__file__).resolve().parent.parent / "visual_web_agent" / "main.py").read_text(
+        encoding="utf-8",
+    )
+
+    assert "ensure_input_contract_skeleton(" in src
+    assert "vlm_options=vlm_options or None" in src

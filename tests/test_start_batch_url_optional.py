@@ -123,6 +123,28 @@ class TestStartBatchUrlOptional:
         assert body.get("status") == "success", body
         assert body.get("target_url") == "https://primary.example/"
 
+    def test_explicit_urls_override_target_url(
+        self, client, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import api_server as api
+
+        monkeypatch.setattr(api, "_start_queue_workers", lambda bt: ([], {}))
+        monkeypatch.setattr(api, "_task_snapshot", lambda: {"running": False, "in_cooldown": False})
+
+        resp = client.post(
+            "/api/start_batch",
+            data={
+                "prompt": "compare these pages",
+                "target_url": "https://legacy.example/",
+                "urls": '["https://a.test/", "https://b.test/"]',
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body.get("status") == "success", body
+        assert body.get("target_url") == "https://a.test/"
+        assert body.get("urls") == ["https://b.test/"]
+
     def test_url_less_goal_uses_semantic_entry_llm(
         self, client, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -8,6 +8,7 @@ when the agent loop has called ``set_current_run``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -77,6 +78,19 @@ class TestRunContextSlot:
         clear_current_run()
         assert current_run_id() == ""
 
+    def test_context_is_task_local(self) -> None:
+        from visual_web_agent.io_contract import current_run_id, set_current_run
+
+        async def worker(run_id: str) -> str:
+            set_current_run(run_id)
+            await asyncio.sleep(0)
+            return current_run_id()
+
+        async def main() -> list[str]:
+            return await asyncio.gather(worker("run_a"), worker("run_b"))
+
+        assert asyncio.run(main()) == ["run_a", "run_b"]
+
 
 # ---------------------------------------------------------------------------
 # data_manager.save_to_excel: when the run slot is set, it must drop a
@@ -136,6 +150,8 @@ class TestSaveToExcelManifestHook:
         assert target["mime"] == (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["new_row_count"] == 2
         assert target["size"] > 0
         assert target["sha256"]
 

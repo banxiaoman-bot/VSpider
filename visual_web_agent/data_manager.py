@@ -663,6 +663,7 @@ def save_to_excel(
         kind="dataset_rows",
         mime=_XLSX_MIME,
         produced_by="vlm_extract",
+        extra={"row_count": total, "new_row_count": len(df_new)},
     )
     return abs_path
 
@@ -733,5 +734,6 @@ def save_intercepted_data(
         kind="dataset_rows",
         mime=_XLSX_MIME,
         produced_by="xhr_intercept",
+        extra={"row_count": total, "new_row_count": new_count},
     )
     return abs_path

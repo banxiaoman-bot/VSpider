@@ -103,6 +103,55 @@ def compute_sha256_size(data: bytes) -> tuple[str, int]:
     return hashlib.sha256(data).hexdigest(), len(data)
 
 
+def _field_names(rows: Iterable[Any]) -> list[str]:
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            sk = str(key)
+            if sk not in seen_set:
+                seen.append(sk)
+                seen_set.add(sk)
+    return seen
+
+
+def dataset_extra(
+    extra: dict[str, Any] | None,
+    *,
+    output_kind: str,
+    rows: Iterable[Any] | None = None,
+    row_count: int | None = None,
+    fields: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Merge dataset evidence into manifest ``extra`` without overwriting caller data."""
+    merged = dict(extra or {})
+    if output_kind not in {"dataset_rows", "dataset_records"}:
+        return merged
+
+    materialized_rows: list[Any] | None = None
+    if rows is not None:
+        materialized_rows = list(rows)
+
+    if row_count is None and materialized_rows is not None:
+        row_count = len(materialized_rows)
+    if row_count is not None:
+        try:
+            merged.setdefault("row_count", int(row_count))
+        except (TypeError, ValueError):
+            pass
+
+    field_names: list[str] = []
+    if fields is not None:
+        field_names = [str(f) for f in fields if str(f)]
+    if not field_names and materialized_rows is not None:
+        field_names = _field_names(materialized_rows)
+    if field_names:
+        merged.setdefault("fields", field_names)
+    return merged
+
+
 def finalize_file_artifact(
     *,
     run_id: str,

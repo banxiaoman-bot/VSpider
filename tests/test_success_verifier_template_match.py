@@ -69,6 +69,12 @@ class TestFamilyTemplatesOnlyVetoOwnCapability:
             route, capability="api_replay", result={"response": {"ok": True}}
         )
         assert _checks(ok).get("template_api") is True
+        rows_ok = verify_route_success(
+            route,
+            capability="api_replay",
+            result={"row_count": 1, "rows": [{"id": 1}]},
+        )
+        assert _checks(rows_ok).get("template_api") is True
         bad = verify_route_success(route, capability="api_replay", result={})
         assert _checks(bad).get("template_api") is False
 

@@ -69,18 +69,53 @@ class TestInputContractIO:
             goal="hello",
             target_url="https://a.com",
             vlm_options={"api_key": "vlm-secret", "semantic_api_key": "sem-secret"},
-            constraints={"proxy_server": "http://p:3128", "proxy_password": "proxy-secret"},
+            constraints={
+                "proxy_server": "http://proxy-user:proxy-pass@proxy.example:3128",
+                "proxy_password": "proxy-secret",
+            },
         )
         write_input_contract("run_sec", c, base_dir=tmp_path)
         raw = (tmp_path / "run_sec" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
         assert "vlm-secret" not in raw
         assert "sem-secret" not in raw
         assert "proxy-secret" not in raw
+        assert "proxy-user" not in raw
+        assert "proxy-pass" not in raw
         assert "***" in raw
-        assert "http://p:3128" in raw  # non-secret survives
+        assert "http://proxy.example:3128" in raw  # non-secret endpoint survives
         # the in-memory object still holds the real secrets
         assert c.model_overrides.vlm["api_key"] == "vlm-secret"
+        assert c.constraints.proxy_server == "http://proxy-user:proxy-pass@proxy.example:3128"
         assert c.constraints.proxy_password == "proxy-secret"
+
+    def test_extra_constraint_secrets_masked_on_disk(self, tmp_path: Path) -> None:
+        c = build_input_contract(
+            goal="hello",
+            target_url="https://a.com",
+            constraints={
+                "resume": True,
+                "captcha_api_token": "captcha-secret",
+                "proxy_chain": [
+                    "http://chain-user:chain-pass@p1.example:8080",
+                    "bare-user:bare-pass@p2.example:8080",
+                ],
+            },
+        )
+        write_input_contract("run_sec_extra", c, base_dir=tmp_path)
+        raw = (tmp_path / "run_sec_extra" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+
+        assert payload["constraints"]["resume"] is True
+        assert payload["constraints"]["proxy_chain"] == [
+            "http://p1.example:8080",
+            "p2.example:8080",
+        ]
+        assert payload["constraints"]["captcha_api_token"] == "***"
+        assert "captcha-secret" not in raw
+        assert "chain-user" not in raw
+        assert "chain-pass" not in raw
+        assert "bare-user" not in raw
+        assert "bare-pass" not in raw
 
     def test_skeleton_also_masks_secrets(self, tmp_path: Path) -> None:
         ensure_input_contract_skeleton(

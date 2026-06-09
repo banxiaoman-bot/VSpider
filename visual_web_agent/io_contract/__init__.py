@@ -33,6 +33,9 @@ from .output_contract import (
     CONTAINERS,
     infer_output_contract,
     default_container_for_kind,
+    normalize_output_fields,
+    output_contract_fields,
+    normalize_output_contract_dict,
 )
 from .manifest import (
     Manifest,
@@ -95,6 +98,9 @@ __all__ = [
     "CONTAINERS",
     "infer_output_contract",
     "default_container_for_kind",
+    "normalize_output_fields",
+    "output_contract_fields",
+    "normalize_output_contract_dict",
     "Manifest",
     "ManifestItem",
     "new_manifest",

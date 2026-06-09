@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from visual_web_agent.capability_router import route_task
+from visual_web_agent import api_replay
 from visual_web_agent.extraction_engine import generic
 from visual_web_agent.spider_lite import SpiderLiteManager
 from visual_web_agent.success_verifier import verify_route_success
@@ -162,10 +163,15 @@ class DeterministicRouteExecutor:
         else:
             attempts.append({"capability": "generic_extractor", "status": "skipped", "reason": "source/html not provided"})
         if bool(payload.get("allow_network")):
+            api_result = self._try_api_replay(payload, route, attempts)
+            if api_result is not None:
+                return self._completed(route, attempts, api_result, capability_to_system)
             spider_result = self._try_spider(payload, route, attempts)
             if spider_result is not None:
                 return self._completed(route, attempts, spider_result, capability_to_system)
         else:
+            if _api_replay_candidates(payload):
+                attempts.append({"capability": "api_replay", "status": "skipped", "reason": "allow_network is false"})
             attempts.append({"capability": "spider_lite", "status": "skipped", "reason": "allow_network is false"})
         status = "fallback" if any(item.get("status") == "attempted" for item in attempts) else "skipped"
         router = _router_from_route(route)
@@ -256,6 +262,51 @@ class DeterministicRouteExecutor:
             return None
         return {"capability": "generic_extractor", "result": result, "artifact": artifact, "verification": verification}
 
+    def _try_api_replay(self, payload: dict[str, Any], route: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        candidates = _api_replay_candidates(payload)
+        if not candidates:
+            return None
+        candidate = api_replay.choose_candidate(
+            candidates,
+            endpoint=str(payload.get("endpoint") or payload.get("api_endpoint") or ""),
+        )
+        if candidate is None:
+            attempts.append({"capability": "api_replay", "status": "skipped", "reason": "network candidate not provided"})
+            return None
+        headers = payload.get("api_headers") if isinstance(payload.get("api_headers"), dict) else payload.get("headers")
+        if not isinstance(headers, dict):
+            headers = {}
+        fetcher = payload.get("api_replay_fetcher") if callable(payload.get("api_replay_fetcher")) else None
+        try:
+            result = api_replay.replay_candidate(
+                run_id=str(payload.get("run_id") or "route_executor"),
+                candidate=candidate,
+                page=_positive_int(payload.get("page"), default=1),
+                page_size=_positive_int(payload.get("page_size"), default=_target_count(route) or 50, max_value=500),
+                timeout_s=float(payload.get("api_timeout_s") or payload.get("timeout_s") or 15.0),
+                headers=dict(headers),
+                fetcher=fetcher,
+            )
+        except Exception as exc:
+            attempts.append(_attempt_error("api_replay", exc))
+            return None
+        artifact = result.get("artifact") if isinstance(result.get("artifact"), dict) else None
+        verification = verify_route_success(route, capability="api_replay", result=result, artifact=artifact, payload=payload)
+        attempts.append({
+            "capability": "api_replay",
+            "status": "attempted",
+            "row_count": verification.get("observed_count"),
+            "target_count": verification.get("target_count"),
+            "http_status": result.get("http_status"),
+            "completed": verification.get("passed"),
+            "verification": verification,
+            "verification_summary": verification.get("verification_summary"),
+            "reason": "" if verification.get("passed") else verification.get("summary"),
+        })
+        if not verification.get("passed"):
+            return None
+        return {"capability": "api_replay", "result": result, "artifact": artifact, "verification": verification}
+
     def _try_spider(self, payload: dict[str, Any], route: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
         url = str(payload.get("url") or payload.get("target_url") or payload.get("start_url") or "")
         start_urls = payload.get("start_urls") or payload.get("urls") or ([url] if url else [])
@@ -266,7 +317,7 @@ class DeterministicRouteExecutor:
         spider_payload.setdefault("run_id", str(payload.get("run_id") or "route_executor"))
         spider_payload.setdefault("start_urls", start_urls)
         spider_payload.setdefault("max_depth", int(payload.get("max_depth") or 0))
-        spider_payload.setdefault("max_pages", int(payload.get("max_pages") or 10))
+        spider_payload.setdefault("max_pages", int(payload.get("max_pages") or _target_pages(route) or 10))
         if isinstance(payload.get("extract"), dict):
             spider_payload.setdefault("extract", dict(payload.get("extract") or {}))
         spider_payload.setdefault("export", bool(payload.get("export")) or _save_artifact_required(route, payload))
@@ -283,6 +334,8 @@ class DeterministicRouteExecutor:
             "status": "attempted",
             "item_count": verification.get("observed_count"),
             "target_count": verification.get("target_count"),
+            "page_count": result.get("page_count"),
+            "target_pages": _target_pages(route),
             "completed": verification.get("passed"),
             "verification": verification,
             "verification_summary": verification.get("verification_summary"),
@@ -335,6 +388,54 @@ def _target_count(route: dict[str, Any]) -> int | None:
     except Exception:
         value = 0
     return value if value > 0 else None
+
+
+def _target_pages(route: dict[str, Any]) -> int | None:
+    try:
+        value = int((route.get("strategy_context") or {}).get("target_pages") or 0)
+    except Exception:
+        value = 0
+    return value if value > 0 else None
+
+
+def _positive_int(value: Any, *, default: int, max_value: int | None = None) -> int:
+    try:
+        number = int(value or default)
+    except Exception:
+        number = default
+    number = max(1, number)
+    if max_value is not None:
+        number = min(number, max_value)
+    return number
+
+
+def _api_replay_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def add(raw: Any) -> None:
+        if isinstance(raw, dict):
+            if raw.get("endpoint") or raw.get("url"):
+                out.append(dict(raw))
+            return
+        if isinstance(raw, list):
+            for item in raw:
+                add(item)
+
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    for source in (
+        payload.get("network_candidate"),
+        payload.get("api_candidate"),
+        payload.get("candidate"),
+        payload.get("network_candidates"),
+        payload.get("candidates"),
+        context.get("network_candidate"),
+        context.get("api_candidate"),
+        context.get("candidate"),
+        context.get("network_candidates"),
+        context.get("candidates"),
+    ):
+        add(source)
+    return out
 
 
 def _save_artifact_required(route: dict[str, Any], payload: dict[str, Any]) -> bool:

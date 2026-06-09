@@ -145,17 +145,21 @@ def resolve_output_contract(*contracts: dict[str, Any] | None) -> dict[str, Any]
     # without an explicit container lands as files_folder / inline_text instead
     # of being forced into a spreadsheet. dataset_rows still maps to xlsx -- but
     # by the sanctioned kind->container policy, not a hard-coded default.
+    try:
+        from ..io_contract.output_contract import (
+            default_container_for_kind,
+            normalize_output_contract_dict,
+        )
+    except (ImportError, ValueError):
+        from visual_web_agent.io_contract.output_contract import (
+            default_container_for_kind,
+            normalize_output_contract_dict,
+        )
     if not merged.get("container"):
-        try:
-            from ..io_contract.output_contract import default_container_for_kind
-        except (ImportError, ValueError):
-            from visual_web_agent.io_contract.output_contract import (
-                default_container_for_kind,
-            )
         merged["container"] = default_container_for_kind(
             str(merged.get("output_kind") or "dataset_rows")
         )
-    return merged
+    return normalize_output_contract_dict(merged)
 
 
 def save_run_dataset(

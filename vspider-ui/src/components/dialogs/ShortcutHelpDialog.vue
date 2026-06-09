@@ -27,7 +27,7 @@ const dialogVisible = computed({
           <tbody>
             <tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>提交任务 (在输入框内也生效)</td></tr>
             <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>聚焦业务指令输入框</td></tr>
-            <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd>..<kbd>6</kbd></td><td>切换底部 tab (Terminal/Timeline/Capability/Final/Artifacts/失败记录)</td></tr>
+            <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd>..<kbd>7</kbd></td><td>切换底部 tab (Terminal/Timeline/Capability/Final/Artifacts/Runs/失败记录)</td></tr>
             <tr><td><kbd>Ctrl</kbd>+<kbd>/</kbd></td><td>打开 / 关闭本对话框</td></tr>
           </tbody>
         </table>
