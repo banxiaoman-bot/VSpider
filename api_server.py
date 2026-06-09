@@ -54,6 +54,7 @@ from visual_web_agent import run_registry as _run_registry
 from visual_web_agent import network_intelligence as _network_intelligence
 from visual_web_agent import api_replay as _api_replay
 from visual_web_agent import queue_state as _queue_state
+from visual_web_agent.secret_redaction import redact_event_payload
 from visual_web_agent.capability_api import CapabilityApiDeps, capability_crawl_efficiency_plan as _capability_crawl_efficiency_plan, capability_efficiency_correlation_report as _capability_efficiency_correlation_report, create_capability_router
 from visual_web_agent.extraction_engine import generic as _extractor_engine
 from visual_web_agent.browser_pool import build_browser_runtime_drift as _build_browser_runtime_drift
@@ -159,7 +160,11 @@ class ConnectionManager:
         logger.info(f"[WS] 客户端已断开，剩余连接数: {len(self.active)}")
 
     async def broadcast(self, message: dict) -> None:
-        payload = json.dumps(message, ensure_ascii=False)
+        # WS-EGRESS-REDACT: mask api_key/password/secret/token + URL creds
+        # before any payload leaves over the socket. Opaque blobs (screenshot
+        # ``data``, base64) and over-long strings are skipped to keep this
+        # per-frame hot path cheap.
+        payload = json.dumps(redact_event_payload(message), ensure_ascii=False)
         dead: list[WebSocket] = []
         for ws in list(self.active):
             try:
@@ -1252,7 +1257,11 @@ def _persist_phase_event(payload: dict[str, Any]) -> None:
     if path is None:
         return
     try:
-        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        # WS-EGRESS-REDACT: mask secrets before the phase event hits disk,
+        # mirroring the WebSocket broadcast redaction.
+        line = json.dumps(
+            redact_event_payload(payload), ensure_ascii=False, separators=(",", ":")
+        )
         with _PHASE_LOG_LOCK:
             with path.open("a", encoding="utf-8", newline="\n") as f:
                 f.write(line + "\n")

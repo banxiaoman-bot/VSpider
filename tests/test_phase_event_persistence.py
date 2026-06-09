@@ -194,6 +194,73 @@ class TestPayloadShape:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# WS-EGRESS-REDACT: mask secrets before disk / WebSocket egress
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestSecretRedaction:
+    """Secrets carried in phase ``extra`` / broadcast payloads must be masked
+    before they reach disk (``_persist_phase_event``) or the WebSocket
+    (``ConnectionManager.broadcast``). Opaque blobs like screenshot ``data``
+    must pass through untouched so the hot path stays cheap."""
+
+    def test_phase_event_persist_masks_secrets(self, tmp_logs, quiet_broadcast):
+        api_server.set_phase_log_run_id("20260601_120000")
+        api_server.broadcast_phase(
+            "vlm_call",
+            message="auth",
+            extra={
+                "vlm_api_key": "supersecret-key",
+                "endpoint": "https://u-user:u-pass@api.example.com/v1",
+                "model": "qwen-vl",
+            },
+        )
+        path = tmp_logs / "logs" / "phase_20260601_120000.jsonl"
+        raw = path.read_text(encoding="utf-8")
+        row = json.loads(raw.strip())
+        # secret masked on disk
+        assert "supersecret-key" not in raw
+        assert row["vlm_api_key"] == "***"
+        # url-embedded credentials stripped, endpoint survives
+        assert "u-user" not in raw
+        assert "u-pass" not in raw
+        assert row["endpoint"] == "https://api.example.com/v1"
+        # non-secret fields preserved
+        assert row["model"] == "qwen-vl"
+        assert row["phase"] == "vlm_call"
+
+    def test_ws_broadcast_masks_secrets_keeps_blob(self):
+        import asyncio
+
+        class _FakeWS:
+            def __init__(self):
+                self.sent: list[str] = []
+
+            async def send_text(self, text):
+                self.sent.append(text)
+
+        mgr = api_server.ConnectionManager()
+        ws = _FakeWS()
+        mgr.active.append(ws)
+        blob = "B" * 5000  # screenshot-sized opaque payload
+        payload = {
+            "type": "screenshot",
+            "vlm_api_key": "supersecret-key",
+            "data": blob,
+            "ok": 1,
+        }
+        asyncio.new_event_loop().run_until_complete(mgr.broadcast(payload))
+        assert ws.sent
+        text = ws.sent[-1]
+        # secret masked on the wire
+        assert "supersecret-key" not in text
+        assert '"vlm_api_key"' in text and "***" in text
+        # opaque blob preserved verbatim (not walked / not corrupted)
+        assert blob in text
+        assert '"ok"' in text
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Safety: write failures must not break the live broadcast
 # ════════════════════════════════════════════════════════════════════════
 

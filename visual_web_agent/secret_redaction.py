@@ -58,3 +58,48 @@ def redact_secret_mapping(value: Any, *, drop_empty: bool = False) -> dict[str, 
             continue
         out[str(key)] = redact_secret_value(key, raw_value)
     return out
+
+
+# Keys whose values are opaque blobs (screenshots, base64 frames, raw bytes).
+# They never carry structured secrets and are too large to walk on the live
+# broadcast hot path, so they pass through event redaction untouched.
+EVENT_BLOB_KEYS = frozenset(
+    {"data", "image", "screenshot", "b64", "frame", "thumbnail", "bytes"}
+)
+
+# Strings longer than this are treated as opaque payloads (base64 / HTML
+# response bodies) and skipped, keeping the per-frame broadcast path cheap.
+EVENT_MAX_SCAN_LEN = 2048
+
+
+def _redact_event_value(key: Any, value: Any, *, max_str: int) -> Any:
+    if str(key).lower() in EVENT_BLOB_KEYS:
+        return value
+    if is_secret_key(key) and value not in (None, ""):
+        return "***"
+    if isinstance(value, dict):
+        return redact_event_payload(value, max_str=max_str)
+    if isinstance(value, (list, tuple)):
+        return [_redact_event_value("", item, max_str=max_str) for item in value]
+    if isinstance(value, str):
+        if len(value) > max_str:
+            return value
+        return redact_proxy_userinfo(value)
+    return value
+
+
+def redact_event_payload(payload: Any, *, max_str: int = EVENT_MAX_SCAN_LEN) -> Any:
+    """Cheap, broadcast-safe redaction for live event / WebSocket payloads.
+
+    Masks ``api_key`` / ``password`` / ``secret`` / ``token`` keys at any depth
+    and strips URL-embedded credentials, but leaves opaque blob fields
+    (screenshot ``data``, base64) and over-long strings untouched so the
+    per-frame broadcast path stays cheap. Returns a new object; the input is
+    never mutated.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    return {
+        str(key): _redact_event_value(key, raw_value, max_str=max_str)
+        for key, raw_value in payload.items()
+    }
