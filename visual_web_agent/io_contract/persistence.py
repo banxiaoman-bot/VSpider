@@ -18,7 +18,6 @@ All writes use a temp-file + ``os.replace`` to avoid partial files on crash.
 
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
@@ -106,20 +105,19 @@ def _redact_input_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     # Mask secrets before input_contract.json is written to disk. In-memory
     # InputContract objects keep the real values; only the persisted record is
     # masked, mirroring the run_registry / queue_state secret handling.
+    #
+    # Walk the whole contract tree (model_overrides, constraints, urls,
+    # attachments, auth_profiles) so api_key/password/secret/token at any depth
+    # and URL-embedded credentials are masked -- not just the top-level
+    # constraints block and the model_overrides api_key fields.
     if not isinstance(payload, dict):
         return payload
-    redacted = copy.deepcopy(payload)
-    overrides = redacted.get("model_overrides")
-    if isinstance(overrides, dict):
-        for section in ("vlm", "semantic"):
-            sec = overrides.get(section)
-            if isinstance(sec, dict):
-                for key in list(sec):
-                    if "api_key" in str(key).lower() and sec[key] not in (None, ""):
-                        sec[key] = "***"
-    cons = redacted.get("constraints")
-    if isinstance(cons, dict):
-        redacted["constraints"] = redact_secret_mapping(cons)
+    redacted = redact_secret_mapping(payload)
+    # Keep the human-readable goal verbatim for reproducibility: it is the
+    # user's task text, never a secret container, and proxy-userinfo stripping
+    # could otherwise mangle a goal that happens to contain "a:b@c".
+    if "goal" in payload:
+        redacted["goal"] = payload["goal"]
     return redacted
 
 
