@@ -2262,3 +2262,29 @@ Closes the audit finding "XHR intercept still hard-codes xlsx" (mission 1-A iron
 Tests: tests/test_xhr_intercept_contract.py (13 cases: container resolution,
 suffix rewrite, jsonl/csv append+dedup, policy fallback, wiring, dedup-state
 preservation). Full suite 2951 passed / 2 skipped.
+
+## Slice FORM-IFRAME-1: form_set reaches iframes + open shadow DOM (done)
+
+Layer: operations_plane (actions.py form_set handler + binding JS).
+Closes the audit finding "form_set/auto_form only evaluate the main document".
+
+- Binding JS gains deepQueryAll(): querySelectorAll that descends open shadow
+  roots; wired into allControls / allVisible / findLabelHits / label[for]
+  resolution (root-aware getElementById + CSS.escape fallback) / marker sweep.
+- _form_set_with_frames(): main document first; only when the main doc reports
+  label_or_control_not_found does it probe every child iframe (detached and
+  throwing frames skipped). Returns (result, scope) so opener clicks, dropdown
+  option picks and the readback all run in the found frame's document.
+- Frame-local click_point is never fed to page.mouse (viewport-coords mismatch);
+  dropdown pick falls back to the top document for teleporting widget libraries.
+- rpa_trail gains additive frame_url evidence field (empty for main document).
+
+Tests: tests/test_form_set_iframe_shadow.py (10 cases: fallback ordering,
+found-but-failed stays put, detached/raising frames, evidence field, shadow
+anchors). Live-browser probe (shadow form + srcdoc iframe + ghost label)
+10/10 PASS pre-removal.
+
+Out of scope (next): auto_form batch macro in main.py (same gap, separate
+slice); closed shadow roots (unreachable by design); cross-origin iframes
+(Playwright frame.evaluate still works, but widget popups teleported to the
+top document cannot be clicked from the frame scope alone).

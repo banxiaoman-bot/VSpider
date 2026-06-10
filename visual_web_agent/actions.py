@@ -814,6 +814,15 @@ async def _form_set_bound_control_v2(
                 el?.getAttribute?.('placeholder'),
                 el?.getAttribute?.('title')
             ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+            // querySelectorAll that also descends into open shadow roots, so
+            // web-component forms (e.g. lit/stencil wrappers) stay reachable.
+            const deepQueryAll = (selector, root = document) => {
+                const out = Array.from(root.querySelectorAll(selector));
+                for (const host of root.querySelectorAll('*')) {
+                    if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                }
+                return out;
+            };
             const controlSelector = [
                 'input:not([type=hidden])',
                 'textarea',
@@ -828,7 +837,7 @@ async def _form_set_bound_control_v2(
                 '.el-input',
                 '.ant-input-affix-wrapper'
             ].join(',');
-            const allControls = () => Array.from(document.querySelectorAll(controlSelector))
+            const allControls = () => deepQueryAll(controlSelector)
                 .filter(isVisible)
                 .filter(el => !['button', 'submit', 'reset', 'hidden'].includes(String(el.type || '').toLowerCase()));
             const readValue = (el) => {
@@ -907,7 +916,7 @@ async def _form_set_bound_control_v2(
             };
             const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
             const allVisible = (selector, root = document) =>
-                Array.from(root.querySelectorAll(selector)).filter(isVisible);
+                deepQueryAll(selector, root).filter(isVisible);
             const parseDateTarget = (raw) => {
                 const s = String(raw || '').trim();
                 let m = s.match(/(20\\d{2})[-/.](\\d{1,2})[-/.](\\d{1,2})/);
@@ -1027,9 +1036,9 @@ async def _form_set_bound_control_v2(
                 return best;
             };
             const findLabelHits = () => {
-                const nodes = Array.from(document.querySelectorAll(
+                const nodes = deepQueryAll(
                     'label,[for],.el-form-item__label,.ant-form-item-label,.n-form-item-label,[class*=label],span,div'
-                )).filter(isVisible);
+                ).filter(isVisible);
                 const hits = [];
                 for (const el of nodes) {
                     const t = norm(textOf(el));
@@ -1074,7 +1083,10 @@ async def _form_set_bound_control_v2(
                 for (const hit of labels) {
                     const forId = hit.el.getAttribute?.('for');
                     if (forId) {
-                        const target = document.getElementById(forId);
+                        const escaped = window.CSS?.escape ? CSS.escape(forId) : forId;
+                        const target = (hit.el.getRootNode?.() || document).getElementById?.(forId) ||
+                            document.getElementById(forId) ||
+                            deepQueryAll('#' + escaped)[0] || null;
                         if (target && isVisible(target)) return {el: target, score: 260, reason: 'label_for'};
                     }
                     const container = nearestContainer(hit.el);
@@ -1192,7 +1204,7 @@ async def _form_set_bound_control_v2(
                         return {ok: false, reason: 'readonly_combo_not_opened', binding: binding.reason, observed: before};
                     }
                     const marker = '__vspider_form_bound_control__';
-                    document.querySelectorAll(`[data-${marker}]`).forEach(el => el.removeAttribute(`data-${marker}`));
+                    deepQueryAll(`[data-${marker}]`).forEach(el => el.removeAttribute(`data-${marker}`));
                     let opener = control;
                     for (const sel of ['.el-select__wrapper', '.el-select', '.ant-select-selector', '.ant-select', '.n-base-selection', '[role=combobox]']) {
                         const closest = input.closest?.(sel) || control.closest?.(sel) || control.querySelector?.(sel);
@@ -1250,6 +1262,46 @@ async def _form_set_bound_control_v2(
     return result
 
 
+_FORM_SET_NOT_FOUND_REASONS = {"label_or_control_not_found", "invalid_result"}
+
+
+async def _form_set_with_frames(
+    page: "Page", label: str, value: str, *, open_if_needed: bool = True
+) -> tuple[dict[str, Any], Any]:
+    """Bind in the main document first, then fall back to every child iframe.
+
+    Returns ``(result, scope)`` where scope is the Page or Frame the field was
+    found in, so follow-up clicks/readbacks run in the right document.
+    """
+    result = await _form_set_bound_control_v2(
+        page, label, value, open_if_needed=open_if_needed
+    )
+    if result.get("ok") or result.get("reason") not in _FORM_SET_NOT_FOUND_REASONS:
+        return result, page
+    main_frame = getattr(page, "main_frame", None)
+    for frame in list(getattr(page, "frames", None) or []):
+        if frame is main_frame:
+            continue
+        try:
+            is_detached = getattr(frame, "is_detached", None)
+            if callable(is_detached) and is_detached():
+                continue
+            frame_result = await _form_set_bound_control_v2(
+                frame, label, value, open_if_needed=open_if_needed
+            )
+        except Exception as frame_err:
+            logger.debug(
+                "[FORM_SET] frame probe failed (%s): %s",
+                getattr(frame, "url", "?"),
+                frame_err,
+            )
+            continue
+        if frame_result.get("ok") or frame_result.get("reason") not in _FORM_SET_NOT_FOUND_REASONS:
+            frame_result.setdefault("frame_url", getattr(frame, "url", "") or "")
+            return frame_result, frame
+    return result, page
+
+
 @ActionRegistry.register("form_set")
 class FormSetHandler(ActionHandler):
     async def execute(self, ctx: ActionContext) -> Optional["Page"]:
@@ -1257,30 +1309,41 @@ class FormSetHandler(ActionHandler):
         label, value = _parse_form_set_payload(ctx.action.type_value)
         logger.info("[FORM_SET] label=%r value=%r", label, value)
 
-        result = await _form_set_bound_control_v2(page, label, value)
+        result, scope = await _form_set_with_frames(page, label, value)
         if result.get("mode") in ("opened", "autocomplete_opened") and value:
             click_selector = result.get("click_selector")
             if click_selector:
                 try:
-                    opener = page.locator(click_selector).first
+                    opener = scope.locator(click_selector).first
                     await opener.scroll_into_view_if_needed(timeout=2000)
                     await opener.click(timeout=3000, force=True)
                 except Exception as open_err:
                     point = result.get("click_point") or {}
-                    try:
-                        await page.mouse.click(float(point.get("x")), float(point.get("y")))
-                    except Exception:
-                        logger.debug("[FORM_SET] bound opener click failed: %s", open_err)
+                    if scope is page:
+                        try:
+                            await page.mouse.click(float(point.get("x")), float(point.get("y")))
+                        except Exception:
+                            logger.debug("[FORM_SET] bound opener click failed: %s", open_err)
+                    else:
+                        # click_point is frame-local; page.mouse uses viewport
+                        # coords, so skip the coordinate fallback inside iframes.
+                        logger.debug("[FORM_SET] bound opener click failed in frame: %s", open_err)
             await asyncio.sleep(0.8)
-            option_clicked = await _click_visible_text_option(page, value)
+            option_clicked = await _click_visible_text_option(scope, value)
+            if not option_clicked and scope is not page:
+                # some widget libraries teleport the dropdown to the top document
+                option_clicked = await _click_visible_text_option(page, value)
             if not option_clicked:
                 raise ActionExecutionError(
                     f"form_set located {label!r}, but could not select option {value!r}."
                 )
             await asyncio.sleep(0.3)
-            result = await _form_set_bound_control_v2(
-                page, label, value, open_if_needed=False
+            readback = await _form_set_bound_control_v2(
+                scope, label, value, open_if_needed=False
             )
+            if result.get("frame_url") and "frame_url" not in readback:
+                readback["frame_url"] = result["frame_url"]
+            result = readback
 
         if not result.get("ok"):
             raise ActionExecutionError(
@@ -1293,11 +1356,12 @@ class FormSetHandler(ActionHandler):
                 f"form_set opened {label!r}, but the selected value was not reflected on the bound control."
             )
         logger.info(
-            "[FORM_SET_V2] label=%r ok mode=%s binding=%s observed=%r",
+            "[FORM_SET_V2] label=%r ok mode=%s binding=%s observed=%r frame=%s",
             label,
             result.get("mode"),
             result.get("binding"),
             result.get("observed"),
+            result.get("frame_url", "") or "main",
         )
         print(f"[FORM_SET] {label} = {value}")
         ctx.browser.rpa_trail.append(
@@ -1308,6 +1372,7 @@ class FormSetHandler(ActionHandler):
                 "binding": result.get("binding", ""),
                 "verified": True,
                 "observed": result.get("observed", ""),
+                "frame_url": result.get("frame_url", ""),
             })
         )
         return None
