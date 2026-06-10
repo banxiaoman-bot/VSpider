@@ -527,17 +527,76 @@ def apply_filters(data: list[dict], rules: list[FilterRule]) -> list[dict]:
 
 # ========== 核心保存函数（通用） ==========
 
+# Dataset-shaped containers the XHR intercept track can stream-append into.
+# Anything else from an output_contract (files_folder / html / ...) is not a
+# row container — we keep the rows safe in jsonl instead of forcing xlsx.
+_INTERCEPT_DATASET_CONTAINERS = {"xlsx", "csv", "jsonl"}
+
+_CONTAINER_MIME = {
+    "xlsx": _XLSX_MIME,
+    "csv": "text/csv",
+    "jsonl": "application/x-ndjson",
+}
+
+
+def _resolve_intercept_container(output_contract: dict | None) -> str:
+    """Map ``output_contract.v1`` onto an append-friendly dataset container.
+
+    No contract -> legacy xlsx. A contract with a dataset container wins
+    as-is; a contract whose container is non-dataset (or only carries an
+    output_kind) resolves through the sanctioned kind->container policy and
+    falls back to jsonl rather than silently masquerading as xlsx.
+    """
+    if not isinstance(output_contract, dict) or not output_contract:
+        return "xlsx"
+    container = str(output_contract.get("container") or "").strip().lower()
+    if not container:
+        try:
+            try:
+                from .data_writers.dispatch import resolve_output_contract
+            except ImportError:
+                from data_writers.dispatch import resolve_output_contract
+            container = str(resolve_output_contract(output_contract).get("container") or "").strip().lower()
+        except Exception:
+            container = ""
+    if container in _INTERCEPT_DATASET_CONTAINERS:
+        return container
+    if container:
+        return "jsonl"
+    return "xlsx"
+
+
+def _read_existing_frame(filepath: Path, container: str) -> pd.DataFrame:
+    if container == "csv":
+        return pd.read_csv(filepath)
+    if container == "jsonl":
+        return pd.read_json(filepath, orient="records", lines=True)
+    return pd.read_excel(filepath, engine="openpyxl")
+
+
+def _write_frame(df: pd.DataFrame, filepath: Path, container: str) -> None:
+    if container == "csv":
+        df.to_csv(filepath, index=False, encoding="utf-8-sig")
+    elif container == "jsonl":
+        df.to_json(filepath, orient="records", lines=True, force_ascii=False)
+    else:
+        df.to_excel(filepath, index=False, engine="openpyxl")
+
+
 def _save_dataframe_to_excel(
     df_new: pd.DataFrame,
     filepath: Path,
     unique_key: str | list[str] = None,
+    container: str = "xlsx",
 ) -> tuple[str, int]:
     """
-    内部通用函数：将 DataFrame 追加写入 Excel 文件，支持去重。
+    内部通用函数：将 DataFrame 追加写入数据容器文件（xlsx/csv/jsonl），支持去重。
 
     Returns:
         (文件绝对路径, 总行数)
     """
+    if container not in _INTERCEPT_DATASET_CONTAINERS:
+        container = "xlsx"
     df_new = _normalize_extracted_dataframe(df_new)
 
     # 添加提取时间戳
@@ -546,7 +605,7 @@ def _save_dataframe_to_excel(
     # 追加或新建
     if filepath.exists():
         try:
-            df_existing = pd.read_excel(filepath, engine="openpyxl")
+            df_existing = _read_existing_frame(filepath, container)
             df_existing = _normalize_extracted_dataframe(df_existing)
             df_new = _align_new_columns_to_existing(df_new, df_existing)
             df_combined = pd.concat([df_existing, df_new], ignore_index=True)
@@ -554,7 +613,7 @@ def _save_dataframe_to_excel(
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             fallback = filepath.with_name(f"{filepath.stem}_part_{timestamp}{filepath.suffix}")
             logger.warning(
-                "Failed to read existing Excel; preserving it and writing "
+                "Failed to read existing dataset file; preserving it and writing "
                 "current batch to a part file instead of overwriting: %s -> %s",
                 e,
                 fallback,
@@ -611,7 +670,7 @@ def _save_dataframe_to_excel(
                 logger.warning(f"[AUTO HASH DEDUP] 失败忽略：{_hash_err}")
 
     # 写入
-    df_combined.to_excel(filepath, index=False, engine="openpyxl")
+    _write_frame(df_combined, filepath, container)
     return str(filepath.resolve()), len(df_combined)
 
 
@@ -674,25 +733,30 @@ def save_intercepted_data(
     json_list: list[dict],
     filename: str = "output.xlsx",
     unique_key: str | list[str] = None,
+    output_contract: dict | None = None,
 ) -> str:
     """
-    将网络层拦截到的 JSON 数据保存至 Excel。
+    将网络层拦截到的 JSON 数据按 output_contract 容器落盘（xlsx/csv/jsonl）。
 
     专为 XHR/Fetch 拦截场景设计：
     - 接收 list[dict] 格式的纯 JSON 数据
     - 自动追加到已有文件
     - 支持按 unique_key 去重（防止翻页重复拦截）
-    - 打印醒目的绿色日志
+    - 容器由 ``output_contract.container`` 决定；无契约时保持历史 xlsx 行为
 
     Args:
         json_list: 拦截到的字典列表（API 响应中的数据行）
-        filename: 输出文件名（默认 output.xlsx）
+        filename: 输出文件名（默认 output.xlsx；后缀会按容器改写）
         unique_key: 去重字段（如 "id"、"order_no" 等）
+        output_contract: 本次 run 的 output_contract.v1 dict（可为 None）
 
     Returns:
         保存的文件绝对路径
     """
+    container = _resolve_intercept_container(output_contract)
     filepath = resolve_output_path(filename)
+    if filepath.suffix.lower() != f".{container}":
+        filepath = filepath.with_suffix(f".{container}")
 
     if not json_list or len(json_list) == 0:
         logger.warning("[XHR Intercept] Empty data list, skipping save.")
@@ -705,7 +769,7 @@ def save_intercepted_data(
 
     df_new = pd.DataFrame(json_list)
     new_count = len(df_new)
-    if filepath.exists() and not df_new.empty:
+    if container == "xlsx" and filepath.exists() and not df_new.empty:
         try:
             existing_columns = pd.read_excel(filepath, engine="openpyxl", nrows=0)
             if _is_article_dataframe(existing_columns) and not _is_article_dataframe(df_new):
@@ -717,7 +781,7 @@ def save_intercepted_data(
         except Exception:
             pass
 
-    abs_path, total = _save_dataframe_to_excel(df_new, filepath, unique_key)
+    abs_path, total = _save_dataframe_to_excel(df_new, filepath, unique_key, container=container)
 
     # 醒目的绿色成功日志
     print(
@@ -727,13 +791,13 @@ def save_intercepted_data(
     )
     logger.info(
         f"[XHR Intercept] Saved {new_count} new records -> {abs_path} "
-        f"(total {total} rows)"
+        f"(total {total} rows, container={container})"
     )
     register_artifact(
         abs_path,
         kind="dataset_rows",
-        mime=_XLSX_MIME,
+        mime=_CONTAINER_MIME.get(container, _XLSX_MIME),
         produced_by="xhr_intercept",
-        extra={"row_count": total, "new_row_count": new_count},
+        extra={"row_count": total, "new_row_count": new_count, "container": container},
     )
     return abs_path

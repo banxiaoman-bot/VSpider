@@ -2241,3 +2241,24 @@ largest table (default pick unchanged for existing callers).
 
 Known/accepted: mixed-arrow paths need a trigger keyword; data_manager
 XHR legacy xlsx default is fixed by Slice XHR-INTERCEPT-CONTRACT-1 below.
+
+## Slice XHR-INTERCEPT-CONTRACT-1: intercept track honours output_contract (done)
+
+Layer: data_plane (data_manager.py) + browser_substrate (browser_env.py) + main wiring.
+Closes the audit finding "XHR intercept still hard-codes xlsx" (mission 1-A iron rule).
+
+- save_intercepted_data(..., output_contract=None): resolves the dataset
+  container (xlsx/csv/jsonl) from the contract; suffix rewritten accordingly;
+  manifest mime/extra follow the container. No contract -> legacy xlsx.
+- Non-dataset containers (files_folder/html/...) fall back to jsonl so rows
+  stay rows instead of masquerading as a spreadsheet.
+- _save_dataframe_to_excel generalised with container-aware read/append/write
+  (_read_existing_frame / _write_frame); dedup + tooltip upsert untouched.
+- BrowserEnv: _intercept_output_contract + configure_interceptor(output_contract=)
+  + set_interceptor_output_contract() (late refresh, keeps dedup state).
+- main.py: passes _initial_output_contract at configure time and refreshes
+  with _goal_output_contract right after goal-contract resolution.
+
+Tests: tests/test_xhr_intercept_contract.py (13 cases: container resolution,
+suffix rewrite, jsonl/csv append+dedup, policy fallback, wiring, dedup-state
+preservation). Full suite 2951 passed / 2 skipped.

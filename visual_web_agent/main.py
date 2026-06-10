@@ -8096,6 +8096,7 @@ async def run_agent(
             unique_key=None,
             min_list_size=20,
             url_pattern=xhr_pattern or None,
+            output_contract=_initial_output_contract or None,
         )
         browser.configure_network_intelligence(_run_ts)
         if xhr_pattern:
@@ -8464,6 +8465,11 @@ async def run_agent(
             or _goal_output_contract.get("output_mode")
             or "default"
         )
+        # 拦截器容器跟随最终契约（不重置去重状态）
+        try:
+            browser.set_interceptor_output_contract(_goal_output_contract or None)
+        except Exception as _ic_err:
+            logger.debug("[XHR] interceptor contract refresh skipped: %s", _ic_err)
         # 向前端 Final Answer 面板同步 mode：answer/artifact → answer_type=text/file
         # F3: 同时把目标域分类（weather/stock/recipe/flight/generic）一并存档，
         # 供 done 广播时透传给前端，让 Final Answer 面板按域选卡片渲染。

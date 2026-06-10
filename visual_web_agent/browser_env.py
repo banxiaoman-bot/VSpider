@@ -248,6 +248,9 @@ class BrowserEnv:
         self._intercept_count: int = 0
         self._intercept_unique_key: str | list[str] | None = None
         self._intercept_filename: str = "output.xlsx"
+        # output_contract.v1 of the current run; decides the intercept
+        # dataset container (xlsx/csv/jsonl) instead of a blind xlsx default.
+        self._intercept_output_contract: dict | None = None
         self._registered_pages: set[int] = set()
         # STEALTH-3: identity bundle (UA + CH + ua metadata), set in start() so every page CDP session can replay setUserAgentOverride.
         self._stealth_profile = None
@@ -4201,25 +4204,29 @@ Object.defineProperty(navigator, 'languages', {
         unique_key: str | list[str] = None,
         min_list_size: int = 5,
         url_pattern: str | None = None,
+        output_contract: dict | None = None,
     ) -> None:
         """
         配置 XHR/Fetch 拦截器参数。
 
         Args:
             enabled:     是否启用通用拦截（--xhr 参数控制）
-            filename:    通用拦截数据保存的 Excel 文件名
+            filename:    通用拦截数据保存的文件名（后缀随容器改写）
             unique_key:  去重字段（如 "id"）
             min_list_size: 启发式探测阈值——JSON 中列表长度 >= 此值才认为是数据
             url_pattern: 精准截胡关键词（子串匹配）。
                          匹配到此关键词的响应 URL 会触发"主引擎"分支：
                          数据存入 self._intercepted_data，main.py 检测后直接保存跳过 VLM。
                          独立于 enabled，即使 enabled=False 也可单独启用精准截胡。
+            output_contract: 本次 run 的 output_contract.v1 dict；决定拦截数据
+                         的落盘容器（xlsx/csv/jsonl），缺省时保持 xlsx 兼容行为。
         """
         self._intercept_enabled = enabled
         self._intercept_filename = filename
         self._intercept_unique_key = unique_key
         self._intercept_min_list_size = min_list_size
         self._intercept_url_pattern = url_pattern.strip() if url_pattern else None
+        self._intercept_output_contract = dict(output_contract) if isinstance(output_contract, dict) else None
         # 每次重新配置时清空上次缓存，防止旧数据触发误判
         self._intercepted_data = None
         self._intercept_seen_row_keys.clear()
@@ -4230,6 +4237,11 @@ Object.defineProperty(navigator, 'languages', {
             f"file={filename} | unique_key={unique_key} | "
             f"min_list={min_list_size} | url_pattern={self._intercept_url_pattern!r}"
         )
+
+    def set_interceptor_output_contract(self, output_contract: dict | None) -> None:
+        """Refresh the run's output_contract after late goal inference,
+        without resetting dedup state the way configure_interceptor does."""
+        self._intercept_output_contract = dict(output_contract) if isinstance(output_contract, dict) else None
 
     def configure_network_intelligence(self, run_id: str | None) -> None:
         """Enable per-run network candidate indexing.
@@ -4357,6 +4369,7 @@ Object.defineProperty(navigator, 'languages', {
                             json_list=new_rows,
                             filename=self._intercept_filename,
                             unique_key=self._intercept_unique_key,
+                            output_contract=self._intercept_output_contract,
                         )
                         self._intercept_count += len(new_rows)
                     except Exception as save_err:
@@ -4415,12 +4428,13 @@ Object.defineProperty(navigator, 'languages', {
             f"score={score} fp={fingerprint[:80]} from: {url[:120]}..."
         )
 
-        # 保存到 Excel
+        # 按 output_contract 容器保存（无契约时保持 xlsx 兼容行为）
         try:
             save_intercepted_data(
                 json_list=new_rows,
                 filename=self._intercept_filename,
                 unique_key=self._intercept_unique_key,
+                output_contract=self._intercept_output_contract,
             )
             self._intercept_count += len(new_rows)
         except Exception as e:
