@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -58,6 +60,64 @@ def test_browser_pool_exhaustion() -> None:
         assert "exhausted" in str(exc)
     else:
         raise AssertionError("expected pool exhaustion")
+
+
+def test_browser_pool_acquire_is_atomic_under_thread_race() -> None:
+    """Concurrent acquires must never oversubscribe max_contexts.
+
+    A slow env_factory widens the check->insert window: without a lock every
+    thread passes the capacity check before any of them registers its lease.
+    """
+
+    def slow_factory() -> FakeBrowser:
+        time.sleep(0.05)
+        return FakeBrowser()
+
+    pool = BrowserPool(max_contexts=1, env_factory=slow_factory)
+    leases: list = []
+    errors: list = []
+
+    def worker() -> None:
+        try:
+            leases.append(pool.acquire(run_id="race"))
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(pool.active) <= pool.max_contexts
+    assert len(leases) == 1
+    assert len(errors) == 7
+    assert all("exhausted" in str(exc) for exc in errors)
+
+
+def test_browser_pool_thread_storm_keeps_state_consistent() -> None:
+    """Mixed acquire/release storm across threads must conserve counters."""
+
+    pool = BrowserPool(max_contexts=4, env_factory=FakeBrowser)
+
+    def worker() -> None:
+        for _ in range(50):
+            try:
+                lease = pool.acquire(run_id="storm")
+            except RuntimeError:
+                continue
+            asyncio.run(pool.release(lease))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    status = pool.status()
+    assert status["active_count"] == 0
+    assert status["total_acquired"] == status["total_released"]
+    assert status["total_failed"] == 0
 
 
 def test_browser_pool_release_failure_is_recorded() -> None:

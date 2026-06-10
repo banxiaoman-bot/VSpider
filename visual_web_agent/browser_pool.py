@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -111,19 +112,27 @@ class BrowserPool:
     total_released: int = 0
     total_failed: int = 0
     last_error: str = ""
+    # POOL-LOCK: guards active + counters across worker threads. acquire() is
+    # sync (called from threadpool / sync paths), so an asyncio.Lock cannot
+    # protect it; a threading.Lock covers both sync acquire and the sync
+    # mutation tail of async release. Never held across an await.
+    _state_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def acquire(self, *, run_id: str = "") -> BrowserLease:
-        if len(self.active) >= self.max_contexts:
-            raise RuntimeError("browser pool exhausted")
-        lease = BrowserLease(
-            lease_id=f"lease_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
-            run_id=str(run_id or ""),
-            browser=self.env_factory(),
-            acquired_at=time.time(),
-        )
-        self.active[lease.lease_id] = lease
-        self.total_acquired += 1
-        return lease
+        with self._state_lock:
+            if len(self.active) >= self.max_contexts:
+                raise RuntimeError("browser pool exhausted")
+            lease = BrowserLease(
+                lease_id=f"lease_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
+                run_id=str(run_id or ""),
+                browser=self.env_factory(),
+                acquired_at=time.time(),
+            )
+            self.active[lease.lease_id] = lease
+            self.total_acquired += 1
+            return lease
 
     async def release(self, lease: BrowserLease | None, *, error: str = "") -> None:
         if lease is None:
@@ -133,31 +142,33 @@ class BrowserPool:
             await lease.browser.close()
         except Exception as exc:
             err = err or f"{type(exc).__name__}: {exc}"
-        lease.released_at = time.time()
-        lease.error = err
-        lease.status = "failed" if err else "released"
-        self.active.pop(lease.lease_id, None)
-        self.total_released += 1
-        if err:
-            self.total_failed += 1
-            self.last_error = err
+        with self._state_lock:
+            lease.released_at = time.time()
+            lease.error = err
+            lease.status = "failed" if err else "released"
+            self.active.pop(lease.lease_id, None)
+            self.total_released += 1
+            if err:
+                self.total_failed += 1
+                self.last_error = err
 
     def status(self) -> dict[str, Any]:
         requested = self.requested_max_contexts or self.max_contexts
-        return {
-            "max_contexts": self.max_contexts,
-            "requested_max_contexts": requested,
-            "parallel_enabled": self.parallel_enabled,
-            "safety_cap_active": requested > self.max_contexts,
-            "safety_note": self.safety_note,
-            "active_count": len(self.active),
-            "available_count": max(0, self.max_contexts - len(self.active)),
-            "total_acquired": self.total_acquired,
-            "total_released": self.total_released,
-            "total_failed": self.total_failed,
-            "last_error": self.last_error,
-            "active": [lease.public() for lease in self.active.values()],
-        }
+        with self._state_lock:
+            return {
+                "max_contexts": self.max_contexts,
+                "requested_max_contexts": requested,
+                "parallel_enabled": self.parallel_enabled,
+                "safety_cap_active": requested > self.max_contexts,
+                "safety_note": self.safety_note,
+                "active_count": len(self.active),
+                "available_count": max(0, self.max_contexts - len(self.active)),
+                "total_acquired": self.total_acquired,
+                "total_released": self.total_released,
+                "total_failed": self.total_failed,
+                "last_error": self.last_error,
+                "active": [lease.public() for lease in self.active.values()],
+            }
 
 
 _DEFAULT_CONFIG = resolve_browser_pool_config()
