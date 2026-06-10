@@ -104,6 +104,7 @@ try:
     from .loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
     from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from .url_guard import UrlGuardError, build_guarded_opener, check_url
+    from .stealth_profile import default_user_agent
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
@@ -166,6 +167,7 @@ except ImportError:
     from loop_detector import ActionLoopDetector, LoopDetectorConfig, PageFingerprint
     from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from url_guard import UrlGuardError, build_guarded_opener, check_url
+    from stealth_profile import default_user_agent
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -1461,11 +1463,7 @@ def _load_rpa_challenge_rows(download_url: str, total_rounds: int) -> list[dict[
         request = Request(
             target_url,
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124 Safari/537.36"
-                ),
+                "User-Agent": default_user_agent(),
                 "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
                 "Referer": "https://rpachallenge.com/",
             },
@@ -1534,11 +1532,7 @@ def _load_public_google_sheet_rows(sheet_url: str, row_limit: int) -> list[dict[
     request = Request(
         export_url,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124 Safari/537.36"
-            ),
+            "User-Agent": default_user_agent(),
             "Accept": "text/csv,*/*",
             "Referer": sheet_url,
         },

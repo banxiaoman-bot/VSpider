@@ -37,6 +37,7 @@ try:
     from .artifact_manager import artifact_root, register_download_artifact
     from .action_result import ActionResult
     from .browser_profile import resolve_user_data_dir
+    from .stealth_profile import build_profile
     from .data_manager import save_intercepted_data
     from .network_intelligence import record_candidate as _record_network_candidate
     from .vlm_client import VSpiderAction
@@ -46,6 +47,7 @@ except ImportError:
     from artifact_manager import artifact_root, register_download_artifact
     from action_result import ActionResult
     from browser_profile import resolve_user_data_dir
+    from stealth_profile import build_profile
     from data_manager import save_intercepted_data
     from network_intelligence import record_candidate as _record_network_candidate
     from vlm_client import VSpiderAction
@@ -1727,12 +1729,15 @@ class BrowserEnv:
         # 启动 Playwright + 持久化 Chromium 上下文
         self._playwright = await async_playwright().start()
 
-        # 伪造真实 Windows Chrome UA，避免 Headless 特征泄露
-        _STEALTH_UA = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
+        # 伪造真实 Windows Chrome UA，避免 Headless 特征泄露。
+        # STEALTH-1: 用真实 Chromium 主版本拼 UA，并让 Sec-CH-UA Client Hints
+        # 与之对齐，避免 UA 谎报版本/平台被 Cloudflare 当作风控信号。
+        try:
+            _chromium_exe = self._playwright.chromium.executable_path
+        except Exception:
+            _chromium_exe = None
+        _stealth_profile = build_profile(_chromium_exe, platform="Windows")
+        _STEALTH_UA = _stealth_profile.user_agent
 
         logger.info(f"Launching persistent context: {user_data_path.resolve()}")
         # proxy: single static (PROXY_SERVER) or rotating chain (PROXY_CHAIN),
@@ -1783,11 +1788,10 @@ if (!window.chrome) {
     window.chrome = { runtime: {} };
 }
 
-// 3. 伪造 plugins（真实浏览器通常有 3+ 个）
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3],
-    configurable: true,
-});
+// 3. navigator.plugins 不在此手写伪造：playwright_stealth 的 navigator_plugins
+//    evasion（默认开启，apply_stealth_async 注入，生成带 MimeType 的真实
+//    PluginArray）已统一接管。旧整数数组 [1,2,3] 既假又与库双重打补丁，
+//    按 backlog STEALTH-1/2 P2 移除（见 docs/vspider_architecture_backlog.md）。
 
 // 4. 伪造语言列表
 Object.defineProperty(navigator, 'languages', {
@@ -1797,6 +1801,18 @@ Object.defineProperty(navigator, 'languages', {
 """
         await self._context.add_init_script(_STEALTH_INIT_JS)
         logger.info("Stealth init script injected at context level")
+
+        # STEALTH-1: 对齐低熵 Client Hints，使 Sec-CH-UA 版本/平台与上面伪造的
+        # UA 完全一致（Cloudflare 会比对二者，不一致即判风险）。
+        try:
+            await self._context.set_extra_http_headers(_stealth_profile.client_hints)
+            logger.info(
+                "Client Hints aligned to UA (Chrome %d / %s)",
+                _stealth_profile.major,
+                _stealth_profile.platform,
+            )
+        except Exception as _ch_err:
+            logger.debug("set_extra_http_headers (client hints) skipped: %s", _ch_err)
 
         # ── 全局弹窗静默刺客：MutationObserver 自动隐藏常见牛皮癣浮层 ─────────
         # 策略：display:none 而非 remove()，避免触发页面业务 JS 的 DOM 依赖异常。

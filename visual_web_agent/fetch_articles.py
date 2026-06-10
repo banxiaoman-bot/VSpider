@@ -21,16 +21,14 @@ from bs4 import BeautifulSoup
 
 try:  # SSRF guard import works whether run as a package module or a script
     from visual_web_agent.url_guard import is_url_allowed
+    from visual_web_agent.stealth_profile import default_user_agent
 except ImportError:  # pragma: no cover - script run from inside the package dir
     from url_guard import is_url_allowed
+    from stealth_profile import default_user_agent
 
 # ── 请求头（模拟普通浏览器，避免被拒） ────────────────────────────
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": default_user_agent(),
     "Accept-Language": "zh-CN,zh;q=0.9",
     "Referer": "https://www.baidu.com/",
 }

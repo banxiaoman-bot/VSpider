@@ -2086,3 +2086,60 @@ Out of scope (deliberate, next slices):
   a per-call allow-list of sanctioned internal hosts; an SSRF guard for browser-context
   navigations (this slice covers the server-side python fetchers, not Playwright
   `page.goto`); rate-limit / response size-cap on guarded fetches.
+
+## STEALTH-1: UA <-> Client Hints consistency (Cloudflare anti-bot P0)
+
+Why: the launch UA was hard-coded to `Chrome/124` while the real Playwright
+Chromium build drifts ahead, and only the `User-Agent` header was spoofed -- the
+low-entropy Client Hints (`Sec-CH-UA` / `Sec-CH-UA-Platform`) the browser
+auto-sends still carried the real version/OS. Cloudflare cross-checks UA against
+Client Hints, so the mismatch was itself a bot signal.
+
+Add / change:
+
+- `stealth_profile.py` (new, pure leaf + thin probe): `detect_chromium_major`
+  shells out to `<chromium> --version` once (always falls back to
+  `DEFAULT_CHROME_MAJOR`); `build_user_agent` / `build_sec_ch_ua` /
+  `build_client_hints` / `build_profile` emit a UA whose Chrome major + platform
+  match the `Sec-CH-UA` brand list and `Sec-CH-UA-Platform` exactly.
+- `browser_env.py` wiring: derive `_STEALTH_UA` from the probed real Chromium
+  version and call `context.set_extra_http_headers(profile.client_hints)` right
+  after the stealth init script, so UA + hints agree at the context level.
+
+Acceptance:
+
+- Targeted `test_stealth_profile.py` = 15 passed. Full suite 2873 passed,
+  2 skipped (139.47s) via `validate_y.py STEALTH-1 --skip-build` (frontend deps
+  not installed; backend-only change). `browser_env` import smoke green.
+
+Out of scope (next slices): P1 passive-wait -> `cf_clearance`/redirect-cookie
+poll in `bot_challenge_guard.py`; P2 remove the hand-written `navigator.plugins`
+patch that may double-patch with `playwright_stealth`; CDP
+`Emulation.setUserAgentOverride` with full `userAgentMetadata` (fullVersionList).
+
+## STEALTH-2: passive-wait early release on cf_clearance / URL move (Cloudflare P1)
+
+Why: Phase 1 of `handle_bot_challenge_step` only re-ran the DOM probe and always
+burned up to `passive_wait_seconds` (15s) before escalating. It missed the
+earliest reliable pass signal -- the `cf_clearance` cookie Cloudflare sets the
+moment a challenge clears -- and the address bar leaving the interstitial.
+
+Add / change:
+
+- `bot_challenge_guard.py`: new pure leaves `clearance_from_cookies(cookies)` and
+  `url_left_challenge(current_url, original_url)` (the latter guards against the
+  same-URL Turnstile widget so a bare URL is not mistaken for a pass). New async
+  helpers `_read_cookies` (getattr-guarded `context.cookies()`) and
+  `_detect_clearance_signal`. The Phase 1 loop now releases on either signal
+  before the DOM probe, otherwise falls back to the existing probe-None check.
+- Fully back-compatible: stub browsers without `_context`/`current_url` skip the
+  new signals and keep the old behaviour.
+
+Acceptance:
+
+- Targeted `test_bot_challenge_guard.py` = 16 passed (7 existing + 9 new: pure
+  signal functions + cookie/URL early-release stub flows). Full suite 2884
+  passed, 2 skipped (138.06s) via `validate_y.py STEALTH-2 --skip-build`.
+
+Out of scope (next): P2 remove the hand-written `navigator.plugins` double-patch;
+CDP `setUserAgentOverride` userAgentMetadata; reroute-on-block tuning.
