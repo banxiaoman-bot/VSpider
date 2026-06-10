@@ -45,6 +45,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -1630,6 +1631,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
     **_build_cors_kwargs(os.getenv("VSPIDER_CORS_ORIGINS", "")),
+)
+
+_DEFAULT_TRUSTED_HOSTS = ("localhost", "127.0.0.1", "::1", "testserver")
+
+
+def _build_trusted_hosts(hosts_raw: str) -> list[str]:
+    # Host-header allowlist from VSPIDER_ALLOWED_HOSTS blocks DNS rebinding:
+    # once attacker.com resolves to 127.0.0.1 the request becomes same-origin
+    # and CORS no longer applies, so the Host header is the last gate. Default
+    # covers local dev + TestClient; literal "*" disables the check for
+    # LAN / reverse-proxy deployments.
+    raw = (hosts_raw or "").strip()
+    if raw == "*":
+        return ["*"]
+    if raw:
+        return [h.strip() for h in raw.split(",") if h.strip()]
+    return list(_DEFAULT_TRUSTED_HOSTS)
+
+
+# Added after CORSMiddleware so it runs before CORS (middleware is LIFO).
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=_build_trusted_hosts(os.getenv("VSPIDER_ALLOWED_HOSTS", "")),
 )
 
 

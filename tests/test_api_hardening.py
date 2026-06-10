@@ -120,3 +120,31 @@ class TestWsOriginGuard:
         src = Path("api_server.py").read_text(encoding="utf-8")
         assert "_ws_origin_allowed(origin)" in src
         assert "websocket.close(code=1008)" in src
+
+
+class TestTrustedHostGuard:
+    def test_default_allows_local_and_testserver(self, api, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("VSPIDER_ALLOWED_HOSTS", raising=False)
+        hosts = api._build_trusted_hosts("")
+        for expected in ("localhost", "127.0.0.1", "::1", "testserver"):
+            assert expected in hosts
+        assert "*" not in hosts
+
+    def test_wildcard_optin_disables_check(self, api) -> None:
+        assert api._build_trusted_hosts("*") == ["*"]
+
+    def test_explicit_allowlist_parsed(self, api) -> None:
+        hosts = api._build_trusted_hosts("vspider.lan , 10.0.0.5")
+        assert hosts == ["vspider.lan", "10.0.0.5"]
+
+    def test_rejects_dns_rebinding_host(self, api) -> None:
+        # TrustedHost runs before routing: a forged Host header (DNS rebinding
+        # lands "attacker.com" on 127.0.0.1) must be rejected with 400 while a
+        # legit local Host reaches routing (404 for an unknown path).
+        from fastapi.testclient import TestClient
+
+        client = TestClient(api.app)
+        ok = client.get("/__host_guard_probe__")
+        assert ok.status_code == 404
+        evil = client.get("/__host_guard_probe__", headers={"Host": "evil.example"})
+        assert evil.status_code == 400
