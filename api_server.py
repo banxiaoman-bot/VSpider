@@ -2801,6 +2801,7 @@ async def run_extractor(payload: dict[str, Any] = Body(...)) -> dict:
             source_type=str(payload.get("source_type") or "auto"),
             requested_fields=payload.get("requested_fields") or None,
             max_rows=int(payload.get("max_rows") or 1000),
+            all_tables=bool(payload.get("all_tables")),
         )
         artifact = None
         if bool(payload.get("export")):

@@ -44,6 +44,8 @@ _PATH_KEYWORDS = re.compile(
     r"按路径\s*(?:选择|选|进入)?"
     r"(?=[\s:：，,]{0,5}[^。\n]{0,30}(?:->|→|>>|>|›|»))|"
     r"路径(?:为|是)\s*[:：]|"
+    r"级联(?:选择器?|下拉|菜单)?\s*[:：]"
+    r"(?=[^。\n]{0,30}(?:->|→|>>|>|›|»))|"
     r"select\s+(?:the\s+)?(?:cascader\s+)?path\s*[:：]?|"
     r"drill\s+(?:into|down)\s+(?:the\s+)?cascader",
     re.I,
@@ -75,7 +77,9 @@ def _extract_path_from_goal(goal: str) -> list[str] | None:
     chunk = tail[: stop.start()] if stop else tail
     # Trim leading punctuation/colon.
     chunk = chunk.lstrip(":：，, \t")
-    parts = [p.strip(" \t『』「」\"'") for p in _SEPARATORS.split(chunk)]
+    # Strip wrapping quotes plus trailing CJK/half-width punctuation that the
+    # sentence-stop scan can leave on the last segment ("玄武区，" -> "玄武区").
+    parts = [p.strip(" \t『』「」\"'，。、；！？,;!?") for p in _SEPARATORS.split(chunk)]
     parts = [p for p in parts if p and 1 <= len(p) <= 60]
     if len(parts) < 2:
         return None

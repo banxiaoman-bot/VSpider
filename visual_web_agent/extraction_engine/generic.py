@@ -216,11 +216,17 @@ def _select_css_nodes(root: _HtmlNode, selector: str) -> list[_HtmlNode]:
     selected: list[_HtmlNode] = []
     for group in groups or ["*"]:
         current = [root]
-        for token in _css_parts(group):
+        combinator = "descendant"
+        for token in _css_parts(group.replace(">", " > ")):
+            if token == ">":
+                combinator = "child"
+                continue
             next_nodes: list[_HtmlNode] = []
             for base in current:
-                next_nodes.extend(node for node in base.descendants() if _matches_css(node, token))
+                pool = base.children if combinator == "child" else base.descendants()
+                next_nodes.extend(node for node in pool if _matches_css(node, token))
             current = _dedupe_nodes(next_nodes)
+            combinator = "descendant"
         selected.extend(current)
     return _dedupe_nodes(selected)
 
@@ -357,14 +363,26 @@ def select(
 
 
 def _extract_json_rows(value: Any) -> list[dict[str, Any]]:
+    """Pick the best row-list in a nested JSON payload.
+
+    Quality-weighted: a list of dicts (real records) outscores a longer list
+    of bare scalars (trace/tag noise), so ``{"meta": {"trace": [6 strings]},
+    "data": {"records": [3 dicts]}}`` resolves to the records.
+    """
     best: list[dict[str, Any]] = []
+    best_score = 0.0
 
     def visit(node: Any) -> None:
-        nonlocal best
+        nonlocal best, best_score
         if isinstance(node, list):
             rows = _coerce_rows(node)
-            if len(rows) > len(best):
-                best = rows
+            if rows:
+                dict_count = sum(1 for item in node if isinstance(item, dict))
+                quality = 3.0 if dict_count * 2 >= len(rows) else 1.0
+                score = len(rows) * quality
+                if score > best_score:
+                    best = rows
+                    best_score = score
             for item in node[:30]:
                 if isinstance(item, (dict, list)):
                     visit(item)
@@ -381,62 +399,186 @@ def _extract_json_rows(value: Any) -> list[dict[str, Any]]:
     return best
 
 
+class _TableGrid:
+    """Occupancy-aware grid for one ``<table>``: expands rowspan/colspan."""
+
+    def __init__(self) -> None:
+        self.rows: list[list[str]] = []
+        self.header_flags: list[bool] = []
+        self._pending: dict[int, dict[int, str]] = {}
+        self._row_idx = 0
+
+    def add_row(self, cells: list[tuple[str, int, int]], *, is_header: bool) -> None:
+        placed: dict[int, str] = dict(self._pending.pop(self._row_idx, {}))
+        col = 0
+        for text, colspan, rowspan in cells:
+            while col in placed:
+                col += 1
+            for k in range(colspan):
+                placed[col + k] = text
+                for dr in range(1, rowspan):
+                    self._pending.setdefault(self._row_idx + dr, {})[col + k] = text
+            col += colspan
+        self._row_idx += 1
+        if placed and any(_clean_text(v) for v in placed.values()):
+            width = max(placed) + 1
+            self.rows.append([placed.get(i, "") for i in range(width)])
+            self.header_flags.append(is_header)
+
+
 class _TableParser(HTMLParser):
+    """Nested-table-safe parser: each ``<table>`` builds its own grid on a stack,
+    so inner tables no longer shred the outer table's rows."""
+
+    _MAX_SPAN = 100
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.tables: list[list[list[str]]] = []
-        self._in_table = 0
-        self._in_row = False
-        self._in_cell = False
-        self._cell_parts: list[str] = []
-        self._row: list[str] = []
-        self._table: list[list[str]] = []
+        self.tables: list[_TableGrid] = []
+        self._stack: list[dict[str, Any]] = []
+
+    @classmethod
+    def _span(cls, attrs: dict[str, str], key: str) -> int:
+        try:
+            return max(1, min(int(attrs.get(key) or "1"), cls._MAX_SPAN))
+        except Exception:
+            return 1
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag_l = tag.lower()
         if tag_l == "table":
-            self._in_table += 1
-            if self._in_table == 1:
-                self._table = []
-        elif self._in_table and tag_l == "tr":
-            self._in_row = True
-            self._row = []
-        elif self._in_table and self._in_row and tag_l in {"td", "th"}:
-            self._in_cell = True
-            self._cell_parts = []
+            self._stack.append(
+                {
+                    "grid": _TableGrid(),
+                    "cells": [],
+                    "in_row": False,
+                    "in_cell": False,
+                    "cell_parts": [],
+                    "cell_span": (1, 1),
+                    "in_thead": False,
+                    "row_all_th": True,
+                }
+            )
+            return
+        state = self._stack[-1] if self._stack else None
+        if state is None:
+            return
+        if tag_l == "thead":
+            state["in_thead"] = True
+        elif tag_l == "tr":
+            state["in_row"] = True
+            state["in_cell"] = False
+            state["cells"] = []
+            state["row_all_th"] = True
+        elif state["in_row"] and tag_l in {"td", "th"}:
+            attr = {str(k).lower(): str(v or "") for k, v in attrs}
+            state["in_cell"] = True
+            state["cell_parts"] = []
+            state["cell_span"] = (self._span(attr, "colspan"), self._span(attr, "rowspan"))
+            if tag_l == "td":
+                state["row_all_th"] = False
 
     def handle_data(self, data: str) -> None:
-        if self._in_cell:
+        state = self._stack[-1] if self._stack else None
+        if state is not None and state["in_cell"]:
             text = _clean_text(data)
             if text:
-                self._cell_parts.append(text)
+                state["cell_parts"].append(text)
 
     def handle_endtag(self, tag: str) -> None:
         tag_l = tag.lower()
-        if self._in_cell and tag_l in {"td", "th"}:
-            self._row.append(_clean_text(" ".join(self._cell_parts)))
-            self._cell_parts = []
-            self._in_cell = False
-        elif self._in_table and self._in_row and tag_l == "tr":
-            if any(cell for cell in self._row):
-                self._table.append(self._row)
-            self._row = []
-            self._in_row = False
-        elif tag_l == "table" and self._in_table:
-            if self._in_table == 1 and self._table:
-                self.tables.append(self._table)
-            self._in_table -= 1
+        state = self._stack[-1] if self._stack else None
+        if state is None:
+            return
+        if tag_l in {"td", "th"} and state["in_cell"]:
+            colspan, rowspan = state["cell_span"]
+            state["cells"].append((_clean_text(" ".join(state["cell_parts"])), colspan, rowspan))
+            state["cell_parts"] = []
+            state["in_cell"] = False
+        elif tag_l == "tr" and state["in_row"]:
+            is_header = bool(state["in_thead"] or (state["row_all_th"] and state["cells"]))
+            state["grid"].add_row(state["cells"], is_header=is_header)
+            state["cells"] = []
+            state["in_row"] = False
+        elif tag_l == "thead":
+            state["in_thead"] = False
+        elif tag_l == "table":
+            done = self._stack.pop()
+            if done["grid"].rows:
+                self.tables.append(done["grid"])
 
 
-def _rows_from_table(raw_rows: list[list[str]]) -> list[dict[str, Any]]:
-    rows = [row for row in raw_rows if any(_clean_text(cell) for cell in row)]
+_NUMERIC_CELL_RE = re.compile(r"[-+]?\d[\d,.]*%?")
+
+
+def _looks_numeric(cell: str) -> bool:
+    return bool(_NUMERIC_CELL_RE.fullmatch(_clean_text(cell)))
+
+
+def _headerless_first_row_is_header(rows: list[list[str]]) -> bool:
+    """Without any <th>/<thead> signal, only promote row0 to header when it is
+    unique, fully non-numeric AND at least one column flips text->numeric in
+    the body. Plain data tables (e.g. product/price rows) keep all rows."""
+    first = rows[0]
+    if not first or len(set(first)) != len(first):
+        return False
+    if any(_looks_numeric(cell) for cell in first if _clean_text(cell)):
+        return False
+    if len(rows) == 1:
+        return False
+    width = max(len(row) for row in rows)
+    for col in range(width):
+        head = first[col] if col < len(first) else ""
+        body = [_clean_text(row[col]) for row in rows[1:] if col < len(row)]
+        body = [cell for cell in body if cell]
+        if not body or _looks_numeric(head):
+            continue
+        numeric = sum(1 for cell in body if _looks_numeric(cell))
+        if numeric * 2 >= len(body):
+            return True
+    return False
+
+
+def _merged_header_names(header_rows: list[list[str]], width: int) -> list[str]:
+    """Collapse stacked header rows: each column takes the deepest non-empty
+    label (leaf), falling back upward; duplicates get _2/_3 suffixes."""
+    names: list[str] = []
+    for col in range(width):
+        label = ""
+        for row in reversed(header_rows):
+            cell = _clean_text(row[col]) if col < len(row) else ""
+            if cell:
+                label = cell
+                break
+        names.append(_field_name(label) or f"col_{col + 1}")
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for name in names:
+        bump = seen.get(name, 0) + 1
+        seen[name] = bump
+        out.append(name if bump == 1 else f"{name}_{bump}")
+    return out
+
+
+def _rows_from_table(grid: _TableGrid) -> list[dict[str, Any]]:
+    rows = grid.rows
     if not rows:
         return []
     width = max(len(row) for row in rows)
-    first = rows[0]
-    has_header = len(set(first)) == len(first) and any(not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", cell or "") for cell in first)
-    headers = [_field_name(cell) or f"col_{idx + 1}" for idx, cell in enumerate(first)] if has_header else [f"col_{idx + 1}" for idx in range(width)]
-    data_rows = rows[1:] if has_header else rows
+    header_count = 0
+    for flag in grid.header_flags:
+        if flag:
+            header_count += 1
+        else:
+            break
+    if header_count == 0 and _headerless_first_row_is_header(rows):
+        header_count = 1
+    if header_count:
+        headers = _merged_header_names(rows[:header_count], width)
+        data_rows = rows[header_count:]
+    else:
+        headers = [f"col_{idx + 1}" for idx in range(width)]
+        data_rows = rows
     out: list[dict[str, Any]] = []
     for row in data_rows:
         item: dict[str, Any] = {}
@@ -447,13 +589,19 @@ def _rows_from_table(raw_rows: list[list[str]]) -> list[dict[str, Any]]:
     return out
 
 
-def extract_html_tables(html: str) -> list[dict[str, Any]]:
+def extract_html_tables_all(html: str) -> list[list[dict[str, Any]]]:
+    """Every table on the page as its own row-set, largest first."""
     parser = _TableParser()
     parser.feed(str(html or ""))
-    candidates = [_rows_from_table(table) for table in parser.tables]
+    candidates = [_rows_from_table(grid) for grid in parser.tables]
     candidates = [rows for rows in candidates if rows]
     candidates.sort(key=lambda rows: (len(rows), len(rows[0]) if rows else 0), reverse=True)
-    return candidates[0] if candidates else []
+    return candidates
+
+
+def extract_html_tables(html: str) -> list[dict[str, Any]]:
+    tables = extract_html_tables_all(html)
+    return tables[0] if tables else []
 
 
 class _CardParser(HTMLParser):
@@ -540,10 +688,27 @@ def _filter_fields(rows: list[dict[str, Any]], fields: list[str] | None) -> list
     return out
 
 
-def extract(source: Any, *, source_type: str = "auto", requested_fields: list[str] | None = None, max_rows: int = 1000) -> dict[str, Any]:
+def _fields_of(rows: list[dict[str, Any]]) -> list[str]:
+    fields: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fields:
+                fields.append(str(key))
+    return fields
+
+
+def extract(
+    source: Any,
+    *,
+    source_type: str = "auto",
+    requested_fields: list[str] | None = None,
+    max_rows: int = 1000,
+    all_tables: bool = False,
+) -> dict[str, Any]:
     st = str(source_type or "auto").strip().lower()
     rows: list[dict[str, Any]] = []
     family = "UNKNOWN"
+    html_tables: list[list[dict[str, Any]]] = []
     if isinstance(source, (dict, list)):
         rows = _extract_json_rows(source)
         family = "API_JSON"
@@ -556,7 +721,8 @@ def extract(source: Any, *, source_type: str = "auto", requested_fields: list[st
             except Exception:
                 rows = []
         if not rows and st in {"html", "dom_table", "auto"}:
-            rows = extract_html_tables(text)
+            html_tables = extract_html_tables_all(text)
+            rows = html_tables[0] if html_tables else []
             family = "DOM_TABLE" if rows else family
         if not rows and st in {"html", "dom_cards", "dom_list", "auto"}:
             rows = extract_html_cards(text)
@@ -567,18 +733,33 @@ def extract(source: Any, *, source_type: str = "auto", requested_fields: list[st
     except Exception:
         n = 1000
     rows = rows[:n]
-    fields: list[str] = []
-    for row in rows:
-        for key in row.keys():
-            if key not in fields:
-                fields.append(str(key))
-    return {
+    result: dict[str, Any] = {
         "source_family": family,
         "row_count": len(rows),
-        "fields": fields,
+        "fields": _fields_of(rows),
         "rows": rows,
         "sample": rows[:3],
+        # additive (output_contract rule: fields are only ever added):
+        # how many DOM tables were discovered on the page, so callers can
+        # tell when the default largest-table pick is dropping data.
+        "table_count": len(html_tables),
     }
+    if all_tables and html_tables:
+        tables_out: list[dict[str, Any]] = []
+        for idx, table_rows in enumerate(html_tables):
+            t_rows = _filter_fields(table_rows, requested_fields)[:n]
+            if not t_rows:
+                continue
+            tables_out.append(
+                {
+                    "index": idx,
+                    "row_count": len(t_rows),
+                    "fields": _fields_of(t_rows),
+                    "rows": t_rows,
+                }
+            )
+        result["tables"] = tables_out
+    return result
 
 
 def export_jsonl(result: dict[str, Any], *, run_id: str = "manual") -> dict[str, str]:
