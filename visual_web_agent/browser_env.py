@@ -249,6 +249,8 @@ class BrowserEnv:
         self._intercept_unique_key: str | list[str] | None = None
         self._intercept_filename: str = "output.xlsx"
         self._registered_pages: set[int] = set()
+        # STEALTH-3: identity bundle (UA + CH + ua metadata), set in start() so every page CDP session can replay setUserAgentOverride.
+        self._stealth_profile = None
         self._background_tasks: set[asyncio.Task] = set()
         self._intercept_min_list_size: int = 5  # 启发式探测阈值
         # ── 核心 API 精准截胡 ──────────────────────────────────────────
@@ -1127,6 +1129,29 @@ class BrowserEnv:
         except Exception:
             pass
 
+    async def _apply_cdp_ua_override(self, page: Page) -> None:
+        """STEALTH-3: drive CDP Emulation.setUserAgentOverride so the JS-side
+        navigator.userAgentData (and workers / cross-origin iframes) advertise
+        the same identity as the header-level UA + Client Hints. Header
+        injection alone never populates navigator.userAgentData, so a spoofed
+        UA with empty/!mismatched high-entropy hints is itself a bot tell.
+        Best-effort: never breaks page registration."""
+        profile = getattr(self, "_stealth_profile", None)
+        if profile is None:
+            return
+        try:
+            from .stealth_profile import build_cdp_ua_override
+        except ImportError:  # pragma: no cover - script/relative import shim
+            from stealth_profile import build_cdp_ua_override  # type: ignore[no-redef]
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send(
+                "Emulation.setUserAgentOverride",
+                build_cdp_ua_override(profile),
+            )
+        except Exception as _ua_err:
+            logger.debug("[STEALTH-3] setUserAgentOverride skipped: %s", _ua_err)
+
     async def _register_page(
         self, page: Page, reason: str = "", activate: bool = True
     ) -> None:
@@ -1136,6 +1161,7 @@ class BrowserEnv:
         page_key = id(page)
         if page_key not in self._registered_pages:
             self._registered_pages.add(page_key)
+            await self._apply_cdp_ua_override(page)
             page.on("response", self._handle_xhr_response)
             page.on("download", self._handle_download)
             page.on(
@@ -1738,6 +1764,7 @@ class BrowserEnv:
             _chromium_exe = None
         _stealth_profile = build_profile(_chromium_exe, platform="Windows")
         _STEALTH_UA = _stealth_profile.user_agent
+        self._stealth_profile = _stealth_profile
 
         logger.info(f"Launching persistent context: {user_data_path.resolve()}")
         # proxy: single static (PROXY_SERVER) or rotating chain (PROXY_CHAIN),

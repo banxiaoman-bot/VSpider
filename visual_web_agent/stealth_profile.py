@@ -173,3 +173,104 @@ def build_profile(
         user_agent=build_user_agent(major, platform=platform),
         client_hints=build_client_hints(major, platform=platform),
     )
+
+
+# --- Slice STEALTH-3: CDP Emulation.setUserAgentOverride (high-entropy) -----
+#
+# Header injection (STEALTH-1) only fixes the *HTTP request* Sec-CH-UA. It does
+# NOT populate ``navigator.userAgentData`` (the JS-side high-entropy hints) nor
+# does it reach workers / cross-origin iframes that issue their own requests.
+# Cloudflare's JS challenge reads ``navigator.userAgentData.getHighEntropyValues``
+# (platform, platformVersion, architecture, bitness, fullVersionList); if those
+# disagree with the UA string or are empty under a spoofed UA, that itself is a
+# bot tell. Driving CDP ``Emulation.setUserAgentOverride`` with a full
+# ``userAgentMetadata`` makes the JS-side identity match the HTTP-side one across
+# every frame and worker.
+
+
+def _navigator_platform(platform: str) -> str:
+    """navigator.platform value (distinct from the CH platform token).
+
+    Desktop Chrome reports ``Win32`` even on 64-bit Windows, ``MacIntel`` on
+    Apple, and ``Linux x86_64`` on Linux.
+    """
+    token = (platform or "").strip().lower()
+    if token in {"mac", "macos", "darwin"}:
+        return "MacIntel"
+    if token == "linux":
+        return "Linux x86_64"
+    return "Win32"
+
+
+def _platform_version(platform: str) -> str:
+    """High-entropy ``platformVersion`` hint.
+
+    Windows 11 is advertised as the ``"15.0.0"`` family in UA-CH; we keep a
+    recent, plausible value per platform. Linux reports an empty string just
+    like real Chrome.
+    """
+    token = (platform or "").strip().lower()
+    if token in {"mac", "macos", "darwin"}:
+        return "14.0.0"
+    if token == "linux":
+        return ""
+    return "15.0.0"
+
+
+def build_ua_metadata(major: int, *, platform: str = "Windows") -> dict:
+    """Build the CDP ``userAgentMetadata`` object for setUserAgentOverride.
+
+    ``brands`` carry the reduced (major-only) versions exactly like the
+    Sec-CH-UA header, while ``fullVersionList`` carries the reduced full version
+    (``{major}.0.0.0``) so the JS-side high-entropy list stays consistent with
+    the spoofed UA string instead of leaking a real build number.
+    """
+    value = int(major)
+    brands = [
+        {"brand": "Chromium", "version": str(value)},
+        {"brand": "Google Chrome", "version": str(value)},
+        {"brand": _GREASE_BRAND, "version": _GREASE_VERSION},
+    ]
+    full = f"{value}.0.0.0"
+    full_version_list = [
+        {"brand": "Chromium", "version": full},
+        {"brand": "Google Chrome", "version": full},
+        {"brand": _GREASE_BRAND, "version": f"{_GREASE_VERSION}.0.0.0"},
+    ]
+    return {
+        "brands": brands,
+        "fullVersionList": full_version_list,
+        "fullVersion": full,
+        "platform": _ch_platform_token(platform),
+        "platformVersion": _platform_version(platform),
+        "architecture": "x86",
+        "model": "",
+        "mobile": False,
+        "bitness": "64",
+        "wow64": False,
+    }
+
+
+def build_cdp_ua_override(
+    profile: StealthProfile,
+    *,
+    accept_language: str = "",
+) -> dict:
+    """Params for CDP ``Emulation.setUserAgentOverride``.
+
+    Propagates the same identity as the header-level UA + Client Hints to the
+    JS side (``navigator.userAgentData``) and to workers / iframes. ``profile``
+    already carries the canonical CH platform token (``Windows`` / ``macOS`` /
+    ``Linux``) so the navigator.platform value and metadata stay derived from a
+    single source of truth. ``acceptLanguage`` is only included when non-empty,
+    so we never clobber the context's natural Accept-Language by default.
+    """
+    params: dict = {
+        "userAgent": profile.user_agent,
+        "platform": _navigator_platform(profile.platform),
+        "userAgentMetadata": build_ua_metadata(profile.major, platform=profile.platform),
+    }
+    lang = (accept_language or "").strip()
+    if lang:
+        params["acceptLanguage"] = lang
+    return params

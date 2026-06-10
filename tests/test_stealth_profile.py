@@ -12,9 +12,11 @@ from __future__ import annotations
 from visual_web_agent.stealth_profile import (
     DEFAULT_CHROME_MAJOR,
     StealthProfile,
+    build_cdp_ua_override,
     build_client_hints,
     build_profile,
     build_sec_ch_ua,
+    build_ua_metadata,
     build_user_agent,
     default_user_agent,
     detect_chromium_major,
@@ -139,3 +141,79 @@ def test_profile_platform_consistency_macos() -> None:
     assert "Macintosh" in prof.user_agent
     assert prof.client_hints["sec-ch-ua-platform"] == '"macOS"'
     assert '"127"' in prof.client_hints["sec-ch-ua"]
+
+
+# --- Slice STEALTH-3: CDP userAgentMetadata high-entropy hints --------------
+
+def test_ua_metadata_brands_are_major_only() -> None:
+    meta = build_ua_metadata(131, platform="Windows")
+    brands = {b["brand"]: b["version"] for b in meta["brands"]}
+    assert brands["Chromium"] == "131"
+    assert brands["Google Chrome"] == "131"
+    # GREASE brand present so the list shape matches real Chrome
+    assert any("Not" in b for b in brands)
+
+
+def test_ua_metadata_full_version_list_is_reduced_not_real_build() -> None:
+    meta = build_ua_metadata(131, platform="Windows")
+    full = {b["brand"]: b["version"] for b in meta["fullVersionList"]}
+    # reduced full version keeps JS-side consistent with the spoofed UA and
+    # never leaks a real build number like 131.0.6778.86
+    assert full["Chromium"] == "131.0.0.0"
+    assert full["Google Chrome"] == "131.0.0.0"
+    assert meta["fullVersion"] == "131.0.0.0"
+
+
+def test_ua_metadata_windows_platform_shape() -> None:
+    meta = build_ua_metadata(131, platform="Windows")
+    assert meta["platform"] == "Windows"
+    assert meta["platformVersion"] == "15.0.0"
+    assert meta["mobile"] is False
+    assert meta["bitness"] == "64"
+    assert meta["architecture"] == "x86"
+    assert meta["wow64"] is False
+
+
+def test_ua_metadata_macos_platform_shape() -> None:
+    meta = build_ua_metadata(127, platform="macOS")
+    assert meta["platform"] == "macOS"
+    assert meta["platformVersion"] == "14.0.0"
+
+
+def test_ua_metadata_linux_platform_version_empty() -> None:
+    meta = build_ua_metadata(120, platform="linux")
+    assert meta["platform"] == "Linux"
+    assert meta["platformVersion"] == ""
+
+
+def test_cdp_override_matches_profile_identity() -> None:
+    prof = build_profile(None, platform="Windows", fallback=131)
+    params = build_cdp_ua_override(prof)
+    # JS-side UA == header-side UA (single source of truth)
+    assert params["userAgent"] == prof.user_agent
+    # navigator.platform is Win32 on 64-bit Windows, not the CH token
+    assert params["platform"] == "Win32"
+    # metadata major agrees with the profile / CH header major
+    brands = {b["brand"]: b["version"] for b in params["userAgentMetadata"]["brands"]}
+    assert brands["Google Chrome"] == "131"
+    # acceptLanguage omitted by default so we don't clobber context locale
+    assert "acceptLanguage" not in params
+
+
+def test_cdp_override_navigator_platform_macos() -> None:
+    prof = build_profile(None, platform="macOS", fallback=128)
+    params = build_cdp_ua_override(prof)
+    assert params["platform"] == "MacIntel"
+    assert params["userAgentMetadata"]["platform"] == "macOS"
+
+
+def test_cdp_override_navigator_platform_linux() -> None:
+    prof = build_profile(None, platform="linux", fallback=120)
+    params = build_cdp_ua_override(prof)
+    assert params["platform"] == "Linux x86_64"
+
+
+def test_cdp_override_includes_accept_language_when_given() -> None:
+    prof = build_profile(None, platform="Windows", fallback=131)
+    params = build_cdp_ua_override(prof, accept_language="zh-CN,zh;q=0.9")
+    assert params["acceptLanguage"] == "zh-CN,zh;q=0.9"
