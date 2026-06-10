@@ -2213,3 +2213,31 @@ Acceptance:
 
 Out of scope (next): reroute-on-block tuning; optional acceptLanguage
 alignment with context locale once a locale policy exists.
+
+## Slice EXTRACT-COMPLEX-1: complex-structure extraction hardening (done)
+
+Layer: data_plane (extraction_engine/generic.py) + intent_planning (semantic_macros/cascader_pick.py).
+Driven by a 24-scenario capability probe (2026-06-10): 9 GAPs found, all fixed.
+
+- _TableParser rewritten: per-<table> grid stack (nested tables no longer
+  shred outer rows) + rowspan/colspan occupancy expansion (span clamped at 100).
+- Header pipeline: thead/all-th rows are trusted signals; stacked header rows
+  merge leaf-first; duplicate names get _2 suffixes; headerless tables only
+  promote row0 when a column flips text->numeric (data tables keep all rows).
+- _extract_json_rows: dict-quality weighting (x3) so record lists beat longer
+  scalar noise lists (trace/tags).
+- select() CSS: direct-child combinator > (spaced and compact forms).
+- cascader_pick.parse: strips trailing CJK punctuation from path segments;
+  new 级联选择： trigger (lookahead-guarded, math comparisons stay unhijacked).
+
+Tests: tests/test_extract_complex_tables.py. Probe scripts:
+.pttmp/probe_extract_complex.py, .pttmp/probe_fill_complex.py
+(24/24 PASS post-fix).
+
+Same-slice follow-up: extract_html_tables_all() + extract(all_tables=True)
++ additive table_count/tables result fields + /api/extractor/run
+passthrough, so multi-table pages are no longer silently reduced to the
+largest table (default pick unchanged for existing callers).
+
+Known/accepted: mixed-arrow paths need a trigger keyword; data_manager
+XHR legacy xlsx default is fixed by Slice XHR-INTERCEPT-CONTRACT-1 below.
