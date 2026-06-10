@@ -2143,3 +2143,73 @@ Acceptance:
 
 Out of scope (next): P2 remove the hand-written `navigator.plugins` double-patch;
 CDP `setUserAgentOverride` userAgentMetadata; reroute-on-block tuning.
+
+## Slice INTENT-OVERRIDE-1: 附件 intent 用户显式覆盖（前端选择器 → input_contract 落盘）
+
+Why: 输入契约 §一-B 要求 `attachments[i].intent` "必推断 + 用户可覆盖"，但
+`/api/start_batch` 从未暴露覆盖位——前端上传 PDF 想"作为上下文阅读"却被推断成
+`upload_to_page` 时用户无路可走，违反"禁止把上传文件只当批处理 DataFrame"约束。
+
+Add / change:
+
+- `vspider-ui/composables/useAttachmentIntent.js`（新）: auto + 4 个用户可选
+  intent（batch_rows/upload_to_page/prompt_context/media_source；unknown 仅属
+  推断域）；`appendAttachmentIntentToFormData` 仅在真实覆盖时附加字段。
+  `App.vue` 上传区加 el-select（选文件后出现，移除/换文件重置 auto）。
+- `api_server.py /api/start_batch`: 新 Form 字段 `attachment_intent`
+  （空/auto=自动推断，非法值快速失败）；响应新增 `attachment_intent_source`
+  （user|inferred）；用户覆盖随 queue item（`_enqueue_task`）、worker
+  （`_run_batch_kwargs`）、retry（从 input_contract.json 的 intent 复现）、
+  recover（snapshot 白名单）全链路透传。
+- `smart_batch_runner.py`: `run_smart_batch(_sync)` 新 kwarg
+  `attachment_intent` → `_persist_io_contracts_safe`（intent 落盘进
+  input_contract.json）+ `_dispatch_attachment(intent_override=)`（覆盖优先于
+  推断，路由 adapter 按用户意图走）。
+- `io_contract/__init__.py` 导出 `ATTACHMENT_INTENTS`；`queue_state.py`
+  `_execution_task` 白名单补 `attachment_intent`（字段只加不删）。
+
+Acceptance:
+
+- 新 `tests/test_attachment_intent_override.py` 12 passed：dispatcher 覆盖优先/
+  非法回退、契约落盘、API 校验 + 入队 + auto 推断回显、_run_batch_task 转发、
+  retry/recover 保持、source wiring。前端 `useAttachmentIntent.test.js` 8 passed
+  （vitest 共 17）。`validate_y.py attachment_intent_override` 全链路 success：
+  target 161 + build + core + full 2920 passed, 2 skipped (141.81s)。
+- 测试坑：TestClient POST `/api/start_batch` 会真启 `_queue_worker` 循环且
+  TestClient 等 background task 完成 → 永久挂起；用例需预置 fake idle worker
+  （`_block_worker_autostart`）。直调 `start_batch()` 时 Form 默认值是 `Form`
+  对象，已加 `isinstance(attachment_intent, str)` 防御（对齐 constraints/urls）。
+
+## STEALTH-3: CDP setUserAgentOverride with full userAgentMetadata (Cloudflare P2)
+
+Why: header injection (STEALTH-1) fixes the HTTP-side Sec-CH-UA but never
+populates the JS-side `navigator.userAgentData`, and workers / cross-origin
+iframes issue requests outside `set_extra_http_headers`. A spoofed UA with
+empty or mismatched high-entropy hints (platform/platformVersion/bitness/
+fullVersionList) is itself a bot tell for Cloudflare's JS challenge.
+
+Add / change:
+
+- `stealth_profile.py`: pure leaves `_navigator_platform` (Win32 / MacIntel /
+  Linux x86_64), `_platform_version`, `build_ua_metadata` (brands = major-only,
+  fullVersionList = reduced `{major}.0.0.0` so no real build leaks) and
+  `build_cdp_ua_override(profile)` (acceptLanguage only when explicitly given,
+  so the context locale is never clobbered by default).
+- `browser_env.py` wiring: `self._stealth_profile` stashed in `start()`;
+  `_register_page` awaits new `_apply_cdp_ua_override(page)` once per page
+  (initial + tabs + popups), driving `Emulation.setUserAgentOverride` over a
+  fresh CDP session. Best-effort try/except so registration never breaks.
+
+Acceptance:
+
+- Targeted `test_stealth_profile.py` (28) + new `test_stealth3_cdp_wiring.py`
+  (3 stub-frame: override params identity / missing-profile no-op / CDP failure
+  swallowed) = 31 passed. Core 4 suites passed. Full suite 2919 passed,
+  2 skipped, 1 failed via `validate_y.py STEALTH-3 --skip-build` -- the single
+  failure (`test_task_queue.py::test_start_batch_queues_when_current_task_is_running`,
+  AttributeError at `api_server.py:3175 attachment_intent.strip`) comes from
+  another agent's uncommitted attachment-intent WIP in `api_server.py`,
+  untouched by this slice (stealth files do not import that path).
+
+Out of scope (next): reroute-on-block tuning; optional acceptLanguage
+alignment with context locale once a locale policy exists.

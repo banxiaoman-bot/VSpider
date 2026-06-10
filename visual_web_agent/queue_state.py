@@ -118,6 +118,7 @@ def _execution_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
         "upload_sha256": task.get("upload_sha256", ""),
         "upload_mime": task.get("upload_mime", ""),
         "constraints": _scrub_secret_mapping(task.get("constraints")),
+        "attachment_intent": task.get("attachment_intent", ""),
         "created_at": task.get("created_at"),
         "queued_at": task.get("queued_at"),
         "started_at": task.get("started_at"),

@@ -715,6 +715,7 @@ def _enqueue_task(
     upload_sha256: str = "",
     upload_mime: str = "",
     constraints: dict[str, Any] | None = None,
+    attachment_intent: str = "",
 ) -> tuple[dict[str, Any], bool]:
     task_id = _next_task_id()
     now = time.time()
@@ -736,6 +737,7 @@ def _enqueue_task(
         "upload_sha256": upload_sha256,
         "upload_mime": upload_mime,
         "constraints": dict(constraints or {}),
+        "attachment_intent": str(attachment_intent or "").strip(),
         "status": "queued",
         "running": False,
         "created_at": now,
@@ -887,6 +889,14 @@ def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:
             file_size_kb = 0.0
     upload_sha256 = str(run.get("upload_sha256") or contract_attachment.get("sha256") or "")
     upload_mime = str(run.get("upload_mime") or contract_attachment.get("mime") or "")
+    # input_contract.json is the reproduction baseline (§一-B): the persisted
+    # intent is this run's authoritative routing key, so the retry replays it
+    # as an explicit override ("unknown" stays an inference result, not one).
+    retry_attachment_intent = str(
+        run.get("attachment_intent") or contract_attachment.get("intent") or ""
+    ).strip()
+    if retry_attachment_intent == "unknown":
+        retry_attachment_intent = ""
     file_path = ""
     if mode == "batch" and (filename or attachment_path):
         candidates: list[Path] = []
@@ -925,6 +935,7 @@ def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:
         constraints=retry_constraints,
         upload_sha256=upload_sha256,
         upload_mime=upload_mime,
+        attachment_intent=retry_attachment_intent,
     )
     try:
         _run_registry.update_run(
@@ -984,6 +995,7 @@ def recover_queued_tasks() -> dict[str, Any]:
             "upload_sha256": str(item.get("upload_sha256") or ""),
             "upload_mime": str(item.get("upload_mime") or ""),
             "constraints": _drop_redacted_secret_values(item.get("constraints")),
+            "attachment_intent": str(item.get("attachment_intent") or ""),
             "status": "queued",
             "running": False,
             "created_at": item.get("created_at") or time.time(),
@@ -1349,6 +1361,7 @@ async def _run_batch_task(
     vlm_options: dict[str, Any] | None = None,
     urls: list[str] | None = None,
     run_constraints: dict[str, Any] | None = None,
+    attachment_intent: str = "",
 ) -> None:
     """
     后台任务执行器。
@@ -1374,6 +1387,7 @@ async def _run_batch_task(
             run_id=task_id,
             urls=list(urls or []),
             run_constraints=run_constraints or None,
+            attachment_intent=attachment_intent,
         )
 
         with _TASK_LOCK:
@@ -1517,6 +1531,8 @@ async def _queue_worker(worker_id: str = "worker_default") -> None:
                     _run_batch_kwargs["urls"] = _task_urls
                 if task_item.get("constraints"):
                     _run_batch_kwargs["run_constraints"] = task_item.get("constraints")
+                if task_item.get("attachment_intent"):
+                    _run_batch_kwargs["attachment_intent"] = str(task_item.get("attachment_intent") or "")
                 await _run_batch_task(
                     task_id,
                     str(task_item.get("target_url") or ""),
@@ -3103,6 +3119,12 @@ async def start_batch(
                     "(csv/xlsx/json/txt/pdf/docx/pptx/eml/img/video/zip ...); "
                     "intent is auto-inferred from filename + mime + goal.",
     ),
+    attachment_intent: str = Form(
+        "",
+        description="Optional explicit attachment intent override "
+                    "(batch_rows | upload_to_page | prompt_context | media_source). "
+                    "Empty or 'auto' keeps automatic inference.",
+    ),
     constraints: str = Form(
         "",
         description="Optional JSON object for input_contract.constraints (proxy, max_steps, ...).",
@@ -3121,6 +3143,8 @@ async def start_batch(
         constraints = ""
     if not isinstance(urls, str):
         urls = ""
+    if not isinstance(attachment_intent, str):
+        attachment_intent = ""
     current = _task_snapshot()
     if not current.get("running") and current.get("in_cooldown"):
         # 任务刚刚完成，短时间内再次下发大概率是前端双击 / 自动重试 / done 广播抖动
@@ -3145,6 +3169,28 @@ async def start_batch(
             "status": "error",
             "message": "Missing prompt parameter (or compatible field goal).",
         }
+
+    # §一-B: the user may explicitly override the attachment intent. "auto"
+    # (or empty) keeps inference; anything else must be a real intent —
+    # reject early instead of silently degrading ("unknown" is an inference
+    # result, never a user choice).
+    user_attachment_intent = (attachment_intent or "").strip().lower()
+    if user_attachment_intent == "auto":
+        user_attachment_intent = ""
+    if user_attachment_intent:
+        try:
+            from visual_web_agent.io_contract import ATTACHMENT_INTENTS as _ATTACHMENT_INTENTS
+        except Exception:
+            _ATTACHMENT_INTENTS = ("batch_rows", "upload_to_page", "prompt_context", "media_source", "unknown")
+        allowed_user_intents = tuple(i for i in _ATTACHMENT_INTENTS if i != "unknown")
+        if user_attachment_intent not in allowed_user_intents:
+            return {
+                "status": "error",
+                "message": (
+                    f"Invalid attachment_intent {attachment_intent!r}; "
+                    f"expected one of {', '.join(allowed_user_intents)} or 'auto'."
+                ),
+            }
 
     inferred_from_prompt = False
     auto_entry_source = ""
@@ -3308,19 +3354,25 @@ async def start_batch(
             saved_path_obj.write_bytes(content)
             saved_path = str(saved_path_obj)
 
-    attachment_intent = ""
+    effective_attachment_intent = ""
+    attachment_intent_source = ""
     if saved_path:
-        try:
-            from visual_web_agent.io_contract import infer_attachment_intent as _infer_attachment_intent
+        if user_attachment_intent:
+            effective_attachment_intent = user_attachment_intent
+            attachment_intent_source = "user"
+        else:
+            try:
+                from visual_web_agent.io_contract import infer_attachment_intent as _infer_attachment_intent
 
-            attachment_intent = _infer_attachment_intent(
-                filename=safe_name,
-                mime=upload_mime,
-                goal=merged_prompt,
-            )
-        except Exception as _intent_exc:
-            logger.debug("[start_batch] attachment intent inference failed: %s", _intent_exc)
-            attachment_intent = ""
+                effective_attachment_intent = _infer_attachment_intent(
+                    filename=safe_name,
+                    mime=upload_mime,
+                    goal=merged_prompt,
+                )
+                attachment_intent_source = "inferred" if effective_attachment_intent else ""
+            except Exception as _intent_exc:
+                logger.debug("[start_batch] attachment intent inference failed: %s", _intent_exc)
+                effective_attachment_intent = ""
 
     mode_label = "batch" if saved_path else "single"
     logger.info(
@@ -3333,7 +3385,8 @@ async def start_batch(
         f"semantic={vlm_options.get('semantic_model') or '<default>'}, "
         f"semantic_base={vlm_options.get('semantic_base_url') or '<default>'}\n"
         f"  file       : {safe_name!r}  ({file_size_kb:.1f} KB)\n"
-        f"  intent     : {attachment_intent or '<none>'}\n"
+        f"  intent     : {effective_attachment_intent or '<none>'}"
+        f"{' (user override)' if attachment_intent_source == 'user' else ''}\n"
         f"  saved_to   : {saved_path or '<none>'}\n"
         f"  overwritten: {existed}"
     )
@@ -3366,6 +3419,7 @@ async def start_batch(
         upload_sha256=upload_sha256,
         upload_mime=upload_mime,
         constraints=run_constraints,
+        attachment_intent=user_attachment_intent if saved_path else "",
     )
     if upload_sha256:
         try:
@@ -3400,7 +3454,8 @@ async def start_batch(
         "vlm_model_type": vlm_options.get("model_type", "vl"),
         "upload_sha256": upload_sha256,
         "upload_mime": upload_mime,
-        "attachment_intent": attachment_intent,
+        "attachment_intent": effective_attachment_intent,
+        "attachment_intent_source": attachment_intent_source,
     }
 
 

@@ -71,9 +71,13 @@ def _load_dataframe(file_path: str) -> pd.DataFrame:
     raise ValueError(f"仅支持 csv/tsv/xls/xlsx/xlsm/ods/parquet，收到: {suffix or '<none>'}")
 
 
-def _dispatch_attachment(file_path: str, goal: str):
+def _dispatch_attachment(file_path: str, goal: str, intent_override: str = ""):
     """Build a transient ``InputContract`` for the single attachment and run
     it through ``adapt_attachment``.
+
+    ``intent_override`` is the user's explicit intent from the API layer; a
+    valid value wins over inference (``build_input_contract`` falls back to
+    inference for empty/invalid values, so this stays backward compatible).
 
     Returns ``(spec, result)`` where ``spec`` is the inferred
     :class:`AttachmentSpec` and ``result`` is the :class:`AdapterResult`.
@@ -99,6 +103,7 @@ def _dispatch_attachment(file_path: str, goal: str):
             "filename": fp.name,
             "size": fp.stat().st_size if fp.exists() else 0,
             "sample_bytes": sample_bytes,
+            "intent": str(intent_override or "").strip(),
         }],
     )
     spec = contract.attachments[0] if contract.attachments else None
@@ -111,7 +116,9 @@ def _dispatch_attachment(file_path: str, goal: str):
     return spec, result
 
 
-def _load_batch_rows_via_adapter(file_path: str, goal: str) -> pd.DataFrame:
+def _load_batch_rows_via_adapter(
+    file_path: str, goal: str, intent_override: str = ""
+) -> pd.DataFrame:
     """Load a tabular attachment as a DataFrame via ``adapt_attachment``.
 
     Falls back to :func:`_load_dataframe` when the adapter returns no rows,
@@ -119,7 +126,7 @@ def _load_batch_rows_via_adapter(file_path: str, goal: str) -> pd.DataFrame:
     than silently emitting an empty DataFrame.
     """
 
-    spec, result = _dispatch_attachment(file_path, goal)
+    spec, result = _dispatch_attachment(file_path, goal, intent_override=intent_override)
     if spec is None or spec.intent != "batch_rows" or not result.ok or result.kind != "rows":
         return _load_dataframe(file_path)
     rows = list(result.rows or [])
@@ -347,6 +354,7 @@ def _persist_io_contracts_safe(
     auth_profiles: str,
     vlm_options: dict | None,
     run_constraints: dict | None = None,
+    attachment_intent: str = "",
 ) -> None:
     """Persist ``input_contract.json`` + ``output_contract.json`` for the run.
 
@@ -364,6 +372,7 @@ def _persist_io_contracts_safe(
                 "path": str(fp),
                 "filename": fp.name,
                 "size": fp.stat().st_size if fp.exists() else 0,
+                "intent": str(attachment_intent or "").strip(),
             })
 
         all_urls: list[str] = []
@@ -448,6 +457,7 @@ async def run_smart_batch(
     urls: list[str] | None = None,
     run_constraints: dict | None = None,
     resume: bool = False,
+    attachment_intent: str = "",
 ) -> bool:
     """
     批处理入口（供 FastAPI BackgroundTasks 调用）。
@@ -460,9 +470,12 @@ async def run_smart_batch(
         run_id: 当前 run 的 ID；非空时会把 input/output contract 落盘到
             ``runs/<run_id>/`` 便于复现与审计。
         urls: 多 URL 任务的可选额外起点（``target_url`` 始终是第一个）。
+        attachment_intent: 用户显式声明的附件 intent（输入契约 §一-B 用户
+            覆盖位）；空字符串表示交给 ``infer_attachment_intent`` 推断。
     """
     from visual_web_agent import main as agent_main
 
+    intent_override = str(attachment_intent or "").strip()
     _persist_io_contracts_safe(
         run_id=run_id,
         goal=prompt,
@@ -472,6 +485,7 @@ async def run_smart_batch(
         auth_profiles=auth_profiles,
         vlm_options=vlm_options,
         run_constraints=run_constraints,
+        attachment_intent=intent_override,
     )
 
     attachment_spec = None
@@ -479,7 +493,9 @@ async def run_smart_batch(
     attachment_intent = ""
     if file_path:
         try:
-            attachment_spec, attachment_result = _dispatch_attachment(file_path, prompt or "")
+            attachment_spec, attachment_result = _dispatch_attachment(
+                file_path, prompt or "", intent_override=intent_override
+            )
             attachment_intent = (
                 attachment_spec.intent if attachment_spec is not None else ""
             )
@@ -572,7 +588,9 @@ async def run_smart_batch(
 
     # ── Branch B: batch_rows attachment ──────────────────────────────────
     try:
-        df = _load_batch_rows_via_adapter(file_path, prompt or "")
+        df = _load_batch_rows_via_adapter(
+            file_path, prompt or "", intent_override=intent_override
+        )
     except Exception as exc:
         _emit_log(f"❌ 读取文件失败: {exc}", level="error")
         try:
@@ -665,12 +683,14 @@ def run_smart_batch_sync(
     urls: list[str] | None = None,
     run_constraints: dict | None = None,
     resume: bool = False,
+    attachment_intent: str = "",
 ) -> bool:
     """CLI 同步入口。
 
     ``run_id`` / ``urls`` 是新加的可选 kwargs：当从 ``api_server`` 调用时携带
     任务 ID 与多 URL 列表，让 :func:`run_smart_batch` 把 input/output
-    contract 落盘到 ``runs/<run_id>/``。CLI 直接调用时省略即可，行为与
+    contract 落盘到 ``runs/<run_id>/``。``attachment_intent`` 携带用户显式
+    声明的附件 intent（空 = 自动推断）。CLI 直接调用时省略即可，行为与
     旧版本完全兼容。
     """
 
@@ -691,6 +711,7 @@ def run_smart_batch_sync(
             urls=urls,
             run_constraints=run_constraints,
             resume=resume,
+            attachment_intent=attachment_intent,
         )
     )
 

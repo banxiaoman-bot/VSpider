@@ -14,6 +14,7 @@ effects. Persistence helpers that touch disk live alongside
 """
 
 from .input_contract import (
+    ATTACHMENT_INTENTS,
     InputContract,
     UrlSpec,
     AttachmentSpec,
@@ -81,6 +82,7 @@ from .persistence import (
 
 
 __all__ = [
+    "ATTACHMENT_INTENTS",
     "InputContract",
     "UrlSpec",
     "AttachmentSpec",

@@ -34,6 +34,11 @@ import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import {
+  ATTACHMENT_INTENT_AUTO,
+  ATTACHMENT_INTENT_OPTIONS,
+  appendAttachmentIntentToFormData,
+} from './composables/useAttachmentIntent.js'
+import {
   ATTACHMENT_ACCEPT,
   ATTACHMENT_HINT,
   appendConstraintsToFormData,
@@ -62,6 +67,8 @@ const captchaSolverEnabled = ref(false)
 const captchaSolverProvider = ref('')
 const selectedAuthProfiles = ref([])
 const selectedFile = ref(null)
+// 优化 E: 附件 intent 用户覆盖（auto = 交给后端推断）
+const attachmentIntent = ref(ATTACHMENT_INTENT_AUTO)
 const isRunning = ref(false)
 // 优化 D: batched log buffer — one reactive update + one scroll per frame
 // instead of per WS line; ring-trims to LOG_LIMIT (backend event_stream
@@ -884,10 +891,12 @@ const connectWebSocket = () => {
 const handleUploadChange = (uploadFile, uploadFiles) => {
   if (!uploadFile || !uploadFile.raw) {
     selectedFile.value = null
+    attachmentIntent.value = ATTACHMENT_INTENT_AUTO
     return
   }
 
   selectedFile.value = uploadFile.raw
+  attachmentIntent.value = ATTACHMENT_INTENT_AUTO
   if (uploadFiles.length > 1) {
     uploadFiles.splice(0, uploadFiles.length - 1)
   }
@@ -895,6 +904,7 @@ const handleUploadChange = (uploadFile, uploadFiles) => {
 
 const handleUploadRemove = () => {
   selectedFile.value = null
+  attachmentIntent.value = ATTACHMENT_INTENT_AUTO
 }
 
 const loadAuthProfiles = async () => {
@@ -3427,6 +3437,7 @@ const submitTask = async () => {
   }
   if (selectedFile.value) {
     formData.append('file', selectedFile.value)
+    appendAttachmentIntentToFormData(formData, attachmentIntent.value)
   }
 
   try {
@@ -3811,6 +3822,25 @@ onUnmounted(() => {
             <p class="file-status">
               当前文件：{{ selectedFile ? selectedFile.name : '未选择文件，当前为单任务模式' }}
             </p>
+            <template v-if="selectedFile">
+              <el-select
+                v-model="attachmentIntent"
+                :disabled="isRunning"
+                size="small"
+                class="attachment-intent-select"
+                placeholder="附件用途"
+              >
+                <el-option
+                  v-for="option in ATTACHMENT_INTENT_OPTIONS"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+              <p class="file-status">
+                附件用途：自动推断不合预期时可在此显式指定（写入 input_contract）
+              </p>
+            </template>
           </el-collapse-item>
         </el-collapse>
       </div>
@@ -5875,6 +5905,11 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.attachment-intent-select {
+  width: 100%;
+  margin-top: 8px;
 }
 
 .field-hint {
