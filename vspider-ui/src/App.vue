@@ -682,7 +682,10 @@ watch(terminalSearchQuery, () => {
   terminalSearchCurrent.value = 0
 })
 
-watch(() => logs.value.length, () => {
+// Watch the ref itself (not .length): the log buffer replaces the array on
+// every flush, so this fires even when ring-trim keeps length constant at
+// LOG_LIMIT while matched lines get trimmed away.
+watch(logs, () => {
   if (terminalSearchCurrent.value >= terminalSearchTotal.value) {
     terminalSearchCurrent.value = 0
   }

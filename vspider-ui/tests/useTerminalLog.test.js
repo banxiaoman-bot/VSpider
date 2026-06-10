@@ -119,4 +119,21 @@ describe('createTerminalLogBuffer', () => {
   it('exports a production LOG_LIMIT of 2000', () => {
     expect(LOG_LIMIT).toBe(2000)
   })
+
+  // App.vue watches the `logs` ref itself (shallow) to re-clamp the terminal
+  // search index. That only fires if every flush replaces the array reference,
+  // including when the buffer is already full and length stays constant.
+  it('replaces the array reference on every flush (shallow watch contract)', () => {
+    const scheduler = manualScheduler()
+    const buf = createTerminalLogBuffer({ scheduler, limit: 3 })
+    for (let i = 1; i <= 3; i++) buf.appendLog(`L${i}`)
+    scheduler.run()
+    const fullRef = buf.logs.value
+    expect(fullRef).toHaveLength(3)
+    buf.appendLog('L4') // buffer already at limit → length stays 3
+    scheduler.run()
+    expect(buf.logs.value).toHaveLength(3)
+    expect(buf.logs.value).not.toBe(fullRef)
+    expect(buf.logs.value).toEqual(['L2', 'L3', 'L4'])
+  })
 })
