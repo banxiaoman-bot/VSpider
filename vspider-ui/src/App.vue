@@ -32,6 +32,7 @@ import CapabilityEfficiencyPanel from './components/CapabilityEfficiencyPanel.vu
 import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
+import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import {
   ATTACHMENT_ACCEPT,
   ATTACHMENT_HINT,
@@ -62,7 +63,16 @@ const captchaSolverProvider = ref('')
 const selectedAuthProfiles = ref([])
 const selectedFile = ref(null)
 const isRunning = ref(false)
-const logs = ref([])
+// 优化 D: batched log buffer — one reactive update + one scroll per frame
+// instead of per WS line; ring-trims to LOG_LIMIT (backend event_stream
+// keeps the full log). scrollToBottom is defined below; the arrow defers
+// the lookup until the first async flush, after setup has finished.
+const {
+  logs,
+  trimmedCount: logsTrimmedCount,
+  appendLog,
+  clear: clearTerminalLogs,
+} = createTerminalLogBuffer({ onFlush: () => { scrollToBottom() } })
 const currentImageBase64 = ref('')
 const terminalRef = ref(null)
 const wsStatus = ref('connecting')
@@ -509,10 +519,8 @@ const exportFinalAnswerAsMarkdown = () => {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-const appendLog = async (message) => {
-  logs.value.push(message)
-  await scrollToBottom()
-}
+// appendLog now comes from createTerminalLogBuffer (see top of setup):
+// synchronous push into a plain buffer, batched flush per frame.
 
 // ── R: Live Terminal log line severity coloring ──────────────────────
 // Inspect the log line's leading "[TAG]" and return a CSS modifier class.
@@ -3341,7 +3349,7 @@ const submitTask = async () => {
   }
 
   isRunning.value = true
-  logs.value = []
+  clearTerminalLogs()
   currentImageBase64.value = ''
   // M: clear timeline buffer at the start of every new run so phases
   // from old runs don't bleed into the new timeline view.
@@ -3955,6 +3963,9 @@ onUnmounted(() => {
               >搜索</el-button>
             </div>
             <el-scrollbar ref="terminalRef" class="terminal-scroll">
+              <p v-if="logsTrimmedCount > 0" class="log-line log-line--system">
+                [SYSTEM] 已裁剪最早 {{ logsTrimmedCount }} 行（完整日志见后端 event_stream.jsonl）
+              </p>
               <template v-if="logs.length">
                 <p
                   v-for="(line, idx) in logs"
