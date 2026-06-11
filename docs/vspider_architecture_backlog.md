@@ -2896,3 +2896,34 @@ owns those; importing api_server in unit tests drags the FastAPI app);
 live fixture capture from a real failing run (covered implicitly by
 capability_failure fixtures written during agent_case runs); fixture TTL
 / pruning policy for workspace artifact growth.
+
+## Slice EXTRACT-SHADOW-2: list/card harvest reaches open shadow roots (done)
+
+Layer: data_plane (main.py structured DOM_LIST harvest + compact
+list-text feed). Closes the EXTRACT-SHADOW-1 out-of-scope item "list/card
+harvest inside shadow roots": both list scripts queried the light DOM
+only, so card components rendered inside open shadow roots produced zero
+DOM_LIST candidates and zero compact list text - shadow card pages fell
+through to screenshot extraction even after SHADOW-1 fixed the tables.
+
+- _extract_list_rows_via_dom (structured rows) and
+  _extract_compact_list_text_via_dom (compact text feed) both gain the
+  deepQueryAll walker; their direct-selector sweeps AND container-repeat
+  sweeps ride it. Candidate scoring, meta parsing (points/comments/time/
+  rating/summary), link classification, and dedup are untouched -
+  light-DOM results stay byte-identical.
+- Both scripts still ride their frame fallbacks, so iframe + shadow
+  combinations compose.
+
+Tests: tests/test_extract_shadow_list.py (3 source anchors: both
+direct-selector sweeps walk shadow roots and the naive query is gone,
+both container sweeps ditto, >= 4 walker copies across the harvest
+scripts - each evaluates separately). Live probe extracted the REAL
+_list_rows_js from run_agent source: custom element with 8 shadow cards -
+8/8 harvested with titles/points/links parsed, control naive query counts
+0 items there; light-DOM 4/4 regression intact - 7/7 PASS pre-removal.
+
+Out of scope (next): shadow-hosted pager controls (AUTOPAGER-SHADOW-1);
+closed shadow roots; slotted light-DOM content projected into shadow
+layouts (innerText follows the flattened tree, believed covered, not
+live-probed).

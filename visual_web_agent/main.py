@@ -9928,6 +9928,16 @@ async def run_agent(
                                 && rect.width > 0
                                 && rect.height > 0;
                         };
+                        // EXTRACT-SHADOW-2: list/card components can render
+                        // inside open shadow roots (same walker as the table
+                        // harvest / form fallback).
+                        const deepQueryAll = (selector, root = document) => {
+                            const out = Array.from(root.querySelectorAll(selector));
+                            for (const host of root.querySelectorAll('*')) {
+                                if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                            }
+                            return out;
+                        };
                         const candidates = [];
                         const addCandidate = (el, source) => {
                             if (!isVisible(el)) return;
@@ -9955,7 +9965,7 @@ async def run_agent(
                             '.Story', '.story', '.ais-Hits-item', '.hit',
                             '.search-result', '.result', '.item'
                         ];
-                        for (const el of document.querySelectorAll(directSelectors.join(','))) {
+                        for (const el of deepQueryAll(directSelectors.join(','))) {
                             addCandidate(el, 'selector');
                         }
 
@@ -9964,7 +9974,7 @@ async def run_agent(
                             '.list', '.item-list', '.results', '.search-results',
                             'ol', 'ul', 'section'
                         ];
-                        for (const root of document.querySelectorAll(containerSelectors.join(','))) {
+                        for (const root of deepQueryAll(containerSelectors.join(','))) {
                             if (!isVisible(root)) continue;
                             const children = Array.from(root.children || []).filter(isVisible);
                             if (children.length < 4) continue;
@@ -10165,6 +10175,16 @@ async def run_agent(
                                 && rect.width > 0
                                 && rect.height > 0;
                         };
+                        // EXTRACT-SHADOW-2: card/list components render inside
+                        // open shadow roots, invisible to plain querySelectorAll
+                        // (same walker as the table harvest / form fallback).
+                        const deepQueryAll = (selector, root = document) => {
+                            const out = Array.from(root.querySelectorAll(selector));
+                            for (const host of root.querySelectorAll('*')) {
+                                if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                            }
+                            return out;
+                        };
                         const classifyUrl = (href) => {
                             const text = String(href || '').toLowerCase();
                             if (!text) return '';
@@ -10262,7 +10282,7 @@ async def run_agent(
                             '.Story', '.story', '.ais-Hits-item', '.hit',
                             '.search-result', '.result', '.item', '.card'
                         ];
-                        for (const el of document.querySelectorAll(directSelectors.join(','))) {
+                        for (const el of deepQueryAll(directSelectors.join(','))) {
                             addCandidate(el, 'selector');
                         }
 
@@ -10271,7 +10291,7 @@ async def run_agent(
                             '.list', '.item-list', '.results', '.search-results',
                             'ol', 'ul', 'section'
                         ];
-                        for (const root of document.querySelectorAll(containerSelectors.join(','))) {
+                        for (const root of deepQueryAll(containerSelectors.join(','))) {
                             if (!isVisible(root)) continue;
                             const children = Array.from(root.children || []).filter(isVisible);
                             if (children.length < 4) continue;
