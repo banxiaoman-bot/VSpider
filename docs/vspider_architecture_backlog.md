@@ -2792,3 +2792,39 @@ shadow-hosted pager buttons for the autopager click path (the signature
 now verifies, but _auto_advance_table_page_via_dom locators stay
 light-DOM); list/card harvest inside shadow roots (different selector
 family); declarative shadow DOM SSR edge cases.
+
+## Slice EXTRACT-CANVAS-1: canvas grids get an explicit declaration (done)
+
+Layer: operations_plane (main.py pre-extract empty-candidate branch +
+probe helper). Closes the P3 item "canvas grid fallback declaration":
+sheet engines (Luckysheet / Univer / Handsontable canvas mode, ECharts/
+AntV dashboards) paint rows onto a canvas, so every deterministic harvest
+legitimately returns empty - the fast path just logged "no deterministic
+candidates" and the planner burned VLM rounds rediscovering that there is
+no DOM to extract. row_action already had a failure-time canvas hint; the
+extraction entry point had nothing.
+
+- _detect_canvas_grid(reason): one evaluate - large canvas/svg only
+  (>= 500x300, sparklines ignored), scored by viewport coverage plus a
+  grid-like bonus when the element/parent class or id mentions
+  grid|table|sheet|spread|cell|excel|luckysheet|univer|handsontable.
+  Returns evidence (tag/width/height/coverage/grid_like/class_hint/
+  canvas_count) or {} - probe failures stay quiet.
+- Empty-candidate branch: declares BEFORE giving up - evidence + fallback
+  guidance (export/download button via data_export > switch to a DOM
+  table/list view > screenshot extraction with an explicit accuracy
+  caveat) published to workflow_memory["canvas_grid_notice"], so the
+  planner sees it on the very next turn. Deterministic candidates present
+  -> probe never runs (zero overhead on normal pages).
+
+Tests: tests/test_extract_canvas_fallback.py (5 source anchors: probe
+helper + size thresholds, grid-like scoring, declare-before-give-up
+ordering, memory key + guidance, quiet failure). Live probe extracted the
+REAL _canvas_js from run_agent source: canvas-painted 14x6 sheet inside a
+luckysheet-like container - found, grid_like, coverage 0.55, evidence
+fields; plain text page and small sparkline page both found=False -
+5/5 PASS pre-removal.
+
+Out of scope (next): auto-clicking the export button (stays a planner
+decision - guidance only); OCR-based canvas cell reading; WebGL grids
+where getBoundingClientRect underreports the painted area.

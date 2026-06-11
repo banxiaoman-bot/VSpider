@@ -10814,6 +10814,68 @@ async def run_agent(
                 logger.debug("[EXTRACT DEDUP] scroll drain probe failed: %s", probe_err)
                 return {"at_bottom": False, "probe_failed": True}
 
+        async def _detect_canvas_grid(reason: str) -> dict:
+            """Detect a dominant canvas/svg-rendered grid (EXTRACT-CANVAS-1).
+
+            Sheet engines (Luckysheet / Univer / Handsontable canvas mode /
+            x-spreadsheet, ECharts/AntV dashboards) paint rows onto a canvas,
+            so every DOM harvest legitimately comes back empty. Returns {}
+            when no large canvas/svg exists; otherwise evidence plus fallback
+            guidance the planner can act on.
+            """
+            _canvas_js = """() => {
+                    const vw = window.innerWidth || 1;
+                    const vh = window.innerHeight || 1;
+                    const els = Array.from(document.querySelectorAll('canvas, svg'));
+                    let best = null;
+                    for (const el of els) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 500 || r.height < 300) continue;
+                        const coverage = (r.width * r.height) / (vw * vh);
+                        const cls = [
+                            el.className && el.className.baseVal !== undefined
+                                ? el.className.baseVal : el.className,
+                            el.id,
+                            el.parentElement ? el.parentElement.className : '',
+                            el.parentElement ? el.parentElement.id : ''
+                        ].map(v => String(v || '')).join(' ').toLowerCase();
+                        const gridLike = /(grid|table|sheet|spread|cell|excel|luckysheet|univer|handsontable)/.test(cls);
+                        const score = coverage + (gridLike ? 1 : 0);
+                        if (!best || score > best.score) {
+                            best = {
+                                score,
+                                tag: String(el.tagName || '').toLowerCase(),
+                                width: Math.round(r.width),
+                                height: Math.round(r.height),
+                                coverage: Math.round(coverage * 100) / 100,
+                                grid_like: gridLike,
+                                class_hint: cls.replace(/\\s+/g, ' ').trim().slice(0, 120)
+                            };
+                        }
+                    }
+                    if (!best) return {found: false};
+                    delete best.score;
+                    return {found: true, canvas_count: els.length, ...best};
+                }"""
+            try:
+                _cv_page = await browser._ensure_active_page(reason=reason)
+                if _cv_page is None:
+                    return {}
+                info = await _cv_page.evaluate(_canvas_js)
+            except Exception as cv_err:
+                logger.debug("[PRE-EXTRACT] canvas grid probe failed: %s", cv_err)
+                return {}
+            if not isinstance(info, dict) or not info.get("found"):
+                return {}
+            notice = dict(info)
+            notice["guidance"] = (
+                "页面主体由 canvas/svg 渲染（DOM 无行可抽），确定性抽取不可用。"
+                "按优先级兜底：1) 找「导出/下载 CSV/Excel」按钮走 data_export；"
+                "2) 找「表格视图/列表模式」开关切回 DOM 渲染再抽取；"
+                "3) 都没有时才用截图视觉抽取，并在结果中明确告知用户精度受限。"
+            )
+            return notice
+
         async def _try_pre_extract_fast_path() -> bool:
             """Try deterministic extraction before invoking the VLM planner."""
             nonlocal _run_succeeded, _rpa_cache_allowed, _rpa_skip_reason
@@ -10989,6 +11051,28 @@ async def run_agent(
                         )
 
             if not candidates:
+                # EXTRACT-CANVAS-1: declare canvas/svg-rendered grids
+                # explicitly instead of silently falling through - the
+                # planner gets actionable guidance (export button > view
+                # switch > screenshot-with-caveat) via workflow_memory.
+                canvas_notice = await _detect_canvas_grid(
+                    "pre-extract canvas grid probe"
+                )
+                if canvas_notice:
+                    try:
+                        workflow_memory["canvas_grid_notice"] = canvas_notice
+                    except Exception:
+                        pass
+                    logger.info(
+                        "[PRE-EXTRACT] canvas/svg grid declared: tag=%s %sx%s "
+                        "coverage=%s grid_like=%s - deterministic DOM extraction "
+                        "unavailable, fallback guidance published",
+                        canvas_notice.get("tag"),
+                        canvas_notice.get("width"),
+                        canvas_notice.get("height"),
+                        canvas_notice.get("coverage"),
+                        canvas_notice.get("grid_like"),
+                    )
                 logger.info("[PRE-EXTRACT] no deterministic candidates")
                 return False
 
