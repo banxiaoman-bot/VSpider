@@ -2927,3 +2927,37 @@ Out of scope (next): shadow-hosted pager controls (AUTOPAGER-SHADOW-1);
 closed shadow roots; slotted light-DOM content projected into shadow
 layouts (innerText follows the flattened tree, believed covered, not
 live-probed).
+
+## Slice AUTOPAGER-SHADOW-1: table autopager reaches open shadow roots (done)
+
+Layer: data_plane (main.py _auto_advance_table_page_via_dom scripts).
+Closes the SHADOW-1/2 out-of-scope item "shadow-hosted pager controls":
+the harvest and the before-signature already walked shadow roots, but the
+autopager itself stayed light-DOM on BOTH sides - the DataTables sweep
+and the Next/numeric candidate scan never saw a shadow pager (no click),
+and _pager_wait_js confirmed flips against light-DOM tables only, so even
+a successfully clicked shadow pager always "timed out" and the autopager
+reported failure on a page that actually flipped (signature parity bug
+left dormant by SHADOW-1).
+
+- _pager_js: deepQueryAll for the DataTables API sweep and the
+  button/link candidate scan; in-page el.click() works inside open
+  shadow roots as-is. Light-DOM candidate order unchanged (document
+  nodes enumerate first).
+- _pager_wait_js: same walker, restoring parity with the deep
+  before-signature - the after-flip check now sees the same shadow table
+  the signature hashed.
+
+Tests: tests/test_autopager_shadow.py (4 source anchors: DataTables sweep
++ candidate scan walk shadow roots with naive queries gone, the flip
+confirmation keeps parity, both scripts carry their own walker). Live
+probe extracted the REAL _pager_js / _pager_wait_js / signature JS:
+custom element hosting a 40-row paginated table + pager fully inside an
+open shadow root - Next found and clicked (dom_next_button), flip 1->2
+CONFIRMED via the deep wait, second flip 2->3 confirmed; light-DOM pager
+regression clicked + confirmed - 6/6 PASS pre-removal.
+
+Out of scope (next): the scope loop already sweeps child frames, so
+iframe x shadow pagers compose but were not live-probed together; closed
+shadow roots; pagers rendered in a DIFFERENT shadow root than their table
+(cross-root aria-controls linking).

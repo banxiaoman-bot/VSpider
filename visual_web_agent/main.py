@@ -10595,8 +10595,18 @@ async def run_agent(
                                 || el.getAttribute('aria-disabled') === 'true'
                                 || cls.includes('disabled');
                         };
+                        // AUTOPAGER-SHADOW-1: pager controls can live inside
+                        // open shadow roots together with their table (the
+                        // harvest + signature already walk them - SHADOW-1/2).
+                        const deepQueryAll = (selector, root = document) => {
+                            const out = Array.from(root.querySelectorAll(selector));
+                            for (const host of root.querySelectorAll('*')) {
+                                if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                            }
+                            return out;
+                        };
 
-                        const tables = Array.from(document.querySelectorAll('table'))
+                        const tables = deepQueryAll('table')
                             .filter(isVisible);
                         if (window.jQuery && window.jQuery.fn && window.jQuery.fn.dataTable) {
                             for (const table of tables) {
@@ -10618,8 +10628,8 @@ async def run_agent(
                         }
 
                         const nextText = /^(next|next page|>|›|»|→|下一页|下页)$/i;
-                        const candidates = Array.from(
-                            document.querySelectorAll('button,a,[role="button"],[role="link"]')
+                        const candidates = deepQueryAll(
+                            'button,a,[role="button"],[role="link"]'
                         ).filter(isVisible);
                         for (const el of candidates) {
                             const label = clean(
@@ -10667,7 +10677,17 @@ async def run_agent(
                                     && rect.width > 0
                                     && rect.height > 0;
                             };
-                            const table = Array.from(document.querySelectorAll('table'))
+                            // AUTOPAGER-SHADOW-1: keep parity with the deep
+                            // before-signature, or a shadow table's page flip
+                            // can never be confirmed here.
+                            const deepQueryAll = (selector, root = document) => {
+                                const out = Array.from(root.querySelectorAll(selector));
+                                for (const host of root.querySelectorAll('*')) {
+                                    if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                                }
+                                return out;
+                            };
+                            const table = deepQueryAll('table')
                                 .find(t => isVisible(t));
                             if (!table) return false;
                             const after = Array.from(table.querySelectorAll('tbody tr'))
