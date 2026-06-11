@@ -105,6 +105,7 @@ try:
     from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from .url_guard import UrlGuardError, build_guarded_opener, check_url
     from .stealth_profile import default_user_agent
+    from .virtual_scroll import nudge_virtual_scroll
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
@@ -168,6 +169,7 @@ except ImportError:
     from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from url_guard import UrlGuardError, build_guarded_opener, check_url
     from stealth_profile import default_user_agent
+    from virtual_scroll import nudge_virtual_scroll
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -10535,7 +10537,23 @@ async def run_agent(
                     "[EXTRACT DEDUP] nudged page downward (%s): %d→%d bytes (+%d, %.1f%%)",
                     reason, before_size, after_size, delta, pct,
                 )
-                return delta > 100
+                if delta > 100:
+                    return True
+                # EXTRACT-VSCROLL-1: virtualised lists render a constant row
+                # window inside an inner scroller, so window.scrollBy does
+                # nothing and body length stays flat. Scroll the dominant
+                # container itself and compare row signatures instead.
+                vs = await nudge_virtual_scroll(_scroll_page, amount=scroll_amount)
+                if vs.get("rows_changed") or (
+                    vs.get("mode") == "container" and vs.get("moved")
+                ):
+                    logger.info(
+                        "[EXTRACT DEDUP] virtual-scroll nudge advanced (%s): %s",
+                        reason,
+                        vs,
+                    )
+                    return True
+                return False
             except Exception as scroll_err:
                 logger.debug("[EXTRACT DEDUP] duplicate-row scroll nudge failed: %s", scroll_err)
                 return False

@@ -2363,3 +2363,37 @@ Out of scope (next): auto_form macro's contenteditable branch in main.py
 (still flat textContent); TinyMCE classic iframe mode via editor API (the
 frame sweep reaches the body and uses the generic chain instead);
 virtual-scroll list capture.
+
+## Slice EXTRACT-VSCROLL-1: virtual-scroll lists become harvestable (done)
+
+Layer: data_plane / browser_substrate (new visual_web_agent/virtual_scroll.py
++ main.py dedup-nudge wiring).
+Closes the weakness-list item "virtual-scroll list extraction is weak".
+
+Root cause: windowed lists (react-window, vue-virtual-scroller, ag-grid,
+Element Plus virtual table) keep a constant row window inside an inner
+scroller - window.scrollBy never moves it and body innerText length stays
+flat while rows are recycled, so _nudge_scroll_after_duplicate_extract
+reported a dead end and the VLM extract->scroll loop terminated early.
+
+- New module virtual_scroll.py (kept out of the oversized main.py):
+  findScroller picks the largest visible overflow-y scrollable container
+  (incl. .el-scrollbar__wrap / .ag-body-viewport / [class*=virtual] hosts);
+  nudge_virtual_scroll() scrolls it one step (dispatching a real scroll
+  event, which windowed renderers listen to) and reports progress via a
+  first/last row-text signature diff plus moved/remaining evidence.
+- _nudge_scroll_after_duplicate_extract falls back to the virtual-scroll
+  nudge when the legacy window scroll yields no body growth; window-scroll
+  behaviour for normal pages is unchanged.
+
+Tests: tests/test_virtual_scroll_nudge.py (12 cases: progress/bottom/window
+fallback, contained evaluate errors, non-dict normalisation, settle wait,
+JS anchors, run_agent wiring). Live-browser probe with a true windowed list
+(600 rows, recycled DOM): window-scroll no-op confirmed, capture loop got
+600/600 unique rows in 71 passes, clean bottom detection - 4/4 PASS
+pre-removal.
+
+Out of scope (next): a dedicated deterministic capture-loop action that
+accumulates rows across nudges in one shot (today the existing VLM
+extract->scroll->dedup loop drives accumulation); horizontal virtual
+scrollers; iframe-hosted virtual lists (combine with the frame sweep).
