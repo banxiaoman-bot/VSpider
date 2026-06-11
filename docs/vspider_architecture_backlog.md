@@ -2828,3 +2828,33 @@ fields; plain text page and small sparkline page both found=False -
 Out of scope (next): auto-clicking the export button (stays a planner
 decision - guidance only); OCR-based canvas cell reading; WebGL grids
 where getBoundingClientRect underreports the painted area.
+
+## Slice XSYS-E2E-1: dual-login cross-system relay e2e (done)
+
+Layer: execution_kernel (test + live evidence only - no production code
+changed; the unit suites already pinned SessionRouter / pool / executor in
+isolation, what was missing is one continuous dual-login scenario plus
+real-browser proof of the isolation the mission rule demands).
+
+- tests/test_xsys_dual_login_e2e.py (7): one run, system_1 (alpha.example
+  / alpha_admin) -> system_2 (beta.example / beta_ops) -> home, driven
+  through the REAL router + pool + storage-apply code (only BrowserEnv is
+  stubbed). Pins: cookie AND origin-localStorage subsets are mutually
+  exclusive with foreign domains never leaking; unknown system gets the
+  empty state; the forward hop launches one isolated profile whose
+  context receives ONLY the beta login cookie; the home hop returns the
+  home lease without launching a pool session; both sessions coexist
+  under one run_id and release together; repeat hops reuse the session
+  (A->B->A->B does not stack contexts).
+- Live probe (real Playwright, one chromium instance): merged dual-login
+  state split via router.storage_state_for_system and injected into two
+  real contexts - storage_state() readback mutually exclusive (cookies +
+  origins, tracker junk never leaks); renderer-level proof on one shared
+  127.0.0.1 origin - page A sees only session_a + its own localStorage
+  token, page B sees only session_b and reads null - 7/7 PASS
+  pre-removal.
+
+Out of scope (next): data relay assertions through WorkflowDataEdge once
+the kernel consumes it (route_executor today only stamps system metadata;
+no false e2e for unwired plumbing); live two-site login flows with real
+credential vaults; cross-instance (multi-process) session pools.
