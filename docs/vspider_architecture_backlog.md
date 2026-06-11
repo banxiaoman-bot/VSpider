@@ -2563,3 +2563,37 @@ Out of scope (next): exposing the capture as a mid-run action for VLM use;
 horizontal scrollers; nested iframes hosting the scroller inside another
 iframe ride page.frames already (flat enumeration) but were not live-probed;
 semantic field mapping for captured text rows.
+
+## Slice FORM-RICHTEXT-3: TinyMCE classic iframe writes (done)
+
+Layer: intent_planning (main.py auto_form bound-controls macro JS).
+Closes the FORM-RICHTEXT-2 out-of-scope item "TinyMCE classic iframe via
+editor API": classic mode hides the textarea (display:none) and renders
+into an <id>_ifr editor iframe, so the bound-controls pass saw no control
+for the labelled field and the whole form fell through to the VLM.
+
+- Binding: iframe[id$="_ifr"] / iframe.tox-edit-area__iframe join the
+  bindable-control selector; a for= attribute that targets the hidden
+  textarea falls back to the <forId>_ifr stand-in.
+- Writing: the TinyMCE registry lookup strips the _ifr suffix to find the
+  editor under its textarea id, and editor matching also accepts
+  getContainer().contains(el) (getBody() lives in the iframe document, so
+  cross-document contains() is always false). API-less same-origin editor
+  iframes get structured paragraphs written into the body directly
+  (iframe_structured_paragraphs - the main-document execCommand path cannot
+  reach an iframe body), with input/change events dispatched.
+- Readback: verify reads contentDocument.body.innerText for iframes; the
+  write gate admits iframe controls.
+
+Tests: tests/test_auto_form_richtext.py 9 -> 17 (binding selectors, for_attr
+stand-in, registry suffix strip, container match, iframe branch ordered
+ahead of exec_insert_text, setNativeValue routing, write gate, readback).
+Live probe: real TinyMCE 6 classic via CDN - macro ok, iframe body and
+editor.getContent({format:'text'}) both read the value back (registry API
+path); offline simulated classic - for_attr stand-in binding, exactly one
+setContent call (suffix strip), API-less iframe direct write with
+insertText event + <p> paragraphs - 6/6 + 3/3 PASS pre-removal.
+
+Out of scope (next): cross-origin editor iframes (no contentDocument access;
+needs a frame-level form_set pass); TinyMCE inline mode already rides the
+contenteditable branch; Froala/Summernote registry APIs.

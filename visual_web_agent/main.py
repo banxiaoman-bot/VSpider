@@ -3325,7 +3325,10 @@ async def _try_auto_form_fill_bound_controls(
             };
 
             const scope = findScope();
-            const controls = allVisible('input,textarea,select,[contenteditable=true],[contenteditable="true"]', scope)
+            // TinyMCE classic hides its textarea and renders into an editor
+            // iframe (<id>_ifr / .tox-edit-area__iframe): bind the visible
+            // iframe host so labelled rich-text fields stay reachable.
+            const controls = allVisible('input,textarea,select,[contenteditable=true],[contenteditable="true"],iframe[id$="_ifr"],iframe.tox-edit-area__iframe', scope)
                 .filter(el => !['hidden','button','submit','reset'].includes((el.type || '').toLowerCase()));
             const labelNodes = allVisible(
                 'label,.el-form-item__label,[class*=form-item__label],.ant-form-item-label,.n-form-item-label,span,div',
@@ -3361,7 +3364,10 @@ async def _try_auto_form_fill_bound_controls(
                 for (const hit of hits.slice(0, 6)) {
                     const forId = hit.el.getAttribute?.('for');
                     if (forId) {
-                        const explicit = available.find(ctrl => ctrl.id === forId);
+                        // for= targets the hidden textarea in TinyMCE classic;
+                        // its visible stand-in is the <forId>_ifr iframe.
+                        const explicit = available.find(ctrl => ctrl.id === forId)
+                            || available.find(ctrl => ctrl.id === forId + '_ifr');
                         if (explicit) return {labelEl: hit.el, control: explicit, method: 'for_attr'};
                     }
                     let cur = hit.el;
@@ -3441,10 +3447,15 @@ async def _try_auto_form_fill_bound_controls(
                 const tiny = window.tinymce;
                 if (tiny && (typeof tiny.get === 'function' || Array.isArray(tiny.editors))) {
                     const editors = Array.from(tiny.editors || []);
-                    const byId = el.id && typeof tiny.get === 'function' ? tiny.get(el.id) : null;
+                    // classic mode binds the <id>_ifr editor iframe; the
+                    // registry key is the original textarea id.
+                    const ids = [el.id, el.id?.replace(/_ifr$/, '')].filter(Boolean);
+                    const byId = typeof tiny.get === 'function'
+                        ? ids.map(id => tiny.get(id)).find(Boolean) : null;
                     const ed = byId || editors.find(e => {
                         const body = e?.getBody?.();
-                        return body && (body === el || body.contains?.(el) || el.contains?.(body));
+                        if (body && (body === el || body.contains?.(el) || el.contains?.(body))) return true;
+                        return Boolean(e?.getContainer?.()?.contains?.(el));
                     });
                     if (ed && typeof ed.setContent === 'function') {
                         ed.setContent(toParagraphHtml(text));
@@ -3456,6 +3467,21 @@ async def _try_auto_form_fill_bound_controls(
                 if (ckHost?.ckeditorInstance && typeof ckHost.ckeditorInstance.setData === 'function') {
                     ckHost.ckeditorInstance.setData(toParagraphHtml(text));
                     return 'ckeditor5_api';
+                }
+                if (String(el.tagName || '').toLowerCase() === 'iframe') {
+                    // same-origin editor iframe without a reachable API:
+                    // the main-document execCommand path cannot reach its
+                    // body, so write structured paragraphs directly.
+                    try {
+                        const body = el.contentDocument?.body;
+                        if (body) {
+                            body.innerHTML = toParagraphHtml(text);
+                            body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));
+                            body.dispatchEvent(new Event('change', {bubbles: true}));
+                            return 'iframe_structured_paragraphs';
+                        }
+                    } catch (_) {}
+                    return 'iframe_unreachable';
                 }
                 try {
                     el.focus?.({preventScroll: true});
@@ -3475,6 +3501,10 @@ async def _try_auto_form_fill_bound_controls(
                 return 'structured_paragraphs';
             };
             const setNativeValue = (el, value) => {
+                if (String(el.tagName || '').toLowerCase() === 'iframe') {
+                    setRichTextValue(el, String(value || ''));
+                    return;
+                }
                 if (el.isContentEditable) {
                     setRichTextValue(el, String(value || ''));
                     el.dispatchEvent(new Event('blur', {bubbles: true}));
@@ -3498,6 +3528,12 @@ async def _try_auto_form_fill_bound_controls(
                 if (tag === 'select') {
                     return [control.value, control.selectedOptions?.[0]?.textContent]
                         .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                }
+                if (tag === 'iframe') {
+                    // editor iframe readback: same-origin body text only.
+                    try {
+                        return clean(control.contentDocument?.body?.innerText || '');
+                    } catch (_) { return ''; }
                 }
                 if (control.isContentEditable) {
                     return clean(control.innerText || control.textContent || '');
@@ -3561,7 +3597,7 @@ async def _try_auto_form_fill_bound_controls(
                     results.push({label, ok: false, reason: 'complex_component_requires_form_set_or_macro', method: binding.method});
                     continue;
                 }
-                if (tag === 'input' || tag === 'textarea' || control.isContentEditable) {
+                if (tag === 'input' || tag === 'textarea' || tag === 'iframe' || control.isContentEditable) {
                     setNativeValue(control, expected);
                     results.push({label, ok: true, mode: 'input', method: binding.method});
                     continue;
