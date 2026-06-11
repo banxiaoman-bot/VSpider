@@ -3592,6 +3592,50 @@ async def _auto_form_fill_bound_controls_with_frames(
             return frame_result
     return result
 
+async def _evaluate_rows_with_frame_fallback(
+    page, js: str, *, log_tag: str = "EXTRACT DOM"
+) -> list:
+    """Evaluate row-harvesting JS in the main document, then child iframes.
+
+    Returns the first non-empty list result. Mirrors the FORM-IFRAME-2
+    pattern: detached/raising frames are skipped, frame hits log the URL,
+    and a main-document failure still lets iframes be probed.
+    """
+    rows: object = []
+    try:
+        rows = await page.evaluate(js)
+    except Exception as main_err:
+        logger.debug("[%s] main-document evaluate failed: %s", log_tag, main_err)
+        rows = []
+    if isinstance(rows, list) and rows:
+        return rows
+    main_frame = getattr(page, "main_frame", None)
+    for frame in list(getattr(page, "frames", None) or []):
+        if frame is main_frame:
+            continue
+        try:
+            is_detached = getattr(frame, "is_detached", None)
+            if callable(is_detached) and is_detached():
+                continue
+            frame_rows = await frame.evaluate(js)
+        except Exception as frame_err:
+            logger.debug(
+                "[%s] frame probe failed (%s): %s",
+                log_tag,
+                getattr(frame, "url", "?"),
+                frame_err,
+            )
+            continue
+        if isinstance(frame_rows, list) and frame_rows:
+            logger.info(
+                "[%s] rows=%s frame=%s",
+                log_tag,
+                len(frame_rows),
+                getattr(frame, "url", "") or "?",
+            )
+            return frame_rows
+    return rows if isinstance(rows, list) else []
+
 async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
     """Deterministic label/scoped form executor, used before handing control to VLM."""
     if not _goal_is_form_fill(goal):
@@ -10165,8 +10209,7 @@ async def run_agent(
         async def _extract_visible_table_rows_via_dom(reason: str) -> list[dict]:
             try:
                 _table_page = await browser._ensure_active_page(reason=reason)
-                rows = await _table_page.evaluate(
-                    """() => {
+                _table_rows_js = """() => {
                         const clean = (value) => String(value || '')
                             .replace(/\\s+/g, ' ')
                             .trim();
@@ -10302,6 +10345,8 @@ async def run_agent(
                         }
                         return best.rows;
                     }"""
+                rows = await _evaluate_rows_with_frame_fallback(
+                    _table_page, _table_rows_js, log_tag="EXTRACT DOM"
                 )
                 if isinstance(rows, list) and rows:
                     logger.info("[EXTRACT DOM] visible table rows=%s", len(rows))

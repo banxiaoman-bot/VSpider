@@ -2314,3 +2314,25 @@ submit_not_found, detached/raising frames, shadow + caller wiring anchors).
 Out of scope (next): component-aware fallback JS in _try_auto_form_fill
 (secondary path, light-DOM only); bulk table extraction iframe sweep;
 virtual-scroll list capture; rich-text structured write.
+
+## Slice EXTRACT-IFRAME-1: bulk table extraction sweeps child iframes (done)
+
+Layer: data_plane (main.py run_agent DOM table harvest).
+Closes the weakness-list item "bulk table extraction never scans iframes"
+(admin consoles routinely render the data grid inside one).
+
+- New module-level _evaluate_rows_with_frame_fallback(page, js, log_tag):
+  evaluates row-harvesting JS in the main document first; on an empty/non-list
+  result (or a crashing main document) probes every child iframe, skipping
+  detached/raising frames, and returns the first non-empty list. Frame hits
+  log the frame URL as evidence.
+- _extract_visible_table_rows_via_dom now routes through the helper with its
+  table JS hoisted to a local constant; scoring/header heuristics unchanged.
+
+Tests: tests/test_extract_table_iframe.py (10 cases: fallback ordering,
+main-document crash still probes frames, non-list normalisation,
+detached/raising frames, run_agent wiring anchor).
+
+Out of scope (next): list/card extraction iframe sweep; table autopager +
+signature inside frames (pagination still main-document only); shadow-DOM
+table hosts; virtual-scroll capture; rich-text structured write.
