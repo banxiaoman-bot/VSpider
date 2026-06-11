@@ -2636,3 +2636,44 @@ order intact; plain page raised; type_value=50 capped with complete=False -
 Out of scope (next): horizontal scrollers; semantic field mapping for
 captured text rows; an agent_case probe site exercising the mid-run call
 (pre-extract path already live-probed in EXTRACT-VSCROLL-2/3).
+
+## Slice DATA-SIG-FRAME-1: next_page sees iframe-hosted DataTables (done)
+
+Layer: operations_plane (actions.py NextPageHandler). Closes the P3 item
+"DATA_SIGNATURE_JS dt-info paging counter across frames": every next_page
+layer ran in the main document only, so an iframe-hosted DataTables widget
+was triple-blind - the L-1/L3.5 probes never found its Next button, the
+data signature never saw its dt-info counter, and an iframe-internal page
+flip (main url/text unchanged) was always judged "page did not change".
+
+- _page_data_signature: when the main document shows no table evidence
+  (no tableRows, tablePageTotal=None), sweep child frames with the same
+  DATA_SIGNATURE_JS and merge the first table-bearing frame's fields
+  (tableInfo / tablePage* / tableRows; rowSignature when non-empty) into
+  the main signature plus a tableFrameUrl evidence key. Main url/bodyText
+  stay authoritative; main-table pages short-circuit (frames not probed).
+- _wait_for_pagination_change: an unchanged main shell now consults
+  pagination_moved(before_data, after_data) before failing, so the merged
+  dt-info window move (1-10 -> 11-20) or frame row-signature change
+  confirms the flip.
+- _js_mark_pagination_candidate_with_frames: probe the main document
+  first, then non-detached child frames (probe JS is evaluate-only, so
+  Frames satisfy its contract); both the L-1 and L3.5 layers ride the
+  sweep and click the marked candidate in the hit scope, stamping
+  frame=<url> into the strategy trail.
+
+Tests: tests/test_next_page_frame_signature.py (12: main-table
+short-circuit, frame merge fields + authority, raising/detached skip,
+no-table passthrough, unchanged-shell pagination via merged window move,
+static-data still fails, probe sweep main-hit/frame-hit/all-miss, wiring
+anchors locking both call sites + the data-consult branch order). Live
+probe: host shell + srcdoc iframe with a DataTables-style pager - probe
+clicked Next inside the frame (strategy frame='about:srcdoc'), dt-info
+1-10 -> 11-20 -> 21-30 over two next_page calls with the host shell
+byte-identical - 4/4 PASS pre-removal.
+
+Out of scope (next): CSS/text/role locator layers (L1-L3) stay
+main-document (wide-net selectors risk cross-frame misclicks; the scored
+probe covers component-library pagers inside frames); URL mutation is
+meaningless for iframe-internal paging; nested iframes ride page.frames
+flat enumeration but were not live-probed.

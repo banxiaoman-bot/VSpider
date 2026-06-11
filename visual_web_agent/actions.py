@@ -3952,10 +3952,56 @@ class NextPageHandler(ActionHandler):
 
     async def _page_data_signature(self, page) -> dict:
         try:
-            return await page.evaluate(DATA_SIGNATURE_JS) or {}
+            sig = await page.evaluate(DATA_SIGNATURE_JS) or {}
         except Exception as exc:
             logger.debug("[NEXT_PAGE] data signature probe failed: %s", exc)
             return {}
+        if not isinstance(sig, dict):
+            return {}
+        if sig.get("tableRows") or sig.get("tablePageTotal") is not None:
+            return sig
+        # DATA-SIG-FRAME-1: the main document shows no table evidence - the
+        # DataTables widget (rows + dt-info paging counter) may live inside a
+        # child iframe. Merge the first frame's table fields so the dt-info
+        # page-window comparison in pagination_moved keeps working; the main
+        # document's url/bodyText fields stay authoritative.
+        main_frame = getattr(page, "main_frame", None)
+        for frame in list(getattr(page, "frames", None) or []):
+            if frame is main_frame:
+                continue
+            try:
+                is_detached = getattr(frame, "is_detached", None)
+                if callable(is_detached) and is_detached():
+                    continue
+                fsig = await frame.evaluate(DATA_SIGNATURE_JS) or {}
+            except Exception as frame_err:
+                logger.debug(
+                    "[NEXT_PAGE] frame data signature probe failed (%s): %s",
+                    getattr(frame, "url", "?"),
+                    frame_err,
+                )
+                continue
+            if not isinstance(fsig, dict):
+                continue
+            if not fsig.get("tableRows") and fsig.get("tablePageTotal") is None:
+                continue
+            for key in (
+                "tableInfo",
+                "tablePageStart",
+                "tablePageEnd",
+                "tablePageTotal",
+                "tableRows",
+            ):
+                sig[key] = fsig.get(key)
+            if fsig.get("rowSignature"):
+                sig["rowSignature"] = fsig.get("rowSignature")
+            sig["tableFrameUrl"] = str(getattr(frame, "url", "") or "")
+            logger.info(
+                "[NEXT_PAGE] table data signature found in frame=%s",
+                sig["tableFrameUrl"][:80] or "?",
+            )
+            break
+        return sig
 
     async def _wait_for_pagination_change(
         self,
@@ -4006,6 +4052,18 @@ class NextPageHandler(ActionHandler):
                     return False
                 logger.info("[NEXT_PAGE] data-page movement confirmed: %s", data_reason)
             return True
+        if before_data:
+            # DATA-SIG-FRAME-1: an iframe-hosted table can page without the
+            # main document's url/text changing at all - the only movement
+            # evidence is the merged frame table signature (dt-info window /
+            # row signature).
+            moved, data_reason = pagination_moved(before_data, after_data)
+            if moved:
+                logger.info(
+                    "[NEXT_PAGE] main shell unchanged but data page moved: %s",
+                    data_reason,
+                )
+                return True
         logger.info(f"[NEXT_PAGE] candidate {label} clicked but page did not change")
         return False
 
@@ -4145,6 +4203,43 @@ class NextPageHandler(ActionHandler):
         return await self._wait_for_pagination_change(
             page, before, f"{label}/{click_mode}", before_data
         )
+
+    async def _js_mark_pagination_candidate_with_frames(self, page) -> tuple[dict, Any]:
+        """Probe the main document first, then child frames (DATA-SIG-FRAME-1).
+
+        DataTables widgets often live inside an iframe together with their
+        pager; the main-document probe sees nothing there. Returns
+        ``(probe, scope)`` where scope is the Page or Frame the candidate was
+        marked in, so the follow-up locator click runs in the right document.
+        The probe JS is evaluate-only, so Frames satisfy its contract as-is.
+        """
+        probe = await self._js_mark_pagination_candidate(page)
+        if probe.get("found"):
+            return probe, page
+        main_frame = getattr(page, "main_frame", None)
+        for frame in list(getattr(page, "frames", None) or []):
+            if frame is main_frame:
+                continue
+            try:
+                is_detached = getattr(frame, "is_detached", None)
+                if callable(is_detached) and is_detached():
+                    continue
+                fprobe = await self._js_mark_pagination_candidate(frame)
+            except Exception as frame_err:
+                logger.debug(
+                    "[NEXT_PAGE] frame pagination probe failed (%s): %s",
+                    getattr(frame, "url", "?"),
+                    frame_err,
+                )
+                continue
+            if fprobe.get("found"):
+                fprobe.setdefault("frame_url", str(getattr(frame, "url", "") or ""))
+                logger.info(
+                    "[NEXT_PAGE] pagination candidate found in frame=%s",
+                    str(fprobe.get("frame_url"))[:80] or "?",
+                )
+                return fprobe, frame
+        return probe, page
 
     async def _js_mark_pagination_candidate(self, page) -> dict:
         """Mark a likely next-page element using in-page DOM heuristics.
@@ -4548,12 +4643,13 @@ class NextPageHandler(ActionHandler):
         # numeric/Next pager, clicking it is safer than inventing a URL query.
         _probe_clicked_but_undetected = False  # 幽灵双击防护标志
         try:
-            probe = await self._js_mark_pagination_candidate(page)
+            probe, probe_scope = await self._js_mark_pagination_candidate_with_frames(page)
             if probe.get("found"):
-                loc = page.locator('[data-vspider-next-page-probe="1"]').first
+                loc = probe_scope.locator('[data-vspider-next-page-probe="1"]').first
                 used_strategy = (
                     f"js_probe_pre_url {probe.get('strategy')} "
                     f"label={probe.get('label')!r}"
+                    + (f" frame={probe['frame_url'][:60]!r}" if probe.get("frame_url") else "")
                 )
                 if await self._click_if_effective(page, loc, used_strategy):
                     clicked = True
@@ -4682,12 +4778,13 @@ class NextPageHandler(ActionHandler):
         # Strategy 3.5: JS pagination probe for component-library/numeric pagers.
         if not clicked:
             try:
-                probe = await self._js_mark_pagination_candidate(page)
+                probe, probe_scope = await self._js_mark_pagination_candidate_with_frames(page)
                 if probe.get("found"):
-                    loc = page.locator('[data-vspider-next-page-probe="1"]').first
+                    loc = probe_scope.locator('[data-vspider-next-page-probe="1"]').first
                     used_strategy = (
                         f"js_probe {probe.get('strategy')} "
                         f"label={probe.get('label')!r}"
+                        + (f" frame={probe['frame_url'][:60]!r}" if probe.get("frame_url") else "")
                     )
                     if await self._click_if_effective(page, loc, used_strategy):
                         clicked = True
