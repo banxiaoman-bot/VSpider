@@ -325,6 +325,74 @@ class TestFindVirtualListScope:
         assert result["complete"] is True
 
 
+class TestHorizontalAxis:
+    """VSCROLL-H-1: horizontal card strips / film-strips become harvestable."""
+
+    def test_all_scripts_know_the_horizontal_axis(self) -> None:
+        for js in (VIRTUAL_LIST_SIGNATURE_JS, VIRTUAL_SCROLL_NUDGE_JS, VIRTUAL_LIST_ROWS_JS):
+            assert "scrollWidth" in js
+            assert "scrollLeft" in js
+            assert "overflowX" in js
+            assert "axis: vOk ? 'y' : 'x'" in js
+
+    def test_vertical_hits_outrank_horizontal_ones(self) -> None:
+        assert "a.axis === 'y' ? -1 : 1" in VIRTUAL_LIST_SIGNATURE_JS, (
+            "legacy vertical priority must be preserved"
+        )
+
+    def test_nudge_scrolls_left_on_the_x_axis(self) -> None:
+        assert (
+            "target.scrollLeft = Math.min(before + step, target.scrollWidth)"
+            in VIRTUAL_SCROLL_NUDGE_JS
+        )
+
+    def test_rows_js_collects_card_nodes(self) -> None:
+        assert '[class*="card"]' in VIRTUAL_LIST_ROWS_JS
+
+    def test_nudge_propagates_axis(self) -> None:
+        page = _StubPage([
+            {"found": True, "sig": "Card 1||Card 6", "remaining": 800, "axis": "x"},
+            {"mode": "container", "moved": True, "container_class": "strip",
+             "axis": "x", "remaining": 500},
+            {"found": True, "sig": "Card 5||Card 10", "remaining": 500, "axis": "x"},
+        ])
+        result = _run(page)
+        assert result["axis"] == "x"
+        assert result["moved"] is True
+        assert result["rows_changed"] is True
+
+    def test_nudge_defaults_axis_to_vertical(self) -> None:
+        page = _StubPage([
+            {"found": True, "sig": "Row 1||Row 10"},
+            {"mode": "container", "moved": True, "container_tag": "div"},
+            {"found": True, "sig": "Row 9||Row 18"},
+        ])
+        assert _run(page)["axis"] == "y"
+
+    def test_capture_meta_carries_axis(self) -> None:
+        class _AxisCapturePage(_CapturePage):
+            async def evaluate(self, script: str, arg: Any = None) -> Any:
+                payload = await super().evaluate(script, arg)
+                if isinstance(payload, dict):
+                    payload.setdefault("axis", "x")
+                return payload
+
+        page = _AxisCapturePage([[{"text": "Card 1"}]], moves=[False])
+        result = asyncio.run(capture_virtual_list_rows(page, settle_ms=0))
+        assert result["axis"] == "x"
+        assert result["row_count"] == 1
+
+    def test_scope_probe_propagates_axis(self) -> None:
+        page = _StubHostPage(
+            {"found": True, "sig": "Card 1||Card 6", "remaining": 640, "axis": "x"},
+            [],
+        )
+        result = asyncio.run(find_virtual_list_scope(page))
+        assert result["scope"] is page
+        assert result["axis"] == "x"
+        assert result["remaining"] == 640
+
+
 class TestMainWiring:
     def test_dedup_nudge_falls_back_to_virtual_scroll(self) -> None:
         src = inspect.getsource(run_agent)

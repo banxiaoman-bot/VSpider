@@ -2677,3 +2677,43 @@ main-document (wide-net selectors risk cross-frame misclicks; the scored
 probe covers component-library pagers inside frames); URL mutation is
 meaningless for iframe-internal paging; nested iframes ride page.frames
 flat enumeration but were not live-probed.
+
+## Slice VSCROLL-H-1: horizontal virtual card strips become harvestable (done)
+
+Layer: data_plane (virtual_scroll.py shared scroller finder + axis
+threading). Closes the P3 item "horizontal scrollers" from
+EXTRACT-VSCROLL-2/3: the shared findScroller only accepted overflow-y
+containers with vertical headroom, so a horizontally virtualised card
+strip / film-strip (recycled DOM, scrollLeft windowing) was invisible to
+the signature probe, the nudge, and the capture - per-viewport VLM rounds
+again.
+
+- _FIND_SCROLLER_JS_SNIPPET: scrollableRect scores both axes - vertical
+  keeps the legacy gate (w>=160, h>=120, overflow-y + scrollHeight
+  headroom), horizontal accepts shorter-but-wide boxes (w>=240, h>=80,
+  overflow-x + scrollWidth headroom). findScroller returns {el, axis};
+  vertical hits always outrank horizontal ones, so any page that used to
+  pick a vertical scroller still picks it (legacy priority preserved).
+  carousel/strip class hints join the candidate selector.
+- All three consumer scripts ride the axis: SIGNATURE reports
+  axis + scrollLeft-based remaining, NUDGE steps scrollLeft by 0.85x
+  clientWidth on x-hits (window fallback stays vertical), ROWS_JS adds
+  [class*="card"] to the row selector and stamps axis into the snapshot.
+- Python threading (all additive): the scope probe, nudge_virtual_scroll,
+  capture_virtual_list_rows, and the vscroll_capture action evidence/
+  rpa_trail all carry axis ('y' default), so artifacts and the VLM can
+  tell which direction was drained.
+
+Tests: tests/test_virtual_scroll_nudge.py 26 -> 34 (axis anchors in all
+three scripts, vertical-outranks-horizontal anchor, scrollLeft step
+anchor, card selector, nudge axis propagation + vertical default, capture
+meta axis, scope probe axis); test_vscroll_capture_action.py rides along
+(21 green, evidence gains axis). Live probe: 60-card horizontal windowed
+strip - 60/60 in 14 passes complete=True axis=x, card order intact;
+vertical 600/600 regression intact (axis=y); page with both axes picks
+the vertical scroller - 8/8 PASS pre-removal.
+
+Out of scope (next): column-virtualised wide grids (ag-grid column
+virtualisation needs per-row horizontal stitching, a different harvest
+semantic); bidirectional grids (x+y virtualised simultaneously); RTL
+strips (scrollLeft sign conventions differ per engine).

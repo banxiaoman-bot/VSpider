@@ -19,8 +19,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Shared scroll-container finder: visible, overflow-y scrollable, with real
-# scroll headroom; the largest visible area wins (mirrors the drain probe).
+# Shared scroll-container finder: visible, scrollable with real headroom on
+# either axis; vertical hits win over horizontal ones (legacy priority), the
+# largest visible area wins within an axis (mirrors the drain probe).
+# Horizontal support (VSCROLL-H-1) targets card strips / film-strips - a
+# shorter-but-wide box (h >= 80, w >= 240) with overflow-x headroom.
 _FIND_SCROLLER_JS_SNIPPET = r"""
     const viewportW = window.innerWidth || 0;
     const viewportH = window.innerHeight || 0;
@@ -29,24 +32,31 @@ _FIND_SCROLLER_JS_SNIPPET = r"""
         const r = el.getBoundingClientRect();
         const w = Math.max(0, Math.min(r.right, viewportW) - Math.max(r.left, 0));
         const h = Math.max(0, Math.min(r.bottom, viewportH) - Math.max(r.top, 0));
-        if (w < 160 || h < 120) return null;
         const style = window.getComputedStyle(el);
         if (style.display === 'none' || style.visibility === 'hidden') return null;
-        if (!/(auto|scroll|overlay)/i.test(style.overflowY || '')) return null;
-        if (el.scrollHeight <= el.clientHeight + 80) return null;
-        return {el, area: w * h};
+        const vOk = w >= 160 && h >= 120
+            && /(auto|scroll|overlay)/i.test(style.overflowY || '')
+            && el.scrollHeight > el.clientHeight + 80;
+        const hOk = w >= 240 && h >= 80
+            && /(auto|scroll|overlay)/i.test(style.overflowX || '')
+            && el.scrollWidth > el.clientWidth + 80;
+        if (!vOk && !hOk) return null;
+        return {el, area: w * h, axis: vOk ? 'y' : 'x'};
     };
     const findScroller = () => {
         const candidates = Array.from(document.querySelectorAll(
             '.el-scrollbar__wrap, .el-table__body-wrapper, .ant-table-body, ' +
             '.ag-body-viewport, .v-data-table__wrapper, [class*="virtual"], ' +
-            '[class*="scroller"], [class*="scroll"], [role="grid"], ' +
+            '[class*="scroller"], [class*="scroll"], [class*="carousel"], ' +
+            '[class*="strip"], [role="grid"], ' +
             '[role="listbox"], main, [role="main"], ul, ol, div'
         ))
             .map(scrollableRect)
             .filter(Boolean)
-            .sort((a, b) => b.area - a.area);
-        return candidates.length ? candidates[0].el : null;
+            .sort((a, b) => (a.axis === b.axis
+                ? b.area - a.area
+                : (a.axis === 'y' ? -1 : 1)));
+        return candidates.length ? candidates[0] : null;
     };
     const rowSignatureOf = (root) => {
         const isVisible = (el) => {
@@ -70,13 +80,18 @@ VIRTUAL_LIST_SIGNATURE_JS = (
     "() => {"
     + _FIND_SCROLLER_JS_SNIPPET
     + r"""
-    const target = findScroller();
-    if (!target) return {found: false, sig: ''};
+    const hit = findScroller();
+    if (!hit) return {found: false, sig: ''};
+    const target = hit.el;
+    const axis = hit.axis;
     return {
         found: true,
         sig: rowSignatureOf(target),
-        scroll_top: Math.round(target.scrollTop),
-        remaining: Math.round(target.scrollHeight - target.scrollTop - target.clientHeight),
+        axis,
+        scroll_top: Math.round(axis === 'x' ? target.scrollLeft : target.scrollTop),
+        remaining: Math.round(axis === 'x'
+            ? target.scrollWidth - target.scrollLeft - target.clientWidth
+            : target.scrollHeight - target.scrollTop - target.clientHeight),
     };
 }"""
 )
@@ -85,24 +100,37 @@ VIRTUAL_SCROLL_NUDGE_JS = (
     "(amt) => {"
     + _FIND_SCROLLER_JS_SNIPPET
     + r"""
-    const target = findScroller();
-    if (!target) {
+    const hit = findScroller();
+    if (!hit) {
         const before = window.scrollY || 0;
         window.scrollBy({top: Math.max(amt || 0, window.innerHeight * 1.5), behavior: 'instant'});
         return {mode: 'window', moved: (window.scrollY || 0) > before + 4};
     }
-    const before = target.scrollTop;
-    const step = Math.max(amt || 0, target.clientHeight * 0.85);
-    target.scrollTop = Math.min(before + step, target.scrollHeight);
+    const target = hit.el;
+    const axis = hit.axis;
+    const before = axis === 'x' ? target.scrollLeft : target.scrollTop;
+    const step = Math.max(
+        amt || 0,
+        (axis === 'x' ? target.clientWidth : target.clientHeight) * 0.85
+    );
+    if (axis === 'x') {
+        target.scrollLeft = Math.min(before + step, target.scrollWidth);
+    } else {
+        target.scrollTop = Math.min(before + step, target.scrollHeight);
+    }
     target.dispatchEvent(new Event('scroll', {bubbles: true}));
+    const afterPos = axis === 'x' ? target.scrollLeft : target.scrollTop;
     return {
         mode: 'container',
-        moved: target.scrollTop > before + 4,
+        axis,
+        moved: afterPos > before + 4,
         container_tag: String(target.tagName || '').toLowerCase(),
         container_class: String(target.className || '').slice(0, 80),
         before_top: Math.round(before),
-        after_top: Math.round(target.scrollTop),
-        remaining: Math.round(target.scrollHeight - target.scrollTop - target.clientHeight),
+        after_top: Math.round(afterPos),
+        remaining: Math.round(axis === 'x'
+            ? target.scrollWidth - target.scrollLeft - target.clientWidth
+            : target.scrollHeight - target.scrollTop - target.clientHeight),
     };
 }"""
 )
@@ -112,8 +140,10 @@ VIRTUAL_LIST_ROWS_JS = (
     "() => {"
     + _FIND_SCROLLER_JS_SNIPPET
     + r"""
-    const target = findScroller();
-    if (!target) return {found: false, rows: []};
+    const hit = findScroller();
+    if (!hit) return {found: false, rows: []};
+    const target = hit.el;
+    const axis = hit.axis;
     const isVisible = (el) => {
         if (!el || !el.getBoundingClientRect) return false;
         const r = el.getBoundingClientRect();
@@ -121,7 +151,7 @@ VIRTUAL_LIST_ROWS_JS = (
     };
     const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
     const nodes = Array.from(target.querySelectorAll(
-        'tr, [role="row"], li, [class*="item"], [class*="row"]'
+        'tr, [role="row"], li, [class*="item"], [class*="row"], [class*="card"]'
     )).filter(isVisible);
     const rows = [];
     for (const el of nodes) {
@@ -139,8 +169,11 @@ VIRTUAL_LIST_ROWS_JS = (
     return {
         found: true,
         rows,
-        scroll_top: Math.round(target.scrollTop),
-        remaining: Math.round(target.scrollHeight - target.scrollTop - target.clientHeight),
+        axis,
+        scroll_top: Math.round(axis === 'x' ? target.scrollLeft : target.scrollTop),
+        remaining: Math.round(axis === 'x'
+            ? target.scrollWidth - target.scrollLeft - target.clientWidth
+            : target.scrollHeight - target.scrollTop - target.clientHeight),
     };
 }"""
 )
@@ -179,7 +212,7 @@ async def find_virtual_list_scope(
             remaining = 0
         if remaining <= 0:
             return None
-        return {"remaining": remaining}
+        return {"remaining": remaining, "axis": str(sig.get("axis") or "y")}
 
     if include_main:
         hit = await _probe(page)
@@ -224,6 +257,7 @@ async def capture_virtual_list_rows(
     seen: set[str] = set()
     rows: list[dict] = []
     container = ""
+    axis = ""
     complete = False
     passes = 0
     while passes < max_passes:
@@ -235,6 +269,7 @@ async def capture_virtual_list_rows(
             logger.debug("[VSCROLL CAPTURE] row snapshot failed: %s", snap_err)
         if not isinstance(snap, dict):
             snap = {}
+        axis = str(snap.get("axis") or axis or "")
         for item in snap.get("rows") or []:
             if not isinstance(item, dict):
                 continue
@@ -249,6 +284,7 @@ async def capture_virtual_list_rows(
             break
         vs = await nudge_virtual_scroll(page, amount=0, settle_ms=settle_ms)
         container = vs.get("container") or container
+        axis = str(vs.get("axis") or axis or "")
         if not vs.get("moved") and not vs.get("rows_changed"):
             complete = True
             break
@@ -258,10 +294,11 @@ async def capture_virtual_list_rows(
         "passes": passes,
         "complete": complete,
         "container": container,
+        "axis": axis or "y",
     }
     logger.info(
-        "[VSCROLL CAPTURE] rows=%s passes=%s complete=%s container=%s",
-        len(rows), passes, complete, container or "?",
+        "[VSCROLL CAPTURE] rows=%s passes=%s complete=%s container=%s axis=%s",
+        len(rows), passes, complete, container or "?", axis or "y",
     )
     return result
 
@@ -313,6 +350,7 @@ async def nudge_virtual_scroll(
             move.get("container_class") or move.get("container_tag") or ""
         ),
         "remaining": int(after.get("remaining") or move.get("remaining") or 0),
+        "axis": str(move.get("axis") or after.get("axis") or "y"),
     }
     logger.debug("[VSCROLL] nudge result=%s", result)
     return result
