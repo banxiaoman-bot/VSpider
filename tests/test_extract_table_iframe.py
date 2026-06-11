@@ -124,6 +124,53 @@ class TestFrameFallback:
         assert _run(page) == ROWS
 
 
+class TestDictPayloads:
+    """EXTRACT-IFRAME-2: payload_empty generalises the sweep to dict payloads."""
+
+    @staticmethod
+    def _empty(value: Any) -> bool:
+        return not (isinstance(value, dict) and value.get("rows"))
+
+    def _run_dict(self, page: Any) -> Any:
+        return asyncio.run(
+            _evaluate_rows_with_frame_fallback(
+                page, JS, log_tag="TEST LIST", payload_empty=self._empty
+            )
+        )
+
+    def test_main_document_dict_hit_skips_frames(self) -> None:
+        payload = {"rows": ROWS, "sourceText": "Item 1"}
+        frame = _StubFrame("child", [{"rows": ROWS}])
+        page = _StubPage([payload], [frame])
+        assert self._run_dict(page) is payload
+        assert frame.eval_calls == 0
+
+    def test_empty_dict_falls_through_to_iframe(self) -> None:
+        hit_payload = {"rows": ROWS, "sourceText": "frame items"}
+        miss = _StubFrame("miss", [{"rows": [], "sourceText": ""}])
+        hit = _StubFrame("hit", [hit_payload])
+        page = _StubPage([{"rows": [], "sourceText": ""}], [miss, hit])
+        assert self._run_dict(page) is hit_payload
+        assert miss.eval_calls == 1
+
+    def test_all_empty_returns_main_payload_unchanged(self) -> None:
+        main_payload = {"rows": [], "sourceText": "nothing"}
+        page = _StubPage([main_payload], [_StubFrame("a")])
+        assert self._run_dict(page) is main_payload
+
+    def test_raising_emptiness_probe_treated_as_empty(self) -> None:
+        def explosive(value: Any) -> bool:
+            raise ValueError("boom")
+
+        page = _StubPage([list(ROWS)], [])
+        result = asyncio.run(
+            _evaluate_rows_with_frame_fallback(
+                page, JS, log_tag="TEST", payload_empty=explosive
+            )
+        )
+        assert result == ROWS, "a raising probe must fall back, not crash"
+
+
 class TestWiring:
     def test_table_harvest_routes_through_frame_fallback(self) -> None:
         src = inspect.getsource(run_agent)
@@ -132,10 +179,18 @@ class TestWiring:
         )
         assert 'log_tag="EXTRACT DOM"' in src
 
+    def test_list_harvest_routes_through_frame_fallback(self) -> None:
+        src = inspect.getsource(run_agent)
+        assert 'log_tag="EXTRACT DOM LIST"' in src, (
+            "list/card extraction no longer routes through the iframe sweep"
+        )
+        assert "_list_rows_js" in src
+
     def test_helper_keeps_main_result_shape(self) -> None:
         """Helper must always return a list, never None or raw evaluate output."""
         sig = inspect.signature(_evaluate_rows_with_frame_fallback)
         assert "log_tag" in sig.parameters
+        assert "payload_empty" in sig.parameters
 
 
 if __name__ == "__main__":

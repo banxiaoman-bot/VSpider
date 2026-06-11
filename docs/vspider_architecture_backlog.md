@@ -2397,3 +2397,26 @@ Out of scope (next): a dedicated deterministic capture-loop action that
 accumulates rows across nudges in one shot (today the existing VLM
 extract->scroll->dedup loop drives accumulation); horizontal virtual
 scrollers; iframe-hosted virtual lists (combine with the frame sweep).
+
+## Slice EXTRACT-IFRAME-2: list/card extraction sweeps child iframes (done)
+
+Layer: data_plane (main.py list harvest + the shared frame-fallback helper).
+Closes the P1 weakness "list/card extraction never scans iframes" (tables
+got the sweep in EXTRACT-IFRAME-1; lists were still main-document only).
+
+- _evaluate_rows_with_frame_fallback gains an optional payload_empty
+  predicate so dict payloads ({rows, sourceText}) ride the same sweep;
+  default behaviour (list payloads) is unchanged and the original 10 stub
+  cases still pass untouched. A raising predicate degrades to "empty"
+  instead of crashing the harvest.
+- _extract_list_rows_via_dom hoists its JS to a local constant and routes
+  through the helper with log_tag=EXTRACT DOM LIST; the >=2-rows acceptance
+  rule and row normalisation stay outside the sweep, so a partial main-doc
+  hit (1 row) never triggers cross-frame guessing.
+
+Tests: tests/test_extract_table_iframe.py extended 10 -> 15 cases (dict
+payload hit/fallback/all-empty/raising predicate + list wiring anchors).
+
+Out of scope (next): _extract_body_text_for_semantic_cards (main-document
+body text only - semantic cards inside iframes still get their rows but
+lose the auxiliary body context); virtual-scroll capture fast-path.

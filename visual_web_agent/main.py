@@ -3595,21 +3595,32 @@ async def _auto_form_fill_bound_controls_with_frames(
     return result
 
 async def _evaluate_rows_with_frame_fallback(
-    page, js: str, *, log_tag: str = "EXTRACT DOM"
-) -> list:
+    page, js: str, *, log_tag: str = "EXTRACT DOM", payload_empty=None
+) -> object:
     """Evaluate row-harvesting JS in the main document, then child iframes.
 
-    Returns the first non-empty list result. Mirrors the FORM-IFRAME-2
-    pattern: detached/raising frames are skipped, frame hits log the URL,
-    and a main-document failure still lets iframes be probed.
+    Returns the first non-empty payload. ``payload_empty`` customises the
+    emptiness check for non-list payloads (e.g. ``{rows, sourceText}``
+    dicts); the default keeps the original list-only contract. Mirrors the
+    FORM-IFRAME-2 pattern: detached/raising frames are skipped, frame hits
+    log the URL, and a main-document failure still lets iframes be probed.
     """
+
+    def _is_empty(value: object) -> bool:
+        if payload_empty is not None:
+            try:
+                return bool(payload_empty(value))
+            except Exception:
+                return True
+        return not (isinstance(value, list) and value)
+
     rows: object = []
     try:
         rows = await page.evaluate(js)
     except Exception as main_err:
         logger.debug("[%s] main-document evaluate failed: %s", log_tag, main_err)
         rows = []
-    if isinstance(rows, list) and rows:
+    if not _is_empty(rows):
         return rows
     main_frame = getattr(page, "main_frame", None)
     for frame in list(getattr(page, "frames", None) or []):
@@ -3628,15 +3639,21 @@ async def _evaluate_rows_with_frame_fallback(
                 frame_err,
             )
             continue
-        if isinstance(frame_rows, list) and frame_rows:
+        if not _is_empty(frame_rows):
+            try:
+                size = len(frame_rows)
+            except Exception:
+                size = -1
             logger.info(
-                "[%s] rows=%s frame=%s",
+                "[%s] payload_size=%s frame=%s",
                 log_tag,
-                len(frame_rows),
+                size,
                 getattr(frame, "url", "") or "?",
             )
             return frame_rows
-    return rows if isinstance(rows, list) else []
+    if payload_empty is None:
+        return rows if isinstance(rows, list) else []
+    return rows
 
 async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
     """Deterministic label/scoped form executor, used before handing control to VLM."""
@@ -10013,8 +10030,7 @@ async def run_agent(
             """Extract repeated list/card rows directly with DOM semantics."""
             try:
                 _list_page = await browser._ensure_active_page(reason=reason)
-                result = await _list_page.evaluate(
-                    """() => {
+                _list_rows_js = """() => {
                         const clean = (value) => String(value || '')
                             .replace(/\\s+/g, ' ')
                             .trim();
@@ -10191,6 +10207,13 @@ async def run_agent(
                         });
                         return {rows: publicRows, sourceText};
                     }"""
+                result = await _evaluate_rows_with_frame_fallback(
+                    _list_page,
+                    _list_rows_js,
+                    log_tag="EXTRACT DOM LIST",
+                    payload_empty=lambda value: not (
+                        isinstance(value, dict) and value.get("rows")
+                    ),
                 )
                 if not isinstance(result, dict):
                     return [], ""
