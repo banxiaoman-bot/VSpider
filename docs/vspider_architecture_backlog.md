@@ -2717,3 +2717,42 @@ Out of scope (next): column-virtualised wide grids (ag-grid column
 virtualisation needs per-row horizontal stitching, a different harvest
 semantic); bidirectional grids (x+y virtualised simultaneously); RTL
 strips (scrollLeft sign conventions differ per engine).
+
+## Slice VSCROLL-FIELDS-1: captured rows map onto named header fields (done)
+
+Layer: data_plane (virtual_scroll.py header harvest + pure mapper, wired
+into the action handler and the pre-extract candidate). Closes the P3
+item "semantic field mapping for captured text rows": the capture emitted
+anonymous {text, cells} rows, so dataset_rows artifacts and the candidate
+ranking saw nameless columns even when the table had a perfectly good
+header row.
+
+- VIRTUAL_LIST_ROWS_JS: harvests column headers near the scroller -
+  headers usually live OUTSIDE it (sticky thead / sibling header wrapper),
+  so the lookup walks up to the closest table/.el-table/.ant-table/
+  .n-data-table/.ag-root/[role=grid|table|treegrid] container and tries
+  thead th|td, then [role=columnheader], then .ag-header-cell-text
+  (capped at 40). capture_virtual_list_rows keeps the first non-empty
+  headers list and reports it in the result (additive).
+- map_captured_rows_to_fields(rows, headers): pure, dependency-free
+  positional zip - duplicate header names get _N suffixes, blank/overflow
+  positions fall back to col_N, cell-less rows keep their {text} form,
+  junk rows are skipped.
+- Consumers: vscroll_capture persists/exposes mapped rows (memory rows +
+  jsonl artifact are named dicts; headers + header_count join the
+  evidence/trail); the pre-extract VSCROLL_LIST candidate maps before
+  ranking, while source_text keeps the raw text lines.
+
+Tests: tests/test_virtual_scroll_nudge.py 34 -> 44 (header-selector
+anchors, first-non-empty header carry + empty default, zip/overflow/
+duplicate/blank/text-only/junk mapper table, pre-extract wiring anchor);
+test_vscroll_capture_action.py 21 -> 22 (named-field end-to-end with
+header_count trail evidence). Live probe: virtual table with sticky thead
+outside the scroller - headers [Name, Office, Salary], 200/200 rows, memory
+and jsonl rows are named dicts; headerless card list regression keeps
+{text} rows - 8/8 PASS pre-removal.
+
+Out of scope (next): alias-matching harvested headers onto the user's
+requested fields (planner-side field coverage already normalises);
+header harvest for horizontal strips (cards rarely have column headers);
+colspan/rowspan header grids.

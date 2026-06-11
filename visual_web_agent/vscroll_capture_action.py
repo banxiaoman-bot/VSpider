@@ -28,7 +28,11 @@ try:
         ActionHandler,
         ActionRegistry,
     )
-    from .virtual_scroll import capture_virtual_list_rows, find_virtual_list_scope
+    from .virtual_scroll import (
+        capture_virtual_list_rows,
+        find_virtual_list_scope,
+        map_captured_rows_to_fields,
+    )
 except ImportError:  # pragma: no cover - flat-layout fallback, mirrors actions.py
     from actions import (  # type: ignore[no-redef]
         ActionContext,
@@ -39,6 +43,7 @@ except ImportError:  # pragma: no cover - flat-layout fallback, mirrors actions.
     from virtual_scroll import (  # type: ignore[no-redef]
         capture_virtual_list_rows,
         find_virtual_list_scope,
+        map_captured_rows_to_fields,
     )
 
 _DEFAULT_MAX_ROWS = 2000
@@ -78,16 +83,20 @@ class VscrollCaptureHandler(ActionHandler):
         except Exception:  # pragma: no cover - defensive
             source_url = ""
 
-        entry = self._persist(rows, source_url=source_url)
+        # VSCROLL-FIELDS-1: persist named columns when headers were harvested.
+        headers = list(meta.get("headers") or [])
+        mapped_rows = map_captured_rows_to_fields(rows, headers)
+        entry = self._persist(mapped_rows, source_url=source_url)
         output_path = (entry or {}).get("path", "")
 
         evidence = {
-            "rows": rows,
+            "rows": mapped_rows,
             "row_count": len(rows),
             "complete": bool(meta.get("complete")),
             "passes": meta.get("passes"),
             "container": meta.get("container") or "",
             "axis": meta.get("axis") or "y",
+            "headers": headers,
             "where": probe.get("where") or "",
             "frame_url": probe.get("url") or "",
             "source_url": source_url,
@@ -109,6 +118,7 @@ class VscrollCaptureHandler(ActionHandler):
                         "complete": bool(meta.get("complete")),
                         "container": meta.get("container") or "",
                         "axis": meta.get("axis") or "y",
+                        "header_count": len(headers),
                         "where": probe.get("where") or "",
                         "frame_url": probe.get("url") or "",
                         "max_rows": max_rows,

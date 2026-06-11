@@ -28,6 +28,7 @@ from visual_web_agent.virtual_scroll import (
     VIRTUAL_SCROLL_NUDGE_JS,
     capture_virtual_list_rows,
     find_virtual_list_scope,
+    map_captured_rows_to_fields,
     nudge_virtual_scroll,
 )
 
@@ -391,6 +392,68 @@ class TestHorizontalAxis:
         assert result["scope"] is page
         assert result["axis"] == "x"
         assert result["remaining"] == 640
+
+
+class TestFieldMapping:
+    """VSCROLL-FIELDS-1: captured cells map onto harvested header names."""
+
+    def test_rows_js_harvests_headers_above_the_scroller(self) -> None:
+        assert "thead th, thead td" in VIRTUAL_LIST_ROWS_JS
+        assert '[role="columnheader"]' in VIRTUAL_LIST_ROWS_JS
+        assert ".ag-header-cell-text" in VIRTUAL_LIST_ROWS_JS
+
+    def test_capture_carries_first_nonempty_headers(self) -> None:
+        class _HeaderPage(_CapturePage):
+            async def evaluate(self, script: str, arg: Any = None) -> Any:
+                payload = await super().evaluate(script, arg)
+                if isinstance(payload, dict) and "rows" in payload:
+                    payload.setdefault("headers", ["Name", "Office"])
+                return payload
+
+        page = _HeaderPage([[{"text": "a b", "cells": ["a", "b"]}]], moves=[False])
+        meta = asyncio.run(capture_virtual_list_rows(page, settle_ms=0))
+        assert meta["headers"] == ["Name", "Office"]
+
+    def test_capture_defaults_to_no_headers(self) -> None:
+        page = _CapturePage([[{"text": "only"}]], moves=[False])
+        meta = asyncio.run(capture_virtual_list_rows(page, settle_ms=0))
+        assert meta["headers"] == []
+
+    def test_cells_zip_onto_headers(self) -> None:
+        rows = [{"text": "t", "cells": ["Tiger", "Edinburgh"]}]
+        assert map_captured_rows_to_fields(rows, ["Name", "Office"]) == [
+            {"Name": "Tiger", "Office": "Edinburgh"}
+        ]
+
+    def test_overflow_cells_fall_back_to_col_n(self) -> None:
+        rows = [{"text": "t", "cells": ["a", "b", "c"]}]
+        assert map_captured_rows_to_fields(rows, ["Name"]) == [
+            {"Name": "a", "col_2": "b", "col_3": "c"}
+        ]
+
+    def test_duplicate_headers_get_suffixes(self) -> None:
+        rows = [{"text": "t", "cells": ["a", "b", "c"]}]
+        mapped = map_captured_rows_to_fields(rows, ["Name", "Name", "Name"])
+        assert mapped == [{"Name": "a", "Name_2": "b", "Name_3": "c"}]
+
+    def test_blank_header_positions_become_col_n(self) -> None:
+        rows = [{"text": "t", "cells": ["a", "b"]}]
+        assert map_captured_rows_to_fields(rows, ["", "Office"]) == [
+            {"col_1": "a", "Office": "b"}
+        ]
+
+    def test_cell_less_rows_keep_text_form(self) -> None:
+        rows = [{"text": "plain card"}]
+        assert map_captured_rows_to_fields(rows, ["Name"]) == [{"text": "plain card"}]
+
+    def test_junk_rows_are_skipped(self) -> None:
+        assert map_captured_rows_to_fields(["junk", None, 5], ["Name"]) == []
+
+    def test_pre_extract_candidate_rides_the_mapping(self) -> None:
+        src = inspect.getsource(run_agent)
+        assert "map_captured_rows_to_fields(" in src, (
+            "the VSCROLL_LIST candidate no longer maps cells onto header names"
+        )
 
 
 class TestMainWiring:

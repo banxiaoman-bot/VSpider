@@ -108,6 +108,7 @@ try:
     from .virtual_scroll import (
         capture_virtual_list_rows,
         find_virtual_list_scope,
+        map_captured_rows_to_fields,
         nudge_virtual_scroll,
     )
 except ImportError:
@@ -176,6 +177,7 @@ except ImportError:
     from virtual_scroll import (
         capture_virtual_list_rows,
         find_virtual_list_scope,
+        map_captured_rows_to_fields,
         nudge_virtual_scroll,
     )
 
@@ -10923,7 +10925,10 @@ async def run_agent(
                 candidates.append(
                     _sanitize_extraction_candidate(
                         name="VSCROLL_LIST",
-                        data=vscroll_rows,
+                        # VSCROLL-FIELDS-1: named columns when headers exist.
+                        data=map_captured_rows_to_fields(
+                            vscroll_rows, vscroll_meta.get("headers") or []
+                        ),
                         source_text="\n".join(
                             str(row.get("text") or "") for row in vscroll_rows[:400]
                         ),

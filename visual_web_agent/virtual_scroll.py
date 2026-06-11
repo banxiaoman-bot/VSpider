@@ -166,9 +166,28 @@ VIRTUAL_LIST_ROWS_JS = (
         const cells = cellNodes.map(c => clean(c.innerText || c.textContent)).filter(Boolean);
         rows.push(cells.length >= 2 ? {text, cells} : {text});
     }
+    // VSCROLL-FIELDS-1: column headers usually live outside the scroller
+    // (sticky thead / sibling header wrapper) - look upwards for them so
+    // captured cells can be mapped onto named fields.
+    const headerScope = target.closest(
+        'table, .el-table, .ant-table, .n-data-table, .ag-root, ' +
+        '[role="grid"], [role="table"], [role="treegrid"]'
+    ) || target.parentElement || target;
+    let headerCells = Array.from(headerScope.querySelectorAll('thead th, thead td'));
+    if (!headerCells.length) {
+        headerCells = Array.from(headerScope.querySelectorAll('[role="columnheader"]'));
+    }
+    if (!headerCells.length) {
+        headerCells = Array.from(headerScope.querySelectorAll('.ag-header-cell-text'));
+    }
+    const headers = headerCells
+        .map(c => clean(c.innerText || c.textContent))
+        .filter(Boolean)
+        .slice(0, 40);
     return {
         found: true,
         rows,
+        headers,
         axis,
         scroll_top: Math.round(axis === 'x' ? target.scrollLeft : target.scrollTop),
         remaining: Math.round(axis === 'x'
@@ -258,6 +277,7 @@ async def capture_virtual_list_rows(
     rows: list[dict] = []
     container = ""
     axis = ""
+    headers: list[str] = []
     complete = False
     passes = 0
     while passes < max_passes:
@@ -270,6 +290,10 @@ async def capture_virtual_list_rows(
         if not isinstance(snap, dict):
             snap = {}
         axis = str(snap.get("axis") or axis or "")
+        if not headers:
+            headers = [
+                str(h) for h in (snap.get("headers") or []) if str(h or "").strip()
+            ]
         for item in snap.get("rows") or []:
             if not isinstance(item, dict):
                 continue
@@ -295,12 +319,50 @@ async def capture_virtual_list_rows(
         "complete": complete,
         "container": container,
         "axis": axis or "y",
+        "headers": headers,
     }
     logger.info(
-        "[VSCROLL CAPTURE] rows=%s passes=%s complete=%s container=%s axis=%s",
-        len(rows), passes, complete, container or "?", axis or "y",
+        "[VSCROLL CAPTURE] rows=%s passes=%s complete=%s container=%s axis=%s headers=%s",
+        len(rows), passes, complete, container or "?", axis or "y", len(headers),
     )
     return result
+
+
+def map_captured_rows_to_fields(rows: list, headers: list) -> list[dict]:
+    """Map captured ``{text, cells}`` rows onto named header fields.
+
+    VSCROLL-FIELDS-1: the capture emits anonymous cell lists; downstream
+    consumers (dataset_rows artifacts, the candidate ranking, the VLM) want
+    named columns. Positional zip against the harvested headers - duplicate
+    header names get a ``_N`` suffix, blank/overflow positions fall back to
+    ``col_N``, and rows without cells keep their ``text`` form. Pure and
+    dependency-free so every capture call site can use it as-is.
+    """
+    clean_headers: list[str] = []
+    seen: dict[str, int] = {}
+    for idx, raw in enumerate(headers or []):
+        name = str(raw or "").strip() or f"col_{idx + 1}"
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        clean_headers.append(name if count == 1 else f"{name}_{count}")
+    mapped: list[dict] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        cells = row.get("cells")
+        if isinstance(cells, list) and cells:
+            record: dict = {}
+            for idx, value in enumerate(cells):
+                key = (
+                    clean_headers[idx]
+                    if idx < len(clean_headers)
+                    else f"col_{idx + 1}"
+                )
+                record[key] = value
+            mapped.append(record)
+        else:
+            mapped.append({"text": str(row.get("text") or "")})
+    return mapped
 
 
 async def nudge_virtual_scroll(

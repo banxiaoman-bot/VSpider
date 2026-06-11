@@ -253,6 +253,27 @@ class TestHandlerBehavior:
         assert mem["complete"] is False
         assert ctx.browser.rpa_trail[-1]["max_rows"] == 2
 
+    def test_headers_map_cells_to_named_fields(self) -> None:
+        page = _StubPage(
+            sig=[_HIT_SIG],
+            rows=[{
+                "found": True,
+                "headers": ["Name", "Office"],
+                "rows": [
+                    {"text": "Tiger Nixon Edinburgh", "cells": ["Tiger Nixon", "Edinburgh"]},
+                    {"text": "Garrett Winters Tokyo", "cells": ["Garrett Winters", "Tokyo"]},
+                ],
+            }],
+            nudge=[_DONE_NUDGE],
+        )
+        ctx = _make_ctx(page)
+        asyncio.run(VscrollCaptureHandler().execute(ctx))
+        mem = ctx.workflow_memory["vscroll_rows"]
+        assert mem["headers"] == ["Name", "Office"]
+        assert mem["rows"][0] == {"Name": "Tiger Nixon", "Office": "Edinburgh"}
+        assert mem["rows"][1] == {"Name": "Garrett Winters", "Office": "Tokyo"}
+        assert ctx.browser.rpa_trail[-1]["header_count"] == 2
+
     def test_junk_type_value_falls_back_to_default(self) -> None:
         assert VscrollCaptureHandler._max_rows("not a number") == 2000
         assert VscrollCaptureHandler._max_rows("") == 2000
