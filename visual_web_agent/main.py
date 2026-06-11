@@ -3407,10 +3407,70 @@ async def _try_auto_form_fill_bound_controls(
                 return scored[0] ? {labelEl: fallbackLabel, control: scored[0].ctrl, method: 'page_geometry'} : null;
             };
 
+            const escHtml = (s) => String(s).replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const toParagraphHtml = (text) => String(text)
+                .split(/\\n{2,}/)
+                .map(part => `<p>${escHtml(part).replace(/\\n/g, '<br>')}</p>`)
+                .join('') || '<p></p>';
+            // Mirrors actions.setRichTextValue: write through the editor API
+            // when one is found, else the real input chain, else escaped <p>s.
+            const setRichTextValue = (el, val) => {
+                const text = String(val || '');
+                const qlEditor = el.classList?.contains('ql-editor')
+                    ? el
+                    : (el.querySelector?.('.ql-editor')
+                        || el.closest?.('.ql-container')?.querySelector?.('.ql-editor'));
+                if (qlEditor) {
+                    const container = qlEditor.closest('.ql-container') || qlEditor.parentElement;
+                    const quill = (container && container.__quill)
+                        || window.Quill?.find?.(container) || null;
+                    if (quill && typeof quill.setText === 'function') {
+                        quill.setText(text, 'user');
+                        return 'quill_api';
+                    }
+                }
+                const tiny = window.tinymce;
+                if (tiny && (typeof tiny.get === 'function' || Array.isArray(tiny.editors))) {
+                    const editors = Array.from(tiny.editors || []);
+                    const byId = el.id && typeof tiny.get === 'function' ? tiny.get(el.id) : null;
+                    const ed = byId || editors.find(e => {
+                        const body = e?.getBody?.();
+                        return body && (body === el || body.contains?.(el) || el.contains?.(body));
+                    });
+                    if (ed && typeof ed.setContent === 'function') {
+                        ed.setContent(toParagraphHtml(text));
+                        ed.fire?.('change');
+                        return 'tinymce_api';
+                    }
+                }
+                const ckHost = el.closest?.('.ck-editor__editable') || el;
+                if (ckHost?.ckeditorInstance && typeof ckHost.ckeditorInstance.setData === 'function') {
+                    ckHost.ckeditorInstance.setData(toParagraphHtml(text));
+                    return 'ckeditor5_api';
+                }
+                try {
+                    el.focus?.({preventScroll: true});
+                    const sel = window.getSelection?.();
+                    if (sel && typeof document.execCommand === 'function') {
+                        sel.selectAllChildren(el);
+                        document.execCommand('delete', false, null);
+                        if (document.execCommand('insertText', false, text)) {
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            return 'exec_insert_text';
+                        }
+                    }
+                } catch (_) {}
+                el.innerHTML = toParagraphHtml(text);
+                el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return 'structured_paragraphs';
+            };
             const setNativeValue = (el, value) => {
                 if (el.isContentEditable) {
-                    el.focus?.();
-                    el.textContent = String(value || '');
+                    setRichTextValue(el, String(value || ''));
+                    el.dispatchEvent(new Event('blur', {bubbles: true}));
+                    return;
                 } else {
                     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
                     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -3431,8 +3491,15 @@ async def _try_auto_form_fill_bound_controls(
                     return [control.value, control.selectedOptions?.[0]?.textContent]
                         .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
                 }
-                return [control.value, control.textContent, control.getAttribute('aria-label')]
+                if (control.isContentEditable) {
+                    return clean(control.innerText || control.textContent || '');
+                }
+                // aria-label is the field's label, not its value: joining it
+                // into the readback made every labelled control fail verify.
+                const direct = [control.value, control.textContent]
                     .filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                if (direct) return direct;
+                return clean(control.getAttribute('aria-label') || '');
             };
             const verify = (binding, label, value) => {
                 const control = binding.control;
@@ -3789,7 +3856,14 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                     if (typeof el.click === 'function') el.click();
                     else el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, composed: true, view: window}));
                 };
-                const allVisible = (selector, root = document) => Array.from(root.querySelectorAll(selector)).filter(isVisible);
+                const deepQueryAll = (selector, root = document) => {
+                    const out = Array.from(root.querySelectorAll(selector));
+                    for (const host of root.querySelectorAll('*')) {
+                        if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                    }
+                    return out;
+                };
+                const allVisible = (selector, root = document) => deepQueryAll(selector, root).filter(isVisible);
                 const labels = Object.keys(fields || {});
 
                 const findScope = () => {

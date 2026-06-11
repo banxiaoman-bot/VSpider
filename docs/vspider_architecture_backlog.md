@@ -2450,3 +2450,30 @@ Out of scope (next): exposing the capture as a mid-run action for VLM use;
 horizontal scrollers; iframe-hosted virtual lists (combine with the frame
 sweep); semantic field mapping for captured text rows (rides DOM_CARDS
 today only via candidate competition).
+
+## Slice FORM-RICHTEXT-2: macro rich-text writes + fallback shadow reach (done)
+
+Layer: intent_planning (main.py auto_form macro JS, both passes).
+Closes two backlog items: the macro's contenteditable branch was a flat
+textContent write, and the component-aware fallback JS was light-DOM only.
+
+- Bound-controls JS gains the same setRichTextValue tier chain as actions.py
+  (Quill API -> TinyMCE registry -> CKEditor 5 -> execCommand insertText ->
+  escaped paragraph HTML); the contenteditable branch routes through it.
+- Component-aware fallback's allVisible now rides deepQueryAll, so the
+  secondary pass also reaches open shadow roots.
+- Verify fix (found by the live probe): valueOf joined aria-label into the
+  readback, so every labelled control failed verify ('macro quill text
+  Notes' != 'macro quill text') and the macro declined to VLM despite
+  writing correctly. contenteditable now reads innerText only; value/
+  textContent are read directly; aria-label only remains as the empty-value
+  fallback.
+
+Tests: tests/test_auto_form_richtext.py (9 source anchors: tier order,
+escaping guard, valueOf semantics, fallback shadow reach). Live probe:
+macro filled a Quill double via the API + a plain contenteditable, and the
+bound-controls pass reached an open-shadow input end-to-end - PASS
+pre-removal (probe surfaced the valueOf bug before commit).
+
+Out of scope (next): table autopager inside frames; field-name case
+contract lock; TinyMCE classic iframe via editor API.
