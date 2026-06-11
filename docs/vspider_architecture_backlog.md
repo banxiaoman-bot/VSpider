@@ -2528,3 +2528,38 @@ lowercase-header production feeding coverage end to end. A future
 
 Out of scope: documenting {{column}} placeholder case rules for batch
 runner templates (input_contract layer, separate concern).
+
+## Slice EXTRACT-VSCROLL-3: iframe-hosted virtual lists reach the capture (done)
+
+Layer: data_plane (virtual_scroll.py scope sweep + main.py pre-extract gate).
+Closes the P2 item "iframe-hosted virtual lists (combine with the frame
+sweep)" from EXTRACT-VSCROLL-1/2: the pre-extract drain probe sees the main
+document only, so a virtualised list inside an iframe never reached the
+deterministic capture - bulk goals fell back to one VLM round per viewport.
+
+- virtual_scroll.py gains find_virtual_list_scope(page, include_main=True):
+  one lightweight VIRTUAL_LIST_SIGNATURE_JS evaluate per scope; a hit needs
+  found=True plus scroll headroom (remaining > 0 - fully rendered lists are
+  already covered by the static frame sweeps). Main document first
+  (optional), then child frames in document order; detached and raising
+  frames are skipped (EXTRACT-IFRAME sweep pattern). The returned scope
+  feeds capture_virtual_list_rows as-is: Frames satisfy its
+  evaluate/wait_for_timeout contract unchanged.
+- main.py pre-extract: when the drain probe misses (no main-document
+  scroller), sweep child frames via find_virtual_list_scope(...,
+  include_main=False) and run the capture on the hit Frame. The
+  main-document path (drain-probe gate -> capture on the page) is
+  byte-for-byte unchanged.
+
+Tests: tests/test_virtual_scroll_nudge.py extended 18 -> 26 (scope sweep:
+main hit stops sweep, frame hit + url/remaining evidence, include_main=False
+skips main, detached/raising skipped, zero-headroom miss, non-dict probe,
+frame-scope capture; wiring anchors incl. the preserved drain gate). Live
+probe: host page with no scrollable container + 600-row windowed list in an
+iframe - main-doc probe miss / frame sweep hit (remaining=17520) / capture
+600/600 unique in 44 passes complete=True - 3/3 PASS pre-removal.
+
+Out of scope (next): exposing the capture as a mid-run action for VLM use;
+horizontal scrollers; nested iframes hosting the scroller inside another
+iframe ride page.frames already (flat enumeration) but were not live-probed;
+semantic field mapping for captured text rows.

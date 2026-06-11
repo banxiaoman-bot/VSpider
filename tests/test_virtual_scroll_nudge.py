@@ -27,6 +27,7 @@ from visual_web_agent.virtual_scroll import (
     VIRTUAL_LIST_SIGNATURE_JS,
     VIRTUAL_SCROLL_NUDGE_JS,
     capture_virtual_list_rows,
+    find_virtual_list_scope,
     nudge_virtual_scroll,
 )
 
@@ -223,6 +224,107 @@ class TestCaptureLoop:
         assert "nested" in VIRTUAL_LIST_ROWS_JS, "wrapper rows must not duplicate children"
 
 
+class _StubFrame:
+    """Child-frame stand-in for the scope sweep (EXTRACT-VSCROLL-3)."""
+
+    def __init__(
+        self,
+        sig: Any,
+        *,
+        url: str = "https://child.example/",
+        detached: bool = False,
+        raise_on_probe: bool = False,
+    ) -> None:
+        self._sig = sig
+        self.url = url
+        self._detached = detached
+        self._raise = raise_on_probe
+        self.eval_count = 0
+
+    def is_detached(self) -> bool:
+        return self._detached
+
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
+        self.eval_count += 1
+        if self._raise:
+            raise RuntimeError("frame probe exploded")
+        return self._sig
+
+
+class _StubHostPage:
+    """Host page exposing main_frame + frames like a Playwright Page."""
+
+    def __init__(self, main_sig: Any, frames: list[Any]) -> None:
+        self._sig = main_sig
+        self.main_frame = object()
+        self.frames = [self.main_frame, *frames]
+        self.eval_count = 0
+
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
+        self.eval_count += 1
+        return self._sig
+
+
+class TestFindVirtualListScope:
+    def test_main_document_hit_wins(self) -> None:
+        frame = _StubFrame({"found": True, "remaining": 500})
+        page = _StubHostPage({"found": True, "remaining": 900}, [frame])
+        result = asyncio.run(find_virtual_list_scope(page))
+        assert result["scope"] is page
+        assert result["where"] == "main"
+        assert frame.eval_count == 0, "a main-document hit must stop the sweep"
+
+    def test_frame_sweep_finds_iframe_virtual_list(self) -> None:
+        frame = _StubFrame({"found": True, "remaining": 740})
+        page = _StubHostPage({"found": False, "sig": ""}, [frame])
+        result = asyncio.run(find_virtual_list_scope(page))
+        assert result["scope"] is frame
+        assert result["where"] == "frame"
+        assert result["url"] == "https://child.example/"
+        assert result["remaining"] == 740
+
+    def test_include_main_false_skips_the_main_document(self) -> None:
+        frame = _StubFrame({"found": True, "remaining": 300})
+        page = _StubHostPage({"found": True, "remaining": 900}, [frame])
+        result = asyncio.run(find_virtual_list_scope(page, include_main=False))
+        assert result["scope"] is frame
+        assert page.eval_count == 0, "the drain probe already covered the main document"
+
+    def test_detached_and_raising_frames_are_skipped(self) -> None:
+        dead = _StubFrame({"found": True, "remaining": 100}, detached=True)
+        angry = _StubFrame({"found": True, "remaining": 100}, raise_on_probe=True)
+        good = _StubFrame({"found": True, "remaining": 220}, url="https://ok.example/")
+        page = _StubHostPage({"found": False}, [dead, angry, good])
+        result = asyncio.run(find_virtual_list_scope(page))
+        assert result["scope"] is good
+        assert result["url"] == "https://ok.example/"
+        assert dead.eval_count == 0, "detached frames must not be evaluated"
+
+    def test_no_scroll_headroom_is_not_a_hit(self) -> None:
+        flat = _StubFrame({"found": True, "remaining": 0})
+        page = _StubHostPage({"found": False}, [flat])
+        result = asyncio.run(find_virtual_list_scope(page))
+        assert result["scope"] is None
+        assert result["where"] == ""
+        assert result["remaining"] == 0
+
+    def test_non_dict_probe_results_are_skipped(self) -> None:
+        junk = _StubFrame("junk")
+        page = _StubHostPage(None, [junk])
+        result = asyncio.run(find_virtual_list_scope(page))
+        assert result["scope"] is None
+
+    def test_captures_straight_from_a_frame_scope(self) -> None:
+        """The sweep's scope feeds capture_virtual_list_rows unchanged."""
+        capture_frame = _CapturePage(
+            [[{"text": "frame row 1"}], [{"text": "frame row 2"}]],
+            moves=[True, False],
+        )
+        result = asyncio.run(capture_virtual_list_rows(capture_frame, settle_ms=0))
+        assert [r["text"] for r in result["rows"]] == ["frame row 1", "frame row 2"]
+        assert result["complete"] is True
+
+
 class TestMainWiring:
     def test_dedup_nudge_falls_back_to_virtual_scroll(self) -> None:
         src = inspect.getsource(run_agent)
@@ -239,6 +341,16 @@ class TestMainWiring:
         assert 'name="VSCROLL_LIST"' in src
         assert 'drain.get("container_can_scroll")' in src, (
             "capture must stay gated behind the scroll-drain probe"
+        )
+
+    def test_pre_extract_sweeps_frames_when_main_probe_misses(self) -> None:
+        """EXTRACT-VSCROLL-3: iframe-hosted virtual lists reach the capture."""
+        src = inspect.getsource(run_agent)
+        assert "find_virtual_list_scope(" in src, (
+            "the pre-extract path no longer sweeps child frames for scrollers"
+        )
+        assert "include_main=False" in src, (
+            "the drain probe already covers the main document - do not re-probe"
         )
 
 

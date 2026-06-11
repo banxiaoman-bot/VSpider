@@ -146,6 +146,67 @@ VIRTUAL_LIST_ROWS_JS = (
 )
 
 
+async def find_virtual_list_scope(
+    page: Any, *, include_main: bool = True
+) -> dict:
+    """Locate the scope (page or child frame) hosting a drainable virtual list.
+
+    One lightweight ``VIRTUAL_LIST_SIGNATURE_JS`` evaluate per scope: a hit
+    needs ``found=True`` plus real scroll headroom (``remaining > 0`` - lists
+    already rendered in full are covered by the static frame sweeps). The
+    main document goes first (optional: the pre-extract drain probe already
+    covers it), then child frames in document order; detached and raising
+    frames are skipped, mirroring the EXTRACT-IFRAME sweep pattern. The
+    returned scope feeds :func:`capture_virtual_list_rows` directly - Frames
+    satisfy its evaluate/wait_for_timeout contract as-is.
+    """
+
+    async def _probe(scope: Any) -> dict | None:
+        try:
+            sig = await scope.evaluate(VIRTUAL_LIST_SIGNATURE_JS)
+        except Exception as probe_err:
+            logger.debug(
+                "[VSCROLL SCOPE] probe failed (%s): %s",
+                getattr(scope, "url", "?"),
+                probe_err,
+            )
+            return None
+        if not isinstance(sig, dict) or not sig.get("found"):
+            return None
+        try:
+            remaining = int(sig.get("remaining") or 0)
+        except Exception:
+            remaining = 0
+        if remaining <= 0:
+            return None
+        return {"remaining": remaining}
+
+    if include_main:
+        hit = await _probe(page)
+        if hit:
+            return {"scope": page, "where": "main", "url": "", **hit}
+    main_frame = getattr(page, "main_frame", None)
+    for frame in list(getattr(page, "frames", None) or []):
+        if frame is main_frame:
+            continue
+        try:
+            is_detached = getattr(frame, "is_detached", None)
+            if callable(is_detached) and is_detached():
+                continue
+        except Exception:
+            continue
+        hit = await _probe(frame)
+        if hit:
+            url = str(getattr(frame, "url", "") or "")
+            logger.info(
+                "[VSCROLL SCOPE] virtual list found in frame=%s remaining=%s",
+                url or "?",
+                hit["remaining"],
+            )
+            return {"scope": frame, "where": "frame", "url": url, **hit}
+    return {"scope": None, "where": "", "url": "", "remaining": 0}
+
+
 async def capture_virtual_list_rows(
     page: Any,
     *,

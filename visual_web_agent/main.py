@@ -105,7 +105,11 @@ try:
     from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from .url_guard import UrlGuardError, build_guarded_opener, check_url
     from .stealth_profile import default_user_agent
-    from .virtual_scroll import capture_virtual_list_rows, nudge_virtual_scroll
+    from .virtual_scroll import (
+        capture_virtual_list_rows,
+        find_virtual_list_scope,
+        nudge_virtual_scroll,
+    )
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
@@ -169,7 +173,11 @@ except ImportError:
     from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from url_guard import UrlGuardError, build_guarded_opener, check_url
     from stealth_profile import default_user_agent
-    from virtual_scroll import capture_virtual_list_rows, nudge_virtual_scroll
+    from virtual_scroll import (
+        capture_virtual_list_rows,
+        find_virtual_list_scope,
+        nudge_virtual_scroll,
+    )
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -10845,12 +10853,26 @@ async def run_agent(
             ):
                 try:
                     drain = await _probe_scroll_drain_state("pre-extract vscroll probe")
+                    _vs_scope = None
                     if drain.get("container_can_scroll"):
-                        _vs_page = await browser._ensure_active_page(
+                        _vs_scope = await browser._ensure_active_page(
                             reason="pre-extract vscroll capture"
                         )
+                    else:
+                        # EXTRACT-VSCROLL-3: the drain probe sees the main
+                        # document only - sweep child frames so iframe-hosted
+                        # virtual lists reach the deterministic capture too.
+                        _vs_page = await browser._ensure_active_page(
+                            reason="pre-extract vscroll frame sweep"
+                        )
+                        if _vs_page is not None:
+                            _vs_probe = await find_virtual_list_scope(
+                                _vs_page, include_main=False
+                            )
+                            _vs_scope = _vs_probe.get("scope")
+                    if _vs_scope is not None:
                         vscroll_meta = await capture_virtual_list_rows(
-                            _vs_page, max_rows=max(target_count * 2, 200)
+                            _vs_scope, max_rows=max(target_count * 2, 200)
                         )
                         vscroll_rows = list(vscroll_meta.get("rows") or [])
                 except Exception as vs_err:
