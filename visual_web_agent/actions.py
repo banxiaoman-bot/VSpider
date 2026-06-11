@@ -872,12 +872,73 @@ async def _form_set_bound_control_v2(
                 if (nested && isVisible(nested)) return readValue(nested);
                 return textOf(el);
             };
+            const escHtml = (s) => String(s).replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const toParagraphHtml = (text) => String(text)
+                .split(/\\n{2,}/)
+                .map(part => `<p>${escHtml(part).replace(/\\n/g, '<br>')}</p>`)
+                .join('') || '<p></p>';
+            // Rich-text editors keep their own document model; a bare
+            // textContent write desyncs it (Quill re-renders over it, TinyMCE
+            // never sees it). Write through the editor API when one is found,
+            // otherwise fall back to the real input chain / structured HTML.
+            const setRichTextValue = (el, val) => {
+                const text = String(val || '');
+                const qlEditor = el.classList?.contains('ql-editor')
+                    ? el
+                    : (el.querySelector?.('.ql-editor')
+                        || el.closest?.('.ql-container')?.querySelector?.('.ql-editor'));
+                if (qlEditor) {
+                    const container = qlEditor.closest('.ql-container') || qlEditor.parentElement;
+                    const quill = (container && container.__quill)
+                        || window.Quill?.find?.(container) || null;
+                    if (quill && typeof quill.setText === 'function') {
+                        quill.setText(text, 'user');
+                        return 'quill_api';
+                    }
+                }
+                const tiny = window.tinymce;
+                if (tiny && (typeof tiny.get === 'function' || Array.isArray(tiny.editors))) {
+                    const editors = Array.from(tiny.editors || []);
+                    const byId = el.id && typeof tiny.get === 'function' ? tiny.get(el.id) : null;
+                    const ed = byId || editors.find(e => {
+                        const body = e?.getBody?.();
+                        return body && (body === el || body.contains?.(el) || el.contains?.(body));
+                    });
+                    if (ed && typeof ed.setContent === 'function') {
+                        ed.setContent(toParagraphHtml(text));
+                        ed.fire?.('change');
+                        return 'tinymce_api';
+                    }
+                }
+                const ckHost = el.closest?.('.ck-editor__editable') || el;
+                if (ckHost?.ckeditorInstance && typeof ckHost.ckeditorInstance.setData === 'function') {
+                    ckHost.ckeditorInstance.setData(toParagraphHtml(text));
+                    return 'ckeditor5_api';
+                }
+                // Generic contenteditable (ProseMirror/Slate/Lexical listen to
+                // beforeinput): select-all + insertText drives the real input chain.
+                try {
+                    el.focus?.({preventScroll: true});
+                    const sel = window.getSelection?.();
+                    if (sel && typeof document.execCommand === 'function') {
+                        sel.selectAllChildren(el);
+                        document.execCommand('delete', false, null);
+                        if (document.execCommand('insertText', false, text)) {
+                            el.dispatchEvent(new Event('change', {bubbles: true}));
+                            return 'exec_insert_text';
+                        }
+                    }
+                } catch (_) {}
+                el.innerHTML = toParagraphHtml(text);
+                el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return 'structured_paragraphs';
+            };
             const setNativeValue = (el, val) => {
                 const tag = String(el.tagName || '').toLowerCase();
                 if (el.isContentEditable) {
-                    el.textContent = val;
-                    el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: val}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    setRichTextValue(el, val);
                     return;
                 }
                 if (tag === 'select') {

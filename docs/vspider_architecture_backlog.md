@@ -2336,3 +2336,30 @@ detached/raising frames, run_agent wiring anchor).
 Out of scope (next): list/card extraction iframe sweep; table autopager +
 signature inside frames (pagination still main-document only); shadow-DOM
 table hosts; virtual-scroll capture; rich-text structured write.
+
+## Slice FORM-RICHTEXT-1: rich-text editors get structured writes (done)
+
+Layer: operations_plane (actions.py form_set binding JS).
+Closes the weakness-list item "rich-text editors only receive a flat
+textContent write" (which desyncs Quill's Delta model, never reaches
+TinyMCE, and drops all line structure).
+
+- setRichTextValue() replaces the bare textContent branch in setNativeValue,
+  with a strict priority order: Quill API (container.__quill / Quill.find ->
+  setText) -> TinyMCE registry (tinymce.get / editors -> setContent + fire
+  change) -> CKEditor 5 (ckeditorInstance.setData) -> generic real input
+  chain (select-all + execCommand insertText, which fires the beforeinput
+  chain ProseMirror/Slate/Lexical listen to) -> structured paragraph HTML
+  (escaped, blank-line-separated <p> blocks with <br> line breaks).
+- Multi-line values now keep paragraph/line structure in every fallback tier
+  instead of collapsing into one flat text node.
+
+Tests: tests/test_form_richtext_write.py (9 source anchors incl. fallback
+priority order + Python-escaping guard for the JS regexes). Live-browser
+probe (generic contenteditable / Quill API double / multiline) 3/3 PASS
+pre-removal; the probe also caught a real regex-escaping bug before commit.
+
+Out of scope (next): auto_form macro's contenteditable branch in main.py
+(still flat textContent); TinyMCE classic iframe mode via editor API (the
+frame sweep reaches the body and uses the generic chain instead);
+virtual-scroll list capture.
