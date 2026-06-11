@@ -2858,3 +2858,41 @@ Out of scope (next): data relay assertions through WorkflowDataEdge once
 the kernel consumes it (route_executor today only stamps system metadata;
 no false e2e for unwired plumbing); live two-site login flows with real
 credential vaults; cross-instance (multi-process) session pools.
+
+## Slice FIXTURE-AUDIT-1: failure-fixture coverage audited and locked (done)
+
+Layer: audit close-out (tests only - the audit ran the real chain and
+found no blocking gap; the findings are frozen as regression locks).
+
+Audit scope: capability_execute_failure_bundle.v1 production
+(api_server._capability_execute_failure_bundle: failure_code >
+non-action_failed warning > action_error fallback), fixture build/write
+(capability_failure_fixture.py), offline replay chain
+(capability_failure_replay.py: planner_feedback -> route_task ->
+execution_plan, 13 checks), and the failure-code vocabularies
+(_FAILURE_REPAIR_HINTS repair layer vs the planner-feedback mappings).
+
+Findings (all verified by execution, not by reading):
+- all 9 mapped codes + the action_error producer fallback + a completely
+  unmapped code build fixtures and replay GREEN (11/11) - the fallback
+  paths (default repair actions, default avoid list, generic preferred
+  capabilities) keep the loop closed for unknown codes;
+- preferred_capabilities are IDENTICAL per code across both layers; the
+  avoid vocabularies differ by wording by design (route_task overlays the
+  repair hints over the feedback, repair wins) but every code has a
+  specific avoid list in both layers - no blocking drift;
+- disk round-trip (write -> read -> replay) and the batch report
+  aggregation (top_primary_failures buckets) hold.
+
+Locks: tests/test_fixture_coverage_audit.py (18: parametrized
+green-replay loop over all 11 codes, the conscious 9-code list, per-code
+layer alignment, specific avoid lists, unmapped-code defaults, disk
+round-trip + bundleless rejection, batch aggregation). Adding a failure
+code to one table but not the other, breaking a fallback, or bending a
+replay check now fails loudly.
+
+Out of scope (next): api_server bundle-extraction unit tests (api layer
+owns those; importing api_server in unit tests drags the FastAPI app);
+live fixture capture from a real failing run (covered implicitly by
+capability_failure fixtures written during agent_case runs); fixture TTL
+/ pruning policy for workspace artifact growth.
