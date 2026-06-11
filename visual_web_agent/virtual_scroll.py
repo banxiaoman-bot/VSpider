@@ -108,6 +108,103 @@ VIRTUAL_SCROLL_NUDGE_JS = (
 )
 
 
+VIRTUAL_LIST_ROWS_JS = (
+    "() => {"
+    + _FIND_SCROLLER_JS_SNIPPET
+    + r"""
+    const target = findScroller();
+    if (!target) return {found: false, rows: []};
+    const isVisible = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    };
+    const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+    const nodes = Array.from(target.querySelectorAll(
+        'tr, [role="row"], li, [class*="item"], [class*="row"]'
+    )).filter(isVisible);
+    const rows = [];
+    for (const el of nodes) {
+        // skip wrappers whose row children are captured separately
+        const nested = el.querySelector('tr, [role="row"], li');
+        if (nested && isVisible(nested)) continue;
+        const text = clean(el.innerText || el.textContent);
+        if (!text || text.length > 2000) continue;
+        const cellNodes = Array.from(el.querySelectorAll(
+            'td, th, [role="cell"], [role="gridcell"]'
+        )).filter(isVisible);
+        const cells = cellNodes.map(c => clean(c.innerText || c.textContent)).filter(Boolean);
+        rows.push(cells.length >= 2 ? {text, cells} : {text});
+    }
+    return {
+        found: true,
+        rows,
+        scroll_top: Math.round(target.scrollTop),
+        remaining: Math.round(target.scrollHeight - target.scrollTop - target.clientHeight),
+    };
+}"""
+)
+
+
+async def capture_virtual_list_rows(
+    page: Any,
+    *,
+    max_rows: int = 2000,
+    max_passes: int = 120,
+    settle_ms: int = 250,
+) -> dict:
+    """Deterministic one-shot harvest of a virtualised list.
+
+    Alternates row collection and container nudges, deduplicating recycled
+    rows by their text, until the scroller stops moving (complete=True),
+    ``max_rows`` is reached, or ``max_passes`` runs out. Replaces ~1 VLM
+    round per viewport with a single deterministic call.
+    """
+    seen: set[str] = set()
+    rows: list[dict] = []
+    container = ""
+    complete = False
+    passes = 0
+    while passes < max_passes:
+        passes += 1
+        snap: Any = {}
+        try:
+            snap = await page.evaluate(VIRTUAL_LIST_ROWS_JS)
+        except Exception as snap_err:
+            logger.debug("[VSCROLL CAPTURE] row snapshot failed: %s", snap_err)
+        if not isinstance(snap, dict):
+            snap = {}
+        for item in snap.get("rows") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            rows.append(item)
+            if len(rows) >= max_rows:
+                break
+        if len(rows) >= max_rows:
+            break
+        vs = await nudge_virtual_scroll(page, amount=0, settle_ms=settle_ms)
+        container = vs.get("container") or container
+        if not vs.get("moved") and not vs.get("rows_changed"):
+            complete = True
+            break
+    result = {
+        "rows": rows,
+        "row_count": len(rows),
+        "passes": passes,
+        "complete": complete,
+        "container": container,
+    }
+    logger.info(
+        "[VSCROLL CAPTURE] rows=%s passes=%s complete=%s container=%s",
+        len(rows), passes, complete, container or "?",
+    )
+    return result
+
+
 async def nudge_virtual_scroll(
     page: Any, *, amount: int = 2000, settle_ms: int = 900
 ) -> dict:

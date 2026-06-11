@@ -2420,3 +2420,33 @@ payload hit/fallback/all-empty/raising predicate + list wiring anchors).
 Out of scope (next): _extract_body_text_for_semantic_cards (main-document
 body text only - semantic cards inside iframes still get their rows but
 lose the auxiliary body context); virtual-scroll capture fast-path.
+
+## Slice EXTRACT-VSCROLL-2: deterministic one-shot virtual-list capture (done)
+
+Layer: data_plane (virtual_scroll.py capture loop + main.py pre-extract).
+Closes the P1 item "dedicated deterministic capture loop" from
+EXTRACT-VSCROLL-1's out-of-scope list: bulk goals on virtualised lists used
+to burn ~1 VLM round per viewport (extract -> scroll -> dedup); now a single
+deterministic call drains the scroller before the planner ever runs.
+
+- virtual_scroll.py gains VIRTUAL_LIST_ROWS_JS (rows inside the dominant
+  scroller; nested wrapper rows skipped; cells split out for tr/[role=row])
+  and capture_virtual_list_rows(): alternates snapshot + nudge, dedupes
+  recycled rows by text, stops on bottom (complete=True), max_rows cap
+  (complete=False) or max_passes; snapshot errors degrade per-pass.
+- _try_pre_extract_fast_path runs the capture only when both static
+  harvests (table + list) fall short of target_count AND the scroll-drain
+  probe reports container_can_scroll; the result joins candidate selection
+  as VSCROLL_LIST and rides the existing schema-filter/landing chain.
+
+Tests: tests/test_virtual_scroll_nudge.py extended 12 -> 18 (capture
+dedupe/cap/first-pass-exit/error-degrade, rows-JS anchors, pre-extract
+wiring incl. the drain-probe gate). Live probe: 600-row windowed list
+captured 600/600 in 71 passes complete=True; max_rows=50 cap returns 50
+with complete=False - 2/2 PASS pre-removal. The probe also confirmed an
+unscrollable container exits on pass 1 (no spin).
+
+Out of scope (next): exposing the capture as a mid-run action for VLM use;
+horizontal scrollers; iframe-hosted virtual lists (combine with the frame
+sweep); semantic field mapping for captured text rows (rides DOM_CARDS
+today only via candidate competition).

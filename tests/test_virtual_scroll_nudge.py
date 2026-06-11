@@ -23,8 +23,10 @@ import pytest
 
 from visual_web_agent.main import run_agent
 from visual_web_agent.virtual_scroll import (
+    VIRTUAL_LIST_ROWS_JS,
     VIRTUAL_LIST_SIGNATURE_JS,
     VIRTUAL_SCROLL_NUDGE_JS,
+    capture_virtual_list_rows,
     nudge_virtual_scroll,
 )
 
@@ -148,6 +150,79 @@ class TestJsAnchors:
         assert "[role=\"row\"]" in VIRTUAL_LIST_SIGNATURE_JS
 
 
+class _CapturePage:
+    """Scripted page for the capture loop: rows snapshots + nudge sequences.
+
+    Each capture pass evaluates ROWS_JS once (rows snapshot), then the nudge
+    runs SIGNATURE_JS / NUDGE_JS / SIGNATURE_JS; scripts are told apart by
+    content so the stub stays robust to call-order tweaks.
+    """
+
+    def __init__(self, row_batches: list[list[dict]], moves: list[bool]) -> None:
+        self._row_batches = list(row_batches)
+        self._moves = list(moves)
+        self._sig = 0
+
+    async def evaluate(self, script: str, arg: Any = None) -> Any:
+        if "(amt)" in script:  # NUDGE_JS is the only (amt) => {...} script
+            moved = self._moves.pop(0) if self._moves else False
+            if moved:
+                self._sig += 1  # the rendered row window only changes on real moves
+            return {"mode": "container", "moved": moved, "container_class": "vlist"}
+        if "rows.push" in script:  # ROWS_JS harvests row nodes
+            if self._row_batches:
+                return {"found": True, "rows": self._row_batches.pop(0)}
+            return {"found": True, "rows": []}
+        return {"found": True, "sig": f"sig-{self._sig}"}  # SIGNATURE_JS
+
+    async def wait_for_timeout(self, ms: int) -> None:
+        return None
+
+
+class TestCaptureLoop:
+    def test_accumulates_and_dedupes_recycled_rows(self) -> None:
+        batches = [
+            [{"text": "row 1"}, {"text": "row 2"}],
+            [{"text": "row 2"}, {"text": "row 3"}],
+            [{"text": "row 3"}, {"text": "row 4"}],
+        ]
+        page = _CapturePage(batches, moves=[True, True, False])
+        result = asyncio.run(capture_virtual_list_rows(page, settle_ms=0))
+        assert [r["text"] for r in result["rows"]] == ["row 1", "row 2", "row 3", "row 4"]
+        assert result["complete"] is True
+        assert result["container"] == "vlist"
+
+    def test_max_rows_cap_reports_incomplete(self) -> None:
+        batches = [[{"text": f"row {i}"} for i in range(1, 7)]]
+        page = _CapturePage(batches, moves=[True] * 10)
+        result = asyncio.run(capture_virtual_list_rows(page, max_rows=4, settle_ms=0))
+        assert result["row_count"] == 4
+        assert result["complete"] is False
+
+    def test_unscrollable_container_exits_first_pass(self) -> None:
+        page = _CapturePage([[{"text": "only"}]], moves=[False])
+        result = asyncio.run(capture_virtual_list_rows(page, settle_ms=0))
+        assert result["row_count"] == 1
+        assert result["passes"] == 1
+        assert result["complete"] is True
+
+    def test_snapshot_errors_do_not_abort_the_loop(self) -> None:
+        class _Raising(_CapturePage):
+            async def evaluate(self, script: str, arg: Any = None) -> Any:
+                if "rows.push" in script:
+                    raise RuntimeError("snapshot exploded")
+                return await super().evaluate(script, arg)
+
+        page = _Raising([], moves=[False])
+        result = asyncio.run(capture_virtual_list_rows(page, settle_ms=0))
+        assert result["rows"] == []
+        assert result["complete"] is True
+
+    def test_rows_js_shares_scroller_and_skips_nested_wrappers(self) -> None:
+        assert "findScroller" in VIRTUAL_LIST_ROWS_JS
+        assert "nested" in VIRTUAL_LIST_ROWS_JS, "wrapper rows must not duplicate children"
+
+
 class TestMainWiring:
     def test_dedup_nudge_falls_back_to_virtual_scroll(self) -> None:
         src = inspect.getsource(run_agent)
@@ -155,6 +230,16 @@ class TestMainWiring:
             "the dedup nudge no longer falls back to the virtual-scroll path"
         )
         assert 'vs.get("rows_changed")' in src
+
+    def test_pre_extract_runs_capture_as_candidate(self) -> None:
+        src = inspect.getsource(run_agent)
+        assert "capture_virtual_list_rows(" in src, (
+            "pre-extract fast path no longer runs the deterministic capture"
+        )
+        assert 'name="VSCROLL_LIST"' in src
+        assert 'drain.get("container_can_scroll")' in src, (
+            "capture must stay gated behind the scroll-drain probe"
+        )
 
 
 if __name__ == "__main__":

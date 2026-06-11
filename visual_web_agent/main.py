@@ -105,7 +105,7 @@ try:
     from .a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from .url_guard import UrlGuardError, build_guarded_opener, check_url
     from .stealth_profile import default_user_agent
-    from .virtual_scroll import nudge_virtual_scroll
+    from .virtual_scroll import capture_virtual_list_rows, nudge_virtual_scroll
 except ImportError:
     from config import MAX_STEPS, SCREENSHOT_DIR, JUDGE_ENABLED, A11Y_ENHANCER_ENABLED
     from browser_env import BrowserEnv, ActionExecutionError
@@ -169,7 +169,7 @@ except ImportError:
     from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata as A11yPageMetadata
     from url_guard import UrlGuardError, build_guarded_opener, check_url
     from stealth_profile import default_user_agent
-    from virtual_scroll import nudge_virtual_scroll
+    from virtual_scroll import capture_virtual_list_rows, nudge_virtual_scroll
 
 # ========== 日志配置 ==========
 # Windows 终端默认编码不是 UTF-8，中文会显示为 ????
@@ -10718,6 +10718,45 @@ async def run_agent(
                         name="DOM_LIST",
                         data=dom_list_rows,
                         source_text=dom_list_text or body_text,
+                        data_shape=data_shape,
+                    )
+                )
+
+            # EXTRACT-VSCROLL-2: when static harvests fall short of the goal
+            # and an inner scroller exists, run the deterministic capture
+            # loop once instead of burning one VLM round per viewport.
+            vscroll_rows: list = []
+            vscroll_meta: dict = {}
+            if (
+                len(dom_table_rows) < target_count
+                and len(dom_list_rows) < target_count
+            ):
+                try:
+                    drain = await _probe_scroll_drain_state("pre-extract vscroll probe")
+                    if drain.get("container_can_scroll"):
+                        _vs_page = await browser._ensure_active_page(
+                            reason="pre-extract vscroll capture"
+                        )
+                        vscroll_meta = await capture_virtual_list_rows(
+                            _vs_page, max_rows=max(target_count * 2, 200)
+                        )
+                        vscroll_rows = list(vscroll_meta.get("rows") or [])
+                except Exception as vs_err:
+                    logger.debug("[PRE-EXTRACT] vscroll capture skipped: %s", vs_err)
+            if len(vscroll_rows) > max(len(dom_table_rows), len(dom_list_rows), 1):
+                logger.info(
+                    "[PRE-EXTRACT] vscroll capture rows=%s passes=%s complete=%s",
+                    len(vscroll_rows),
+                    vscroll_meta.get("passes"),
+                    vscroll_meta.get("complete"),
+                )
+                candidates.append(
+                    _sanitize_extraction_candidate(
+                        name="VSCROLL_LIST",
+                        data=vscroll_rows,
+                        source_text="\n".join(
+                            str(row.get("text") or "") for row in vscroll_rows[:400]
+                        ),
                         data_shape=data_shape,
                     )
                 )
