@@ -2288,3 +2288,29 @@ Out of scope (next): auto_form batch macro in main.py (same gap, separate
 slice); closed shadow roots (unreachable by design); cross-origin iframes
 (Playwright frame.evaluate still works, but widget popups teleported to the
 top document cannot be clicked from the frame scope alone).
+
+## Slice FORM-IFRAME-2: auto_form macro reaches iframes + open shadow DOM (done)
+
+Layer: intent_planning (main.py _try_auto_form_fill bound-controls path).
+Closes the weakness-list item "auto_form batch macro: same gap as
+FORM-IFRAME-1" by porting the proven pattern to the deterministic macro.
+
+- Bound-controls JS gains deepQueryAll() (mirrors actions.py): allVisible now
+  descends open shadow roots, so scope detection, control harvesting, label
+  nodes and the submit-button sweep all reach web-component forms.
+- _auto_form_fill_bound_controls_with_frames(): main document first; only a
+  full miss (every requested field field_not_found/invalid_result) probes
+  child iframes (detached/raising frames skipped). Partial hits and
+  complex_component_requires_form_set_or_macro stay in the main document so
+  the macro never guesses across frames. Both call sites (repeat loop +
+  single pass) route through the wrapper; result carries additive frame_url.
+- _auto_form_result_found_nothing(): explicit predicate so submit_not_found,
+  unsupported_control and verification failures never trigger frame probing.
+
+Tests: tests/test_auto_form_iframe_shadow.py (18 cases: fallback ordering,
+partial-hit/complex-component stay-put, predicate edge cases incl.
+submit_not_found, detached/raising frames, shadow + caller wiring anchors).
+
+Out of scope (next): component-aware fallback JS in _try_auto_form_fill
+(secondary path, light-DOM only); bulk table extraction iframe sweep;
+virtual-scroll list capture; rich-text structured write.

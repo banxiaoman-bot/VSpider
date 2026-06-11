@@ -3283,8 +3283,17 @@ async def _try_auto_form_fill_bound_controls(
             const labelTextOf = (el) => cleanLabel(
                 el?.innerText || el?.textContent || el?.getAttribute?.('aria-label') || ''
             );
+            // querySelectorAll that also descends into open shadow roots, so
+            // web-component forms stay reachable (mirrors actions.deepQueryAll).
+            const deepQueryAll = (selector, root = document) => {
+                const out = Array.from(root.querySelectorAll(selector));
+                for (const host of root.querySelectorAll('*')) {
+                    if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                }
+                return out;
+            };
             const allVisible = (selector, root = document) =>
-                Array.from(root.querySelectorAll(selector)).filter(isVisible);
+                deepQueryAll(selector, root).filter(isVisible);
             const sleep = (ms) => new Promise(r => setTimeout(r, ms));
             const labels = Object.keys(fields || {});
 
@@ -3515,6 +3524,74 @@ async def _try_auto_form_fill_bound_controls(
     )
 
 
+_AUTO_FORM_NOT_FOUND_REASONS = {"field_not_found", "invalid_result"}
+
+
+def _auto_form_result_found_nothing(result: object) -> bool:
+    """True when the bound-control pass resolved none of the requested fields."""
+    if not isinstance(result, dict):
+        return True
+    if result.get("ok"):
+        return False
+    results = result.get("results")
+    if not isinstance(results, list) or not results:
+        return True
+    return all(
+        isinstance(item, dict)
+        and not item.get("ok")
+        and item.get("reason") in _AUTO_FORM_NOT_FOUND_REASONS
+        for item in results
+    )
+
+
+async def _auto_form_fill_bound_controls_with_frames(
+    page,
+    *,
+    scope_title: str,
+    fields: dict[str, str],
+    require_submit: bool,
+) -> dict:
+    """Run the bound-control pass in the main document, then probe child iframes.
+
+    Mirrors actions._form_set_with_frames: only a full miss (every requested
+    field unresolved) falls through to iframes; partial hits stay in the main
+    document so we never guess across frames.
+    """
+    result = await _try_auto_form_fill_bound_controls(
+        page,
+        scope_title=scope_title,
+        fields=fields,
+        require_submit=require_submit,
+    )
+    if not _auto_form_result_found_nothing(result):
+        return result
+    main_frame = getattr(page, "main_frame", None)
+    for frame in list(getattr(page, "frames", None) or []):
+        if frame is main_frame:
+            continue
+        try:
+            is_detached = getattr(frame, "is_detached", None)
+            if callable(is_detached) and is_detached():
+                continue
+            frame_result = await _try_auto_form_fill_bound_controls(
+                frame,
+                scope_title=scope_title,
+                fields=fields,
+                require_submit=require_submit,
+            )
+        except Exception as frame_err:
+            logger.debug(
+                "[AUTO FORM] frame probe failed (%s): %s",
+                getattr(frame, "url", "?"),
+                frame_err,
+            )
+            continue
+        if not _auto_form_result_found_nothing(frame_result):
+            if isinstance(frame_result, dict):
+                frame_result.setdefault("frame_url", getattr(frame, "url", "") or "")
+            return frame_result
+    return result
+
 async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
     """Deterministic label/scoped form executor, used before handing control to VLM."""
     if not _goal_is_form_fill(goal):
@@ -3564,7 +3641,7 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                         "repetitions": repeat_results,
                     }
                     break
-                bound_result = await _try_auto_form_fill_bound_controls(
+                bound_result = await _auto_form_fill_bound_controls_with_frames(
                     active_page,
                     scope_title=scope_title,
                     fields=fields,
@@ -3599,7 +3676,7 @@ async def _try_auto_form_fill(browser: "BrowserEnv", goal: str) -> bool:
                     "repetitions": repeat_results,
                 }
         else:
-            bound_result = await _try_auto_form_fill_bound_controls(
+            bound_result = await _auto_form_fill_bound_controls_with_frames(
                 page,
                 scope_title=scope_title,
                 fields=fields,
