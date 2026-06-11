@@ -10373,6 +10373,16 @@ async def run_agent(
                                 && rect.width > 0
                                 && rect.height > 0;
                         };
+                        // EXTRACT-SHADOW-1: component-library tables render
+                        // inside open shadow roots, invisible to plain
+                        // document.querySelectorAll (mirrors actions.deepQueryAll).
+                        const deepQueryAll = (selector, root = document) => {
+                            const out = Array.from(root.querySelectorAll(selector));
+                            for (const host of root.querySelectorAll('*')) {
+                                if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                            }
+                            return out;
+                        };
                         const headerText = (el) => cleanHeader(
                             el.getAttribute('aria-label')
                             || el.getAttribute('data-label')
@@ -10446,7 +10456,7 @@ async def run_agent(
                             if (!best) return [];
                             return uniqueHeaders(best.headers.slice(0, width));
                         };
-                        const tables = Array.from(document.querySelectorAll('table'));
+                        const tables = deepQueryAll('table');
                         let best = { score: 0, rows: [] };
 
                         for (const table of tables) {
@@ -10520,7 +10530,16 @@ async def run_agent(
                                 && rect.width > 0
                                 && rect.height > 0;
                         };
-                        const table = Array.from(document.querySelectorAll('table'))
+                        // EXTRACT-SHADOW-1: keep parity with the deep table
+                        // harvest so autopager verification sees the same table.
+                        const deepQueryAll = (selector, root = document) => {
+                            const out = Array.from(root.querySelectorAll(selector));
+                            for (const host of root.querySelectorAll('*')) {
+                                if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                            }
+                            return out;
+                        };
+                        const table = deepQueryAll('table')
                             .find(t => isVisible(t));
                         if (!table) return '';
                         return Array.from(table.querySelectorAll('tbody tr'))

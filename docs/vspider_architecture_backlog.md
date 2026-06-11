@@ -2756,3 +2756,39 @@ Out of scope (next): alias-matching harvested headers onto the user's
 requested fields (planner-side field coverage already normalises);
 header harvest for horizontal strips (cards rarely have column headers);
 colspan/rowspan header grids.
+
+## Slice EXTRACT-SHADOW-1: bulk table harvest reaches open shadow roots (done)
+
+Layer: data_plane (main.py pre-extract DOM_TABLE harvest + autopager table
+signature). Closes the P3 item "shadow tables": component-library tables
+(Lit / Stencil / vanilla custom elements) render inside open shadow roots,
+which plain document.querySelectorAll('table') never sees - the DOM_TABLE
+candidate came back empty and the whole page fell through to screenshot
+extraction; the autopager's signature verification was blind on the same
+pages.
+
+- _table_rows_js: gains the deepQueryAll walker (same recursion the form
+  fallback already ships in actions.deepQueryAll) and harvests tables via
+  deepQueryAll('table'); header selection, row parsing, and scoring are
+  untouched - light-DOM tables produce byte-identical results.
+- _visible_table_signature: same walker, so autopager verification sees
+  the same table the harvest extracted (paging a shadow table now has a
+  verifiable signature).
+- Both scripts still ride _evaluate_rows_with_frame_fallback / scoped
+  evaluate, so iframe + shadow combinations compose (each frame's
+  document is walked independently).
+
+Tests: tests/test_extract_shadow_table.py (4 source anchors: harvest uses
+deepQueryAll('table') and the naive query is gone, signature uses the
+walker, both scripts carry their own copy - they evaluate separately, and
+the walker recurses from the document root). Live probe extracted the
+REAL scripts out of run_agent source and evaluated them: custom element
+with a 30-row shadow table - 30/30 named rows, signature sees shadow rows,
+control confirms plain querySelectorAll counts 0 tables there; light-DOM
+3/3 regression byte-intact - 7/7 PASS pre-removal.
+
+Out of scope (next): closed shadow roots (no JS access by design);
+shadow-hosted pager buttons for the autopager click path (the signature
+now verifies, but _auto_advance_table_page_via_dom locators stay
+light-DOM); list/card harvest inside shadow roots (different selector
+family); declarative shadow DOM SSR edge cases.
