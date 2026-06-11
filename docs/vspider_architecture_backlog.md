@@ -2477,3 +2477,30 @@ pre-removal (probe surfaced the valueOf bug before commit).
 
 Out of scope (next): table autopager inside frames; field-name case
 contract lock; TinyMCE classic iframe via editor API.
+
+## Slice EXTRACT-IFRAME-3: table autopager sweeps scopes (done)
+
+Layer: data_plane (main.py run_agent table autopager + signature helper).
+Closes the P2 weakness "iframe tables can be harvested (EXTRACT-IFRAME-1)
+but not paged": the autopager clicked and verified in the main document
+only, so iframe-hosted multi-page tables yielded just their first page.
+
+- _visible_table_signature(reason, scope=None): explicit scope (Page or
+  Frame) bypasses the active-page lookup; legacy callers unchanged.
+- _auto_advance_table_page_via_dom hoists the pager + wait JS and walks
+  scopes = [page, *child frames] (detached skipped). Per scope: empty
+  signature -> next scope (nothing clicked yet); pager not_found -> next
+  scope; a real click -> verify in that same scope (wait_for_function +
+  after-signature) and STOP - probing further scopes after a click risks
+  double-paging. DataTables API / next-button / numeric-pager heuristics
+  unchanged inside the JS.
+
+Tests: tests/test_table_autopager_frames.py (8 source anchors: scope
+parameter, hoisted JS, sweep order, empty-signature advance, post-click
+termination, legacy main-only flow gone). Live probe: host page with the
+paged table inside an iframe - main-doc signature empty / frame signature
+ROW-1..3, Next only resolvable in the frame, frame-scoped wait saw page 2
+(ROW-4..6) - 3/3 PASS pre-removal.
+
+Out of scope (next): field-name case contract lock; cross-frame pagination
+counters in tableInfo (dt-info) remain main-document in DATA_SIGNATURE_JS.

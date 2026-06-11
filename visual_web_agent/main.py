@@ -10454,9 +10454,13 @@ async def run_agent(
                 logger.debug("[EXTRACT DOM] table extraction skipped: %s", table_err)
             return []
 
-        async def _visible_table_signature(reason: str) -> str:
+        async def _visible_table_signature(reason: str, scope=None) -> str:
             try:
-                _sig_page = await browser._ensure_active_page(reason=reason)
+                _sig_page = scope
+                if _sig_page is None:
+                    _sig_page = await browser._ensure_active_page(reason=reason)
+                if _sig_page is None:
+                    return ""
                 return await _sig_page.evaluate(
                     """() => {
                         const clean = (value) => String(value || '')
@@ -10486,11 +10490,9 @@ async def run_agent(
         async def _auto_advance_table_page_via_dom(reason: str) -> bool:
             try:
                 _page_for_next = await browser._ensure_active_page(reason=reason)
-                before_sig = await _visible_table_signature("table autopager before")
-                if not before_sig:
+                if _page_for_next is None:
                     return False
-                result = await _page_for_next.evaluate(
-                    """() => {
+                _pager_js = """() => {
                         const clean = (value) => String(value || '')
                             .replace(/\\s+/g, ' ')
                             .trim();
@@ -10568,12 +10570,7 @@ async def run_agent(
 
                         return {ok: false, method: 'not_found'};
                     }"""
-                )
-                if not isinstance(result, dict) or not result.get("ok"):
-                    return False
-                try:
-                    await _page_for_next.wait_for_function(
-                        """(before) => {
+                _pager_wait_js = """(before) => {
                             const clean = (value) => String(value || '')
                                 .replace(/\\s+/g, ' ')
                                 .trim();
@@ -10594,20 +10591,61 @@ async def run_agent(
                                 .map(tr => clean(tr.innerText))
                                 .join('|');
                             return after && after !== before;
-                        }""",
-                        arg=before_sig,
-                        timeout=3000,
+                        }"""
+                scopes = [_page_for_next]
+                main_frame = getattr(_page_for_next, "main_frame", None)
+                for frame in list(getattr(_page_for_next, "frames", None) or []):
+                    if frame is main_frame:
+                        continue
+                    try:
+                        is_detached = getattr(frame, "is_detached", None)
+                        if callable(is_detached) and is_detached():
+                            continue
+                    except Exception:
+                        continue
+                    scopes.append(frame)
+                for scope in scopes:
+                    scope_label = (
+                        "main"
+                        if scope is _page_for_next
+                        else (getattr(scope, "url", "") or "frame")
                     )
-                except Exception:
-                    after_sig = await _visible_table_signature("table autopager after")
-                    if not after_sig or after_sig == before_sig:
-                        logger.info(
-                            "[TABLE AUTOPAGER] clicked but visible table signature did not change: %s",
-                            result,
+                    before_sig = await _visible_table_signature(
+                        "table autopager before", scope=scope
+                    )
+                    if not before_sig:
+                        continue
+                    try:
+                        result = await scope.evaluate(_pager_js)
+                    except Exception:
+                        continue
+                    if not isinstance(result, dict) or not result.get("ok"):
+                        continue
+                    # A pager was clicked in this scope: verify here and stop -
+                    # probing further scopes after a click risks double-paging.
+                    try:
+                        await scope.wait_for_function(
+                            _pager_wait_js, arg=before_sig, timeout=3000
                         )
-                        return False
-                logger.info("[TABLE AUTOPAGER] advanced page via %s", result)
-                return True
+                    except Exception:
+                        after_sig = await _visible_table_signature(
+                            "table autopager after", scope=scope
+                        )
+                        if not after_sig or after_sig == before_sig:
+                            logger.info(
+                                "[TABLE AUTOPAGER] clicked but visible table "
+                                "signature did not change (%s): %s",
+                                scope_label,
+                                result,
+                            )
+                            return False
+                    logger.info(
+                        "[TABLE AUTOPAGER] advanced page via %s (scope=%s)",
+                        result,
+                        scope_label,
+                    )
+                    return True
+                return False
             except Exception as pager_err:
                 logger.debug("[TABLE AUTOPAGER] skipped: %s", pager_err)
                 return False
