@@ -2597,3 +2597,42 @@ insertText event + <p> paragraphs - 6/6 + 3/3 PASS pre-removal.
 Out of scope (next): cross-origin editor iframes (no contentDocument access;
 needs a frame-level form_set pass); TinyMCE inline mode already rides the
 contenteditable branch; Froala/Summernote registry APIs.
+
+## Slice VSCROLL-ACTION-1: mid-run deterministic virtual-list capture (done)
+
+Layer: operations_plane (action_registry + capability_router + prompts) +
+data_plane handler module. Closes the P3 item "exposing the capture as a
+mid-run action for VLM use" from EXTRACT-VSCROLL-2/3: the deterministic
+capture ran only in the pre-extract fast-path (before the planner starts),
+so a virtualised list discovered mid-run - behind a login, a navigation, a
+tab switch - still cost one VLM round per viewport.
+
+- vscroll_capture_action.py (new module per workflow rule §三 - actions.py
+  is oversized): @ActionRegistry.register("vscroll_capture") handler wires
+  find_virtual_list_scope (main doc first, then same-origin child frames)
+  into capture_virtual_list_rows; rows persist as a dataset_rows jsonl
+  artifact + manifest entry (run-aware, skipped for ad-hoc calls) and land
+  in workflow_memory (default key vscroll_rows) with row_count / complete /
+  passes / container / where / frame_url evidence, stamped onto rpa_trail.
+  type_value is an optional row cap (junk falls back to 2000, ceiling
+  20000); no-hit and zero-row captures raise ActionExecutionError so the
+  VLM reroutes instead of retrying.
+- Six-step wiring: VSpiderAction literal (vlm_client), ActionTool with
+  zh/en aliases + evidence (action_registry), _VSCROLL_RE signal
+  vscroll_capture_preferred + plan step (capability_router), trigger
+  tuple + skill block injection (prompts / prompt_skills), import hook in
+  actions.py triggering registration.
+
+Tests: tests/test_vscroll_capture_action.py (21: schema literal, handler +
+tool registration with goal scoring, router signal/plan 中英文 + unrelated
+guard, prompt-skill registration/injection guard, handler stubs: main-doc
+end-to-end with trail evidence, frame fallback with frame_url, no-hit and
+empty-capture errors, type_value cap + junk fallback, jsonl persistence
+under an active run). Live probe: true windowed list (600 rows, recycled
+DOM) - 600/600 in 53 passes complete=True, jsonl artifact 600 lines, row
+order intact; plain page raised; type_value=50 capped with complete=False -
+9/9 PASS pre-removal.
+
+Out of scope (next): horizontal scrollers; semantic field mapping for
+captured text rows; an agent_case probe site exercising the mid-run call
+(pre-extract path already live-probed in EXTRACT-VSCROLL-2/3).

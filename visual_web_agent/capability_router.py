@@ -37,6 +37,11 @@ _MARKDOWN_RE = re.compile(
     r"\b(markdown|readable|reader[ -]?mode|clean text|main content|rag|llm[ -]?friendly)\b|正文提取|转\s*markdown|网页转\s*md|可读正文|喂给?大模型",
     re.I,
 )
+_VSCROLL_RE = re.compile(
+    r"\b(virtual\s*(?:scroll|list|table)|virtuali[sz]ed?|infinite\s*scroll|react-window|vue-virtual)\b"
+    r"|虚拟滚动|虚拟列表|虚拟表格|无限滚动|滚动加载|滚动采集|全量采集",
+    re.I,
+)
 _FORM_RE = re.compile(r"\b(form|fill|submit|register|input|textbox)\b|表单|填写|填入|提交|输入", re.I)
 _CHAT_RE = re.compile(r"\b(chatgpt|claude|kimi|deepseek|gemini|copilot|chat|ai answer)\b|文心|豆包|通义|元宝|智谱|助手|聊天|对话|AI", re.I)
 _FILE_RE = re.compile(r"\b(upload|download|file|excel|csv|xlsx)\b|上传|下载|文件|导入|导出", re.I)
@@ -494,6 +499,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     api = bool(_API_RE.search(text))
     full_content = bool(_FULL_CONTENT_RE.search(text))
     markdown_doc = bool(_MARKDOWN_RE.search(text))
+    vscroll = bool(_VSCROLL_RE.search(text))
     form = bool(_FORM_RE.search(text) or "form" in strategy_context.get("capabilities", []))
     chat = bool(_CHAT_RE.search(text) or "chat" in strategy_context.get("capabilities", []))
     file_io = bool(_FILE_RE.search(text))
@@ -509,6 +515,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "api_or_network": api or full_content,
         "full_content_preferred": full_content,
         "markdown_preferred": markdown_doc,
+        "vscroll_capture_preferred": vscroll,
         "form": form,
         "chat": chat,
         "file_io": file_io,
@@ -542,6 +549,8 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "item_pipeline", "post_processing", "Y28", ["GET /api/spider/{run_id}/items"], "Validate fields, required values, dedupe, empty rows, and pagination of extracted items.", "runtime_guards")
     if signals.get("markdown_preferred"):
         _add(plan, "page_to_markdown", "extraction", "Y-FITMD", ["ActionRegistry: page_to_markdown"], "Convert the current page into denoised LLM-friendly Markdown (readability denoise + density prune + numbered link references + optional BM25 focus query) for question-answering / RAG feeds instead of full-page screenshots.", "deterministic_router")
+    if signals.get("vscroll_capture_preferred"):
+        _add(plan, "vscroll_capture", "extraction", "VSCROLL-ACTION", ["ActionRegistry: vscroll_capture"], "Deterministically harvest every row of a virtualised / infinite-scroll list (main document first, then same-origin child iframes) in one mid-run call - alternate row snapshots with container nudges and dedup recycled rows - instead of one VLM round per viewport.", "deterministic_router")
     if signals.get("resume_preferred"):
         _add(plan, "resume_run", "resume", "RUN-RESUME1", ["ActionRegistry: resume_run"], "Read the prior run checkpoint / resume state and continue from where the previous run left off (dedup already-captured rows, skip already-completed sub-goals) instead of restarting from scratch.", "deterministic_router")
     if signals.get("crawl") or (signals.get("structured") and signals.get("artifact_required")):

@@ -6742,3 +6742,7 @@ try:
     from . import resume_run_action as _resume_run_action  # noqa: F401
 except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
     import resume_run_action as _resume_run_action  # type: ignore  # noqa: F401
+try:
+    from . import vscroll_capture_action as _vscroll_capture_action  # noqa: F401
+except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
+    import vscroll_capture_action as _vscroll_capture_action  # type: ignore  # noqa: F401

@@ -1152,6 +1152,30 @@ PAGE_TO_MARKDOWN_SKILL = """
 """.strip()
 
 
+VSCROLL_CAPTURE_SKILL = """
+## Skill: Virtual List Capture（虚拟列表一键全量采集）
+适用：列表/表格只渲染可视窗口、往下滚旧行被回收（react-window / vue-virtual-scroller /
+ag-grid / Element Plus 虚拟表格），或任务说"无限滚动 / 滚到底 / 全量采集"。
+
+何时用 vscroll_capture（而不是 scroll+extract 逐屏循环）：
+- 往下滚后行数不变、旧行从 DOM 消失 → 逐屏 extract 会重复+遗漏。
+- 想一回合拿到全量行：本动作在浏览器内交替"收行 + 推进容器滚动"直到触底，按行文本去重。
+- 主文档没有可滚容器时自动扫同源子 iframe。
+
+用法：
+1. action=vscroll_capture，target_id=0。
+2. type_value 选填：行数上限（如 type_value="500"；默认 2000，触底即停）。
+3. memory_key 选填：默认写到 vscroll_rows；结果含 {rows, row_count, complete, passes,
+   container, where, output_path}。
+
+行为约定：
+1. 确定性动作：不靠截图，按 DOM 行文本采集去重；rows 落盘 jsonl 产物并登记 manifest。
+2. complete=true 表示滚到底已全量；false 表示按上限截断（row_count 已达 type_value）。
+3. 未发现带滚动余量的虚拟列表会报错——此时回到普通 extract / scroll 路径，不要重试本动作。
+4. 采集后页面停在列表底部；后续动作不要依赖原滚动位置。
+""".strip()
+
+
 RESUME_RUN_SKILL = """
 ## Skill: Resume Run（断点续跑 / 接着上次继续）
 适用：用户说“续跑 / 断点续跑 / 接着上次 / 继续上次没抓完的 / resume / continue last run”，或本次为中断后的重启。
@@ -1175,6 +1199,7 @@ RESUME_RUN_SKILL = """
 SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
+    "vscroll_capture": VSCROLL_CAPTURE_SKILL,
     "resume_run": RESUME_RUN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,

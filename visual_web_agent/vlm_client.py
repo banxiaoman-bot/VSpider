@@ -170,6 +170,7 @@ class VSpiderAction(BaseModel):
         "chat_submit",    # 通用 AI 聊天发送按钮点击：当 SoM 漏标了图标式发送按钮（<div>+SVG）或 press_key Enter 无效时使用；底层用启发式 locator 直接点击
         "page_to_markdown", # 整页 HTML→去噪 LLM 友好 Markdown：type_value=可选聚焦 query，落 markdown_doc 产物 + 写回 memory
         "resume_run",     # 断点续跑：读取上次 run_checkpoint / resume 状态写回 memory，据此继续而非从头重来
+        "vscroll_capture", # 虚拟列表一键全量采集：交替收行+推进容器滚动并按行文本去重直到触底；type_value=可选行数上限，落 dataset_rows jsonl + 写回 memory
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(
         default=0,

@@ -500,6 +500,41 @@ def build_default_action_registry() -> ActionRegistry:
         changes_state=False,
     ))
     register(ActionTool(
+        name="vscroll_capture",
+        capability="extract",
+        description=(
+            "Deterministically harvest every row of a virtualised / "
+            "infinite-scroll list (react-window, vue-virtual-scroller, "
+            "ag-grid, Element Plus virtual tables) by alternating row "
+            "snapshots with container nudges, deduplicating recycled rows "
+            "by text. Sweeps the main document first, then same-origin "
+            "child iframes. type_value is an optional row cap. Writes a "
+            "dataset_rows jsonl artifact + manifest entry and stores rows "
+            "in memory. Replaces ~1 VLM round per viewport with a single "
+            "mid-run call."
+        ),
+        actions=("vscroll_capture",),
+        aliases=(
+            "virtual list",
+            "virtual scroll",
+            "virtualized list",
+            "infinite scroll",
+            "react-window",
+            "vue-virtual-scroller",
+            "ag-grid",
+            "虚拟列表",
+            "虚拟滚动",
+            "无限滚动",
+            "滚动加载",
+            "全量采集",
+            "滚动采集",
+        ),
+        tags=("extract", "list", "virtual-scroll", "deterministic"),
+        evidence=("row_count", "passes", "complete", "container", "output_path"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
         name="page_to_markdown",
         capability="extract",
         description=(
