@@ -2504,3 +2504,27 @@ ROW-1..3, Next only resolvable in the frame, frame-scoped wait saw page 2
 
 Out of scope (next): field-name case contract lock; cross-frame pagination
 counters in tableInfo (dt-info) remain main-document in DATA_SIGNATURE_JS.
+
+## Slice EXTRACT-FIELD-CASE-1: field-name case contract locked (done, no fix needed)
+
+Layer: data_plane (page_data_controller + extraction_engine contract).
+Investigates the functional-test observation "engine lowercases table
+headers (Order -> order); downstream consumers must be case-tolerant".
+
+Audit result: the schema-matching chain is ALREADY case-insensitive end to
+end - normalize_field_key lowercases and strips separators
+(page_data_controller.py:103), requested_field_coverage normalises both
+row keys and requested fields through _field_aliases with bidirectional
+substring matching (:156), and filter_undercomplete_rows inherits that
+(:189). The functional-test miss was the test script reading dict keys
+directly, bypassing the normalise layer - not a product defect.
+
+Deliverable: tests/test_field_key_case_contract.py (13 cases) locks the
+contract on both sides - normalize_field_key equivalences (case,
+separators, CJK passthrough), capitalised-goal vs lowercase-engine-key
+coverage in both directions, filter keep/drop stats, and the engine's
+lowercase-header production feeding coverage end to end. A future
+"optimisation" reintroducing case-sensitive matching now fails loudly.
+
+Out of scope: documenting {{column}} placeholder case rules for batch
+runner templates (input_contract layer, separate concern).
