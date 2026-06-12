@@ -210,14 +210,25 @@ class _StubEditorFrame:
 
 
 class _StubPage:
-    def __init__(self, handle=None, frames=()) -> None:
+    def __init__(self, handle=None, frames=(), main_frame=None) -> None:
         self._handle = handle
         self.frames = list(frames)
+        self.main_frame = main_frame
         self.query_calls: list[str] = []
 
     async def query_selector(self, selector):
         self.query_calls.append(selector)
         return self._handle
+
+
+class _StubHostFrame:
+    """The same-origin child frame that hosts the form (not the editor)."""
+
+    def __init__(self, url: str = "https://host.example/form_frame.html") -> None:
+        self.url = url
+
+    def is_detached(self) -> bool:
+        return False
 
 
 FIELDS = {"Title": "hello title", "Notes": "macro tiny text"}
@@ -403,6 +414,160 @@ class TestFrameLevelRescue:
         )
         assert out is original
         assert frame.evaluate_calls == []
+
+
+class TestNestedFrameRescue:
+    """FORM-RICHTEXT-5: editor iframes nested inside child frames. The sweep
+    path returns the host frame's result without rescuing, and the rerun must
+    happen on that host frame (bindings, sibling fields and submit live
+    there), while frame resolution stays on the page whose .frames flattens
+    every nesting level."""
+
+    def test_sweep_hits_route_through_the_rescue(self) -> None:
+        src = inspect.getsource(main_mod._auto_form_fill_bound_controls_with_frames)
+        assert src.count("_auto_form_rescue_unreachable_iframes") >= 2, (
+            "both the main-document path and the sweep-hit path must rescue"
+        )
+        assert "rerun_scope=frame" in src
+
+    def test_rescue_reruns_on_the_given_scope(self, monkeypatch) -> None:
+        editor = _StubEditorFrame(readback="macro tiny text")
+        page = _StubPage(handle=_StubElementHandle(editor))
+        host = _StubHostFrame()
+        rerun_scopes: list[object] = []
+
+        async def fake_macro(scope, **kwargs):
+            rerun_scopes.append(scope)
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                _unreachable_result(),
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+                rerun_scope=host,
+            )
+        )
+        assert rerun_scopes == [host]
+        assert out["ok"] is True
+
+    def test_rerun_defaults_to_the_page(self, monkeypatch) -> None:
+        editor = _StubEditorFrame(readback="macro tiny text")
+        page = _StubPage(handle=_StubElementHandle(editor))
+        rerun_scopes: list[object] = []
+
+        async def fake_macro(scope, **kwargs):
+            rerun_scopes.append(scope)
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                _unreachable_result(),
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert rerun_scopes == [page]
+
+    def test_rescue_inherits_frame_url_evidence(self, monkeypatch) -> None:
+        editor = _StubEditorFrame(readback="macro tiny text")
+        page = _StubPage(handle=_StubElementHandle(editor))
+        host = _StubHostFrame()
+
+        async def fake_macro(scope, **kwargs):
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        original = _unreachable_result()
+        original["frame_url"] = host.url
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                original,
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+                rerun_scope=host,
+            )
+        )
+        assert out["frame_url"] == host.url
+
+    def test_wrapper_rescues_sweep_hits_end_to_end(self, monkeypatch) -> None:
+        editor = _StubEditorFrame(readback="macro tiny text")
+        host = _StubHostFrame()
+        main_frame = object()
+        page = _StubPage(
+            handle=_StubElementHandle(editor),
+            frames=[main_frame, host],
+            main_frame=main_frame,
+        )
+        calls: list[tuple[object, list[str]]] = []
+
+        async def fake_macro(scope, *, preset_labels=None, **kwargs):
+            calls.append((scope, list(preset_labels or [])))
+            if scope is page:
+                return {
+                    "ok": False,
+                    "results": [
+                        {"label": "Title", "ok": False, "reason": "field_not_found"},
+                        {"label": "Notes", "ok": False, "reason": "field_not_found"},
+                    ],
+                }
+            if preset_labels:
+                return {"ok": True, "results": [], "verifications": []}
+            return _unreachable_result()
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        out = _run(
+            main_mod._auto_form_fill_bound_controls_with_frames(
+                page,
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out["ok"] is True
+        assert out["frame_level_writes"][0]["label"] == "Notes"
+        assert out["frame_url"] == host.url
+        assert calls == [(page, []), (host, []), (host, ["Notes"])]
+        assert editor.evaluate_calls, "the rescue must write through the editor frame"
+
+    def test_wrapper_keeps_ok_sweep_hits_untouched(self, monkeypatch) -> None:
+        """Same-origin nested editors already succeed inside the host frame -
+        the rescue must stay a no-op on that path."""
+        host = _StubHostFrame()
+        main_frame = object()
+        page = _StubPage(frames=[main_frame, host], main_frame=main_frame)
+        ok_hit = {"ok": True, "results": [{"label": "Notes", "ok": True}]}
+
+        async def fake_macro(scope, *, preset_labels=None, **kwargs):
+            if scope is page:
+                return {
+                    "ok": False,
+                    "results": [
+                        {"label": "Notes", "ok": False, "reason": "field_not_found"}
+                    ],
+                }
+            return ok_hit
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        out = _run(
+            main_mod._auto_form_fill_bound_controls_with_frames(
+                page,
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out is ok_hit
+        assert out["frame_url"] == host.url
+        assert page.query_calls == []
 
 
 if __name__ == "__main__":

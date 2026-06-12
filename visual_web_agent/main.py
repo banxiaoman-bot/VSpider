@@ -3731,6 +3731,7 @@ async def _auto_form_rescue_unreachable_iframes(
     scope_title: str,
     fields: dict[str, str],
     require_submit: bool,
+    rerun_scope=None,
 ) -> object:
     """Rescue cross-origin editor iframes through Playwright's frame tree.
 
@@ -3779,7 +3780,7 @@ async def _auto_form_rescue_unreachable_iframes(
             }
         )
     rerun = await _try_auto_form_fill_bound_controls(
-        page,
+        rerun_scope if rerun_scope is not None else page,
         scope_title=scope_title,
         fields=fields,
         require_submit=require_submit,
@@ -3787,6 +3788,8 @@ async def _auto_form_rescue_unreachable_iframes(
     )
     if isinstance(rerun, dict):
         rerun["frame_level_writes"] = writes
+        if isinstance(result, dict) and result.get("frame_url"):
+            rerun.setdefault("frame_url", result["frame_url"])
         logger.info(
             "[AUTO FORM] frame-level rescue wrote %d editor iframe field(s); rerun ok=%s",
             len(writes),
@@ -3847,7 +3850,14 @@ async def _auto_form_fill_bound_controls_with_frames(
         if not _auto_form_result_found_nothing(frame_result):
             if isinstance(frame_result, dict):
                 frame_result.setdefault("frame_url", getattr(frame, "url", "") or "")
-            return frame_result
+            return await _auto_form_rescue_unreachable_iframes(
+                page,
+                frame_result,
+                scope_title=scope_title,
+                fields=fields,
+                require_submit=require_submit,
+                rerun_scope=frame,
+            )
     return result
 
 async def _evaluate_rows_with_frame_fallback(

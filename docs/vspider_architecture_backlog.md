@@ -3016,6 +3016,45 @@ prefers a registered TinyMCE API (exactly one setContent after suffix
 strip), and fails honestly cross-origin - 16/16 PASS pre-removal.
 
 Out of scope (next): editor iframes nested inside child frames (the
-rescue resolves against the top-level page only); sandboxed iframes that
-block scripting entirely; Froala/Summernote registry APIs; rescue for the
-component-aware fallback path (macro-only today).
+rescue resolves against the top-level page only - closed by
+FORM-RICHTEXT-5); sandboxed iframes that block scripting entirely;
+Froala/Summernote registry APIs; rescue for the component-aware fallback
+path (macro-only today).
+
+## Slice FORM-RICHTEXT-5: nested-frame editors rescued via sweep path (done)
+
+Layer: intent_planning (main.py rescue pass + frames wrapper). Closes the
+FORM-RICHTEXT-4 out-of-scope item "editor iframes nested inside child
+frames": when the form lives in a same-origin child frame A and its
+editor iframe B is cross-origin, the sweep entered A and surfaced the
+honest iframe_unreachable evidence, but the sweep-hit path returned
+without rescuing - the whole form still fell back to the VLM even though
+B is reachable through Playwright's frame tree (audit probe 8/8
+confirmed: page.frames flattens nesting, the URL fallback of
+_resolve_editor_frame already finds B; the id lookup is main-document
+only by design).
+
+- _auto_form_rescue_unreachable_iframes gains rerun_scope (default page):
+  the macro rerun executes on the host frame A where the bindings, the
+  sibling fields and the submit button live; frame RESOLUTION stays on
+  the page (flat frame tree). The rerun inherits the frame_url evidence
+  from the swept result.
+- The sweep-hit branch of _auto_form_fill_bound_controls_with_frames now
+  routes through the rescue with rerun_scope=frame. ok results and
+  failures without iframe_unreachable items pass through the rescue
+  no-op unchanged, so same-origin nested editors keep their existing
+  single-pass behaviour.
+
+Tests: tests/test_auto_form_richtext.py 36 -> 42 (sweep wiring anchor,
+rerun-scope routing, page default, frame_url inheritance, end-to-end
+wrapper stub chain main-miss -> sweep-hit -> rescue -> preset rerun on
+the host frame, ok-sweep-hit no-op lock). Live probe (three-layer real
+pages, REAL source functions): nested cross-origin editor end-to-end ok
+with rescue evidence + preset rerun + Title/submit inside frame A;
+same-origin nested regression (no rescue); top-level cross-origin
+regression (RICHTEXT-4 path) - 10/10 PASS pre-removal.
+
+Out of scope (next): editors nested deeper than one URL-distinct level
+with duplicate URLs (first match wins); srcdoc editor iframes (no URL to
+match, id lookup cannot cross documents); sandboxed iframes; rescue for
+the component-aware fallback path.
