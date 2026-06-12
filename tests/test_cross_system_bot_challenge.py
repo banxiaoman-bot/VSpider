@@ -11,6 +11,9 @@ C3 被动等待   - handle_bot_challenge_step（async Chromium）在被动等待
                 靠 cf_clearance / URL 离开 interstitial 自行通过，无 HITL。
 C4 跨系统接力 - Alpha 抓 SKU → Beta 过盾 → 登录 → 下单写回 store；
                 cf_clearance / beta_session 只存在于 Beta origin，不泄漏给 Alpha。
+C5 HITL 失败路径 - 顽固盾（waf_autopass=False，interstitial 永不自动过）下：
+                HITL 没解决、HITL 人工解决、HITL 预算耗尽（回调不再触发）、
+                HITL 回调抛异常不崩溃。
 """
 
 from __future__ import annotations
@@ -97,6 +100,7 @@ def store(site):
     shared.beta_logins.clear()
     shared.waf_blocks = 0
     shared.waf_clearances = 0
+    shared.waf_autopass = True
     return shared
 
 
@@ -344,3 +348,139 @@ class TestC4CrossSystemRelay:
         assert "beta_session" in beta_cookies
         assert "cf_clearance" not in alpha_cookies
         assert "beta_session" not in alpha_cookies
+
+
+# ---------------------------------------------------------------------------
+# C5 HITL 失败路径：clearance 端点被掐断 → 盾永不自动过
+# ---------------------------------------------------------------------------
+
+
+def _run_stubborn_challenge(beta_url: str, *, state_factory, hitl_factory):
+    """Drive handle_bot_challenge_step against a stubborn challenge: the
+    interstitial is served without the auto-pass script (caller flips
+    ``store.waf_autopass = False`` first), so the guard must walk
+    passive-wait → HITL → recheck.
+
+    ``hitl_factory(ctx, page)`` builds the HITL callback; it may navigate to
+    the clearance endpoint to simulate a human actually solving the challenge.
+    Returns (result, state, hitl_calls).
+    """
+
+    from playwright.async_api import async_playwright
+
+    async def _scenario():
+        hitl_calls: list[str] = []
+        async with async_playwright() as pw:
+            try:
+                instance = await pw.chromium.launch(headless=True)
+            except Exception as exc:
+                pytest.skip(f"chromium not launchable: {exc}")
+            ctx = await instance.new_context()
+            page = await ctx.new_page()
+            await page.goto(f"{beta_url}/orders", wait_until="domcontentloaded")
+
+            inner = hitl_factory(ctx, page)
+
+            async def _hitl(reason: str) -> None:
+                hitl_calls.append(reason)
+                if inner is not None:
+                    await inner(reason)
+
+            state = state_factory()
+            result = await handle_bot_challenge_step(
+                _AsyncBrowserAdapter(page, ctx),
+                state,
+                hitl_callback=_hitl,
+                passive_wait_seconds=1.2,
+                poll_interval=0.3,
+            )
+            await instance.close()
+            return result, state, hitl_calls
+
+    return _run_async_in_thread(_scenario)
+
+
+class TestC5HitlFailurePaths:
+    def test_hitl_invoked_but_human_does_not_solve(self, site, store) -> None:
+        _, _, beta = site
+        store.waf_autopass = False
+        result, state, hitl_calls = _run_stubborn_challenge(
+            beta.base_url,
+            state_factory=BotChallengeState,
+            hitl_factory=lambda ctx, page: None,
+        )
+        assert result.detected is True
+        assert result.cleared is False
+        assert result.action == "hitl"
+        assert result.cleared_after_hitl is False
+        assert result.vendor == "cloudflare"
+        assert "需人工" in result.notice
+        assert len(hitl_calls) == 1 and "Cloudflare" in hitl_calls[0]
+        assert state.hitl_count == 1
+
+    def test_hitl_human_solves_challenge(self, site, store) -> None:
+        _, _, beta = site
+        store.waf_autopass = False
+
+        def _factory(ctx, page):
+            async def _solve(reason: str) -> None:
+                # The "human" walks the clearance endpoint by hand.
+                await page.goto(
+                    f"{beta.base_url}/cdn-cgi/challenge?next=/orders",
+                    wait_until="domcontentloaded",
+                )
+
+            return _solve
+
+        result, state, hitl_calls = _run_stubborn_challenge(
+            beta.base_url,
+            state_factory=BotChallengeState,
+            hitl_factory=_factory,
+        )
+        assert result.detected is True
+        assert result.cleared is True
+        assert result.action == "hitl"
+        assert result.cleared_after_hitl is True
+        assert len(hitl_calls) == 1
+        assert state.hitl_count == 1
+        assert store.waf_clearances >= 1
+
+    def test_hitl_budget_exhausted_skips_callback(self, site, store) -> None:
+        _, _, beta = site
+        store.waf_autopass = False
+        result, state, hitl_calls = _run_stubborn_challenge(
+            beta.base_url,
+            state_factory=lambda: BotChallengeState(
+                hitl_count=2, max_hitl_per_run=2
+            ),
+            hitl_factory=lambda ctx, page: None,
+        )
+        assert result.detected is True
+        assert result.cleared is False
+        assert result.action == "max_hitl"
+        assert "已达人工上限" in result.notice
+        assert hitl_calls == []
+        assert state.hitl_count == 2  # budget untouched
+
+    def test_hitl_callback_crash_does_not_break_guard(self, site, store) -> None:
+        _, _, beta = site
+        store.waf_autopass = False
+
+        def _factory(ctx, page):
+            async def _boom(reason: str) -> None:
+                raise RuntimeError("HITL UI channel down")
+
+            return _boom
+
+        result, state, hitl_calls = _run_stubborn_challenge(
+            beta.base_url,
+            state_factory=BotChallengeState,
+            hitl_factory=_factory,
+        )
+        # The guard swallows the callback failure, rechecks, and reports
+        # an uncleared HITL step instead of raising.
+        assert result.detected is True
+        assert result.cleared is False
+        assert result.action == "hitl"
+        assert len(hitl_calls) == 1
+        assert state.hitl_count == 1

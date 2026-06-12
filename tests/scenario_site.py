@@ -111,6 +111,9 @@ class ScenarioStore:
     beta_logins: list[str] = field(default_factory=list)
     waf_blocks: int = 0
     waf_clearances: int = 0
+    # When False the interstitial renders without the auto-pass script, so
+    # the challenge never clears by itself (stubborn-WAF / HITL scenarios).
+    waf_autopass: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -448,9 +451,16 @@ CLEARANCE_COOKIE = "cf_clearance=fixture-cleared"
 CHALLENGE_AUTOPASS_MS = 700
 
 
-def _beta_challenge_html(next_path: str) -> bytes:
+def _beta_challenge_html(next_path: str, autopass: bool = True) -> bytes:
     """Cloudflare-style interstitial the bot_challenge_guard probe must flag."""
 
+    autopass_js = f"""
+  <script>
+    setTimeout(function () {{
+      window.location.href = '/cdn-cgi/challenge?next=' +
+        encodeURIComponent('{next_path}');
+    }}, {CHALLENGE_AUTOPASS_MS});
+  </script>""" if autopass else ""
     html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>Just a moment...</title></head>
 <body data-ray="fixture-ray-0001">
@@ -458,13 +468,7 @@ def _beta_challenge_html(next_path: str) -> bytes:
   <p>This process is automatic. Please wait while we verify you are human.</p>
   <form id="challenge-form" action="/cdn-cgi/challenge" method="get">
     <input type="hidden" name="next" value="{next_path}">
-  </form>
-  <script>
-    setTimeout(function () {{
-      window.location.href = '/cdn-cgi/challenge?next=' +
-        encodeURIComponent('{next_path}');
-    }}, {CHALLENGE_AUTOPASS_MS});
-  </script>
+  </form>{autopass_js}
 </body></html>"""
     return html.encode("utf-8")
 
@@ -545,7 +549,10 @@ def make_beta_handler(store: ScenarioStore, challenge: bool = False):
                 return True
             if not self._cleared():
                 store.waf_blocks += 1
-                self._send(_beta_challenge_html(path), status=403)
+                self._send(
+                    _beta_challenge_html(path, autopass=store.waf_autopass),
+                    status=403,
+                )
                 return True
             return False
 
