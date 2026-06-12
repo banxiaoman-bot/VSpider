@@ -542,13 +542,14 @@ _CONTAINER_MIME = {
 def _resolve_intercept_container(output_contract: dict | None) -> str:
     """Map ``output_contract.v1`` onto an append-friendly dataset container.
 
-    No contract -> legacy xlsx. A contract with a dataset container wins
+    No contract -> jsonl (rows stay rows; never a blind xlsx default, per the
+    output-contract iron rule). A contract with a dataset container wins
     as-is; a contract whose container is non-dataset (or only carries an
     output_kind) resolves through the sanctioned kind->container policy and
     falls back to jsonl rather than silently masquerading as xlsx.
     """
     if not isinstance(output_contract, dict) or not output_contract:
-        return "xlsx"
+        return "jsonl"
     container = str(output_contract.get("container") or "").strip().lower()
     if not container:
         try:
@@ -561,9 +562,7 @@ def _resolve_intercept_container(output_contract: dict | None) -> str:
             container = ""
     if container in _INTERCEPT_DATASET_CONTAINERS:
         return container
-    if container:
-        return "jsonl"
-    return "xlsx"
+    return "jsonl"
 
 
 def _read_existing_frame(filepath: Path, container: str) -> pd.DataFrame:
@@ -596,7 +595,8 @@ def _save_dataframe_to_excel(
         (文件绝对路径, 总行数)
     """
     if container not in _INTERCEPT_DATASET_CONTAINERS:
-        container = "xlsx"
+        # never fall back to xlsx blindly — jsonl keeps rows as rows
+        container = "jsonl"
     df_new = _normalize_extracted_dataframe(df_new)
 
     # 添加提取时间戳
@@ -731,7 +731,7 @@ def save_to_excel(
 
 def save_intercepted_data(
     json_list: list[dict],
-    filename: str = "output.xlsx",
+    filename: str = "output",
     unique_key: str | list[str] = None,
     output_contract: dict | None = None,
 ) -> str:
@@ -742,11 +742,11 @@ def save_intercepted_data(
     - 接收 list[dict] 格式的纯 JSON 数据
     - 自动追加到已有文件
     - 支持按 unique_key 去重（防止翻页重复拦截）
-    - 容器由 ``output_contract.container`` 决定；无契约时保持历史 xlsx 行为
+    - 容器由 ``output_contract.container`` 决定；无契约时落 jsonl（不默认 xlsx）
 
     Args:
         json_list: 拦截到的字典列表（API 响应中的数据行）
-        filename: 输出文件名（默认 output.xlsx；后缀会按容器改写）
+        filename: 输出文件名（后缀会按容器改写）
         unique_key: 去重字段（如 "id"、"order_no" 等）
         output_contract: 本次 run 的 output_contract.v1 dict（可为 None）
 

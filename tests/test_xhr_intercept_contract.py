@@ -5,7 +5,7 @@ The XHR/Fetch intercept track used to hard-code xlsx
 output_contract iron rule ("data_manager must read output_contract.container,
 never blind-default to xlsx"). These tests lock in:
 
-* no contract            -> legacy xlsx behaviour (backwards compatible)
+* no contract            -> jsonl (rows stay rows; no blind xlsx default)
 * container=jsonl/csv    -> append + dedup in that container, suffix rewritten
 * non-dataset container  -> falls back to jsonl (rows stay rows, no fake xlsx)
 * kind-only contract     -> resolved through the kind->container policy
@@ -45,9 +45,9 @@ ROWS = [
 
 
 class TestContainerResolution:
-    def test_no_contract_keeps_legacy_xlsx(self, out_dir: Path) -> None:
+    def test_no_contract_defaults_to_jsonl(self, out_dir: Path) -> None:
         saved = data_manager.save_intercepted_data(ROWS, filename="xhr_run.xlsx")
-        assert saved.endswith(".xlsx")
+        assert saved.endswith(".jsonl")
         assert Path(saved).exists()
 
     def test_jsonl_contract_writes_jsonl_with_suffix_rewrite(self, out_dir: Path) -> None:
@@ -108,18 +108,24 @@ class TestAppendAndDedup:
         assert by_id == {1: "Alice", 2: "Bob-updated", 3: "Carol"}
 
     def test_xlsx_append_path_unchanged(self, out_dir: Path) -> None:
-        data_manager.save_intercepted_data(ROWS, filename="legacy.xlsx", unique_key="id")
+        contract = {"container": "xlsx"}
+        data_manager.save_intercepted_data(
+            ROWS, filename="legacy.xlsx", unique_key="id", output_contract=contract
+        )
         saved = data_manager.save_intercepted_data(
-            [{"id": 3, "name": "Carol"}], filename="legacy.xlsx", unique_key="id"
+            [{"id": 3, "name": "Carol"}],
+            filename="legacy.xlsx",
+            unique_key="id",
+            output_contract=contract,
         )
         df = pd.read_excel(saved, engine="openpyxl")
         assert len(df) == 3
 
 
 class TestResolveInterceptContainer:
-    def test_empty_contract_is_xlsx(self) -> None:
-        assert data_manager._resolve_intercept_container(None) == "xlsx"
-        assert data_manager._resolve_intercept_container({}) == "xlsx"
+    def test_empty_contract_is_jsonl(self) -> None:
+        assert data_manager._resolve_intercept_container(None) == "jsonl"
+        assert data_manager._resolve_intercept_container({}) == "jsonl"
 
     def test_dataset_containers_pass_through(self) -> None:
         for c in ("xlsx", "csv", "jsonl"):

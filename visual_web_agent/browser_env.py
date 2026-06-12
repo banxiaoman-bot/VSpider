@@ -247,7 +247,7 @@ class BrowserEnv:
         self._intercept_enabled: bool = False  # 默认关闭，由 configure_interceptor() 或 --xhr 参数开启
         self._intercept_count: int = 0
         self._intercept_unique_key: str | list[str] | None = None
-        self._intercept_filename: str = "output.xlsx"
+        self._intercept_filename: str = "output"
         # output_contract.v1 of the current run; decides the intercept
         # dataset container (xlsx/csv/jsonl) instead of a blind xlsx default.
         self._intercept_output_contract: dict | None = None
@@ -4200,7 +4200,7 @@ Object.defineProperty(navigator, 'languages', {
     def configure_interceptor(
         self,
         enabled: bool = True,
-        filename: str = "output.xlsx",
+        filename: str = "output",
         unique_key: str | list[str] = None,
         min_list_size: int = 5,
         url_pattern: str | None = None,
@@ -4219,7 +4219,7 @@ Object.defineProperty(navigator, 'languages', {
                          数据存入 self._intercepted_data，main.py 检测后直接保存跳过 VLM。
                          独立于 enabled，即使 enabled=False 也可单独启用精准截胡。
             output_contract: 本次 run 的 output_contract.v1 dict；决定拦截数据
-                         的落盘容器（xlsx/csv/jsonl），缺省时保持 xlsx 兼容行为。
+                         的落盘容器（xlsx/csv/jsonl），缺省时落 jsonl（不默认 xlsx）。
         """
         self._intercept_enabled = enabled
         self._intercept_filename = filename
@@ -4428,7 +4428,7 @@ Object.defineProperty(navigator, 'languages', {
             f"score={score} fp={fingerprint[:80]} from: {url[:120]}..."
         )
 
-        # 按 output_contract 容器保存（无契约时保持 xlsx 兼容行为）
+        # 按 output_contract 容器保存（无契约时落 jsonl，不默认 xlsx）
         try:
             save_intercepted_data(
                 json_list=new_rows,

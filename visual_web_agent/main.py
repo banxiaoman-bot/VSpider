@@ -9592,13 +9592,28 @@ async def run_agent(
             filename = str(getattr(browser, "_intercept_filename", "") or "")
             if not filename:
                 return None, ""
-            path = resolve_artifact_path(filename)
+            # The intercept saver rewrites the suffix per the run's
+            # output_contract container (jsonl/csv/xlsx), so probe all
+            # dataset suffixes instead of assuming xlsx.
+            base = resolve_artifact_path(filename)
+            candidates = [base]
+            for _suffix in (".jsonl", ".csv", ".xlsx"):
+                alt = base.with_suffix(_suffix)
+                if alt not in candidates:
+                    candidates.append(alt)
+            path = next((p for p in candidates if p.exists()), base)
             if not path.exists():
                 return None, str(path)
             try:
                 import pandas as _pd
 
-                df = _pd.read_excel(path)
+                suffix = path.suffix.lower()
+                if suffix == ".jsonl":
+                    df = _pd.read_json(path, orient="records", lines=True)
+                elif suffix == ".csv":
+                    df = _pd.read_csv(path)
+                else:
+                    df = _pd.read_excel(path)
                 return int(len(df.index)), str(path)
             except Exception as exc:
                 logger.debug("[XHR HARD KILL] saved-row count skipped: %s", exc)

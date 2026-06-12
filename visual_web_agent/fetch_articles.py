@@ -1,13 +1,13 @@
 """
 fetch_articles.py
 
-读取 VSpider 生成的 output_*.xlsx，
+读取 VSpider 生成的 output_*.{xlsx,csv,jsonl}，
 对每条热搜标题搜索百度新闻，提取第一条结果的摘要内容，
-保存为 articles_*.xlsx。
+保存为 articles_*.<同输入容器>（跟随 output_contract 容器，不硬编码 xlsx）。
 
 用法：
-    python fetch_articles.py                   # 自动读取最新的 output_*.xlsx
-    python fetch_articles.py output_xxx.xlsx   # 指定文件
+    python fetch_articles.py                   # 自动读取最新的 output_*.{xlsx,csv,jsonl}
+    python fetch_articles.py output_xxx.jsonl  # 指定文件
 """
 
 import sys
@@ -43,8 +43,32 @@ ANTI_BOT_HINTS = [
 ]
 
 
+DATASET_SUFFIXES = (".xlsx", ".csv", ".jsonl")
+
+
+def _read_dataset(path: Path) -> pd.DataFrame:
+    """按后缀读取数据集容器（xlsx/csv/jsonl）。"""
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    if suffix == ".jsonl":
+        return pd.read_json(path, orient="records", lines=True)
+    return pd.read_excel(path, engine="openpyxl")
+
+
+def _write_dataset(df: pd.DataFrame, path: Path) -> None:
+    """按后缀写入数据集容器，与输入容器保持一致。"""
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+    elif suffix == ".jsonl":
+        df.to_json(path, orient="records", lines=True, force_ascii=False)
+    else:
+        df.to_excel(path, index=False, engine="openpyxl")
+
+
 def _get_search_dirs() -> list[Path]:
-    """返回用于搜索 output_*.xlsx 的目录列表（去重后保持顺序）。"""
+    """返回用于搜索 output_* 数据集文件的目录列表（去重后保持顺序）。"""
     cwd = Path.cwd().resolve()
     script_dir = Path(__file__).parent.resolve()
     project_root = script_dir.parent
@@ -58,10 +82,11 @@ def _get_search_dirs() -> list[Path]:
 
 
 def find_output_candidates() -> list[Path]:
-    """查找所有候选 output_*.xlsx，按修改时间升序排序。"""
+    """查找所有候选 output_*.{xlsx,csv,jsonl}，按修改时间升序排序。"""
     files: list[Path] = []
     for search_dir in _get_search_dirs():
-        files.extend(search_dir.glob("output_*.xlsx"))
+        for suffix in DATASET_SUFFIXES:
+            files.extend(search_dir.glob(f"output_*{suffix}"))
 
     # 同一文件可能被多个目录引用到，先规范化去重，再按 mtime 排序
     dedup = {f.resolve(): f.resolve() for f in files}
@@ -249,7 +274,7 @@ def main():
         if not candidates:
             search_dirs = "\n".join(f"- {d}" for d in _get_search_dirs())
             print(
-                "未找到 output_*.xlsx，请先运行 VSpider。\n"
+                "未找到 output_*.{xlsx,csv,jsonl}，请先运行 VSpider。\n"
                 "搜索目录：\n"
                 f"{search_dirs}"
             )
@@ -263,14 +288,14 @@ def main():
         else:
             print("\n发现多个文件，请选择：")
             for i, f in enumerate(candidates):
-                row_count = len(pd.read_excel(f, engine="openpyxl"))
+                row_count = len(_read_dataset(f))
                 print(f"  [{i}] {f.name}  ({row_count} 行)")
             print(f"  [Enter] 默认选最新：{candidates[-1].name}")
             choice = input("\n输入序号：").strip()
             input_path = candidates[int(choice)] if choice.isdigit() and int(choice) < len(candidates) else candidates[-1]
 
     print(f"\n读取文件: {input_path}")
-    df = pd.read_excel(input_path, engine="openpyxl")
+    df = _read_dataset(input_path)
 
     if "title" not in df.columns:
         print(f"[ERROR] 文件中没有 'title' 列，现有列：{list(df.columns)}")
@@ -301,10 +326,10 @@ def main():
 
     df["content"] = snippets
 
-    # 输出文件与 output_*.xlsx 放在同一目录
+    # 输出文件与输入放同一目录，容器跟随输入（不硬编码 xlsx）
     ts_part = input_path.stem.replace("output_", "")
-    output_path = input_path.parent / f"articles_{ts_part}.xlsx"
-    df.to_excel(output_path, index=False, engine="openpyxl")
+    output_path = input_path.parent / f"articles_{ts_part}{input_path.suffix}"
+    _write_dataset(df, output_path)
     print(f"\n保存完成 → {output_path.resolve()}")
 
 
