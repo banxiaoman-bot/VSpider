@@ -3630,6 +3630,8 @@ async def replay_run_network_candidate(
     page: int = 1,
     page_size: int = 50,
     execute: bool = False,
+    paginate: bool = False,
+    max_pages: int = 20,
 ) -> dict:
     candidates = _network_intelligence.list_candidates(run_id, limit=200)
     candidate = _api_replay.choose_candidate(candidates, endpoint=endpoint)
@@ -3649,12 +3651,21 @@ async def replay_run_network_candidate(
             "plan": plan,
         }
     try:
-        result = _api_replay.replay_candidate(
-            run_id=run_id,
-            candidate=candidate,
-            page=max(1, int(page or 1)),
-            page_size=max(1, min(int(page_size or 50), 500)),
-        )
+        if paginate:
+            result = _api_replay.paginate_replay(
+                run_id=run_id,
+                candidate=candidate,
+                page_size=max(1, min(int(page_size or 50), 500)),
+                start_page=max(1, int(page or 1)),
+                max_pages=max(1, min(int(max_pages or 20), 100)),
+            )
+        else:
+            result = _api_replay.replay_candidate(
+                run_id=run_id,
+                candidate=candidate,
+                page=max(1, int(page or 1)),
+                page_size=max(1, min(int(page_size or 50), 500)),
+            )
     except Exception as exc:
         logger.warning("[API REPLAY] replay failed for %s: %s", run_id, exc)
         raise HTTPException(status_code=502, detail=f"api replay failed: {type(exc).__name__}") from exc

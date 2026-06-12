@@ -318,22 +318,42 @@ class DeterministicRouteExecutor:
         if not isinstance(headers, dict):
             headers = {}
         fetcher = payload.get("api_replay_fetcher") if callable(payload.get("api_replay_fetcher")) else None
+        target = _target_count(route) or 0
+        page_size = _positive_int(payload.get("page_size"), default=target or 50, max_value=500)
+        # S12: paginate when explicitly requested or when one page provably
+        # cannot satisfy the target row count.
+        paginate = bool(payload.get("paginate") or payload.get("auto_paginate")) or (
+            target > page_size
+        )
         try:
-            result = api_replay.replay_candidate(
-                run_id=str(payload.get("run_id") or "route_executor"),
-                candidate=candidate,
-                page=_positive_int(payload.get("page"), default=1),
-                page_size=_positive_int(payload.get("page_size"), default=_target_count(route) or 50, max_value=500),
-                timeout_s=float(payload.get("api_timeout_s") or payload.get("timeout_s") or 15.0),
-                headers=dict(headers),
-                fetcher=fetcher,
-            )
+            if paginate:
+                result = api_replay.paginate_replay(
+                    run_id=str(payload.get("run_id") or "route_executor"),
+                    candidate=candidate,
+                    page_size=page_size,
+                    start_page=_positive_int(payload.get("page"), default=1),
+                    max_pages=_positive_int(payload.get("max_pages"), default=20, max_value=100),
+                    target_rows=target or None,
+                    timeout_s=float(payload.get("api_timeout_s") or payload.get("timeout_s") or 15.0),
+                    headers=dict(headers),
+                    fetcher=fetcher,
+                )
+            else:
+                result = api_replay.replay_candidate(
+                    run_id=str(payload.get("run_id") or "route_executor"),
+                    candidate=candidate,
+                    page=_positive_int(payload.get("page"), default=1),
+                    page_size=page_size,
+                    timeout_s=float(payload.get("api_timeout_s") or payload.get("timeout_s") or 15.0),
+                    headers=dict(headers),
+                    fetcher=fetcher,
+                )
         except Exception as exc:
             attempts.append(_attempt_error("api_replay", exc))
             return None
         artifact = result.get("artifact") if isinstance(result.get("artifact"), dict) else None
         verification = verify_route_success(route, capability="api_replay", result=result, artifact=artifact, payload=payload)
-        attempts.append({
+        attempt: dict[str, Any] = {
             "capability": "api_replay",
             "status": "attempted",
             "row_count": verification.get("observed_count"),
@@ -343,7 +363,12 @@ class DeterministicRouteExecutor:
             "verification": verification,
             "verification_summary": verification.get("verification_summary"),
             "reason": "" if verification.get("passed") else verification.get("summary"),
-        })
+        }
+        if paginate:
+            attempt["page_count"] = result.get("page_count")
+            attempt["stop_reason"] = result.get("stop_reason")
+            attempt["truncated"] = result.get("truncated")
+        attempts.append(attempt)
         if not verification.get("passed"):
             return None
         return {"capability": "api_replay", "result": result, "artifact": artifact, "verification": verification}
@@ -364,6 +389,9 @@ class DeterministicRouteExecutor:
         spider_payload.setdefault("export", bool(payload.get("export")) or _save_artifact_required(route, payload))
         if payload.get("item_pipeline") is not None:
             spider_payload.setdefault("item_pipeline", dict(payload.get("item_pipeline") or {}))
+        for key in ("incremental", "incremental_scope", "incremental_key_fields", "incremental_dir"):
+            if payload.get(key) is not None:
+                spider_payload.setdefault(key, payload.get(key))
         try:
             result = self.spider_lite.run(spider_payload)
         except Exception as exc:
