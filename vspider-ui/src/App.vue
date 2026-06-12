@@ -105,6 +105,9 @@ const activeBottomTab = ref('terminal')
 const capabilitySubTab = ref('overview')
 // B: Timeline 筛选 chips 默认收起，点「筛选」按钮展开
 const timelineFiltersExpanded = ref(false)
+// C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
+const settingsDrawerOpen = ref(false)
+const settingsActivePanels = ref(['models', 'identity', 'constraints', 'file'])
 const artifactList = ref([])
 const hasNewArtifacts = ref(false)
 const runHistoryRefreshToken = ref(0)
@@ -3558,6 +3561,14 @@ const handleTimelineMoreAction = (command) => {
   }
   handlers[command]?.()
 }
+// C2: 抽屉关闭时在左栏回显当前配置概要
+const settingsSummaryText = computed(() => {
+  const identity = selectedAuthProfiles.value.length
+    ? selectedAuthProfiles.value.join('、')
+    : '默认身份'
+  const attach = selectedFile.value ? selectedFile.value.name : '无附件'
+  return `${selectedModel.value} · ${selectedSemanticModel.value} · ${identity} · ${attach}`
+})
 </script>
 
 <template>
@@ -3615,7 +3626,45 @@ const handleTimelineMoreAction = (command) => {
           </div>
         </div>
 
-        <el-collapse class="advanced-collapse">
+        <button type="button" class="settings-summary" @click="settingsDrawerOpen = true">
+          <span class="settings-summary__title">
+            <el-icon><Setting /></el-icon>
+            高级配置
+            <span class="settings-summary__open">打开 ›</span>
+          </span>
+          <span class="settings-summary__echo">{{ settingsSummaryText }}</span>
+        </button>
+      </div>
+
+      <footer class="action-footer">
+        <el-button
+          type="primary"
+          class="run-button"
+          :icon="VideoPlay"
+          :loading="isRunning"
+          @click="submitTask"
+        >
+          开始执行
+        </el-button>
+        <el-button
+          class="stop-button"
+          :icon="Close"
+          :disabled="!isRunning"
+          @click="forceStop"
+        >
+          强制终止
+        </el-button>
+      </footer>
+
+      <!-- C2: 高级配置抽屉 — 双脑调度/身份/运行约束/附件统一入口 -->
+      <el-drawer
+        v-model="settingsDrawerOpen"
+        title="高级配置"
+        direction="rtl"
+        size="440px"
+        class="settings-drawer"
+      >
+          <el-collapse v-model="settingsActivePanels" class="advanced-collapse">
           <el-collapse-item name="models">
             <template #title>
               <span>双脑调度中心</span>
@@ -3880,28 +3929,8 @@ const handleTimelineMoreAction = (command) => {
               </p>
             </template>
           </el-collapse-item>
-        </el-collapse>
-      </div>
-
-      <footer class="action-footer">
-        <el-button
-          type="primary"
-          class="run-button"
-          :icon="VideoPlay"
-          :loading="isRunning"
-          @click="submitTask"
-        >
-          开始执行
-        </el-button>
-        <el-button
-          class="stop-button"
-          :icon="Close"
-          :disabled="!isRunning"
-          @click="forceStop"
-        >
-          强制终止
-        </el-button>
-      </footer>
+          </el-collapse>
+      </el-drawer>
     </section>
 
     <section class="monitor-panel">
@@ -8086,6 +8115,49 @@ const handleTimelineMoreAction = (command) => {
 .collapse-title-echo {
   margin-left: 8px;
   max-width: 55%;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--vsp-text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* C2: 高级配置入口（抽屉触发器） */
+.settings-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  margin-top: 2px;
+  padding: 10px 12px;
+  text-align: left;
+  background: transparent;
+  border: 1px dashed var(--vsp-border);
+  border-radius: 8px;
+  color: var(--vsp-text-label);
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+
+.settings-summary:hover {
+  border-color: var(--vsp-accent);
+}
+
+.settings-summary__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-summary__open {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--vsp-text-2);
+}
+
+.settings-summary__echo {
   overflow: hidden;
   font-size: 12px;
   color: var(--vsp-text-2);
