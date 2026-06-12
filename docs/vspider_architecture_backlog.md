@@ -2961,3 +2961,61 @@ Out of scope (next): the scope loop already sweeps child frames, so
 iframe x shadow pagers compose but were not live-probed together; closed
 shadow roots; pagers rendered in a DIFFERENT shadow root than their table
 (cross-root aria-controls linking).
+
+## Slice FORM-RICHTEXT-4: cross-origin editor iframes rescued via frame tree (done)
+
+Layer: intent_planning (main.py macro JS + rescue pass) + operations_plane
+(actions.py form_set). Closes the FORM-RICHTEXT-3 out-of-scope item
+"cross-origin editor iframes" after a probe-backed audit found three
+non-blocking issues: (a) the macro's setNativeValue dropped
+setRichTextValue's return value, so a cross-origin write failure still
+pushed ok:true into results while verify failed on the same field
+(misleading evidence); (b) the only escape was the full VLM fallback even
+when every other field had written+verified fine; (c) the single-field
+form_set path had none of the FORM-RICHTEXT-3 iframe support, so even
+same-origin classic TinyMCE could not bind there.
+
+- Evidence (main.py macro JS): setNativeValue returns the write method
+  (iframe branch propagates, contenteditable returns it, native path
+  returns 'native_value'); the write loop checks for 'iframe_unreachable'
+  and pushes ok:false with reason + frameId/frameSrc coordinates instead
+  of a fake ok:true.
+- Rescue (main.py Python): _auto_form_rescue_unreachable_iframes runs
+  inside _auto_form_fill_bound_controls_with_frames on failures carrying
+  iframe_unreachable items - resolves the Playwright frame (by iframe id,
+  then by URL), writes structured paragraphs via frame.evaluate (a
+  cross-origin body is scriptable through the frame tree even when
+  main-document JS is not), verifies the readback, then reruns the macro
+  with preset_labels so rescued fields bind (exclusivity) but skip the
+  in-macro write+verify; preset hits satisfy the verification gate and
+  submit semantics stay in the macro. Any miss returns the original
+  result (VLM fallback unchanged as backstop). Evidence lands in
+  frame_level_writes on the rerun result.
+- form_set (actions.py): mirrors the macro - editor iframes join
+  controlSelector, label_for falls back to the <forId>_ifr stand-in
+  (label_for_ifr), the TinyMCE registry lookup strips _ifr and matches
+  getContainer().contains(), API-less same-origin iframes get structured
+  paragraphs written into the body ahead of the execCommand path,
+  setNativeValue routes iframe hosts to the rich-text writer, and
+  readValue reads contentDocument.body.innerText back - so same-origin
+  classic editors work end-to-end and cross-origin ones produce an honest
+  value_mismatch with observed='' instead of fake evidence.
+
+Tests: tests/test_auto_form_richtext.py 17 -> 36 (evidence anchors, preset
+binding order + verification gate, rescue stub matrix: pass-throughs,
+preset rerun wiring, id->URL frame resolution fallback, evaluate failure,
+readback mismatch, missing frame, label-drift guard);
+tests/test_form_richtext_write.py 10 -> 17 (binding selectors, _ifr
+stand-in, registry strip, container match, iframe-before-exec ordering,
+setNativeValue routing, body readback). Live probe (two local origins,
+REAL source functions): macro first pass surfaces iframe_unreachable with
+frame coordinates; wrapper rescue writes through the cross-origin frame,
+reruns with preset_frame_write, Title + submit handled by the rerun, body
+text verified; form_set binds same-origin classic via label_for_ifr,
+prefers a registered TinyMCE API (exactly one setContent after suffix
+strip), and fails honestly cross-origin - 16/16 PASS pre-removal.
+
+Out of scope (next): editor iframes nested inside child frames (the
+rescue resolves against the top-level page only); sandboxed iframes that
+block scripting entirely; Froala/Summernote registry APIs; rescue for the
+component-aware fallback path (macro-only today).

@@ -831,6 +831,10 @@ async def _form_set_bound_control_v2(
                 '[role=combobox]',
                 '[role=checkbox]',
                 '[role=radio]',
+                // TinyMCE classic renders into an editor iframe and keeps
+                // its textarea hidden: bind the visible iframe host.
+                'iframe[id$="_ifr"]',
+                'iframe.tox-edit-area__iframe',
                 '.el-select',
                 '.ant-select',
                 '.n-select',
@@ -844,6 +848,12 @@ async def _form_set_bound_control_v2(
                 if (!el) return '';
                 const tag = String(el.tagName || '').toLowerCase();
                 const role = String(el.getAttribute?.('role') || '').toLowerCase();
+                if (tag === 'iframe') {
+                    // editor iframe readback: same-origin body text only.
+                    try {
+                        return String(el.contentDocument?.body?.innerText || '').trim();
+                    } catch (_) { return ''; }
+                }
                 if (tag === 'select') {
                     const opt = el.selectedOptions?.[0];
                     return [el.value, opt?.textContent].filter(Boolean).join(' ').trim();
@@ -900,10 +910,15 @@ async def _form_set_bound_control_v2(
                 const tiny = window.tinymce;
                 if (tiny && (typeof tiny.get === 'function' || Array.isArray(tiny.editors))) {
                     const editors = Array.from(tiny.editors || []);
-                    const byId = el.id && typeof tiny.get === 'function' ? tiny.get(el.id) : null;
+                    // classic mode binds the <id>_ifr editor iframe; the
+                    // registry key is the original textarea id.
+                    const ids = [el.id, el.id?.replace(/_ifr$/, '')].filter(Boolean);
+                    const byId = typeof tiny.get === 'function'
+                        ? ids.map(id => tiny.get(id)).find(Boolean) : null;
                     const ed = byId || editors.find(e => {
                         const body = e?.getBody?.();
-                        return body && (body === el || body.contains?.(el) || el.contains?.(body));
+                        if (body && (body === el || body.contains?.(el) || el.contains?.(body))) return true;
+                        return Boolean(e?.getContainer?.()?.contains?.(el));
                     });
                     if (ed && typeof ed.setContent === 'function') {
                         ed.setContent(toParagraphHtml(text));
@@ -915,6 +930,21 @@ async def _form_set_bound_control_v2(
                 if (ckHost?.ckeditorInstance && typeof ckHost.ckeditorInstance.setData === 'function') {
                     ckHost.ckeditorInstance.setData(toParagraphHtml(text));
                     return 'ckeditor5_api';
+                }
+                if (String(el.tagName || '').toLowerCase() === 'iframe') {
+                    // same-origin editor iframe without a reachable API: the
+                    // main-document execCommand path cannot reach its body,
+                    // so write structured paragraphs directly.
+                    try {
+                        const body = el.contentDocument?.body;
+                        if (body) {
+                            body.innerHTML = toParagraphHtml(text);
+                            body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));
+                            body.dispatchEvent(new Event('change', {bubbles: true}));
+                            return 'iframe_structured_paragraphs';
+                        }
+                    } catch (_) {}
+                    return 'iframe_unreachable';
                 }
                 // Generic contenteditable (ProseMirror/Slate/Lexical listen to
                 // beforeinput): select-all + insertText drives the real input chain.
@@ -937,6 +967,11 @@ async def _form_set_bound_control_v2(
             };
             const setNativeValue = (el, val) => {
                 const tag = String(el.tagName || '').toLowerCase();
+                if (tag === 'iframe') {
+                    // TinyMCE classic: the bound control is the editor
+                    // iframe host itself.
+                    return setRichTextValue(el, val);
+                }
                 if (el.isContentEditable) {
                     setRichTextValue(el, val);
                     return;
@@ -1149,6 +1184,12 @@ async def _form_set_bound_control_v2(
                             document.getElementById(forId) ||
                             deepQueryAll('#' + escaped)[0] || null;
                         if (target && isVisible(target)) return {el: target, score: 260, reason: 'label_for'};
+                        // for= targets the hidden textarea in TinyMCE classic;
+                        // its visible stand-in is the <forId>_ifr editor iframe.
+                        const standIn = (hit.el.getRootNode?.() || document).getElementById?.(forId + '_ifr') ||
+                            document.getElementById(forId + '_ifr') ||
+                            deepQueryAll('#' + escaped + '_ifr')[0] || null;
+                        if (standIn && isVisible(standIn)) return {el: standIn, score: 260, reason: 'label_for_ifr'};
                     }
                     const container = nearestContainer(hit.el);
                     const localControls = Array.from(container.querySelectorAll?.(controlSelector) || [])

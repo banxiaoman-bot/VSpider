@@ -81,5 +81,53 @@ class TestRichTextWritePaths:
         assert "replace(/\\\\n/g, '<br>')" in SRC
 
 
+class TestEditorIframeBinding:
+    """FORM-RICHTEXT-4 (3): the single-field form_set path mirrors the macro's
+    TinyMCE classic iframe support - FORM-RICHTEXT-3 only fixed the macro
+    layer, so same-origin classic editors could not even bind here, and
+    cross-origin ones produced misleading evidence."""
+
+    def test_editor_iframe_is_a_bindable_control(self) -> None:
+        assert 'iframe[id$="_ifr"]' in SRC
+        assert "iframe.tox-edit-area__iframe" in SRC
+
+    def test_label_for_falls_back_to_the_ifr_stand_in(self) -> None:
+        """for= targets the hidden textarea in TinyMCE classic; its visible
+        stand-in is the <forId>_ifr editor iframe."""
+        assert "'label_for_ifr'" in SRC
+        assert "forId + '_ifr'" in SRC
+
+    def test_registry_lookup_strips_the_ifr_suffix(self) -> None:
+        assert "el.id?.replace(/_ifr$/, '')" in SRC
+        assert "ids.map(id => tiny.get(id)).find(Boolean)" in SRC
+
+    def test_container_match_reaches_iframe_hosts(self) -> None:
+        """getBody() lives in the iframe document - cross-document contains()
+        is always false, so the container (main document) must match too."""
+        assert "e?.getContainer?.()?.contains?.(el)" in SRC
+
+    def test_apiless_iframe_writes_into_body_before_exec_path(self) -> None:
+        assert "'iframe_structured_paragraphs'" in SRC
+        assert "'iframe_unreachable'" in SRC
+        assert SRC.index("'iframe_structured_paragraphs'") < SRC.index(
+            "'exec_insert_text'"
+        ), (
+            "the iframe branch must intercept before the main-document "
+            "execCommand path, which cannot reach the iframe body"
+        )
+
+    def test_set_native_value_routes_iframes_to_rich_text(self) -> None:
+        assert re.search(
+            r"if \(tag === 'iframe'\) \{[^}]*?return setRichTextValue\(el, val\);",
+            SRC,
+            re.DOTALL,
+        )
+
+    def test_read_value_reads_the_iframe_body_back(self) -> None:
+        """Same-origin readback proves the write; cross-origin reads back ''
+        so the result is an honest value_mismatch instead of a fake ok."""
+        assert "el.contentDocument?.body?.innerText" in SRC
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

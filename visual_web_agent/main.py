@@ -3268,6 +3268,7 @@ async def _try_auto_form_fill_bound_controls(
     scope_title: str,
     fields: dict[str, str],
     require_submit: bool,
+    preset_labels: list[str] | None = None,
 ) -> dict:
     """Fill generic forms by binding each visible label to one concrete control.
 
@@ -3275,7 +3276,7 @@ async def _try_auto_form_fill_bound_controls(
     complete only when the bound control itself reads back the expected value.
     """
     return await page.evaluate(
-        """async ({scopeTitle, fields, requireSubmit}) => {
+        """async ({scopeTitle, fields, requireSubmit, presetLabels}) => {
             const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim();
             const cleanLabel = (s) => clean(s).replace(/^[*\\s:：-]+|[*\\s:：-]+$/g, '');
             const norm = (s) => cleanLabel(s).toLowerCase();
@@ -3504,13 +3505,12 @@ async def _try_auto_form_fill_bound_controls(
             };
             const setNativeValue = (el, value) => {
                 if (String(el.tagName || '').toLowerCase() === 'iframe') {
-                    setRichTextValue(el, String(value || ''));
-                    return;
+                    return setRichTextValue(el, String(value || ''));
                 }
                 if (el.isContentEditable) {
-                    setRichTextValue(el, String(value || ''));
+                    const method = setRichTextValue(el, String(value || ''));
                     el.dispatchEvent(new Event('blur', {bubbles: true}));
-                    return;
+                    return method;
                 } else {
                     const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
                     const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -3519,6 +3519,7 @@ async def _try_auto_form_fill_bound_controls(
                 el.dispatchEvent(new Event('input', {bubbles: true}));
                 el.dispatchEvent(new Event('change', {bubbles: true}));
                 el.dispatchEvent(new Event('blur', {bubbles: true}));
+                return 'native_value';
             };
             const clickEl = (el) => {
                 el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'});
@@ -3559,6 +3560,8 @@ async def _try_auto_form_fill_bound_controls(
                 return {label, ok: expected && norm(observed) === expected, expected: value, observed, method: binding.method};
             };
 
+            const presetSet = new Set((presetLabels || []).map(s => norm(s)));
+            let presetHits = 0;
             const used = new Set();
             const results = [];
             const bindings = [];
@@ -3569,6 +3572,14 @@ async def _try_auto_form_fill_bound_controls(
                     continue;
                 }
                 used.add(binding.control);
+                if (presetSet.has(norm(label))) {
+                    // already written at frame level (cross-origin editor
+                    // iframe); the in-macro write+verify cannot reach that
+                    // body, and the Python side verified the frame readback.
+                    presetHits += 1;
+                    results.push({label, ok: true, mode: 'preset_frame_write', method: binding.method});
+                    continue;
+                }
                 bindings.push([label, value, binding]);
                 const control = binding.control;
                 const tag = control.tagName?.toLowerCase();
@@ -3600,7 +3611,17 @@ async def _try_auto_form_fill_bound_controls(
                     continue;
                 }
                 if (tag === 'input' || tag === 'textarea' || tag === 'iframe' || control.isContentEditable) {
-                    setNativeValue(control, expected);
+                    const writeMethod = setNativeValue(control, expected);
+                    if (writeMethod === 'iframe_unreachable') {
+                        // cross-origin editor iframe: the main-document write
+                        // cannot reach its body - surface the failure with the
+                        // frame coordinates the Python rescue pass needs.
+                        results.push({
+                            label, ok: false, reason: 'iframe_unreachable', method: binding.method,
+                            frameId: control.id || '', frameSrc: control.src || ''
+                        });
+                        continue;
+                    }
                     results.push({label, ok: true, mode: 'input', method: binding.method});
                     continue;
                 }
@@ -3609,7 +3630,7 @@ async def _try_auto_form_fill_bound_controls(
 
             await sleep(200);
             const verifications = bindings.map(([label, value, binding]) => verify(binding, label, value));
-            const verificationOk = verifications.length > 0 && verifications.every(r => r.ok);
+            const verificationOk = (verifications.length > 0 || presetHits > 0) && verifications.every(r => r.ok);
             if (!verificationOk || !results.every(r => r.ok)) {
                 return {ok: false, results, verifications, scopeText: textOf(scope).slice(0, 160)};
             }
@@ -3635,6 +3656,7 @@ async def _try_auto_form_fill_bound_controls(
             "scopeTitle": scope_title,
             "fields": fields,
             "requireSubmit": require_submit,
+            "presetLabels": list(preset_labels or []),
         },
     )
 
@@ -3659,6 +3681,121 @@ def _auto_form_result_found_nothing(result: object) -> bool:
     )
 
 
+_FRAME_RICH_TEXT_WRITE_JS = """(text) => {
+    const escHtml = (s) => String(s).replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const html = String(text || '')
+        .split(/\\n{2,}/)
+        .map(part => `<p>${escHtml(part).replace(/\\n/g, '<br>')}</p>`)
+        .join('') || '<p></p>';
+    const body = document.body;
+    if (!body) return null;
+    body.innerHTML = html;
+    body.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: String(text || '')}));
+    body.dispatchEvent(new Event('change', {bubbles: true}));
+    return String(body.innerText || '');
+}"""
+
+
+def _norm_form_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+
+async def _resolve_editor_frame(page, *, frame_id: object, frame_src: object):
+    """Locate the Playwright frame of an editor iframe by id, then by URL."""
+    fid = str(frame_id or "").strip()
+    if fid and '"' not in fid:
+        try:
+            handle = await page.query_selector(f'iframe[id="{fid}"]')
+            if handle is not None:
+                frame = await handle.content_frame()
+                if frame is not None:
+                    return frame
+        except Exception:
+            pass
+    src = str(frame_src or "").strip()
+    if src:
+        for frame in list(getattr(page, "frames", None) or []):
+            try:
+                if (getattr(frame, "url", "") or "") == src:
+                    return frame
+            except Exception:
+                continue
+    return None
+
+
+async def _auto_form_rescue_unreachable_iframes(
+    page,
+    result: object,
+    *,
+    scope_title: str,
+    fields: dict[str, str],
+    require_submit: bool,
+) -> object:
+    """Rescue cross-origin editor iframes through Playwright's frame tree.
+
+    Main-document JS cannot reach a cross-origin editor body, but the frame
+    itself can be scripted. Write the structured paragraphs there, verify the
+    readback, then rerun the macro with the rescued labels preset so the
+    remaining fields and the submit step keep their existing semantics. Any
+    miss returns the original result (the VLM path stays the backstop).
+    """
+    if not isinstance(result, dict) or result.get("ok"):
+        return result
+    unreachable = [
+        item
+        for item in (result.get("results") or [])
+        if isinstance(item, dict) and item.get("reason") == "iframe_unreachable"
+    ]
+    if not unreachable:
+        return result
+    writes: list[dict[str, object]] = []
+    for item in unreachable:
+        label = str(item.get("label") or "")
+        expected = fields.get(label)
+        if expected is None:
+            return result
+        frame = await _resolve_editor_frame(
+            page, frame_id=item.get("frameId"), frame_src=item.get("frameSrc")
+        )
+        if frame is None:
+            return result
+        try:
+            readback = await frame.evaluate(_FRAME_RICH_TEXT_WRITE_JS, str(expected))
+        except Exception as frame_err:
+            logger.debug(
+                "[AUTO FORM] frame-level rescue write failed (%s): %s",
+                getattr(frame, "url", "?"),
+                frame_err,
+            )
+            return result
+        if _norm_form_text(readback) != _norm_form_text(expected):
+            return result
+        writes.append(
+            {
+                "label": label,
+                "frame_url": getattr(frame, "url", "") or "",
+                "readback_ok": True,
+            }
+        )
+    rerun = await _try_auto_form_fill_bound_controls(
+        page,
+        scope_title=scope_title,
+        fields=fields,
+        require_submit=require_submit,
+        preset_labels=[str(w["label"]) for w in writes],
+    )
+    if isinstance(rerun, dict):
+        rerun["frame_level_writes"] = writes
+        logger.info(
+            "[AUTO FORM] frame-level rescue wrote %d editor iframe field(s); rerun ok=%s",
+            len(writes),
+            rerun.get("ok"),
+        )
+        return rerun
+    return result
+
+
 async def _auto_form_fill_bound_controls_with_frames(
     page,
     *,
@@ -3679,7 +3816,13 @@ async def _auto_form_fill_bound_controls_with_frames(
         require_submit=require_submit,
     )
     if not _auto_form_result_found_nothing(result):
-        return result
+        return await _auto_form_rescue_unreachable_iframes(
+            page,
+            result,
+            scope_title=scope_title,
+            fields=fields,
+            require_submit=require_submit,
+        )
     main_frame = getattr(page, "main_frame", None)
     for frame in list(getattr(page, "frames", None) or []):
         if frame is main_frame:
