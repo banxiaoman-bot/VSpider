@@ -66,6 +66,7 @@ try:
     from .action_registry import build_default_action_registry
     from .capability_router import route_task as route_capabilities_for_task
     from .browser_state import BrowserStateSnapshot
+    from .phases.perception import PerceptionPhase
     from .event_stream import EventStream
     from .agent_strategy import (
         extraction_targets_reached as _agent_strategy_extraction_targets_reached,
@@ -136,6 +137,7 @@ except ImportError:
     from action_registry import build_default_action_registry
     from capability_router import route_task as route_capabilities_for_task
     from browser_state import BrowserStateSnapshot
+    from phases.perception import PerceptionPhase
     from event_stream import EventStream
     from agent_strategy import (
         extraction_targets_reached as _agent_strategy_extraction_targets_reached,
@@ -12428,170 +12430,28 @@ async def run_agent(
                     )
                     break
                 # ════════════════════════════════════════════════════════════
-                # 图文双模态融合 (Hybrid Modality)
-                # 每一轮都同时采集 SoM 截图 + AX Tree 语义树（含 DOM ID 映射段），融合发送给 VLM。
-                # 彻底废除"智能路由/纯文本降级"的单模态切换 —— 视觉与文本互为冗余，
-                # VLM 得以用红框数字定位 + AX 语义 / DOM ID 映射校验的方式做综合决策。
+                # 图文双模态融合 (Hybrid Modality) —— 感知段已平移至 phases/perception.py（P1）
+                # 每一轮采集 SoM 截图 + AX Tree 语义树，组装 BrowserStateSnapshot 并写 observe 事件。
                 # ════════════════════════════════════════════════════════════
-                _tabs_state = await browser.get_tabs_state()
-                _tabs_hint = f"\n\n【当前标签页列表】{_tabs_state}" if _tabs_state else ""
-                _page_state = await browser.get_active_page_summary()
-                _page_hint = f"\n\n【当前页面摘要】{_page_state}" if _page_state else ""
-
                 # 旧的 _force_vision_next_step 信号在双模态下已失效，这里消耗掉以保持语义干净
                 _force_vision_next_step = False
-
-                print("\033[1;36m🧠 [HYBRID]\033[0m 同步采集 SoM 截图 + 无障碍语义树 (AX Tree)，融合决策")
-                logger.info("[HYBRID] Collecting SoM screenshot + accessibility tree for fused VLM decision")
-
-                await _recover_active_page("before hybrid screenshot")
-                try:
-                    screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
-                except RuntimeError as screenshot_err:
-                    if "No active page" not in str(screenshot_err):
-                        raise
-                    logger.warning(
-                        "[BROWSER RECOVERY] screenshot failed with no active page; restarting and retrying once"
-                    )
-                    await browser.restart(start_url, reason="retry hybrid screenshot")
-                    screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
-                _log_screenshot_path = (
-                    str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
-                )
-
-                try:
-                    try:
-                        from .bot_challenge_guard import handle_bot_challenge_step
-                    except ImportError:
-                        from bot_challenge_guard import handle_bot_challenge_step
-                    _bc_result = await handle_bot_challenge_step(
-                        browser,
-                        _bot_challenge_state,
-                        hitl_callback=_wait_for_human_resume,
-                    )
-                    if _bc_result.notice:
-                        input_descriptions = _bc_result.notice + "\n" + (input_descriptions or "")
-                    if _bc_result.cleared_after_hitl:
-                        screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
-                        _log_screenshot_path = (
-                            str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
-                        )
-                        try:
-                            from .auth_harvester import harvest_storage_state as _bc_harvest
-                        except ImportError:
-                            from auth_harvester import harvest_storage_state as _bc_harvest
-                        try:
-                            _bc_hr = await _bc_harvest(browser)
-                            if _bc_hr.saved:
-                                logger.info("[BOT CHALLENGE] harvested auth profile: %s", _bc_hr.profile_name)
-                        except Exception as _bc_harv_err:
-                            logger.debug("[BOT CHALLENGE] auth harvest skipped: %s", _bc_harv_err)
-                    # PROXY-4b: when the block persists / the IP looks flagged, swap
-                    # to the next proxy and reload (policy + budget live downstream).
-                    try:
-                        _rerouted = await browser.reroute_proxy_on_block(
-                            getattr(browser, "current_url", "") or "",
-                            result=_bc_result,
-                            state=_bot_challenge_state,
-                            reason=f"bot challenge {_bc_result.vendor or 'block'}",
-                        )
-                    except Exception as _reroute_err:
-                        _rerouted = False
-                        logger.debug("[BOT CHALLENGE] proxy reroute skipped: %s", _reroute_err)
-                    if _rerouted:
-                        screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
-                        input_descriptions = (
-                            "\n🛡️【Bot Challenge · 已切换代理并重载页面】\n"
-                            + (input_descriptions or "")
-                        )
-                except Exception as _bc_err:
-                    logger.debug("[BOT CHALLENGE] step hook skipped: %s", _bc_err)
-
-                try:
-                    ax_tree_text = await browser.extract_accessibility_tree()
-                except Exception as _ax_err:
-                    logger.warning(
-                        f"[HYBRID] AX Tree 提取失败，本轮仅凭截图决策: {_ax_err}"
-                    )
-                    ax_tree_text = ""
-
-                _log_reasoning_text_source = "AX_TREE" if ax_tree_text else "SCREENSHOT_ONLY"
-
-                # ── A11y Enhancer：增强 AX Tree 信息 ─────────────────────
-                if ax_tree_text and A11Y_ENHANCER_ENABLED:
-                    try:
-                        _a11y_enhancer = A11yEnhancer(config=A11yEnhancerConfig(
-                            enable_grouping=True,
-                            enable_state_annotation=True,
-                            enable_hidden_hints=True,
-                            max_output_chars=15000,
-                        ))
-                        _a11y_meta = A11yPageMetadata(
-                            url=getattr(browser, "current_url", "") or "",
-                            title=(_page_state or "")[:100],
-                            total_elements=len(getattr(browser, "_last_som_elements", []) or []),
-                            visible_elements=len(getattr(browser, "_last_visible_elements", []) or []),
-                            iframe_count=getattr(browser, "_iframe_count", 0),
-                            scroll_position=getattr(browser, "_last_scroll_y", 0),
-                            page_height=getattr(browser, "_page_height", 0),
-                        )
-                        _a11y_result = _a11y_enhancer.enhance(ax_tree_text, _a11y_meta)
-                        ax_tree_text = _a11y_result.text
-                        if _a11y_result.summary:
-                            logger.debug(f"[A11Y] {_a11y_result.summary}")
-                    except Exception as _a11y_err:
-                        logger.debug(f"[A11Y] Enhancement skipped: {_a11y_err}")
-
-                # 兜底：防止超大 AX Tree 撑爆 Token
-                if ax_tree_text and len(ax_tree_text) > 15000:
-                    _orig_len = len(ax_tree_text)
-                    ax_tree_text = ax_tree_text[:15000] + "\n...[WARNING: AX Tree 过长已截断]..."
-                    logger.warning(
-                        f"[HYBRID] AX Tree 长度 {_orig_len} 超过 15000 阈值，已截断以保护上下文窗口"
-                    )
-                _browser_state = await BrowserStateSnapshot.from_browser(
+                _perception = await PerceptionPhase().run(
                     browser,
                     step=step,
-                    screenshot_path=_log_screenshot_path or "",
-                    ax_tree_text=ax_tree_text,
-                    tabs=_tabs_state,
-                    page_summary=_page_state,
-                    last_action_result=getattr(browser, "_last_action_result", None),
-                    metadata={
-                        "reasoning_text_source": _log_reasoning_text_source,
-                    },
+                    event_stream=event_stream,
+                    start_url=start_url,
+                    recover_active_page=_recover_active_page,
+                    wait_for_human_resume=_wait_for_human_resume,
+                    bot_challenge_state=_bot_challenge_state,
                 )
-                event_stream.observe(
-                    step=step,
-                    url=getattr(browser, "current_url", "") or "",
-                    screenshot_path=_log_screenshot_path or "",
-                    ax_lines=len(ax_tree_text.splitlines()) if ax_tree_text else 0,
-                    browser_state=_browser_state,
-                    metadata={
-                        "tabs": _tabs_state,
-                        "reasoning_text_source": _log_reasoning_text_source,
-                    },
-                )
-
-                ax_block = ""
-                if ax_tree_text:
-                    ax_block = (
-                        "\n\n=====================================\n"
-                        "【辅助信息：页面无障碍语义树 (AX Tree)】\n"
-                        "以下是当前页面的纯语义结构，过滤了所有样式噪音。\n"
-                        "  · 第一段 [可交互元素 @eN 语义快照] 是按阅读顺序编号的紧凑清单：\n"
-                        "    `@eN [role] \"name\" {states}`，N 与截图红框数字一一对应。\n"
-                        "    需要操作某元素时，target_id 直接填数字（如 @e5 → target_id=5）。\n"
-                        "  · 第二段 [页面语义快照] 提供整体 AX 结构（含标题、文本等），辅助理解上下文。\n"
-                        "  ⚠ 执行 extract 时，**必须从 AX Tree 中读取文本数据**（标题、数值、描述），\n"
-                        "    而非仅靠截图 OCR。被浮层遮挡的元素在 AX Tree 中仍然存在。\n"
-                        f"{ax_tree_text}\n"
-                        "====================================="
-                    )
-
-                input_descriptions = (
-                    (input_descriptions or "") + ax_block + _page_hint + _tabs_hint
-                )
+                screenshot_b64 = _perception.screenshot_b64
+                input_descriptions = _perception.input_descriptions
+                ax_tree_text = _perception.ax_tree_text
+                _log_screenshot_path = _perception.screenshot_path
+                _log_reasoning_text_source = _perception.reasoning_text_source
+                _browser_state = _perception.browser_state
+                _tabs_state = _perception.tabs_state
+                _page_state = _perception.page_summary
 
                 # ── Wave 2 Reflector：仅失败信号或兜底触发 ────────────────
                 _prev_loop_guard_size = len(_loop_guard_blocked_ids)

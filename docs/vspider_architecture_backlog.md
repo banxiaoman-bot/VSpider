@@ -3234,3 +3234,69 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   （S10+S11，2 例）、test_cross_system_config.py 默认值翻转 + opt-out 矩阵。
   validate_y s6_s11_cross_system: 定向 112✓ / npm build✓；全量 pytest
   3284 通过 0 失败（排除并行重构中的 test_timeline_replay_search.py，同 M1）。
+
+## Slice S12-S14 (M3 高效): api_replay 自动翻页 + 增量爬取 + spider 并发 (done)
+
+- 能力名: api_replay_pagination / incremental_crawl / spider_concurrency。
+- 影响层: data_plane（api_replay / incremental_state 新模块 / spider_lite）+
+  execution_kernel 接线（route_executor / api_server）。
+- S12 api_replay.py: 新增 `paginate_replay`——page 数值与 cursor/next_url 双
+  模式自动翻页聚合（_CURSOR_KEYS/_NEXT_CURSOR_KEYS/_NEXT_URL_KEYS 识别游标），
+  行级签名去重；停止条件：empty_page / duplicate_page / short_page /
+  repeated_cursor / repeated_next_url / target_reached / http_error /
+  max_pages（truncated 标记），返回 stop_reason + 各页证据并合并落 artifact。
+  route_executor 接线：payload 显式 paginate/auto_paginate 或
+  target_count > page_size 时自动走翻页路径（max_pages 默认 20 上限 100）；
+  api_server `/replay` 端点新增 paginate/max_pages 参数（仅新增向下兼容）。
+- S13 新模块 incremental_state.py（incremental_state.v1）: `IncrementalStore`
+  按 scope（默认首个 allowed_domain）落盘已交付行签名（item_signature 全行或
+  key_fields 子集 sha 截断），`filter_new` + `commit` 实现跨 run 去重续抓。
+  spider_lite 接线 `_apply_incremental_filter`：`incremental=True` opt-in
+  （默认 off 字节不变），result 新增 incremental 统计
+  （new_count/skipped_known/key_fields/store 状态）。
+- S14 spider_lite.py: 抓取循环重构为批量漏斗——`_pop_eligible_batch`
+  （seen/domain/robots 闸门保持原序，每轮至少消费一个 frontier 条目防空转）+
+  `_fetch_batch`（仅网络段进 ThreadPoolExecutor；replay 查缓存与 record 写
+  缓存都留在主线程，PageResponseCache 无需加锁；批内顺序保持，错误单行记
+  errors 不杀 run）。`concurrency` payload opt-in（默认 1 = 原串行语义，
+  上限 16，max_concurrency 别名）；result 新增 `fetch_stats`
+  （network/cache/concurrency，仅新增）。BFS 批量弹出仍是层序，与串行
+  结果逐项一致（test 锁定）。
+- Tests: tests/test_api_replay_pagination.py（S12，page/cursor/next_url、
+  去重、各停止条件、route_executor/api_server 接线）、
+  tests/test_incremental_state.py（S13，签名/scope/key_fields、跨 run 去重、
+  spider 接线、off 路径字节不变）、tests/test_spider_lite_concurrency.py
+  （S14，7 例：并发结果与串行逐项一致、真并发重叠断言、max_pages 预算、
+  record→replay 缓存协同、批内错误隔离、clamp 1..16、串行 fetch_stats）。
+  validate_y S14: 定向✓ / npm build✓；全量 pytest 3313 通过 0 失败
+  （排除并行 App.vue 组件化重构钉源码的 test_timeline_replay_search.py /
+  test_capability_router.py::test_capability_router_source_wiring /
+  test_frontend_component_split_y126.py 单例，字符串已迁至未提交的
+  CapabilityPlanPane.vue 等新组件）。
+
+## Slice P0-P1 (M3 高效前置): 仓库卫生核验 + 感知段抽离 phases/perception.py (done)
+
+- 能力名: perception_phase_split（main.py 拆分第一刀，E1-E3 的地基）。
+- 影响层: execution_kernel（main.py）+ 工程基建（P0 零运行时改动）。
+- P0 仓库卫生: 逐项核验计划清单 11 类运行时产物路径（runs/ workspace/
+  temp_uploads/ browser_data/ logs/ screenshots/ .tmp_*/ .pytest_cache/
+  __pycache__/ 等）`git check-ignore -v` 全部命中已提交的 .gitignore 条目，
+  git status 仅剩源码改动——无需新增条目，验收即通过。
+- P1 感知段平移: main.py 每回合「图文双模态融合」感知块（tabs/page 摘要 →
+  SoM 截图含 no-active-page 重启重试 → bot_challenge 钩子（HITL 过盾重截/
+  auth harvest/代理重路由重截）→ AX 提取 + A11y Enhancer + 15000 截断 →
+  BrowserStateSnapshot 组装 → event_stream.observe → ax_block 拼接）整段
+  165 行原样平移至新模块 visual_web_agent/phases/perception.py
+  （PerceptionPhase.run → PerceptionSnapshot），main.py 原位置一行委托 +
+  字段回填（净 -140 行）。CRLF 大块按工程规范走字节级 _patch 脚本，patch
+  后即删。纯平移零行为改动，零新契约字段。
+- Tests: tests/test_phase_perception_split.py（4 例：snapshot 字段与拆分前
+  主路径一致 url/title/screenshot_path/ax_excerpt/interactive_count、observe
+  事件单发且携带 browser_state、no-active-page 重启重试一次、AX 失败回退
+  SCREENSHOT_ONLY）；tests/test_agent_loop_stub_e2e.py 2 例真 Chromium
+  全链路保持绿（经委托路径）。
+  validate_y P1: 定向✓ / npm build✓；全量 pytest 3336 通过 0 新增失败
+  （沿用 S14 口径排除并行 UI 重构预先存在的 5 例，已在 HEAD 干净 worktree
+  复核均预先失败）。
+- Out of scope (next): E1 感知复用（PerceptionPhase 持 last_signature，
+  改为循环外单例）、E2 局部 SoM、E3 AX 增量 diff。
