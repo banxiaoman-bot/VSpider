@@ -3091,6 +3091,66 @@ about:srcdoc evidence, nested-host token walk via a querying host frame
 stub, stale-token fallback to src, legacy fixtures emit no token query,
 unresolvable srcdoc keeps the original result).
 
+## Slice S1-S3 (M1 准确收口): select/upload 证据链 + 清默认 xlsx (done)
+
+Layer: operations_plane (actions.py handlers) + data_plane (data_manager /
+browser_env intercept track / fetch_articles).
+
+- S1 SelectHandler: removed the silent select_option(index=0) fallback
+  (used to mis-pick the first option without reporting); label -> value
+  miss now fails loudly. Added selected-option readback evidence
+  (selectedOptions text/value vs requested type_value, mismatch raises);
+  rpa_trail entry gains method/verified/observed. Custom widgets where
+  the handle is not a SELECT (readback null) skip verification.
+- S2 UploadHandler: after set_input_files, input.files is read back as
+  page_echo evidence; empty/mismatched echo raises instead of claiming
+  success. rpa_trail entry added (uploaded_file / page_echo / verified).
+- S3 default-xlsx cleanup: _resolve_intercept_container no-contract and
+  unknown-container fallbacks now return jsonl (rows stay rows, never a
+  blind xlsx); _save_dataframe_to_excel invalid-container fallback jsonl;
+  intercept default filename "output.xlsx" -> "output" (suffix follows
+  container) in browser_env; main._xhr_saved_row_count made
+  container-aware (probes jsonl/csv/xlsx); fetch_articles.py reads and
+  writes output_*.{xlsx,csv,jsonl} following the input container.
+
+Tests: tests/test_select_upload_evidence.py (new, 8 cases: label/value
+readback, no index-0 fallback, mismatch fails loudly, non-select skip,
+upload echo match/empty/wrong-file); tests/test_xhr_intercept_contract.py
+updated (no-contract -> jsonl, xlsx append via explicit contract).
+
+## Slice S4-S5 (M1 准确收口): snapshot 一等 action + type 富文本复用 (done)
+
+Layer: operations_plane (new snapshot_actions.py module + actions.py
+TypeHandler) + intent_planning (action_registry / capability_router /
+prompts / prompt_skills wiring).
+
+- S4 html_snapshot / screenshot first-class actions (new module
+  visual_web_agent/snapshot_actions.py, six-step paradigm): persist the
+  page HTML / a viewport-or-full-page PNG through resolve_output_path
+  (prefers runs/<id>/artifacts/) + register_artifact, so snapshots land
+  in manifest.json (kind=html_snapshot / screenshot) instead of living
+  outside the trusted artifact index. Empty HTML / empty PNG raise.
+  Memory writeback {path, size, source_url[, full_page]}; rpa_trail
+  evidence carries output_kind/output_path/size/verified. Wired:
+  VSpiderAction literals, ActionTool entries (capability=snapshot),
+  capability_router _SNAPSHOT_RE -> snapshot_preferred signal ->
+  page_snapshot backend-plan row, prompts _SNAPSHOT_TRIGGERS ->
+  SNAPSHOT_SKILL block.
+- S5 TypeHandler contenteditable reuse: before the keyboard path, the
+  handler probes el.isContentEditable; richtext hosts route through
+  _TYPE_RICHTEXT_WRITE_JS (mirrors form_set's setRichTextValue adapters:
+  Quill -> TinyMCE -> CKEditor5 -> execCommand insertText -> structured
+  paragraphs) with an innerText readback check (mismatch raises), so raw
+  keyboard.type no longer desyncs editor document models. Plain inputs
+  keep the original Ctrl+A/Backspace/type path byte-identical. The trail
+  entry gains method/verified when the richtext branch ran.
+
+Tests: tests/test_snapshot_and_type_richtext.py (new, 15 cases: schema +
+handler/tool registration, SNAPSHOT_SKILL wiring, _SNAPSHOT_RE routing,
+html_snapshot persist/register/memory/trail + filename hint + empty-html
++ missing-page, screenshot viewport/full/empty-bytes, type richtext
+editor-API routing + readback mismatch + plain-input keyboard path).
+
 ## Slice BOT-CHL: anti-bot challenge route + full-loop fixture regression
 
 - 能力名: bot_challenge_guard (Cloudflare/Turnstile/reCAPTCHA/hCaptcha/滑块/风控)。

@@ -3062,6 +3062,73 @@ class FetchLinkContentHandler(ActionHandler):
         return page  # skip Tab Guard
 
 
+# S5: standalone richtext writer for TypeHandler — mirrors form_set's
+# setRichTextValue editor adapters (Quill → TinyMCE → CKEditor5 →
+# execCommand insertText → structured paragraphs). keyboard.type into a
+# contenteditable desyncs the editor's document model (Quill re-renders
+# over it, TinyMCE never sees it), so type routes through the same APIs.
+_TYPE_RICHTEXT_WRITE_JS = """(el, raw) => {
+    const text = String(raw == null ? '' : raw);
+    const escHtml = (s) => String(s).replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const toParagraphHtml = (t) => String(t)
+        .split(/\\n{2,}/)
+        .map(part => `<p>${escHtml(part).replace(/\\n/g, '<br>')}</p>`)
+        .join('') || '<p></p>';
+    const qlEditor = el.classList?.contains('ql-editor')
+        ? el
+        : (el.querySelector?.('.ql-editor')
+            || el.closest?.('.ql-container')?.querySelector?.('.ql-editor'));
+    if (qlEditor) {
+        const container = qlEditor.closest('.ql-container') || qlEditor.parentElement;
+        const quill = (container && container.__quill)
+            || window.Quill?.find?.(container) || null;
+        if (quill && typeof quill.setText === 'function') {
+            quill.setText(text, 'user');
+            return 'quill_api';
+        }
+    }
+    const tiny = window.tinymce;
+    if (tiny && (typeof tiny.get === 'function' || Array.isArray(tiny.editors))) {
+        const editors = Array.from(tiny.editors || []);
+        const ids = [el.id, el.id?.replace(/_ifr$/, '')].filter(Boolean);
+        const byId = typeof tiny.get === 'function'
+            ? ids.map(id => tiny.get(id)).find(Boolean) : null;
+        const ed = byId || editors.find(e => {
+            const body = e?.getBody?.();
+            if (body && (body === el || body.contains?.(el) || el.contains?.(body))) return true;
+            return Boolean(e?.getContainer?.()?.contains?.(el));
+        });
+        if (ed && typeof ed.setContent === 'function') {
+            ed.setContent(toParagraphHtml(text));
+            ed.fire?.('change');
+            return 'tinymce_api';
+        }
+    }
+    const ckHost = el.closest?.('.ck-editor__editable') || el;
+    if (ckHost?.ckeditorInstance && typeof ckHost.ckeditorInstance.setData === 'function') {
+        ckHost.ckeditorInstance.setData(toParagraphHtml(text));
+        return 'ckeditor5_api';
+    }
+    try {
+        el.focus?.({preventScroll: true});
+        const sel = window.getSelection?.();
+        if (sel && typeof document.execCommand === 'function') {
+            sel.selectAllChildren(el);
+            document.execCommand('delete', false, null);
+            if (document.execCommand('insertText', false, text)) {
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                return 'exec_insert_text';
+            }
+        }
+    } catch (_) {}
+    el.innerHTML = toParagraphHtml(text);
+    el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+    return 'structured_paragraphs';
+}"""
+
+
 @ActionRegistry.register("type")
 class TypeHandler(ActionHandler):
     async def execute(self, ctx: ActionContext) -> Optional["Page"]:
@@ -3234,21 +3301,60 @@ class TypeHandler(ActionHandler):
                     ", ".join(env_names),
                 )
 
-            modifier = "Meta" if sys.platform == "darwin" else "Control"
-            await page.keyboard.press(f"{modifier}+a")
-            await page.keyboard.press("Backspace")
-            await page.keyboard.type(type_value, delay=50)
+            # ── S5: contenteditable hosts route through the rich-text editor
+            # API instead of raw keyboard typing, which desyncs the editor's
+            # document model (same adapters as form_set).
+            try:
+                _is_richtext_host = bool(
+                    await target.handle.evaluate(
+                        "el => Boolean(el && el.isContentEditable)"
+                    )
+                )
+            except Exception:
+                _is_richtext_host = False
+
+            _richtext_method = ""
+            if _is_richtext_host:
+                _richtext_method = str(
+                    await target.handle.evaluate(_TYPE_RICHTEXT_WRITE_JS, type_value)
+                    or ""
+                )
+                _observed_text = str(
+                    await target.handle.evaluate(
+                        "el => String(el.innerText || el.textContent || '').trim()"
+                    )
+                    or ""
+                )
+                _norm = lambda s: re.sub(r"\s+", " ", str(s or "")).strip()  # noqa: E731
+                if _norm(type_value) and _norm(type_value) not in _norm(_observed_text):
+                    raise RuntimeError(
+                        f"type richtext readback mismatch on element #{target_id}: "
+                        f"wrote via {_richtext_method}, but editor text is "
+                        f"{_observed_text[:120]!r}"
+                    )
+                logger.info(
+                    "[TYPE RICHTEXT] element #%s written via %s (form_set adapters)",
+                    target_id,
+                    _richtext_method,
+                )
+            else:
+                modifier = "Meta" if sys.platform == "darwin" else "Control"
+                await page.keyboard.press(f"{modifier}+a")
+                await page.keyboard.press("Backspace")
+                await page.keyboard.type(type_value, delay=50)
 
             if _pending_xpath:
-                browser.rpa_trail.append(
-                    ctx.with_rpa_meta({
-                        "action": "type",
-                        "xpath": _pending_xpath,
-                        "ax_role": _pending_ax_role or "",
-                        "ax_name": _pending_ax_name or "",
-                        "type_value": display_value if used_auth_vault else type_value,
-                    })
-                )
+                _trail_step = {
+                    "action": "type",
+                    "xpath": _pending_xpath,
+                    "ax_role": _pending_ax_role or "",
+                    "ax_name": _pending_ax_name or "",
+                    "type_value": display_value if used_auth_vault else type_value,
+                }
+                if _richtext_method:
+                    _trail_step["method"] = _richtext_method
+                    _trail_step["verified"] = True
+                browser.rpa_trail.append(ctx.with_rpa_meta(_trail_step))
                 logger.debug(
                     "[RPA] Recorded type: %s <- %r",
                     _pending_xpath,
@@ -3540,20 +3646,50 @@ class SelectHandler(ActionHandler):
             _pending_ax_role, _pending_ax_name = await browser._get_accessibility_signature(
                 page, target.handle
             )
+            selected_via = "label"
             try:
                 await target.handle.select_option(
                     label=type_value, timeout=browser._LOCATOR_TIMEOUT
                 )
             except Exception:
-                try:
-                    await target.handle.select_option(
-                        value=type_value, timeout=browser._LOCATOR_TIMEOUT
+                selected_via = "value"
+                await target.handle.select_option(
+                    value=type_value, timeout=browser._LOCATOR_TIMEOUT
+                )
+            # readback evidence: verify the option actually selected matches
+            # what was requested — never trust select_option's return alone.
+            readback = await target.handle.evaluate(
+                """el => {
+                    if (!el || el.tagName !== 'SELECT') return null;
+                    const opt = el.selectedOptions && el.selectedOptions[0];
+                    return {
+                        text: opt ? (opt.label || opt.textContent || '').trim() : '',
+                        value: el.value != null ? String(el.value) : '',
+                        index: el.selectedIndex,
+                    };
+                }"""
+            )
+            observed_text = ""
+            observed_value = ""
+            if isinstance(readback, dict):
+                observed_text = str(readback.get("text") or "").strip()
+                observed_value = str(readback.get("value") or "").strip()
+                expected = (type_value or "").strip()
+                matched = bool(expected) and (
+                    observed_text == expected
+                    or observed_value == expected
+                    or (expected and expected in observed_text)
+                )
+                if not matched:
+                    raise RuntimeError(
+                        f"select readback mismatch on element #{target_id}: "
+                        f"expected {type_value!r}, observed "
+                        f"text={observed_text!r} value={observed_value!r}"
                     )
-                except Exception:
-                    await target.handle.select_option(
-                        index=0, timeout=browser._LOCATOR_TIMEOUT
-                    )
-            logger.info(f"Select element #{target_id} succeeded")
+            logger.info(
+                f"Select element #{target_id} succeeded via {selected_via} "
+                f"(readback text={observed_text!r} value={observed_value!r})"
+            )
             if _pending_xpath:
                 browser.rpa_trail.append(
                     ctx.with_rpa_meta({
@@ -3562,6 +3698,9 @@ class SelectHandler(ActionHandler):
                         "ax_role": _pending_ax_role or "",
                         "ax_name": _pending_ax_name or "",
                         "type_value": type_value,
+                        "method": selected_via,
+                        "verified": True,
+                        "observed": observed_text or observed_value,
                     })
                 )
         except Exception as e:
@@ -6394,8 +6533,38 @@ class UploadHandler(ActionHandler):
                     f"No <input type='file'> found near element #{target_id}"
                 )
             await file_target.handle.set_input_files(str(file_path.resolve()))
+            # page_echo evidence: read back input.files to prove the file
+            # actually landed on the control instead of trusting the call.
+            page_echo = await file_target.handle.evaluate(
+                """el => el && el.files
+                    ? Array.from(el.files).map(f => ({name: f.name, size: f.size}))
+                    : []"""
+            )
+            echo_names = [
+                str(item.get("name") or "")
+                for item in (page_echo or [])
+                if isinstance(item, dict)
+            ]
+            if file_path.name not in echo_names:
+                raise RuntimeError(
+                    f"upload page_echo mismatch on element #{target_id}: "
+                    f"expected file {file_path.name!r}, "
+                    f"input.files reported {echo_names!r}"
+                )
+            _upload_xpath = await browser._get_xpath(file_target.handle)
+            browser.rpa_trail.append(
+                ctx.with_rpa_meta({
+                    "action": "upload",
+                    "xpath": _upload_xpath or "",
+                    "type_value": str(file_path.resolve()),
+                    "uploaded_file": file_path.name,
+                    "page_echo": page_echo or [],
+                    "verified": True,
+                })
+            )
             logger.info(
-                f"[UPLOAD] File injected successfully: {file_path.resolve()}"
+                f"[UPLOAD] File injected successfully: {file_path.resolve()} "
+                f"(page_echo={echo_names!r})"
             )
             print(
                 f"\n\033[1;32m✅ 文件上传成功:\033[0m "
@@ -6884,3 +7053,7 @@ try:
     from . import vscroll_capture_action as _vscroll_capture_action  # noqa: F401
 except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
     import vscroll_capture_action as _vscroll_capture_action  # type: ignore  # noqa: F401
+try:
+    from . import snapshot_actions as _snapshot_actions  # noqa: F401
+except ImportError:  # pragma: no cover - flat-layout fallback, mirrors top imports
+    import snapshot_actions as _snapshot_actions  # type: ignore  # noqa: F401

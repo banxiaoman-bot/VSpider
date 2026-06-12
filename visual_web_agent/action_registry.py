@@ -569,6 +569,59 @@ def build_default_action_registry() -> ActionRegistry:
         changes_state=False,
     ))
     register(ActionTool(
+        name="html_snapshot",
+        capability="snapshot",
+        description=(
+            "Persist the current tab's full HTML as a run artifact and record "
+            "it in manifest.json (kind=html_snapshot). type_value is an "
+            "optional filename hint. The saved path is written back to memory "
+            "so later steps (or the user) can reference the snapshot."
+        ),
+        actions=("html_snapshot",),
+        aliases=(
+            "save html",
+            "save page",
+            "page snapshot",
+            "html snapshot",
+            "保存网页",
+            "保存页面",
+            "网页快照",
+            "页面快照",
+            "存为html",
+            "存为 html",
+            "另存网页",
+        ),
+        tags=("snapshot", "artifact", "deterministic"),
+        evidence=("output_path", "size", "source_url"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
+        name="screenshot",
+        capability="snapshot",
+        description=(
+            "Capture a viewport (default) or full-page (type_value='full') "
+            "screenshot, persist it as a run artifact and record it in "
+            "manifest.json (kind=screenshot). The saved path is written back "
+            "to memory. Use when the goal asks for a screenshot deliverable, "
+            "not for perception (the agent loop already sees the page)."
+        ),
+        actions=("screenshot",),
+        aliases=(
+            "take screenshot",
+            "capture screen",
+            "截图",
+            "截屏",
+            "屏幕截图",
+            "整页截图",
+            "保存截图",
+        ),
+        tags=("snapshot", "artifact", "deterministic"),
+        evidence=("output_path", "size", "full_page", "source_url"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
         name="resume_run",
         capability="resume",
         description=(

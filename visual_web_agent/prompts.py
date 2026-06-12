@@ -1022,6 +1022,12 @@ _VSCROLL_CAPTURE_TRIGGERS = (
     "virtualised", "infinite scroll", "react-window", "vue-virtual",
     "ag-grid", "ag grid",
 )
+_SNAPSHOT_TRIGGERS = (
+    "截图", "截屏", "屏幕截图", "整页截图", "保存截图",
+    "网页快照", "页面快照", "保存网页", "保存页面", "另存网页", "存为html", "存为 html",
+    "screenshot", "page snapshot", "html snapshot", "save the page", "save page",
+    "save html",
+)
 _RESUME_RUN_TRIGGERS = (
     "续跑", "断点续跑", "断点续传", "接着上次", "继续上次", "上次没做完", "上次没完成",
     "接着之前", "继续之前", "resume", "resume run", "continue last", "continue previous",
@@ -1147,6 +1153,8 @@ def build_system_prompt(
         skills.append("page_to_markdown")
     if _text_has_any(haystack, _VSCROLL_CAPTURE_TRIGGERS):
         skills.append("vscroll_capture")
+    if _text_has_any(haystack, _SNAPSHOT_TRIGGERS):
+        skills.append("snapshot")
     if _text_has_any(haystack, _RESUME_RUN_TRIGGERS):
         skills.append("resume_run")
     if _text_has_any(haystack, ("示例", "范例", "few-shot", "few shot")):

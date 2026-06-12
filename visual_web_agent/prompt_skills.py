@@ -1176,6 +1176,29 @@ ag-grid / Element Plus 虚拟表格），或任务说"无限滚动 / 滚到底 /
 """.strip()
 
 
+SNAPSHOT_SKILL = """
+## Skill: Page Snapshot（HTML 快照 / 截图落盘）
+适用：任务要求"保存网页 / 网页快照 / 存为 html / 截图 / 整页截图 / 保存截图"等以快照为交付物的场景。
+
+何时用 html_snapshot / screenshot（而不是 extract / 继续浏览）：
+- 用户要的产物就是页面本身（HTML 或图片），不是结构化数据。
+- 需要给某一步留可校验的页面留证（如提交前后对比）。
+
+用法：
+1. action=html_snapshot，target_id=0：保存当前页完整 HTML。type_value 选填文件名；
+   memory_key 选填，默认写到 html_snapshot，结果含 {path, size, source_url}。
+2. action=screenshot，target_id=0：保存截图。type_value="full" 为整页截图，缺省只截视口；
+   memory_key 选填，默认写到 screenshot，结果含 {path, size, full_page, source_url}。
+
+行为约定：
+1. 两个动作都是只读、确定性动作：不改页面，落盘到 run 的 artifacts/ 并登记 manifest.json
+   （kind=html_snapshot / screenshot）——manifest 是产物唯一可信总表。
+2. 落盘后路径写回 memory，可用 {{html_snapshot.path}} / {{screenshot.path}} 引用。
+3. 空 HTML / 空截图会直接报错，不会产出空文件冒充成功。
+4. 不要用 screenshot 动作来"看页面"——感知截图由系统每回合自动提供，本动作只负责交付物落盘。
+""".strip()
+
+
 RESUME_RUN_SKILL = """
 ## Skill: Resume Run（断点续跑 / 接着上次继续）
 适用：用户说“续跑 / 断点续跑 / 接着上次 / 继续上次没抓完的 / resume / continue last run”，或本次为中断后的重启。
@@ -1200,6 +1223,7 @@ SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
     "vscroll_capture": VSCROLL_CAPTURE_SKILL,
+    "snapshot": SNAPSHOT_SKILL,
     "resume_run": RESUME_RUN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,
