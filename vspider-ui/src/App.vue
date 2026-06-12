@@ -20,8 +20,6 @@ import {
   capabilityEventEfficiencyCorrelationReport,
   capabilityEventFailureBundle,
   capabilityEventTraceArtifact,
-  capabilityItemDetail,
-  capabilityItemMeta,
   capabilityItemName,
 } from './components/capabilityTraceUtils'
 import CapabilityStatusBadge from './components/CapabilityStatusBadge.vue'
@@ -29,6 +27,9 @@ import CapabilityTraceList from './components/CapabilityTraceList.vue'
 import CapabilityRuntimePanel from './components/CapabilityRuntimePanel.vue'
 import CapabilityAlignmentCard from './components/CapabilityAlignmentCard.vue'
 import CapabilityEfficiencyPanel from './components/CapabilityEfficiencyPanel.vue'
+import CapabilityPlanPane from './components/CapabilityPlanPane.vue'
+import CapabilityReplayPane from './components/CapabilityReplayPane.vue'
+import CapabilityDiagnosticsPane from './components/CapabilityDiagnosticsPane.vue'
 import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
@@ -2471,6 +2472,56 @@ const buildCapabilityFailureFixtureBatchReplaySummaryText = () => {
   })
 }
 
+const capabilityReplayPaneProps = computed(() => ({
+  efficiencyReplay: {
+    report: capabilityEfficiencyFeedbackReplayReport.value,
+    status: capabilityEfficiencyFeedbackReplayStatus.value,
+    plannerFeedback: capabilityEfficiencyFeedbackReplayPlannerFeedback.value,
+    preferredCapabilities: capabilityEfficiencyFeedbackReplayPreferredCapabilities.value,
+    avoidActions: capabilityEfficiencyFeedbackReplayAvoidActions.value,
+    artifact: capabilityEfficiencyFeedbackReplayArtifact.value,
+    checks: capabilityEfficiencyFeedbackReplayChecks.value,
+    failedChecks: capabilityEfficiencyFeedbackReplayFailedChecks.value,
+  },
+  efficiencyLibrary: {
+    items: capabilityEfficiencyFeedbackReplayLibrary.value,
+    count: capabilityEfficiencyFeedbackReplayLibraryCount.value,
+    loading: capabilityEfficiencyFeedbackReplayLibraryLoading.value,
+  },
+  fixtureReplay: {
+    report: capabilityFailureFixtureReplayReport.value,
+    status: capabilityFailureFixtureReplayStatus.value,
+    artifact: capabilityFailureFixtureReplayArtifact.value,
+    checks: capabilityFailureFixtureReplayChecks.value,
+    failedChecks: capabilityFailureFixtureReplayFailedChecks.value,
+  },
+  fixtureLibrary: {
+    items: capabilityFailureFixtureLibrary.value,
+    count: capabilityFailureFixtureLibraryCount.value,
+    loading: capabilityFailureFixtureLibraryLoading.value,
+  },
+  batchHistory: {
+    items: capabilityFailureFixtureBatchHistory.value,
+    count: capabilityFailureFixtureBatchHistoryCount.value,
+    loading: capabilityFailureFixtureBatchHistoryLoading.value,
+    latest: capabilityFailureFixtureLatestBatchHistory.value,
+    trend: capabilityFailureFixtureBatchHistoryTrend.value,
+    trendDirection: capabilityFailureFixtureBatchHistoryTrendDirection.value,
+    trendPassRateDelta: capabilityFailureFixtureBatchHistoryTrendPassRateDelta.value,
+  },
+  batchReplay: {
+    report: capabilityFailureFixtureBatchReplayReport.value,
+    status: capabilityFailureFixtureBatchReplayStatus.value,
+    summary: capabilityFailureFixtureBatchReplaySummary.value,
+    topPrimaryFailures: capabilityFailureFixtureBatchReplayTopPrimaryFailures.value,
+    topFailureCategories: capabilityFailureFixtureBatchReplayTopFailureCategories.value,
+    topFailedChecks: capabilityFailureFixtureBatchReplayTopFailedChecks.value,
+    artifact: capabilityFailureFixtureBatchReplayArtifact.value,
+    failedChecks: capabilityFailureFixtureBatchReplayFailedChecks.value,
+    items: capabilityFailureFixtureBatchReplayItems.value,
+  },
+}))
+
 const copyCapabilityFailureFixtureBatchReplaySummary = async () => {
   if (!capabilityFailureFixtureBatchReplayReport.value) {
     ElMessage.warning('当前没有可复制的 batch replay 摘要')
@@ -4738,471 +4789,28 @@ const settingsSummaryText = computed(() => {
 
                   </el-tab-pane>
                   <el-tab-pane label="计划 / 工作流" name="plan">
-
-                <section v-if="capabilityExecutionPlanSteps.length" class="capability-section">
-                  <h4>结构化执行计划</h4>
-                  <div class="capability-chain">
-                    <div
-                      v-for="step in capabilityExecutionPlanSteps"
-                      :key="step.id || `plan-step-${step.order}-${step.capability}`"
-                      class="capability-card"
-                    >
-                      <div class="capability-card-head">
-                        <span class="capability-rank">{{ step.order || '?' }}</span>
-                        <strong>{{ step.capability || 'unknown' }}</strong>
-                      </div>
-                      <p class="capability-meta">
-                        {{ step.owner || 'owner?' }} · risk={{ step.risk || 'unknown' }}
-                        <span v-if="step.deterministic === false"> · model</span>
-                        <span v-else> · deterministic</span>
-                      </p>
-                      <p v-if="step.purpose" class="capability-detail">
-                        {{ step.purpose }}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                <section v-if="capabilityWorkflowNodes.length" class="capability-section">
-                  <h4>跨系统工作流图</h4>
-                  <div class="capability-exec-summary">
-                    <span>{{ capabilityWorkflowGraph.version || 'workflow_graph' }}</span>
-                    <span>systems {{ capabilityWorkflowGraph.systems?.length || 0 }}</span>
-                    <span>sessions {{ capabilityWorkflowGraph.sessions?.length || 0 }}</span>
-                    <span>nodes {{ capabilityWorkflowNodes.length }}</span>
-                    <span>edges {{ capabilityWorkflowGraph.data_edges?.length || 0 }}</span>
-                  </div>
-                  <div class="capability-chain">
-                    <div
-                      v-for="node in capabilityWorkflowNodes.slice(0, 8)"
-                      :key="node.id || `workflow-${node.order}-${node.capability}`"
-                      class="capability-card"
-                    >
-                      <div class="capability-card-head">
-                        <span class="capability-rank">{{ node.order || '?' }}</span>
-                        <strong>{{ node.capability || 'unknown' }}</strong>
-                      </div>
-                      <p class="capability-meta">
-                        {{ node.system_id || 'system?' }} · {{ node.session_id || 'session?' }}
-                      </p>
-                      <p v-if="node.purpose" class="capability-detail">
-                        {{ node.purpose }}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                <section v-if="capabilityActionRefSchema.version" class="capability-section">
-                  <h4>Unified ActionRef</h4>
-                  <div class="capability-exec-summary">
-                    <span>{{ capabilityActionRefSchema.version }}</span>
-                    <span
-                      v-for="source in (capabilityActionRefSchema.preferred_sources || [])"
-                      :key="`action-ref-source-${source}`"
-                    >
-                      {{ source }}
-                    </span>
-                  </div>
-                  <p
-                    v-if="capabilityActionRefSchema.notes?.length"
-                    class="capability-detail"
-                  >
-                    {{ capabilityActionRefSchema.notes.join(' · ') }}
-                  </p>
-                </section>
-
-                <section class="capability-section">
-                  <h4>推荐能力链</h4>
-                  <div class="capability-chain">
-                    <div
-                      v-for="(item, idx) in capabilityBackendPlan"
-                      :key="`plan-${idx}-${capabilityItemName(item)}`"
-                      class="capability-card"
-                    >
-                      <div class="capability-card-head">
-                        <span class="capability-rank">{{ idx + 1 }}</span>
-                        <strong>{{ capabilityItemName(item) }}</strong>
-                      </div>
-                      <p v-if="capabilityItemMeta(item)" class="capability-meta">
-                        {{ capabilityItemMeta(item) }}
-                      </p>
-                      <p v-if="capabilityItemDetail(item)" class="capability-detail">
-                        {{ capabilityItemDetail(item) }}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
+                    <CapabilityPlanPane
+                      :plan-steps="capabilityExecutionPlanSteps"
+                      :workflow-graph="capabilityWorkflowGraph"
+                      :workflow-nodes="capabilityWorkflowNodes"
+                      :action-ref-schema="capabilityActionRefSchema"
+                      :backend-plan="capabilityBackendPlan"
+                    />
                   </el-tab-pane>
                   <el-tab-pane label="回放与 Fixture" name="replay">
-
-                <section v-if="capabilityEfficiencyFeedbackReplayReport" class="capability-efficiency-feedback-replay-card">
-                  <div class="capability-section-head">
-                    <h4>Efficiency Feedback Replay</h4>
-                    <CapabilityStatusBadge
-                      :status-class="capabilityEfficiencyFeedbackReplayReport.passed ? 'ok' : 'error'"
-                      :label="capabilityEfficiencyFeedbackReplayStatus"
+                    <CapabilityReplayPane
+                      v-bind="capabilityReplayPaneProps"
+                      @copy-batch-summary="copyCapabilityFailureFixtureBatchReplaySummary"
                     />
-                  </div>
-                  <div class="capability-fixture-replay-grid">
-                    <span>failure</span>
-                    <strong>{{ capabilityEfficiencyFeedbackReplayPlannerFeedback.primary_failure || 'unknown' }}</strong>
-                    <span>action</span>
-                    <strong>{{ capabilityEfficiencyFeedbackReplayPlannerFeedback.recommended_action || 'review' }}</strong>
-                    <span>route</span>
-                    <strong>{{ capabilityEfficiencyFeedbackReplayReport.route?.passed ? 'passed' : 'failed' }}</strong>
-                    <span>plan</span>
-                    <strong>{{ capabilityEfficiencyFeedbackReplayReport.execution_plan?.passed ? 'passed' : 'failed' }}</strong>
-                    <span>step</span>
-                    <strong>{{ capabilityEfficiencyFeedbackReplayReport.execution_plan?.feedback_step?.capability || 'none' }}</strong>
-                  </div>
-                  <div v-if="capabilityEfficiencyFeedbackReplayPreferredCapabilities.length" class="capability-check-list">
-                    <span
-                      v-for="capability in capabilityEfficiencyFeedbackReplayPreferredCapabilities"
-                      :key="`efficiency-feedback-prefer-${capability}`"
-                      class="capability-check is-complete"
-                    >
-                      prefer: {{ capability }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityEfficiencyFeedbackReplayAvoidActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityEfficiencyFeedbackReplayAvoidActions.slice(0, 6)"
-                      :key="`efficiency-feedback-avoid-${action}`"
-                      class="capability-check is-warning"
-                    >
-                      avoid: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityEfficiencyFeedbackReplayArtifact?.url" class="capability-fixture-replay-artifact">
-                    artifact:
-                    <a :href="capabilityEfficiencyFeedbackReplayArtifact.url" target="_blank" rel="noreferrer">
-                      {{ capabilityEfficiencyFeedbackReplayArtifact.url }}
-                    </a>
-                  </div>
-                  <div class="capability-fixture-replay-checks">
-                    <span>
-                      checks {{ capabilityEfficiencyFeedbackReplayChecks.length - capabilityEfficiencyFeedbackReplayFailedChecks.length }}/{{ capabilityEfficiencyFeedbackReplayChecks.length }}
-                    </span>
-                    <span v-if="capabilityEfficiencyFeedbackReplayFailedChecks.length">
-                      failed {{ capabilityEfficiencyFeedbackReplayFailedChecks.length }}
-                    </span>
-                  </div>
-                </section>
-
-                <section class="capability-efficiency-feedback-library-card">
-                  <div class="capability-section-head">
-                    <h4>Efficiency Feedback Replay Library</h4>
-                    <CapabilityStatusBadge
-                      status-class="route-only"
-                      :label="`${capabilityEfficiencyFeedbackReplayLibraryCount} reports`"
-                    />
-                  </div>
-                  <div class="capability-fixture-library-actions">
-                    <span>source capability/efficiency_feedback_replays</span>
-                    <span v-if="capabilityEfficiencyFeedbackReplayLibraryLoading">loading</span>
-                  </div>
-                  <div v-if="capabilityEfficiencyFeedbackReplayLibrary.length" class="capability-efficiency-feedback-library-list">
-                    <div
-                      v-for="item in capabilityEfficiencyFeedbackReplayLibrary.slice(0, 5)"
-                      :key="item.path || item.name"
-                      class="capability-efficiency-feedback-library-item"
-                    >
-                      <strong>{{ item.primary_failure || item.name || 'efficiency feedback replay' }}</strong>
-                      <span>{{ item.passed ? 'passed' : 'failed' }} · {{ item.recommended_action || 'review' }}</span>
-                      <span v-if="Array.isArray(item.preferred_capabilities) && item.preferred_capabilities.length">
-                        prefer {{ item.preferred_capabilities.slice(0, 3).join(', ') }}
-                      </span>
-                      <span v-if="item.feedback_step">step {{ item.feedback_step }}</span>
-                      <a v-if="item.url" :href="item.url" target="_blank" rel="noreferrer">artifact</a>
-                    </div>
-                  </div>
-                  <p v-else class="capability-fixture-library-empty">
-                    暂无 efficiency feedback replay artifacts
-                  </p>
-                </section>
-
-                <section v-if="capabilityFailureFixtureReplayReport" class="capability-fixture-replay-card">
-                  <div class="capability-section-head">
-                    <h4>Failure Fixture Replay</h4>
-                    <CapabilityStatusBadge
-                      :status-class="capabilityFailureFixtureReplayReport.passed ? 'ok' : 'error'"
-                      :label="capabilityFailureFixtureReplayStatus"
-                    />
-                  </div>
-                  <div class="capability-fixture-replay-grid">
-                    <span>failure</span>
-                    <strong>{{ capabilityFailureFixtureReplayReport.fixture?.primary_failure || 'unknown' }}</strong>
-                    <span>planner</span>
-                    <strong>{{ capabilityFailureFixtureReplayReport.planner_feedback?.passed ? 'passed' : 'failed' }}</strong>
-                    <span>route</span>
-                    <strong>{{ capabilityFailureFixtureReplayReport.route?.passed ? 'passed' : 'failed' }}</strong>
-                    <span>plan</span>
-                    <strong>{{ capabilityFailureFixtureReplayReport.execution_plan?.passed ? 'passed' : 'failed' }}</strong>
-                  </div>
-                  <div v-if="capabilityFailureFixtureReplayArtifact?.url" class="capability-fixture-replay-artifact">
-                    artifact:
-                    <a :href="capabilityFailureFixtureReplayArtifact.url" target="_blank" rel="noreferrer">
-                      {{ capabilityFailureFixtureReplayArtifact.url }}
-                    </a>
-                  </div>
-                  <div class="capability-fixture-replay-checks">
-                    <span>
-                      checks {{ capabilityFailureFixtureReplayChecks.length - capabilityFailureFixtureReplayFailedChecks.length }}/{{ capabilityFailureFixtureReplayChecks.length }}
-                    </span>
-                    <span v-if="capabilityFailureFixtureReplayFailedChecks.length">
-                      failed {{ capabilityFailureFixtureReplayFailedChecks.length }}
-                    </span>
-                  </div>
-                  <ul class="capability-fixture-replay-check-list">
-                    <li
-                      v-for="check in capabilityFailureFixtureReplayChecks.slice(0, 6)"
-                      :key="check.name"
-                      :class="check.passed ? 'is-ok' : 'is-error'"
-                    >
-                      <span>{{ check.passed ? '✓' : '×' }}</span>
-                      <code>{{ check.name }}</code>
-                    </li>
-                  </ul>
-                </section>
-
-                <section class="capability-fixture-library-card">
-                  <div class="capability-section-head">
-                    <h4>Failure Fixture Library</h4>
-                    <CapabilityStatusBadge
-                      status-class="route-only"
-                      :label="`${capabilityFailureFixtureLibraryCount} fixtures`"
-                    />
-                  </div>
-                  <div class="capability-fixture-library-actions">
-                    <span>source capability/failure_fixtures</span>
-                    <span v-if="capabilityFailureFixtureLibraryLoading">loading</span>
-                  </div>
-                  <div v-if="capabilityFailureFixtureLibrary.length" class="capability-fixture-library-list">
-                    <div
-                      v-for="item in capabilityFailureFixtureLibrary.slice(0, 5)"
-                      :key="item.path || item.name"
-                      class="capability-fixture-library-item"
-                    >
-                      <strong>{{ item.name || 'fixture' }}</strong>
-                      <span>{{ item.primary_failure || 'unknown' }}</span>
-                      <span>{{ item.action || 'action' }}</span>
-                      <a v-if="item.url" :href="item.url" target="_blank" rel="noreferrer">artifact</a>
-                    </div>
-                  </div>
-                  <div v-else class="capability-fixture-library-empty">
-                    暂无已加载 fixture，点击“刷新 Fixture 库”读取 artifact library。
-                  </div>
-                </section>
-
-                <section class="capability-fixture-history-card">
-                  <div class="capability-section-head">
-                    <h4>Failure Fixture Batch History</h4>
-                    <CapabilityStatusBadge
-                      status-class="route-only"
-                      :label="`${capabilityFailureFixtureBatchHistoryCount} reports`"
-                    />
-                  </div>
-                  <div class="capability-fixture-library-actions">
-                    <span>source capability/failure_fixture_replay_batches</span>
-                    <span v-if="capabilityFailureFixtureBatchHistoryLoading">loading</span>
-                    <span v-if="capabilityFailureFixtureLatestBatchHistory">
-                      latest {{ capabilityFailureFixtureLatestBatchHistory.status || 'unknown' }}
-                      · failed {{ capabilityFailureFixtureLatestBatchHistory.failed_count || 0 }}
-                    </span>
-                  </div>
-                  <div
-                    v-if="capabilityFailureFixtureBatchHistoryTrend"
-                    class="capability-fixture-history-trend"
-                    :class="`is-${capabilityFailureFixtureBatchHistoryTrendDirection}`"
-                  >
-                    <strong>trend {{ capabilityFailureFixtureBatchHistoryTrendDirection }}</strong>
-                    <span>
-                      failed Δ {{ capabilityFailureFixtureBatchHistoryTrend.failed_count_delta || 0 }}
-                      · pass rate Δ {{ capabilityFailureFixtureBatchHistoryTrendPassRateDelta }}%
-                    </span>
-                    <small v-if="capabilityFailureFixtureBatchHistoryTrend.focus_changed">
-                      focus changed {{ capabilityFailureFixtureBatchHistoryTrend.previous_recommended_focus || 'none' }}
-                      → {{ capabilityFailureFixtureBatchHistoryTrend.latest_recommended_focus || 'none' }}
-                    </small>
-                  </div>
-                  <div v-if="capabilityFailureFixtureBatchHistory.length" class="capability-fixture-history-list">
-                    <div
-                      v-for="item in capabilityFailureFixtureBatchHistory.slice(0, 5)"
-                      :key="item.path || item.name"
-                      class="capability-fixture-history-item"
-                      :class="item.passed ? 'is-ok' : 'is-error'"
-                    >
-                      <strong>{{ item.name || 'batch replay' }}</strong>
-                      <span>{{ item.status || (item.passed ? 'passed' : 'failed') }}</span>
-                      <span>{{ item.passed_count || 0 }}/{{ item.fixture_count || 0 }} passed · failed {{ item.failed_count || 0 }}</span>
-                      <small v-if="item.recommended_focus">{{ item.recommended_focus }}</small>
-                      <a v-if="item.url" :href="item.url" target="_blank" rel="noreferrer">artifact</a>
-                    </div>
-                  </div>
-                  <div v-else class="capability-fixture-library-empty">
-                    暂无已加载 batch replay history，点击“刷新 Replay 历史”读取 report artifacts。
-                  </div>
-                </section>
-
-                <section v-if="capabilityFailureFixtureBatchReplayReport" class="capability-fixture-replay-card capability-fixture-batch-card">
-                  <div class="capability-section-head">
-                    <h4>Failure Fixture Batch Replay</h4>
-                    <div class="capability-fixture-batch-head-actions">
-                      <el-button
-                        size="small"
-                        plain
-                        class="capability-export-btn"
-                        title="复制 failure fixture batch replay Markdown 摘要"
-                        @click="copyCapabilityFailureFixtureBatchReplaySummary"
-                      >
-                        复制 Replay 摘要
-                      </el-button>
-                      <CapabilityStatusBadge
-                        :status-class="capabilityFailureFixtureBatchReplayReport.passed ? 'ok' : 'error'"
-                        :label="capabilityFailureFixtureBatchReplayStatus"
-                      />
-                    </div>
-                  </div>
-                  <div class="capability-fixture-replay-grid">
-                    <span>fixtures</span>
-                    <strong>{{ capabilityFailureFixtureBatchReplayReport.fixture_count || 0 }}</strong>
-                    <span>passed</span>
-                    <strong>{{ capabilityFailureFixtureBatchReplayReport.passed_count || 0 }}</strong>
-                    <span>failed</span>
-                    <strong>{{ capabilityFailureFixtureBatchReplayReport.failed_count || 0 }}</strong>
-                    <span>failed checks</span>
-                    <strong>{{ capabilityFailureFixtureBatchReplayFailedChecks.length }}</strong>
-                  </div>
-                  <div v-if="capabilityFailureFixtureBatchReplaySummary.status" class="capability-fixture-triage">
-                    <div v-if="capabilityFailureFixtureBatchReplaySummary.recommended_focus" class="capability-fixture-triage-focus">
-                      focus {{ capabilityFailureFixtureBatchReplaySummary.recommended_focus }}
-                    </div>
-                    <div class="capability-fixture-triage-grid">
-                      <div>
-                        <span>primary</span>
-                        <strong>{{ capabilityFailureFixtureBatchReplayTopPrimaryFailures[0]?.name || 'none' }}</strong>
-                        <small>{{ capabilityFailureFixtureBatchReplayTopPrimaryFailures[0]?.count || 0 }}</small>
-                      </div>
-                      <div>
-                        <span>category</span>
-                        <strong>{{ capabilityFailureFixtureBatchReplayTopFailureCategories[0]?.name || 'none' }}</strong>
-                        <small>{{ capabilityFailureFixtureBatchReplayTopFailureCategories[0]?.count || 0 }}</small>
-                      </div>
-                      <div>
-                        <span>check</span>
-                        <strong>{{ capabilityFailureFixtureBatchReplayTopFailedChecks[0]?.name || 'none' }}</strong>
-                        <small>{{ capabilityFailureFixtureBatchReplayTopFailedChecks[0]?.failed_count || 0 }}</small>
-                      </div>
-                    </div>
-                  </div>
-                  <div v-if="capabilityFailureFixtureBatchReplayArtifact?.url" class="capability-fixture-replay-artifact">
-                    artifact:
-                    <a :href="capabilityFailureFixtureBatchReplayArtifact.url" target="_blank" rel="noreferrer">
-                      {{ capabilityFailureFixtureBatchReplayArtifact.url }}
-                    </a>
-                  </div>
-                  <ul v-if="capabilityFailureFixtureBatchReplayFailedChecks.length" class="capability-fixture-replay-check-list">
-                    <li
-                      v-for="check in capabilityFailureFixtureBatchReplayFailedChecks.slice(0, 6)"
-                      :key="check.name"
-                      class="is-error"
-                    >
-                      <span>×</span>
-                      <code>{{ check.name }}</code>
-                      <span>{{ check.failed_count }}</span>
-                    </li>
-                  </ul>
-                  <div class="capability-fixture-batch-list">
-                    <div
-                      v-for="item in capabilityFailureFixtureBatchReplayItems.slice(0, 6)"
-                      :key="`${item.index}-${item.name}`"
-                      class="capability-fixture-batch-item"
-                      :class="item.passed ? 'is-ok' : 'is-error'"
-                    >
-                      <span>{{ item.passed ? '✓' : '×' }}</span>
-                      <strong>{{ item.name || 'fixture' }}</strong>
-                      <small>{{ item.primary_failure || 'unknown' }} · failed {{ item.failed_check_count || 0 }}</small>
-                    </div>
-                  </div>
-                </section>
-
                   </el-tab-pane>
                   <el-tab-pane label="诊断" name="diagnostics">
-
-                <section v-if="capabilityManifestSummary.length" class="capability-section">
-                  <h4>能力清单摘要</h4>
-                  <div class="capability-fallback">
-                    <span
-                      v-for="item in capabilityManifestSummary"
-                      :key="`manifest-${item.name}`"
-                      class="capability-fallback-pill"
-                      :title="`${item.layer || ''} · ${item.owner || ''}`"
-                    >
-                      {{ item.name }} · {{ item.layer || item.category || 'capability' }}
-                    </span>
-                  </div>
-                </section>
-
-                <section class="capability-section">
-                  <h4>兜底顺序</h4>
-                  <div class="capability-fallback">
-                    <span
-                      v-for="(item, idx) in capabilityFallbackChain"
-                      :key="`fallback-${idx}-${capabilityItemName(item)}`"
-                      class="capability-fallback-pill"
-                      :title="capabilityItemDetail(item)"
-                    >
-                      {{ idx + 1 }}. {{ capabilityItemName(item) }}
-                    </span>
-                  </div>
-                </section>
-
-                <section class="capability-section">
-                  <h4>模型职责边界</h4>
-                  <div class="capability-role-grid">
-                    <article
-                      v-for="role in capabilityRoleRows"
-                      :key="role.key"
-                      class="capability-role-card"
-                    >
-                      <header>
-                        <strong>{{ role.key }}</strong>
-                        <span v-if="role.recommendedUse">{{ role.recommendedUse }}</span>
-                      </header>
-                      <p v-if="role.position" class="capability-meta">{{ role.position }}</p>
-                      <ul v-if="role.responsibilities.length">
-                        <li v-for="item in role.responsibilities" :key="`${role.key}-r-${item}`">
-                          {{ item }}
-                        </li>
-                      </ul>
-                      <p v-if="role.shouldNotDo.length" class="capability-avoid">
-                        avoid: {{ role.shouldNotDo.join(', ') }}
-                      </p>
-                    </article>
-                  </div>
-                </section>
-
-                <section v-if="capabilityAuditFindings.length" class="capability-section">
-                  <h4>审计发现</h4>
-                  <div class="capability-audit-list">
-                    <div
-                      v-for="(finding, idx) in capabilityAuditFindings"
-                      :key="`finding-${idx}-${finding.area || idx}`"
-                      class="capability-audit-item"
-                    >
-                      <strong>{{ finding.area || 'area' }}</strong>
-                      <span>{{ finding.status || 'unknown' }}</span>
-                      <p>{{ finding.detail || '' }}</p>
-                    </div>
-                  </div>
-                </section>
-
-                <section class="capability-section">
-                  <h4>原始事件</h4>
-                  <pre class="capability-json"><code>{{ capabilityTraceJson || capabilityExecuteJson }}</code></pre>
-                </section>
-
+                    <CapabilityDiagnosticsPane
+                      :manifest-summary="capabilityManifestSummary"
+                      :fallback-chain="capabilityFallbackChain"
+                      :role-rows="capabilityRoleRows"
+                      :audit-findings="capabilityAuditFindings"
+                      :raw-json="capabilityTraceJson || capabilityExecuteJson"
+                    />
                   </el-tab-pane>
                 </el-tabs>
               </div>
@@ -5250,7 +4858,7 @@ const settingsSummaryText = computed(() => {
                     href="#"
                     class="tab-jump"
                     @click.prevent="activeBottomTab = 'artifacts'"
-                  >Artifacts</a>
+                  >产物</a>
                   面板下载
                 </p>
               </div>
@@ -6798,484 +6406,6 @@ const settingsSummaryText = computed(() => {
   flex-wrap: wrap;
   align-items: flex-start;
   gap: 8px;
-}
-
-.capability-export-btn {
-  border-color: rgb(var(--rgb-indigo-bright) / 0.45);
-  color: var(--vsp-indigo-200);
-}
-
-.capability-section h4 {
-  margin: 0 0 8px;
-  color: var(--vsp-text-strong);
-  font-size: 13px;
-}
-
-.capability-section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 0 0 8px;
-}
-
-.capability-section-head h4 {
-  margin: 0;
-}
-
-.capability-chain,
-.capability-role-grid,
-.capability-audit-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 8px;
-}
-
-.capability-card,
-.capability-role-card,
-.capability-audit-item {
-  padding: 9px 10px;
-  border-radius: 8px;
-  background: rgb(var(--rgb-ink) / 0.72);
-  border: 1px solid rgb(var(--rgb-slate) / 0.16);
-}
-
-.capability-card-head,
-.capability-role-card header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.capability-card-head strong,
-.capability-role-card strong,
-.capability-audit-item strong {
-  color: var(--vsp-info-200);
-  font-size: 13px;
-}
-
-.capability-rank {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  color: var(--vsp-slate-900);
-  background: var(--vsp-info-200);
-  font-size: 11px;
-  font-weight: 800;
-}
-
-.capability-meta,
-.capability-detail,
-.capability-audit-item p,
-.capability-avoid {
-  margin: 5px 0 0;
-  color: var(--vsp-text-muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.capability-detail {
-  color: var(--vsp-text-2);
-}
-
-.capability-fallback {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.capability-health-strip {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.72);
-  border: 1px solid rgb(var(--rgb-slate) / 0.16);
-  font-size: 12px;
-}
-
-.capability-health-status {
-  padding: 3px 8px;
-  border-radius: 999px;
-  border: 1px solid rgb(var(--rgb-slate) / 0.22);
-  font-weight: 700;
-}
-
-.capability-health-status.is-healthy,
-.capability-health-status.is-executed,
-.capability-health-status.is-ok {
-  color: var(--vsp-success-soft);
-  background: rgb(var(--rgb-success) / 0.12);
-  border-color: rgb(var(--rgb-success) / 0.35);
-}
-
-.capability-health-status.is-route-only,
-.capability-health-status.is-fallback {
-  color: var(--vsp-warn-soft);
-  background: rgb(var(--rgb-warn) / 0.12);
-  border-color: rgb(var(--rgb-warn) / 0.35);
-}
-
-.capability-health-status.is-issue,
-.capability-health-status.is-error {
-  color: var(--vsp-danger-soft);
-  background: rgb(var(--rgb-danger) / 0.14);
-  border-color: rgb(var(--rgb-danger) / 0.4);
-}
-
-.capability-fixture-replay-card,
-.capability-efficiency-feedback-replay-card {
-  padding: 10px 12px;
-  border-radius: 10px;
-  color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.74);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.24);
-}
-
-.capability-fixture-replay-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 6px 10px;
-  font-size: 12px;
-}
-
-.capability-fixture-replay-grid span {
-  color: var(--vsp-text-muted);
-}
-
-.capability-fixture-replay-grid strong {
-  color: var(--vsp-sky-100);
-}
-
-.capability-fixture-replay-artifact,
-.capability-fixture-replay-checks {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
-  color: var(--vsp-text-muted);
-  font-size: 12px;
-}
-
-.capability-fixture-replay-artifact a {
-  color: var(--vsp-info-200);
-  text-decoration: none;
-}
-
-.capability-fixture-replay-check-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin: 8px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.capability-fixture-replay-check-list li {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 7px;
-  border-radius: 999px;
-  border: 1px solid rgb(var(--rgb-slate) / 0.22);
-  background: rgb(var(--rgb-slate) / 0.08);
-  font-size: 11.5px;
-}
-
-.capability-fixture-replay-check-list li.is-ok {
-  color: var(--vsp-success-soft);
-  border-color: rgb(var(--rgb-success) / 0.35);
-  background: rgb(var(--rgb-success) / 0.12);
-}
-
-.capability-fixture-replay-check-list li.is-error {
-  color: var(--vsp-danger-soft);
-  border-color: rgb(var(--rgb-danger) / 0.4);
-  background: rgb(var(--rgb-danger) / 0.14);
-}
-
-.capability-fixture-library-card,
-.capability-efficiency-feedback-library-card {
-  padding: 10px 12px;
-  border-radius: 10px;
-  color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.62);
-  border: 1px solid rgb(var(--rgb-slate) / 0.18);
-}
-
-.capability-fixture-history-card {
-  padding: 10px 12px;
-  border-radius: 10px;
-  color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.58);
-  border: 1px solid rgb(var(--rgb-sky-bright) / 0.18);
-}
-
-.capability-fixture-library-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  color: var(--vsp-text-muted);
-  font-size: 12px;
-}
-
-.capability-fixture-history-trend {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  padding: 7px 9px;
-  border-radius: 8px;
-  color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink-deep) / 0.32);
-  border: 1px solid rgb(var(--rgb-slate) / 0.16);
-  font-size: 12px;
-}
-
-.capability-fixture-history-trend.is-improved {
-  border-color: rgb(var(--rgb-success) / 0.3);
-}
-
-.capability-fixture-history-trend.is-regressed {
-  border-color: rgb(var(--rgb-danger) / 0.36);
-}
-
-.capability-fixture-history-trend.is-stable,
-.capability-fixture-history-trend.is-baseline {
-  border-color: rgb(var(--rgb-sky-bright) / 0.26);
-}
-
-.capability-fixture-library-list,
-.capability-efficiency-feedback-library-list,
-.capability-fixture-history-list,
-.capability-fixture-batch-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.capability-fixture-library-item,
-.capability-efficiency-feedback-library-item,
-.capability-fixture-history-item,
-.capability-fixture-batch-item {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 7px 9px;
-  border-radius: 8px;
-  background: rgb(var(--rgb-ink-deep) / 0.32);
-  border: 1px solid rgb(var(--rgb-slate) / 0.16);
-  font-size: 12px;
-}
-
-.capability-fixture-library-item strong,
-.capability-efficiency-feedback-library-item strong,
-.capability-fixture-history-item strong,
-.capability-fixture-batch-item strong {
-  color: var(--vsp-sky-100);
-}
-
-.capability-fixture-library-item span,
-.capability-efficiency-feedback-library-item span,
-.capability-fixture-history-item span,
-.capability-fixture-history-item small,
-.capability-fixture-batch-item small,
-.capability-fixture-library-empty {
-  color: var(--vsp-text-muted);
-  font-size: 12px;
-}
-
-.capability-fixture-library-item a,
-.capability-efficiency-feedback-library-item a {
-  color: var(--vsp-info-200);
-  text-decoration: none;
-}
-
-.capability-fixture-history-item a {
-  color: var(--vsp-info-200);
-  text-decoration: none;
-}
-
-.capability-fixture-library-empty {
-  margin-top: 8px;
-}
-
-.capability-fixture-triage {
-  margin-top: 8px;
-  padding: 8px;
-  border-radius: 8px;
-  background: rgb(var(--rgb-ink-deep) / 0.28);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.18);
-}
-
-.capability-fixture-triage-focus {
-  color: var(--vsp-indigo-200);
-  font-size: 12px;
-  margin-bottom: 6px;
-}
-
-.capability-fixture-triage-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 6px;
-}
-
-.capability-fixture-triage-grid div {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.capability-fixture-triage-grid span,
-.capability-fixture-triage-grid small {
-  color: var(--vsp-text-muted);
-  font-size: 11px;
-}
-
-.capability-fixture-triage-grid strong {
-  color: var(--vsp-sky-100);
-  font-size: 12px;
-}
-
-.capability-fixture-batch-head-actions {
-  display: inline-flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.capability-fixture-batch-item.is-ok {
-  border-color: rgb(var(--rgb-success) / 0.28);
-}
-
-.capability-fixture-history-item.is-ok {
-  border-color: rgb(var(--rgb-success) / 0.24);
-}
-
-.capability-fixture-batch-item.is-error {
-  border-color: rgb(var(--rgb-danger) / 0.36);
-}
-
-.capability-fixture-history-item.is-error {
-  border-color: rgb(var(--rgb-danger) / 0.3);
-}
-
-.capability-exec-summary,
-.capability-attempt-list,
-.capability-check-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.capability-exec-summary {
-  align-items: center;
-  color: var(--vsp-text-2);
-  font-size: 12px;
-}
-
-.capability-exec-status,
-.capability-attempt,
-.capability-check {
-  border-radius: 999px;
-  border: 1px solid rgb(var(--rgb-slate) / 0.22);
-  background: rgb(var(--rgb-slate) / 0.08);
-}
-
-.capability-exec-status,
-.capability-check {
-  padding: 3px 8px;
-  font-size: 11.5px;
-  font-weight: 700;
-}
-
-.capability-attempt {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 9px;
-  color: var(--vsp-text-2);
-  font-size: 11.5px;
-}
-
-.capability-attempt strong {
-  color: var(--vsp-sky-100);
-}
-
-.capability-attempt p {
-  flex: 1 1 100%;
-  margin: 0;
-  color: var(--vsp-text-muted);
-}
-
-.capability-exec-status.is-complete,
-.capability-attempt.is-complete,
-.capability-check.is-complete {
-  color: var(--vsp-success-soft);
-  background: rgb(var(--rgb-success) / 0.12);
-  border-color: rgb(var(--rgb-success) / 0.35);
-}
-
-.capability-exec-status.is-fallback,
-.capability-attempt.is-skip,
-.capability-check.is-warning,
-.capability-check.is-skip {
-  color: var(--vsp-warn-soft);
-  background: rgb(var(--rgb-warn) / 0.12);
-  border-color: rgb(var(--rgb-warn) / 0.35);
-}
-
-.capability-attempt.is-error,
-.capability-check.is-error {
-  color: var(--vsp-danger-soft);
-  background: rgb(var(--rgb-danger) / 0.14);
-  border-color: rgb(var(--rgb-danger) / 0.4);
-}
-
-.capability-fallback-pill,
-.capability-role-card header span,
-.capability-audit-item span {
-  display: inline-flex;
-  padding: 3px 8px;
-  border-radius: 999px;
-  color: var(--vsp-indigo-200);
-  background: rgb(var(--rgb-indigo) / 0.16);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.32);
-  font-size: 11.5px;
-}
-
-.capability-role-card ul {
-  margin: 7px 0 0;
-  padding-left: 18px;
-  color: var(--vsp-text-2);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.capability-avoid {
-  color: var(--vsp-warn);
-}
-
-.capability-json {
-  margin: 0;
-  max-height: 180px;
-  overflow: auto;
-  padding: 10px 12px;
-  border-radius: 8px;
-  color: var(--vsp-text-2);
-  background: var(--vsp-slate-950);
-  border: 1px solid rgb(var(--rgb-slate) / 0.16);
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 11.5px;
-  line-height: 1.45;
 }
 
 .bottom-tabs {

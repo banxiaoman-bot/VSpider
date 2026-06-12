@@ -151,9 +151,9 @@ watch(() => props.refreshToken, () => fetchRuns())
         :loading="loading"
         @click="fetchRuns"
       >
-        Refresh
+        刷新
       </el-button>
-      <span class="run-registry-count">{{ runs.length }} runs</span>
+      <span class="run-registry-count">共 {{ runs.length }} 条运行记录</span>
     </div>
 
     <el-table
@@ -161,10 +161,10 @@ watch(() => props.refreshToken, () => fetchRuns())
       height="190"
       class="artifact-table run-registry-table"
       header-cell-class-name="dark-table-header"
-      empty-text="No runs yet"
+      empty-text="暂无运行记录"
       @row-click="openRunDetail"
     >
-      <el-table-column label="Status" width="112">
+      <el-table-column label="状态" width="112">
         <template #default="scope">
           <el-tag size="small" :type="statusTagType(scope.row.status)">
             {{ scope.row.status || 'unknown' }}
@@ -172,23 +172,23 @@ watch(() => props.refreshToken, () => fetchRuns())
         </template>
       </el-table-column>
       <el-table-column prop="run_id" label="Run ID" width="168" show-overflow-tooltip />
-      <el-table-column label="Created" width="138">
+      <el-table-column label="创建时间" width="138">
         <template #default="scope">
           {{ formatTime(scope.row.created_at) }}
         </template>
       </el-table-column>
-      <el-table-column prop="target_url" label="Target" show-overflow-tooltip />
-      <el-table-column label="Mode" width="86">
+      <el-table-column prop="target_url" label="目标 URL" show-overflow-tooltip />
+      <el-table-column label="模式" width="86">
         <template #default="scope">
           {{ scope.row.mode || '-' }}
         </template>
       </el-table-column>
-      <el-table-column label="Duration" width="92">
+      <el-table-column label="耗时" width="92">
         <template #default="scope">
           {{ formatDuration(scope.row.duration_s) }}
         </template>
       </el-table-column>
-      <el-table-column label="Action" width="92">
+      <el-table-column label="操作" width="92">
         <template #default="scope">
           <el-button
             size="small"
@@ -196,7 +196,7 @@ watch(() => props.refreshToken, () => fetchRuns())
             :icon="View"
             @click.stop="openRunDetail(scope.row)"
           >
-            Detail
+            详情
           </el-button>
         </template>
       </el-table-column>
@@ -204,13 +204,13 @@ watch(() => props.refreshToken, () => fetchRuns())
 
     <el-dialog
       v-model="dialogVisible"
-      :title="runRecord.run_id ? `Run ${runRecord.run_id}` : 'Run detail'"
+      :title="runRecord.run_id ? `Run ${runRecord.run_id}` : '运行详情'"
       width="860px"
       class="run-detail-dialog"
       destroy-on-close
       @close="closeDialog"
     >
-      <div v-if="detailLoading" class="run-detail-status">Loading run detail...</div>
+      <div v-if="detailLoading" class="run-detail-status">正在加载运行详情...</div>
       <div v-else-if="detailError" class="run-detail-status run-detail-error">
         {{ detailError }}
       </div>
@@ -218,27 +218,27 @@ watch(() => props.refreshToken, () => fetchRuns())
         <section class="run-detail-section">
           <div class="run-detail-summary">
             <div class="run-summary-item">
-              <span>Status</span>
+              <span>状态</span>
               <strong>{{ runRecord.status || 'unknown' }}</strong>
             </div>
             <div class="run-summary-item">
-              <span>Input</span>
+              <span>输入契约</span>
               <strong>{{ contractSummary.has_input_contract ? 'ready' : 'missing' }}</strong>
             </div>
             <div class="run-summary-item">
-              <span>Output</span>
+              <span>输出契约</span>
               <strong>{{ contractSummary.has_output_contract ? 'ready' : 'missing' }}</strong>
             </div>
             <div class="run-summary-item">
-              <span>Manifest</span>
+              <span>清单条目</span>
               <strong>{{ contractSummary.manifest_items ?? 0 }}</strong>
             </div>
             <div class="run-summary-item">
-              <span>Children</span>
+              <span>子任务</span>
               <strong>{{ contractSummary.child_runs ?? childRuns.length }}</strong>
             </div>
             <div class="run-summary-item">
-              <span>Artifacts</span>
+              <span>产物数</span>
               <strong>{{ contractSummary.artifacts ?? 0 }}</strong>
             </div>
           </div>
@@ -247,11 +247,11 @@ watch(() => props.refreshToken, () => fetchRuns())
         <section class="run-detail-section">
           <header>
             <Document class="run-section-icon" />
-            <h4>Input Contract</h4>
+            <h4>输入契约</h4>
           </header>
           <dl class="run-detail-meta">
             <div class="meta-row meta-row-full">
-              <dt>Goal</dt>
+              <dt>目标</dt>
               <dd>{{ inputContract.goal || runRecord.prompt || '-' }}</dd>
             </div>
             <div class="meta-row meta-row-full">
@@ -269,7 +269,7 @@ watch(() => props.refreshToken, () => fetchRuns())
               </dd>
             </div>
             <div class="meta-row meta-row-full">
-              <dt>Attachments</dt>
+              <dt>附件</dt>
               <dd>
                 <span v-if="!attachments.length">-</span>
                 <span
@@ -288,7 +288,7 @@ watch(() => props.refreshToken, () => fetchRuns())
         <section class="run-detail-section">
           <header>
             <Document class="run-section-icon" />
-            <h4>Output Contract</h4>
+            <h4>输出契约</h4>
           </header>
           <div class="run-output-grid">
             <span>mode: <strong>{{ outputContract.mode || '-' }}</strong></span>
@@ -301,36 +301,36 @@ watch(() => props.refreshToken, () => fetchRuns())
         <section class="run-detail-section">
           <header>
             <Document class="run-section-icon" />
-            <h4>Manifest</h4>
+            <h4>产物清单 Manifest</h4>
           </header>
           <el-table
             :data="visibleManifestItems"
             max-height="220"
             class="artifact-table run-manifest-table"
             header-cell-class-name="dark-table-header"
-            empty-text="Manifest is empty"
+            empty-text="清单为空"
           >
-            <el-table-column label="Kind" width="128">
+            <el-table-column label="类型" width="128">
               <template #default="scope">
                 {{ scope.row.kind || 'other' }}
               </template>
             </el-table-column>
-            <el-table-column label="Item" show-overflow-tooltip>
+            <el-table-column label="文件" show-overflow-tooltip>
               <template #default="scope">
                 {{ manifestItemLabel(scope.row) }}
               </template>
             </el-table-column>
-            <el-table-column label="Step" width="118" show-overflow-tooltip>
+            <el-table-column label="步骤" width="118" show-overflow-tooltip>
               <template #default="scope">
                 {{ scope.row.step_id || '-' }}
               </template>
             </el-table-column>
-            <el-table-column label="Produced By" width="156" show-overflow-tooltip>
+            <el-table-column label="产出方" width="156" show-overflow-tooltip>
               <template #default="scope">
                 {{ scope.row.produced_by || '-' }}
               </template>
             </el-table-column>
-            <el-table-column label="Action" width="104">
+            <el-table-column label="操作" width="104">
               <template #default="scope">
                 <a
                   v-if="artifactHref(scope.row)"
@@ -339,7 +339,7 @@ watch(() => props.refreshToken, () => fetchRuns())
                   target="_blank"
                   rel="noreferrer"
                 >
-                  Download
+                  下载
                 </a>
                 <span v-else>-</span>
               </template>
@@ -348,11 +348,13 @@ watch(() => props.refreshToken, () => fetchRuns())
         </section>
 
         <section class="run-detail-section">
-          <header>
-            <Document class="run-section-icon" />
-            <h4>Raw Detail</h4>
-          </header>
-          <pre class="run-detail-json"><code>{{ detailJson }}</code></pre>
+          <details class="run-detail-raw">
+            <summary>
+              <Document class="run-section-icon" />
+              <span>原始 JSON（点击展开）</span>
+            </summary>
+            <pre class="run-detail-json"><code>{{ detailJson }}</code></pre>
+          </details>
         </section>
       </div>
 
@@ -364,9 +366,9 @@ watch(() => props.refreshToken, () => fetchRuns())
           :disabled="!runRecord.run_id"
           @click="openRunDetail(runRecord)"
         >
-          Refresh
+          刷新
         </el-button>
-        <el-button size="small" @click="closeDialog">Close</el-button>
+        <el-button size="small" @click="closeDialog">关闭</el-button>
       </template>
     </el-dialog>
   </section>
@@ -506,6 +508,25 @@ watch(() => props.refreshToken, () => fetchRuns())
   color: #bfdbfe;
   background: rgba(30, 64, 175, 0.18);
   overflow-wrap: anywhere;
+}
+
+.run-detail-raw summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: #e5e7eb;
+  font-size: 13px;
+  font-weight: 600;
+  list-style: none;
+}
+
+.run-detail-raw summary::-webkit-details-marker {
+  display: none;
+}
+
+.run-detail-raw[open] summary {
+  margin-bottom: 10px;
 }
 
 .run-detail-json {

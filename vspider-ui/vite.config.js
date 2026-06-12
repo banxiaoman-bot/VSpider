@@ -9,4 +9,21 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            if (id.includes('element-plus') || id.includes('@element-plus')) {
+              return 'vendor-element-plus'
+            }
+            if (id.includes('/vue/') || id.includes('\\vue\\') || id.includes('@vue')) {
+              return 'vendor-vue'
+            }
+            return 'vendor'
+          }
+        },
+      },
+    },
+  },
 })
