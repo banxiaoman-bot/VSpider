@@ -101,6 +101,10 @@ const semanticApiKey = ref('')
 const isHumanInterventionRequired = ref(false)
 const humanInterventionReason = ref('')
 const activeBottomTab = ref('terminal')
+// A: Capability 页签内部二级子页签（概览/计划/回放/诊断）
+const capabilitySubTab = ref('overview')
+// B: Timeline 筛选 chips 默认收起，点「筛选」按钮展开
+const timelineFiltersExpanded = ref(false)
 const artifactList = ref([])
 const hasNewArtifacts = ref(false)
 const runHistoryRefreshToken = ref(0)
@@ -3530,6 +3534,30 @@ onUnmounted(() => {
   // over refs).
   window.removeEventListener('keydown', handleGlobalKeydown)
 })
+// B: 按钮墙收纳进下拉后的 command 分发（指向原有 handler，不改行为）
+const handleCapabilityMoreAction = (command) => {
+  const handlers = {
+    copySummary: copyCapabilityTraceSummary,
+    generateFixture: generateCapabilityFailureFixture,
+    replayFixture: replayCapabilityFailureFixture,
+    refreshFixtures: fetchCapabilityFailureFixtures,
+    refreshBatchHistory: fetchCapabilityFailureFixtureBatchHistory,
+    batchReplay: batchReplayCapabilityFailureFixtures,
+    replayEfficiency: replayCapabilityEfficiencyFeedback,
+    refreshEfficiencyReplays: fetchCapabilityEfficiencyFeedbackReplays,
+    importReplay: () => triggerReplayImport('capability'),
+  }
+  handlers[command]?.()
+}
+
+const handleTimelineMoreAction = (command) => {
+  const handlers = {
+    exportJsonl: exportPhaseEventsAsJsonl,
+    importReplay: () => triggerReplayImport('timeline'),
+    clear: clearPhaseEvents,
+  }
+  handlers[command]?.()
+}
 </script>
 
 <template>
@@ -3587,9 +3615,15 @@ onUnmounted(() => {
           </div>
         </div>
 
+        <el-collapse class="advanced-collapse">
+          <el-collapse-item name="models">
+            <template #title>
+              <span>双脑调度中心</span>
+              <span class="collapse-title-echo">{{ selectedModel }} · {{ selectedSemanticModel }}</span>
+            </template>
         <div class="field-group model-center">
           <div class="field-title-row">
-            <label>双脑调度中心</label>
+            <label>模型选择</label>
             <el-popover
               v-model:visible="modelSettingsOpen"
               placement="right-start"
@@ -3697,10 +3731,15 @@ onUnmounted(() => {
             当前为纯文本模型，将自动剥离图像，仅依赖 AX Tree 执行任务。
           </p>
         </div>
-
+          </el-collapse-item>
+          <el-collapse-item name="identity">
+            <template #title>
+              <span>身份选择</span>
+              <span class="collapse-title-echo">{{ selectedAuthProfiles.length ? selectedAuthProfiles.join('、') : '未选择（可选）' }}</span>
+            </template>
         <div class="field-group">
           <div class="field-title-row">
-            <label>身份选择</label>
+            <label>Auth Profile</label>
             <div class="field-actions">
               <el-button
                 text
@@ -3740,8 +3779,7 @@ onUnmounted(() => {
             />
           </el-select>
         </div>
-
-        <el-collapse class="advanced-collapse">
+          </el-collapse-item>
           <el-collapse-item title="运行约束（可选）" name="constraints">
             <label>附加 URL 列表</label>
             <el-input
@@ -3940,7 +3978,7 @@ onUnmounted(() => {
         >
           <el-tab-pane name="terminal">
             <template #label>
-              <span>Live Terminal</span>
+              <span>实时日志</span>
             </template>
             <div class="terminal-heading">
               <span class="status-pill" :class="wsStatus">
@@ -4027,7 +4065,7 @@ onUnmounted(() => {
           <el-tab-pane name="timeline">
             <template #label>
               <el-badge :is-dot="hasNewPhase" class="artifact-badge">
-                <span>Timeline</span>
+                <span>时间线</span>
               </el-badge>
             </template>
             <div class="timeline-panel">
@@ -4073,25 +4111,33 @@ onUnmounted(() => {
                   size="small"
                   plain
                   class="timeline-clear-btn"
-                  :title="phaseFilterActive
-                    ? '导出当前筛选后的事件为 JSONL'
-                    : '导出全部事件为 JSONL'"
-                  @click="exportPhaseEventsAsJsonl"
+                  :class="{ 'is-active': timelineFiltersExpanded }"
+                  :title="timelineFiltersExpanded ? '收起筛选条件' : '展开 severity / phase 筛选'"
+                  @click="timelineFiltersExpanded = !timelineFiltersExpanded"
                 >
-                  导出 JSONL
+                  筛选 {{ timelineFiltersExpanded ? '▴' : '▾' }}
                 </el-button>
-                <!-- W: Offline replay import. The hidden <input> is
-                     immediately below — the visible button just
-                     triggers it programmatically. -->
-                <el-button
-                  size="small"
-                  plain
-                  class="timeline-clear-btn"
-                  title="导入 phase_<id>.jsonl 进入离线回放模式"
-                  @click="triggerReplayImport"
+                <el-dropdown
+                  trigger="click"
+                  @command="handleTimelineMoreAction"
                 >
-                  导入回放
-                </el-button>
+                  <el-button size="small" plain class="timeline-clear-btn">
+                    更多 ⋯
+                  </el-button>
+                  <template #dropdown>
+                    <el-dropdown-menu>
+                      <el-dropdown-item command="exportJsonl" :disabled="!phaseEvents.length">
+                        导出 JSONL
+                      </el-dropdown-item>
+                      <el-dropdown-item command="importReplay">
+                        导入回放
+                      </el-dropdown-item>
+                      <el-dropdown-item command="clear" divided :disabled="!phaseEvents.length">
+                        清空
+                      </el-dropdown-item>
+                    </el-dropdown-menu>
+                  </template>
+                </el-dropdown>
                 <input
                   ref="replayInputRef"
                   type="file"
@@ -4099,19 +4145,10 @@ onUnmounted(() => {
                   class="replay-file-input"
                   @change="handleReplayFileChange"
                 />
-                <el-button
-                  v-if="phaseEvents.length"
-                  size="small"
-                  plain
-                  class="timeline-clear-btn"
-                  @click="clearPhaseEvents"
-                >
-                  清空
-                </el-button>
               </div>
               <!-- O: phase + severity filter chips. Click to toggle in/out. -->
               <div
-                v-if="phaseEvents.length"
+                v-if="phaseEvents.length && (timelineFiltersExpanded || phaseFilterActive)"
                 class="timeline-filter-row"
               >
                 <div
@@ -4367,7 +4404,7 @@ onUnmounted(() => {
           <el-tab-pane name="capability">
             <template #label>
               <el-badge :is-dot="hasNewCapability" class="artifact-badge">
-                <span>Capability</span>
+                <span>能力追踪</span>
               </el-badge>
             </template>
             <el-scrollbar class="capability-scroll">
@@ -4396,99 +4433,56 @@ onUnmounted(() => {
                     >
                       导出 JSONL
                     </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :disabled="!capabilityTraceEvents.length"
-                      title="复制 capability trace 健康摘要"
-                      @click="copyCapabilityTraceSummary"
+                    <el-dropdown
+                      trigger="click"
+                      @command="handleCapabilityMoreAction"
                     >
-                      复制摘要
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityFailureFixtureLoading"
-                      :disabled="capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'"
-                      title="保存当前 capability failure bundle 为 regression fixture artifact"
-                      @click="generateCapabilityFailureFixture"
-                    >
-                      生成 Fixture
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityFailureFixtureReplayLoading"
-                      :disabled="capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'"
-                      title="验证当前 capability failure bundle 生成的 regression fixture replay"
-                      @click="replayCapabilityFailureFixture"
-                    >
-                      验证 Fixture
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityFailureFixtureLibraryLoading"
-                      title="刷新已保存的 capability failure fixture library"
-                      @click="fetchCapabilityFailureFixtures"
-                    >
-                      刷新 Fixture 库
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityFailureFixtureBatchHistoryLoading"
-                      title="刷新已保存的 capability failure fixture batch replay history"
-                      @click="fetchCapabilityFailureFixtureBatchHistory"
-                    >
-                      刷新 Replay 历史
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityFailureFixtureBatchReplayLoading"
-                      :disabled="capabilityFailureFixtureBatchReplayLoading"
-                      title="批量离线验证已保存的 capability failure fixtures"
-                      @click="batchReplayCapabilityFailureFixtures"
-                    >
-                      批量验证 Fixture
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityEfficiencyFeedbackReplayLoading"
-                      :disabled="capabilityExecutionEfficiencyCorrelationReport.version !== 'efficiency_correlation_report.v1'"
-                      title="离线验证 efficiency correlation report 生成的 planner feedback replay"
-                      @click="replayCapabilityEfficiencyFeedback"
-                    >
-                      验证 Efficiency
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :loading="capabilityEfficiencyFeedbackReplayLibraryLoading"
-                      title="刷新已保存的 efficiency feedback replay artifact library"
-                      @click="fetchCapabilityEfficiencyFeedbackReplays"
-                    >
-                      刷新 Efficiency Replay
-                    </el-button>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      title="导入 capability_trace_*.jsonl 进入离线回放模式"
-                      @click="triggerReplayImport('capability')"
-                    >
-                      导入回放
-                    </el-button>
+                      <el-button size="small" plain class="capability-export-btn">
+                        更多操作 ⋯
+                      </el-button>
+                      <template #dropdown>
+                        <el-dropdown-menu>
+                          <el-dropdown-item command="copySummary" :disabled="!capabilityTraceEvents.length">
+                            复制摘要
+                          </el-dropdown-item>
+                          <el-dropdown-item command="importReplay">
+                            导入回放
+                          </el-dropdown-item>
+                          <el-dropdown-item
+                            command="generateFixture"
+                            divided
+                            :disabled="capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'"
+                          >
+                            生成 Fixture
+                          </el-dropdown-item>
+                          <el-dropdown-item
+                            command="replayFixture"
+                            :disabled="capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'"
+                          >
+                            验证 Fixture
+                          </el-dropdown-item>
+                          <el-dropdown-item command="refreshFixtures">
+                            刷新 Fixture 库
+                          </el-dropdown-item>
+                          <el-dropdown-item command="refreshBatchHistory">
+                            刷新 Replay 历史
+                          </el-dropdown-item>
+                          <el-dropdown-item command="batchReplay" :disabled="capabilityFailureFixtureBatchReplayLoading">
+                            批量验证 Fixture
+                          </el-dropdown-item>
+                          <el-dropdown-item
+                            command="replayEfficiency"
+                            divided
+                            :disabled="capabilityExecutionEfficiencyCorrelationReport.version !== 'efficiency_correlation_report.v1'"
+                          >
+                            验证 Efficiency
+                          </el-dropdown-item>
+                          <el-dropdown-item command="refreshEfficiencyReplays">
+                            刷新 Efficiency Replay
+                          </el-dropdown-item>
+                        </el-dropdown-menu>
+                      </template>
+                    </el-dropdown>
                   </div>
                 </section>
 
@@ -4509,6 +4503,9 @@ onUnmounted(() => {
                   >退出回放</el-button>
                 </div>
 
+                <el-tabs v-model="capabilitySubTab" class="capability-sub-tabs">
+                  <el-tab-pane label="概览" name="overview">
+
                 <section v-if="capabilityTraceRows.length" class="capability-health-strip">
                   <CapabilityStatusBadge
                     :status-class="capabilityTraceHealth.status"
@@ -4521,6 +4518,294 @@ onUnmounted(() => {
                     {{ capabilityTraceHealth.alignment }}
                   </span>
                 </section>
+
+                <CapabilityRuntimePanel
+                  :runtime-preflight="capabilityRuntimePreflight"
+                  :runtime-preflight-class="capabilityRuntimePreflightClass"
+                  :runtime-preflight-label="capabilityRuntimePreflightLabel"
+                  :browser-runtime="browserRuntime"
+                  :browser-runtime-class="browserRuntimeStatusClass"
+                  :browser-runtime-label="browserRuntimeLabel"
+                  :backend-summary="browserRuntimeBackendSummary"
+                  :capacity="browserRuntimeCapacity"
+                  :health-label="browserRuntimeHealthLabel"
+                  :health-cache-label="browserRuntimeHealthCacheLabel"
+                />
+
+                <CapabilityTraceList
+                  v-model:filter="capabilityTraceFilter"
+                  v-model:search-query="capabilityTraceSearchQuery"
+                  :rows="capabilityFilteredTraceRows"
+                  :total-rows="capabilityTraceRows.length"
+                  :summary="capabilityTraceSummary"
+                  @open-row="openPhaseDialog"
+                />
+
+                <CapabilityAlignmentCard
+                  :visible="Boolean(latestCapabilityExecute)"
+                  :alignment="capabilityExecutionAlignment"
+                />
+
+                <section v-if="latestCapabilityExecute" class="capability-section">
+                  <h4>执行遥测</h4>
+                  <div class="capability-exec-summary">
+                    <span
+                      class="capability-exec-status"
+                      :class="latestCapabilityExecute.completed ? 'is-complete' : 'is-fallback'"
+                    >
+                      {{ latestCapabilityExecute.execution_status || 'unknown' }}
+                    </span>
+                    <span v-if="latestCapabilityExecute.capability">
+                      capability: {{ latestCapabilityExecute.capability }}
+                    </span>
+                    <span v-if="Number.isFinite(latestCapabilityExecute.duration_ms)">
+                      {{ latestCapabilityExecute.duration_ms }}ms
+                    </span>
+                    <span v-if="latestCapabilityExecute.fallback_reason">
+                      fallback: {{ latestCapabilityExecute.fallback_reason }}
+                    </span>
+                  </div>
+                  <CapabilityEfficiencyPanel
+                    :crawl-plan="capabilityActiveCrawlEfficiencyPlan"
+                    :available-paths="capabilityExecutionCrawlEfficiencyAvailablePaths"
+                    :candidates="capabilityExecutionCrawlEfficiencyCandidates"
+                    :summary="capabilityExecutionCrawlEfficiencySummary"
+                    :candidate-class="capabilityCrawlEfficiencyCandidateClass"
+                    :candidate-evidence="capabilityCrawlEfficiencyEvidence"
+                    :correlation-report="capabilityExecutionEfficiencyCorrelationReport"
+                    :correlation-status-class="capabilityEfficiencyCorrelationStatusClass"
+                    :correlation-alignment="capabilityExecutionEfficiencyCorrelationAlignment"
+                    :root-causes="capabilityExecutionEfficiencyCorrelationRootCauses"
+                    :planner-hints="capabilityExecutionEfficiencyCorrelationPlannerHints"
+                    :actions="capabilityExecutionEfficiencyCorrelationActions"
+                  />
+                  <div v-if="capabilityExecutionRuntimeAfter.runtime_status" class="capability-exec-summary">
+                    <span>{{ capabilityExecutionRuntimeLabel }}</span>
+                    <span>runtime: {{ capabilityExecutionRuntimeAfter.runtime_status || 'unknown' }}</span>
+                    <span>backend: {{ capabilityExecutionRuntimeAfter.active_backend || 'unknown' }}</span>
+                    <span>health: {{ capabilityExecutionRuntimeAfter.backend_health || 'unknown' }}</span>
+                    <span>
+                      contexts:
+                      {{ capabilityExecutionRuntimeAfter.available_contexts ?? '?' }}
+                      /
+                      {{ capabilityExecutionRuntimeAfter.max_contexts ?? '?' }}
+                    </span>
+                    <span v-if="capabilityExecutionRuntimeAfter.recommended_action">
+                      action: {{ capabilityExecutionRuntimeAfter.recommended_action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionRuntimeDrift.version" class="capability-exec-summary">
+                    <span>{{ capabilityExecutionDriftLabel }}</span>
+                    <span>changes: {{ Array.isArray(capabilityExecutionRuntimeDrift.changes) ? capabilityExecutionRuntimeDrift.changes.length : 0 }}</span>
+                    <span>warnings: {{ Array.isArray(capabilityExecutionRuntimeDrift.warnings) ? capabilityExecutionRuntimeDrift.warnings.length : 0 }}</span>
+                    <span v-if="capabilityExecutionRuntimeDrift.deltas">
+                      contexts Δ:
+                      {{ capabilityExecutionRuntimeDrift.deltas.available_contexts ?? 0 }}
+                    </span>
+                    <span v-if="capabilityExecutionRuntimeDrift.recommended_action">
+                      action: {{ capabilityExecutionRuntimeDrift.recommended_action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionRuntimeIssueSummary.version" class="capability-exec-summary">
+                    <span>{{ capabilityExecutionIssueLabel }}</span>
+                    <span>issues: {{ capabilityExecutionRuntimeIssueSummary.issue_count ?? 0 }}</span>
+                    <span v-if="capabilityExecutionRuntimeIssueSummary.sources">
+                      drift: {{ capabilityExecutionRuntimeIssueSummary.sources.drift_status || 'unknown' }}
+                    </span>
+                    <span v-if="capabilityExecutionRuntimeIssueSummary.recommended_action">
+                      action: {{ capabilityExecutionRuntimeIssueSummary.recommended_action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionRuntimeIssues.length" class="capability-check-list">
+                    <span
+                      v-for="(issue, idx) in capabilityExecutionRuntimeIssues"
+                      :key="`runtime-issue-${idx}-${issue.code || idx}`"
+                      class="capability-check is-error"
+                    >
+                      {{ issue.source || 'runtime' }}: {{ issue.code || 'issue' }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionRuntimeActions.length" class="capability-check-list">
+                    <span
+                      v-for="action in capabilityExecutionRuntimeActions"
+                      :key="`runtime-action-${action}`"
+                      class="capability-check is-complete"
+                    >
+                      action: {{ action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionActionIssueSummary.version" class="capability-exec-summary">
+                    <span>{{ capabilityExecutionActionIssueLabel }}</span>
+                    <span v-if="capabilityExecutionActionTrace.action">
+                      browser action: {{ capabilityExecutionActionTrace.action }}
+                    </span>
+                    <span v-if="capabilityExecutionActionFailureSummary.failure_code">
+                      failure: {{ capabilityExecutionActionFailureSummary.failure_code }}
+                    </span>
+                    <span v-if="capabilityExecutionActionFailureSummary.failure_category">
+                      category: {{ capabilityExecutionActionFailureSummary.failure_category }}
+                    </span>
+                    <span>issues: {{ capabilityExecutionActionIssueSummary.issue_count ?? 0 }}</span>
+                    <span v-if="capabilityExecutionActionIssueSummary.recommended_action">
+                      action: {{ capabilityExecutionActionIssueSummary.recommended_action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionActionIssues.length" class="capability-check-list">
+                    <span
+                      v-for="(issue, idx) in capabilityExecutionActionIssues"
+                      :key="`browser-action-issue-${idx}-${issue.code || idx}`"
+                      class="capability-check is-error"
+                    >
+                      {{ issue.source || 'action' }}: {{ issue.code || 'issue' }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionActionIssueActions.length" class="capability-check-list">
+                    <span
+                      v-for="action in capabilityExecutionActionIssueActions"
+                      :key="`browser-action-recommendation-${action}`"
+                      class="capability-check is-complete"
+                    >
+                      action: {{ action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionActionRecoveryActions.length" class="capability-check-list">
+                    <span
+                      v-for="action in capabilityExecutionActionRecoveryActions"
+                      :key="`browser-action-recovery-${action}`"
+                      class="capability-check is-warning"
+                    >
+                      recovery: {{ action }}
+                    </span>
+                  </div>
+                  <div v-if="capabilityExecutionAttempts.length" class="capability-attempt-list">
+                    <div
+                      v-for="(attempt, idx) in capabilityExecutionAttempts"
+                      :key="`attempt-${idx}-${attempt.capability || idx}`"
+                      class="capability-attempt"
+                      :class="capabilityAttemptClass(attempt)"
+                    >
+                      <strong>{{ attempt.capability || 'unknown' }}</strong>
+                      <span>{{ attempt.status || 'attempted' }}</span>
+                      <small v-if="attempt.target_count != null">
+                        target {{ attempt.target_count }}
+                      </small>
+                      <small v-if="attempt.count != null">count {{ attempt.count }}</small>
+                      <small v-if="attempt.row_count != null">rows {{ attempt.row_count }}</small>
+                      <small v-if="attempt.item_count != null">items {{ attempt.item_count }}</small>
+                      <p v-if="attempt.reason">{{ attempt.reason }}</p>
+                    </div>
+                  </div>
+                  <div v-if="capabilityExecutionChecks.length" class="capability-check-list">
+                    <span
+                      v-for="check in capabilityExecutionChecks"
+                      :key="check.name"
+                      class="capability-check"
+                      :class="check.passed ? 'is-complete' : 'is-error'"
+                    >
+                      {{ check.name }}: {{ check.passed ? 'pass' : 'fail' }}
+                    </span>
+                  </div>
+                </section>
+
+                  </el-tab-pane>
+                  <el-tab-pane label="计划 / 工作流" name="plan">
+
+                <section v-if="capabilityExecutionPlanSteps.length" class="capability-section">
+                  <h4>结构化执行计划</h4>
+                  <div class="capability-chain">
+                    <div
+                      v-for="step in capabilityExecutionPlanSteps"
+                      :key="step.id || `plan-step-${step.order}-${step.capability}`"
+                      class="capability-card"
+                    >
+                      <div class="capability-card-head">
+                        <span class="capability-rank">{{ step.order || '?' }}</span>
+                        <strong>{{ step.capability || 'unknown' }}</strong>
+                      </div>
+                      <p class="capability-meta">
+                        {{ step.owner || 'owner?' }} · risk={{ step.risk || 'unknown' }}
+                        <span v-if="step.deterministic === false"> · model</span>
+                        <span v-else> · deterministic</span>
+                      </p>
+                      <p v-if="step.purpose" class="capability-detail">
+                        {{ step.purpose }}
+                      </p>
+                    </div>
+                  </div>
+                </section>
+
+                <section v-if="capabilityWorkflowNodes.length" class="capability-section">
+                  <h4>跨系统工作流图</h4>
+                  <div class="capability-exec-summary">
+                    <span>{{ capabilityWorkflowGraph.version || 'workflow_graph' }}</span>
+                    <span>systems {{ capabilityWorkflowGraph.systems?.length || 0 }}</span>
+                    <span>sessions {{ capabilityWorkflowGraph.sessions?.length || 0 }}</span>
+                    <span>nodes {{ capabilityWorkflowNodes.length }}</span>
+                    <span>edges {{ capabilityWorkflowGraph.data_edges?.length || 0 }}</span>
+                  </div>
+                  <div class="capability-chain">
+                    <div
+                      v-for="node in capabilityWorkflowNodes.slice(0, 8)"
+                      :key="node.id || `workflow-${node.order}-${node.capability}`"
+                      class="capability-card"
+                    >
+                      <div class="capability-card-head">
+                        <span class="capability-rank">{{ node.order || '?' }}</span>
+                        <strong>{{ node.capability || 'unknown' }}</strong>
+                      </div>
+                      <p class="capability-meta">
+                        {{ node.system_id || 'system?' }} · {{ node.session_id || 'session?' }}
+                      </p>
+                      <p v-if="node.purpose" class="capability-detail">
+                        {{ node.purpose }}
+                      </p>
+                    </div>
+                  </div>
+                </section>
+
+                <section v-if="capabilityActionRefSchema.version" class="capability-section">
+                  <h4>Unified ActionRef</h4>
+                  <div class="capability-exec-summary">
+                    <span>{{ capabilityActionRefSchema.version }}</span>
+                    <span
+                      v-for="source in (capabilityActionRefSchema.preferred_sources || [])"
+                      :key="`action-ref-source-${source}`"
+                    >
+                      {{ source }}
+                    </span>
+                  </div>
+                  <p
+                    v-if="capabilityActionRefSchema.notes?.length"
+                    class="capability-detail"
+                  >
+                    {{ capabilityActionRefSchema.notes.join(' · ') }}
+                  </p>
+                </section>
+
+                <section class="capability-section">
+                  <h4>推荐能力链</h4>
+                  <div class="capability-chain">
+                    <div
+                      v-for="(item, idx) in capabilityBackendPlan"
+                      :key="`plan-${idx}-${capabilityItemName(item)}`"
+                      class="capability-card"
+                    >
+                      <div class="capability-card-head">
+                        <span class="capability-rank">{{ idx + 1 }}</span>
+                        <strong>{{ capabilityItemName(item) }}</strong>
+                      </div>
+                      <p v-if="capabilityItemMeta(item)" class="capability-meta">
+                        {{ capabilityItemMeta(item) }}
+                      </p>
+                      <p v-if="capabilityItemDetail(item)" class="capability-detail">
+                        {{ capabilityItemDetail(item) }}
+                      </p>
+                    </div>
+                  </div>
+                </section>
+
+                  </el-tab-pane>
+                  <el-tab-pane label="回放与 Fixture" name="replay">
 
                 <section v-if="capabilityEfficiencyFeedbackReplayReport" class="capability-efficiency-feedback-replay-card">
                   <div class="capability-section-head">
@@ -4813,287 +5098,8 @@ onUnmounted(() => {
                   </div>
                 </section>
 
-                <CapabilityRuntimePanel
-                  :runtime-preflight="capabilityRuntimePreflight"
-                  :runtime-preflight-class="capabilityRuntimePreflightClass"
-                  :runtime-preflight-label="capabilityRuntimePreflightLabel"
-                  :browser-runtime="browserRuntime"
-                  :browser-runtime-class="browserRuntimeStatusClass"
-                  :browser-runtime-label="browserRuntimeLabel"
-                  :backend-summary="browserRuntimeBackendSummary"
-                  :capacity="browserRuntimeCapacity"
-                  :health-label="browserRuntimeHealthLabel"
-                  :health-cache-label="browserRuntimeHealthCacheLabel"
-                />
-
-                <CapabilityTraceList
-                  v-model:filter="capabilityTraceFilter"
-                  v-model:search-query="capabilityTraceSearchQuery"
-                  :rows="capabilityFilteredTraceRows"
-                  :total-rows="capabilityTraceRows.length"
-                  :summary="capabilityTraceSummary"
-                  @open-row="openPhaseDialog"
-                />
-
-                <CapabilityAlignmentCard
-                  :visible="Boolean(latestCapabilityExecute)"
-                  :alignment="capabilityExecutionAlignment"
-                />
-
-                <section v-if="latestCapabilityExecute" class="capability-section">
-                  <h4>执行遥测</h4>
-                  <div class="capability-exec-summary">
-                    <span
-                      class="capability-exec-status"
-                      :class="latestCapabilityExecute.completed ? 'is-complete' : 'is-fallback'"
-                    >
-                      {{ latestCapabilityExecute.execution_status || 'unknown' }}
-                    </span>
-                    <span v-if="latestCapabilityExecute.capability">
-                      capability: {{ latestCapabilityExecute.capability }}
-                    </span>
-                    <span v-if="Number.isFinite(latestCapabilityExecute.duration_ms)">
-                      {{ latestCapabilityExecute.duration_ms }}ms
-                    </span>
-                    <span v-if="latestCapabilityExecute.fallback_reason">
-                      fallback: {{ latestCapabilityExecute.fallback_reason }}
-                    </span>
-                  </div>
-                  <CapabilityEfficiencyPanel
-                    :crawl-plan="capabilityActiveCrawlEfficiencyPlan"
-                    :available-paths="capabilityExecutionCrawlEfficiencyAvailablePaths"
-                    :candidates="capabilityExecutionCrawlEfficiencyCandidates"
-                    :summary="capabilityExecutionCrawlEfficiencySummary"
-                    :candidate-class="capabilityCrawlEfficiencyCandidateClass"
-                    :candidate-evidence="capabilityCrawlEfficiencyEvidence"
-                    :correlation-report="capabilityExecutionEfficiencyCorrelationReport"
-                    :correlation-status-class="capabilityEfficiencyCorrelationStatusClass"
-                    :correlation-alignment="capabilityExecutionEfficiencyCorrelationAlignment"
-                    :root-causes="capabilityExecutionEfficiencyCorrelationRootCauses"
-                    :planner-hints="capabilityExecutionEfficiencyCorrelationPlannerHints"
-                    :actions="capabilityExecutionEfficiencyCorrelationActions"
-                  />
-                  <div v-if="capabilityExecutionRuntimeAfter.runtime_status" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionRuntimeLabel }}</span>
-                    <span>runtime: {{ capabilityExecutionRuntimeAfter.runtime_status || 'unknown' }}</span>
-                    <span>backend: {{ capabilityExecutionRuntimeAfter.active_backend || 'unknown' }}</span>
-                    <span>health: {{ capabilityExecutionRuntimeAfter.backend_health || 'unknown' }}</span>
-                    <span>
-                      contexts:
-                      {{ capabilityExecutionRuntimeAfter.available_contexts ?? '?' }}
-                      /
-                      {{ capabilityExecutionRuntimeAfter.max_contexts ?? '?' }}
-                    </span>
-                    <span v-if="capabilityExecutionRuntimeAfter.recommended_action">
-                      action: {{ capabilityExecutionRuntimeAfter.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeDrift.version" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionDriftLabel }}</span>
-                    <span>changes: {{ Array.isArray(capabilityExecutionRuntimeDrift.changes) ? capabilityExecutionRuntimeDrift.changes.length : 0 }}</span>
-                    <span>warnings: {{ Array.isArray(capabilityExecutionRuntimeDrift.warnings) ? capabilityExecutionRuntimeDrift.warnings.length : 0 }}</span>
-                    <span v-if="capabilityExecutionRuntimeDrift.deltas">
-                      contexts Δ:
-                      {{ capabilityExecutionRuntimeDrift.deltas.available_contexts ?? 0 }}
-                    </span>
-                    <span v-if="capabilityExecutionRuntimeDrift.recommended_action">
-                      action: {{ capabilityExecutionRuntimeDrift.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeIssueSummary.version" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionIssueLabel }}</span>
-                    <span>issues: {{ capabilityExecutionRuntimeIssueSummary.issue_count ?? 0 }}</span>
-                    <span v-if="capabilityExecutionRuntimeIssueSummary.sources">
-                      drift: {{ capabilityExecutionRuntimeIssueSummary.sources.drift_status || 'unknown' }}
-                    </span>
-                    <span v-if="capabilityExecutionRuntimeIssueSummary.recommended_action">
-                      action: {{ capabilityExecutionRuntimeIssueSummary.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeIssues.length" class="capability-check-list">
-                    <span
-                      v-for="(issue, idx) in capabilityExecutionRuntimeIssues"
-                      :key="`runtime-issue-${idx}-${issue.code || idx}`"
-                      class="capability-check is-error"
-                    >
-                      {{ issue.source || 'runtime' }}: {{ issue.code || 'issue' }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityExecutionRuntimeActions"
-                      :key="`runtime-action-${action}`"
-                      class="capability-check is-complete"
-                    >
-                      action: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionIssueSummary.version" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionActionIssueLabel }}</span>
-                    <span v-if="capabilityExecutionActionTrace.action">
-                      browser action: {{ capabilityExecutionActionTrace.action }}
-                    </span>
-                    <span v-if="capabilityExecutionActionFailureSummary.failure_code">
-                      failure: {{ capabilityExecutionActionFailureSummary.failure_code }}
-                    </span>
-                    <span v-if="capabilityExecutionActionFailureSummary.failure_category">
-                      category: {{ capabilityExecutionActionFailureSummary.failure_category }}
-                    </span>
-                    <span>issues: {{ capabilityExecutionActionIssueSummary.issue_count ?? 0 }}</span>
-                    <span v-if="capabilityExecutionActionIssueSummary.recommended_action">
-                      action: {{ capabilityExecutionActionIssueSummary.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionIssues.length" class="capability-check-list">
-                    <span
-                      v-for="(issue, idx) in capabilityExecutionActionIssues"
-                      :key="`browser-action-issue-${idx}-${issue.code || idx}`"
-                      class="capability-check is-error"
-                    >
-                      {{ issue.source || 'action' }}: {{ issue.code || 'issue' }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionIssueActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityExecutionActionIssueActions"
-                      :key="`browser-action-recommendation-${action}`"
-                      class="capability-check is-complete"
-                    >
-                      action: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionRecoveryActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityExecutionActionRecoveryActions"
-                      :key="`browser-action-recovery-${action}`"
-                      class="capability-check is-warning"
-                    >
-                      recovery: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionAttempts.length" class="capability-attempt-list">
-                    <div
-                      v-for="(attempt, idx) in capabilityExecutionAttempts"
-                      :key="`attempt-${idx}-${attempt.capability || idx}`"
-                      class="capability-attempt"
-                      :class="capabilityAttemptClass(attempt)"
-                    >
-                      <strong>{{ attempt.capability || 'unknown' }}</strong>
-                      <span>{{ attempt.status || 'attempted' }}</span>
-                      <small v-if="attempt.target_count != null">
-                        target {{ attempt.target_count }}
-                      </small>
-                      <small v-if="attempt.count != null">count {{ attempt.count }}</small>
-                      <small v-if="attempt.row_count != null">rows {{ attempt.row_count }}</small>
-                      <small v-if="attempt.item_count != null">items {{ attempt.item_count }}</small>
-                      <p v-if="attempt.reason">{{ attempt.reason }}</p>
-                    </div>
-                  </div>
-                  <div v-if="capabilityExecutionChecks.length" class="capability-check-list">
-                    <span
-                      v-for="check in capabilityExecutionChecks"
-                      :key="check.name"
-                      class="capability-check"
-                      :class="check.passed ? 'is-complete' : 'is-error'"
-                    >
-                      {{ check.name }}: {{ check.passed ? 'pass' : 'fail' }}
-                    </span>
-                  </div>
-                </section>
-
-                <section v-if="capabilityExecutionPlanSteps.length" class="capability-section">
-                  <h4>结构化执行计划</h4>
-                  <div class="capability-chain">
-                    <div
-                      v-for="step in capabilityExecutionPlanSteps"
-                      :key="step.id || `plan-step-${step.order}-${step.capability}`"
-                      class="capability-card"
-                    >
-                      <div class="capability-card-head">
-                        <span class="capability-rank">{{ step.order || '?' }}</span>
-                        <strong>{{ step.capability || 'unknown' }}</strong>
-                      </div>
-                      <p class="capability-meta">
-                        {{ step.owner || 'owner?' }} · risk={{ step.risk || 'unknown' }}
-                        <span v-if="step.deterministic === false"> · model</span>
-                        <span v-else> · deterministic</span>
-                      </p>
-                      <p v-if="step.purpose" class="capability-detail">
-                        {{ step.purpose }}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                <section v-if="capabilityWorkflowNodes.length" class="capability-section">
-                  <h4>跨系统工作流图</h4>
-                  <div class="capability-exec-summary">
-                    <span>{{ capabilityWorkflowGraph.version || 'workflow_graph' }}</span>
-                    <span>systems {{ capabilityWorkflowGraph.systems?.length || 0 }}</span>
-                    <span>sessions {{ capabilityWorkflowGraph.sessions?.length || 0 }}</span>
-                    <span>nodes {{ capabilityWorkflowNodes.length }}</span>
-                    <span>edges {{ capabilityWorkflowGraph.data_edges?.length || 0 }}</span>
-                  </div>
-                  <div class="capability-chain">
-                    <div
-                      v-for="node in capabilityWorkflowNodes.slice(0, 8)"
-                      :key="node.id || `workflow-${node.order}-${node.capability}`"
-                      class="capability-card"
-                    >
-                      <div class="capability-card-head">
-                        <span class="capability-rank">{{ node.order || '?' }}</span>
-                        <strong>{{ node.capability || 'unknown' }}</strong>
-                      </div>
-                      <p class="capability-meta">
-                        {{ node.system_id || 'system?' }} · {{ node.session_id || 'session?' }}
-                      </p>
-                      <p v-if="node.purpose" class="capability-detail">
-                        {{ node.purpose }}
-                      </p>
-                    </div>
-                  </div>
-                </section>
-
-                <section v-if="capabilityActionRefSchema.version" class="capability-section">
-                  <h4>Unified ActionRef</h4>
-                  <div class="capability-exec-summary">
-                    <span>{{ capabilityActionRefSchema.version }}</span>
-                    <span
-                      v-for="source in (capabilityActionRefSchema.preferred_sources || [])"
-                      :key="`action-ref-source-${source}`"
-                    >
-                      {{ source }}
-                    </span>
-                  </div>
-                  <p
-                    v-if="capabilityActionRefSchema.notes?.length"
-                    class="capability-detail"
-                  >
-                    {{ capabilityActionRefSchema.notes.join(' · ') }}
-                  </p>
-                </section>
-
-                <section class="capability-section">
-                  <h4>推荐能力链</h4>
-                  <div class="capability-chain">
-                    <div
-                      v-for="(item, idx) in capabilityBackendPlan"
-                      :key="`plan-${idx}-${capabilityItemName(item)}`"
-                      class="capability-card"
-                    >
-                      <div class="capability-card-head">
-                        <span class="capability-rank">{{ idx + 1 }}</span>
-                        <strong>{{ capabilityItemName(item) }}</strong>
-                      </div>
-                      <p v-if="capabilityItemMeta(item)" class="capability-meta">
-                        {{ capabilityItemMeta(item) }}
-                      </p>
-                      <p v-if="capabilityItemDetail(item)" class="capability-detail">
-                        {{ capabilityItemDetail(item) }}
-                      </p>
-                    </div>
-                  </div>
-                </section>
+                  </el-tab-pane>
+                  <el-tab-pane label="诊断" name="diagnostics">
 
                 <section v-if="capabilityManifestSummary.length" class="capability-section">
                   <h4>能力清单摘要</h4>
@@ -5167,6 +5173,9 @@ onUnmounted(() => {
                   <h4>原始事件</h4>
                   <pre class="capability-json"><code>{{ capabilityTraceJson || capabilityExecuteJson }}</code></pre>
                 </section>
+
+                  </el-tab-pane>
+                </el-tabs>
               </div>
               <p v-else class="empty-log">
                 暂无 capability_route / capability_execute 事件 — 启动任务后会显示推荐能力链、执行尝试和模型职责边界。
@@ -5177,7 +5186,7 @@ onUnmounted(() => {
           <el-tab-pane name="final">
             <template #label>
               <el-badge :is-dot="hasNewFinalAnswer" class="artifact-badge">
-                <span>Final Answer</span>
+                <span>最终答案</span>
               </el-badge>
             </template>
             <el-scrollbar class="final-scroll">
@@ -5300,7 +5309,7 @@ onUnmounted(() => {
           <el-tab-pane name="artifacts">
             <template #label>
               <el-badge :is-dot="hasNewArtifacts" class="artifact-badge">
-                <span>Artifacts</span>
+                <span>产物</span>
               </el-badge>
             </template>
             <div class="artifact-toolbar">
@@ -5336,7 +5345,7 @@ onUnmounted(() => {
           <el-tab-pane name="runs">
             <template #label>
               <el-badge :is-dot="hasNewRuns" class="artifact-badge">
-                <span>Runs</span>
+                <span>运行记录</span>
               </el-badge>
             </template>
             <RunRegistryPanel
@@ -5766,6 +5775,11 @@ onUnmounted(() => {
   background: var(--vsp-surface);
   border: 1px solid var(--vsp-border);
   border-radius: 8px;
+  box-shadow: 0 8px 22px rgb(var(--rgb-black) / 0.18);
+}
+
+/* D: 主次层级 — 主画面保留重投影，其余面板轻量化 */
+.preview-panel.vspider-panel {
   box-shadow: 0 18px 42px rgb(var(--rgb-black) / 0.32);
 }
 
@@ -8053,5 +8067,29 @@ onUnmounted(() => {
   .monitor-panel {
     min-height: 720px;
   }
+}
+/* A: Capability 二级子页签 */
+:deep(.capability-sub-tabs .el-tabs__header) {
+  margin: 0 0 10px;
+}
+
+:deep(.capability-sub-tabs .el-tabs__nav-wrap::after) {
+  height: 1px;
+  background: var(--vsp-border);
+}
+
+:deep(.capability-sub-tabs .el-tabs__item) {
+  font-size: 13px;
+}
+
+/* C: 折叠标题回显当前选择 */
+.collapse-title-echo {
+  margin-left: 8px;
+  max-width: 55%;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--vsp-text-2);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
