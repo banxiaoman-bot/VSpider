@@ -72,6 +72,7 @@ class EventStream:
         screenshot_path: str = "",
         ax_lines: int = 0,
         browser_state: BrowserStateSnapshot | dict[str, Any] | None = None,
+        perception_reused: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(browser_state, BrowserStateSnapshot):
@@ -87,6 +88,7 @@ class EventStream:
             screenshot_path=screenshot_path,
             ax_lines=ax_lines,
             browser_state=state_payload,
+            perception_reused=bool(perception_reused),
             metadata=dict(metadata or {}),
         )
 

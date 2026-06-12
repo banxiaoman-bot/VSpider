@@ -11473,6 +11473,8 @@ async def run_agent(
         except ImportError:
             from bot_challenge_guard import BotChallengeState
         _bot_challenge_state = BotChallengeState()
+        # E1: 感知复用状态（last_signature / streak）跨回合持有，必须循环外单例
+        _perception_phase = PerceptionPhase()
         # ── Session Drop tracking (Wave 3) ───────────────────────────
         # _last_business_url: most recent non-login URL we observed at
         # step end. Used by the session-drop sniffer to decide whether
@@ -12435,7 +12437,7 @@ async def run_agent(
                 # ════════════════════════════════════════════════════════════
                 # 旧的 _force_vision_next_step 信号在双模态下已失效，这里消耗掉以保持语义干净
                 _force_vision_next_step = False
-                _perception = await PerceptionPhase().run(
+                _perception = await _perception_phase.run(
                     browser,
                     step=step,
                     event_stream=event_stream,

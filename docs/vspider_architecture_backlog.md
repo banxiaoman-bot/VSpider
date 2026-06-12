@@ -3300,3 +3300,33 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   复核均预先失败）。
 - Out of scope (next): E1 感知复用（PerceptionPhase 持 last_signature，
   改为循环外单例）、E2 局部 SoM、E3 AX 增量 diff。
+
+## Slice E1 (M3 高效): 感知复用 perception_reuse (done)
+
+- 能力名: perception_reuse（DOM 签名未变即跳过截图 + SoM 重注入）。
+- 影响层: browser_substrate（browser_env.py 探针）+ execution_kernel
+  （phases/perception.py 复用决策、main.py 持久化实例）+ 契约
+  （event_stream observe 仅新增字段）。
+- browser_env.py 新增 `dom_signature()`：一次轻量 evaluate 取
+  `href + DOM 节点数 + body 文本长度 + 可交互元素数` 拼 sha1；失败 / 无页面
+  安静返回空串，调用方视为"无法判定"走全量感知，探针绝不影响主链路。
+- PerceptionPhase 改为有状态（main.py 循环外单例 `_perception_phase`，
+  CRLF 字节 patch 两处）：每回合先探签名，满足「签名非空且与上轮相同 +
+  上一动作 ActionResult.changed_url/changed_dom 均 False（dict 形态兼容）+
+  连续复用 < 3」则跳过 tabs/截图/SoM/AX/snapshot 整段，复用上一轮
+  PerceptionSnapshot（dataclasses.replace 拷贝，step 更新、
+  browser_state.metadata 标 perception_reused=True），observe 事件照发。
+  逃生阀：连续复用满 3 回合强制全量一次并清零计数，防签名碰撞死视。
+  无 dom_signature 的旧 stub / 旧 browser 自动恒走全量（向下兼容）。
+- 新增 contract 字段: event_stream observe 事件 `perception_reused: bool`
+  （默认 False，仅新增向下兼容）。
+- Tests: tests/test_perception_reuse.py（8 例：同签名第二轮零截图/零 AX/
+  零 tabs 且快照复用标记、签名变更走全量、changed_dom/changed_url
+  （对象 + dict 形态）强制全量、逃生阀第 4 轮强制全量后计数复位再复用、
+  无探针 browser 恒全量、dom_signature sha1 确定性 + 安静回退、
+  observe 字段落盘断言）；TDD 先红后绿。
+  验证: 定向 8✓ + P1 拆分回归 4✓ + test_agent_loop_stub_e2e 真 Chromium
+  2✓；全量 pytest 3354 通过 0 新增失败（沿用 S14/P1 口径排除并行 UI
+  重构预先存在的 5 例）；本 slice 零前端改动，npm build 沿用 P1 绿。
+- Out of scope (next): E2 局部 SoM（viewport scope）、E3 AX 增量 diff、
+  E7 基线把 perception_reused 计入效率指标。

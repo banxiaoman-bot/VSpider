@@ -4673,6 +4673,34 @@ Object.defineProperty(navigator, 'languages', {
             parts.append(f"URL: {url[:120]}")
         return " | ".join(parts)
 
+    async def dom_signature(self) -> str:
+        """E1 感知复用探针：href + DOM 节点数 + body 文本长度 + 可交互元素数 拼 sha1。
+
+        一次轻量 evaluate（<5ms）；失败 / 无页面时安静返回空串——调用方视为
+        "无法判定"并走全量感知，探针绝不影响主链路。
+        """
+        page = await self._ensure_active_page(reason="dom signature probe")
+        if not page:
+            return ""
+        try:
+            raw = await page.evaluate(
+                """() => {
+                    const body = document.body;
+                    const interactive = document.querySelectorAll(
+                        'a,button,input,select,textarea,[role=\"button\"],[onclick],[contenteditable]'
+                    ).length;
+                    return [
+                        location.href,
+                        document.getElementsByTagName('*').length,
+                        body ? (body.innerText || '').length : 0,
+                        interactive,
+                    ].join('|');
+                }"""
+            )
+        except Exception:
+            return ""
+        return hashlib.sha1(str(raw).encode("utf-8")).hexdigest()
+
     async def reload_active_page(self, reason: str = "") -> bool:
         """对当前页做一次轻量重载，并等待重新稳定。"""
         page = await self._ensure_active_page(reason=f"reload active page {reason}".strip())

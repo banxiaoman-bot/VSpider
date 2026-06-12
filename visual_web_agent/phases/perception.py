@@ -8,7 +8,7 @@ straight lift-and-delegate from the agent loop; no logic changes in this slice.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -46,8 +46,59 @@ class PerceptionSnapshot:
     page_summary: str
 
 
+# E1 逃生阀：连续复用达到该回合数后强制全量感知一次，防 DOM 签名碰撞死视。
+_REUSE_STREAK_LIMIT = 3
+
+
+def _action_mutated_page(result: Any) -> bool:
+    """上一动作是否声明改变了 URL / DOM（ActionResult 或 dict 形态均接受）。"""
+    if result is None:
+        return False
+    if isinstance(result, dict):
+        return bool(result.get("changed_url") or result.get("changed_dom"))
+    return bool(getattr(result, "changed_url", False) or getattr(result, "changed_dom", False))
+
+
 class PerceptionPhase:
-    """每回合「截图 + SoM + AX 摘要 + browser_state 组装」感知段（自 main.py 平移）。"""
+    """每回合「截图 + SoM + AX 摘要 + browser_state 组装」感知段（自 main.py 平移）。
+
+    E1 感知复用：实例跨回合持有 ``last_signature`` / 上一轮快照 / 复用计数，
+    DOM 签名未变且上一动作未声明页面变化时跳过截图与 SoM 重注入。
+    """
+
+    def __init__(self) -> None:
+        self._last_signature: str | None = None
+        self._last_snapshot: PerceptionSnapshot | None = None
+        self._reuse_streak: int = 0
+
+    async def _probe_signature(self, browser: Any) -> str:
+        probe = getattr(browser, "dom_signature", None)
+        if not callable(probe):
+            return ""
+        try:
+            return str(await probe() or "")
+        except Exception as probe_err:
+            logger.debug("[PERCEPTION REUSE] signature probe failed: %s", probe_err)
+            return ""
+
+    def _can_reuse(self, browser: Any, signature: str) -> bool:
+        if not signature or self._last_snapshot is None:
+            return False
+        if signature != self._last_signature:
+            return False
+        if self._reuse_streak >= _REUSE_STREAK_LIMIT:
+            return False  # 逃生阀：强制全量感知一次
+        if _action_mutated_page(getattr(browser, "_last_action_result", None)):
+            return False
+        return True
+
+    def _build_reused_snapshot(self, *, step: int) -> PerceptionSnapshot:
+        last = self._last_snapshot
+        assert last is not None
+        state_meta = dict(getattr(last.browser_state, "metadata", {}) or {})
+        state_meta["perception_reused"] = True
+        reused_state = replace(last.browser_state, step=step, metadata=state_meta)
+        return replace(last, browser_state=reused_state)
 
     async def run(
         self,
@@ -60,6 +111,30 @@ class PerceptionPhase:
         wait_for_human_resume: Callable[..., Awaitable[None]],
         bot_challenge_state: Any,
     ) -> PerceptionSnapshot:
+        # ── E1 感知复用：签名未变 + 上一动作未改页 → 跳过截图/SoM/AX，复用上一轮 ──
+        _signature = await self._probe_signature(browser)
+        if self._can_reuse(browser, _signature):
+            self._reuse_streak += 1
+            reused = self._build_reused_snapshot(step=step)
+            logger.info(
+                "[PERCEPTION REUSE] dom signature unchanged (streak %d/%d) — skipping screenshot + SoM",
+                self._reuse_streak,
+                _REUSE_STREAK_LIMIT,
+            )
+            event_stream.observe(
+                step=step,
+                url=getattr(browser, "current_url", "") or "",
+                screenshot_path=reused.screenshot_path or "",
+                ax_lines=int(getattr(reused.browser_state, "ax_line_count", 0) or 0),
+                browser_state=reused.browser_state,
+                perception_reused=True,
+                metadata={
+                    "tabs": reused.tabs_state,
+                    "reasoning_text_source": reused.reasoning_text_source,
+                },
+            )
+            return reused
+
         # ════════════════════════════════════════════════════════════
         # 图文双模态融合 (Hybrid Modality)
         # 每一轮都同时采集 SoM 截图 + AX Tree 语义树（含 DOM ID 映射段），融合发送给 VLM。
@@ -197,6 +272,7 @@ class PerceptionPhase:
             screenshot_path=_log_screenshot_path or "",
             ax_lines=len(ax_tree_text.splitlines()) if ax_tree_text else 0,
             browser_state=_browser_state,
+            perception_reused=False,
             metadata={
                 "tabs": _tabs_state,
                 "reasoning_text_source": _log_reasoning_text_source,
@@ -223,7 +299,7 @@ class PerceptionPhase:
             (input_descriptions or "") + ax_block + _page_hint + _tabs_hint
         )
 
-        return PerceptionSnapshot(
+        snapshot = PerceptionSnapshot(
             screenshot_b64=screenshot_b64,
             input_descriptions=input_descriptions,
             ax_tree_text=ax_tree_text,
@@ -233,3 +309,8 @@ class PerceptionPhase:
             tabs_state=_tabs_state,
             page_summary=_page_state,
         )
+        # E1: 全量感知后刷新复用状态（签名在感知前采样，逃生阀计数归零）
+        self._last_signature = _signature or None
+        self._last_snapshot = snapshot
+        self._reuse_streak = 0
+        return snapshot
