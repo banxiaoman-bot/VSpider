@@ -3331,7 +3331,8 @@ async def _try_auto_form_fill_bound_controls(
             // TinyMCE classic hides its textarea and renders into an editor
             // iframe (<id>_ifr / .tox-edit-area__iframe): bind the visible
             // iframe host so labelled rich-text fields stay reachable.
-            const controls = allVisible('input,textarea,select,[contenteditable=true],[contenteditable="true"],iframe[id$="_ifr"],iframe.tox-edit-area__iframe', scope)
+            // srcdoc iframes are inline editor surfaces too (FORM-RICHTEXT-6).
+            const controls = allVisible('input,textarea,select,[contenteditable=true],[contenteditable="true"],iframe[id$="_ifr"],iframe.tox-edit-area__iframe,iframe[srcdoc]', scope)
                 .filter(el => !['hidden','button','submit','reset'].includes((el.type || '').toLowerCase()));
             const labelNodes = allVisible(
                 'label,.el-form-item__label,[class*=form-item__label],.ant-form-item-label,.n-form-item-label,span,div',
@@ -3616,9 +3617,20 @@ async def _try_auto_form_fill_bound_controls(
                         // cross-origin editor iframe: the main-document write
                         // cannot reach its body - surface the failure with the
                         // frame coordinates the Python rescue pass needs.
+                        // srcdoc frames expose no src and all share the
+                        // about:srcdoc URL, so stamp the host element with a
+                        // reusable token the rescue can query in any frame
+                        // document (reused on retries, never stacked).
+                        let frameToken = '';
+                        try {
+                            frameToken = control.getAttribute('data-vspider-frame-token')
+                                || ('vsp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8));
+                            control.setAttribute('data-vspider-frame-token', frameToken);
+                        } catch (_) { frameToken = ''; }
                         results.push({
                             label, ok: false, reason: 'iframe_unreachable', method: binding.method,
-                            frameId: control.id || '', frameSrc: control.src || ''
+                            frameId: control.id || '', frameSrc: control.src || '',
+                            frameToken, frameSrcdoc: Boolean(control.hasAttribute?.('srcdoc'))
                         });
                         continue;
                     }
@@ -3701,8 +3713,30 @@ def _norm_form_text(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip().lower()
 
 
-async def _resolve_editor_frame(page, *, frame_id: object, frame_src: object):
-    """Locate the Playwright frame of an editor iframe by id, then by URL."""
+async def _resolve_editor_frame(
+    page, *, frame_id: object, frame_src: object, frame_token: object = None
+):
+    """Locate the Playwright frame of an editor iframe by token, id, then URL.
+
+    The token attribute is stamped by the macro JS precisely because srcdoc
+    editor iframes expose no src and every one of them reports about:srcdoc,
+    leaving id/src with nothing to match. Selectors pierce open shadow roots
+    but not frame boundaries, so the lookup walks the page first and then the
+    flat frame list to keep nested hosts reachable.
+    """
+    tok = str(frame_token or "").strip()
+    if tok and '"' not in tok:
+        selector = f'iframe[data-vspider-frame-token="{tok}"]'
+        for host in [page, *list(getattr(page, "frames", None) or [])]:
+            try:
+                handle = await host.query_selector(selector)
+                if handle is None:
+                    continue
+                frame = await handle.content_frame()
+            except Exception:
+                continue
+            if frame is not None:
+                return frame
     fid = str(frame_id or "").strip()
     if fid and '"' not in fid:
         try:
@@ -3757,7 +3791,10 @@ async def _auto_form_rescue_unreachable_iframes(
         if expected is None:
             return result
         frame = await _resolve_editor_frame(
-            page, frame_id=item.get("frameId"), frame_src=item.get("frameSrc")
+            page,
+            frame_id=item.get("frameId"),
+            frame_src=item.get("frameSrc"),
+            frame_token=item.get("frameToken"),
         )
         if frame is None:
             return result

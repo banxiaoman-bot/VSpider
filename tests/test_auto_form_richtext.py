@@ -570,5 +570,179 @@ class TestNestedFrameRescue:
         assert page.query_calls == []
 
 
+class _StubQueryFrame:
+    """A host frame document that can be queried for the tagged iframe."""
+
+    def __init__(self, handle=None, url: str = "https://host.example/inner.html") -> None:
+        self._handle = handle
+        self.url = url
+        self.query_calls: list[str] = []
+
+    def is_detached(self) -> bool:
+        return False
+
+    async def query_selector(self, selector):
+        self.query_calls.append(selector)
+        return self._handle
+
+
+def _srcdoc_unreachable_result(token: str = "vsp-test-1") -> dict:
+    return {
+        "ok": False,
+        "results": [
+            {"label": "Title", "ok": True, "mode": "input", "method": "for_attr"},
+            {
+                "label": "Notes",
+                "ok": False,
+                "reason": "iframe_unreachable",
+                "method": "for_attr",
+                "frameId": "",
+                "frameSrc": "",
+                "frameToken": token,
+                "frameSrcdoc": True,
+            },
+        ],
+        "verifications": [
+            {"label": "Title", "ok": True},
+            {"label": "Notes", "ok": False, "observed": ""},
+        ],
+    }
+
+
+class TestSrcdocFrameRescue:
+    """FORM-RICHTEXT-6: srcdoc editor iframes carry no src and every one of
+    them reports the about:srcdoc URL, so the id/src coordinates can never
+    locate the Playwright frame. The macro tags the host element with a
+    one-shot token attribute; the rescue resolves that token through the
+    page first, then the flat frame list (nested hosts included)."""
+
+    def test_srcdoc_iframes_are_bindable_controls(self) -> None:
+        """A generic srcdoc editor (no _ifr id, no tox class) must enter the
+        control candidate pool, or the unreachable report never fires."""
+        assert 'iframe[srcdoc]' in MACRO_SRC
+
+    def test_macro_tags_unreachable_iframes_with_a_token(self) -> None:
+        assert "data-vspider-frame-token" in MACRO_SRC
+        assert "frameToken" in MACRO_SRC
+
+    def test_macro_reports_the_srcdoc_flag(self) -> None:
+        assert "frameSrcdoc" in MACRO_SRC
+
+    def test_token_reuse_is_idempotent(self) -> None:
+        """A retried macro run must not stack a second token on the host."""
+        get_idx = MACRO_SRC.index("getAttribute('data-vspider-frame-token')")
+        set_idx = MACRO_SRC.index("setAttribute('data-vspider-frame-token'")
+        assert get_idx < set_idx
+
+    def test_token_resolves_via_page_lookup(self, monkeypatch) -> None:
+        frame = _StubEditorFrame(readback="macro tiny text")
+        frame.url = "about:srcdoc"
+        page = _StubPage(handle=_StubElementHandle(frame))
+
+        async def fake_macro(p, *, preset_labels=None, **kwargs):
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                _srcdoc_unreachable_result(),
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out["ok"] is True
+        assert out["frame_level_writes"] == [
+            {"label": "Notes", "frame_url": "about:srcdoc", "readback_ok": True}
+        ]
+        assert any("data-vspider-frame-token" in sel for sel in page.query_calls)
+        assert frame.evaluate_calls, "the rescue must write through the srcdoc frame"
+
+    def test_token_resolves_through_nested_host_frames(self, monkeypatch) -> None:
+        """The tagged iframe element lives inside a child frame document -
+        the page-level lookup misses and the flat frame walk must find it."""
+        editor = _StubEditorFrame(readback="macro tiny text")
+        editor.url = "about:srcdoc"
+        host = _StubQueryFrame(handle=_StubElementHandle(editor))
+        page = _StubPage(handle=None, frames=[host])
+
+        async def fake_macro(p, *, preset_labels=None, **kwargs):
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                _srcdoc_unreachable_result(),
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out["ok"] is True
+        assert any("data-vspider-frame-token" in sel for sel in host.query_calls)
+        assert editor.evaluate_calls
+
+    def test_token_lookup_miss_falls_back_to_src(self, monkeypatch) -> None:
+        """A stale token must not break the existing src resolution."""
+        frame = _StubEditorFrame(readback="macro tiny text")
+        page = _StubPage(handle=None, frames=[frame])
+
+        async def fake_macro(p, *, preset_labels=None, **kwargs):
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        result = _unreachable_result()
+        result["results"][1]["frameToken"] = "vsp-stale-token"
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                result,
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out["ok"] is True
+        assert frame.evaluate_calls
+
+    def test_missing_token_keeps_legacy_lookups_untouched(self, monkeypatch) -> None:
+        """Old fixtures without frameToken must never emit a token query."""
+        frame = _StubEditorFrame(readback="macro tiny text")
+        page = _StubPage(handle=_StubElementHandle(frame))
+
+        async def fake_macro(p, *, preset_labels=None, **kwargs):
+            return {"ok": True, "results": [], "verifications": []}
+
+        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                _unreachable_result(),
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out["ok"] is True
+        assert all("data-vspider-frame-token" not in sel for sel in page.query_calls)
+
+    def test_unresolvable_srcdoc_keeps_original_result(self) -> None:
+        """Token misses everywhere and there is no id/src to fall back to."""
+        page = _StubPage(handle=None, frames=[])
+        original = _srcdoc_unreachable_result()
+        out = _run(
+            main_mod._auto_form_rescue_unreachable_iframes(
+                page,
+                original,
+                scope_title="Ticket",
+                fields=dict(FIELDS),
+                require_submit=False,
+            )
+        )
+        assert out is original
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

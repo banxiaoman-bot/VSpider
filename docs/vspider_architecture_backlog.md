@@ -3056,5 +3056,37 @@ regression (RICHTEXT-4 path) - 10/10 PASS pre-removal.
 
 Out of scope (next): editors nested deeper than one URL-distinct level
 with duplicate URLs (first match wins); srcdoc editor iframes (no URL to
-match, id lookup cannot cross documents); sandboxed iframes; rescue for
-the component-aware fallback path.
+match, id lookup cannot cross documents - closed by FORM-RICHTEXT-6);
+sandboxed iframes; rescue for the component-aware fallback path.
+
+## Slice FORM-RICHTEXT-6: srcdoc editor iframes located via stamped token (done)
+
+Layer: intent_planning (main.py macro JS + rescue resolution). Closes the
+FORM-RICHTEXT-5 out-of-scope item "srcdoc editor iframes": a srcdoc
+editor iframe exposes no src attribute and every srcdoc frame reports
+the about:srcdoc URL, so both coordinates the rescue relied on (id, src)
+could come up empty and the field fell back to the VLM even when the
+frame itself was scriptable (the typical case: <iframe srcdoc
+sandbox="allow-scripts"> blocks contentDocument from the parent but
+still runs Playwright evaluate). Duplicate-URL ambiguity from the
+RICHTEXT-5 out-of-scope list collapses for the same reason: about:srcdoc
+never identifies a frame.
+
+- The macro JS stamps the unreachable iframe host with a
+  data-vspider-frame-token attribute at report time (reused if already
+  present, so retries never stack tokens; attribute stamping lives on
+  the parent-document element and works regardless of the frame's
+  sandbox). The failing result now carries frameToken plus a
+  frameSrcdoc flag alongside the existing frameId/frameSrc.
+- _resolve_editor_frame gains a frame_token lookup that runs before the
+  id and src paths: it queries the page first, then the flat frame list
+  (selectors pierce open shadow roots but not frame boundaries, so the
+  walk is what keeps RICHTEXT-5 nested hosts reachable). Old fixtures
+  without frameToken skip the new path entirely; a stale token falls
+  back to id/src untouched.
+
+Tests: tests/test_auto_form_richtext.py 42 -> 48 (token + srcdoc-flag JS
+anchors, token reuse order lock, page-level token resolution with
+about:srcdoc evidence, nested-host token walk via a querying host frame
+stub, stale-token fallback to src, legacy fixtures emit no token query,
+unresolvable srcdoc keeps the original result).
