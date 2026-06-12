@@ -3681,7 +3681,7 @@ const settingsSummaryText = computed(() => {
             >
               <template #reference>
                 <el-button text size="small" :icon="Setting">
-                  Advanced
+                  高级参数
                 </el-button>
               </template>
               <div class="model-popover">
@@ -3796,7 +3796,7 @@ const settingsSummaryText = computed(() => {
                 :icon="Refresh"
                 @click="loadAuthProfiles"
               >
-                Refresh
+                刷新
               </el-button>
               <el-button
                 text
@@ -3804,7 +3804,7 @@ const settingsSummaryText = computed(() => {
                 :icon="Setting"
                 @click="authDialogOpen = true"
               >
-                Manage
+                管理
               </el-button>
             </div>
           </div>
@@ -3937,7 +3937,7 @@ const settingsSummaryText = computed(() => {
       <div class="preview-panel vspider-panel">
         <div class="panel-title">
           <div>
-            <h2>Visual Preview</h2>
+            <h2>实时画面</h2>
             <p>Agent 实时视觉画面</p>
           </div>
           <span class="live-indicator">
@@ -3975,7 +3975,7 @@ const settingsSummaryText = computed(() => {
                 class="resume-button"
                 @click="resumeAgentExecution"
               >
-                Resume Agent
+                恢复执行
               </el-button>
             </div>
           </div>
@@ -5343,7 +5343,7 @@ const settingsSummaryText = computed(() => {
             </template>
             <div class="artifact-toolbar">
               <el-button size="small" plain :icon="Refresh" @click="fetchArtifacts">
-                Refresh
+                刷新
               </el-button>
             </div>
             <el-table
@@ -5351,19 +5351,19 @@ const settingsSummaryText = computed(() => {
               height="190"
               class="artifact-table"
               header-cell-class-name="dark-table-header"
-              empty-text="No artifacts yet"
+              empty-text="暂无产物"
             >
-              <el-table-column prop="name" label="File" show-overflow-tooltip />
-              <el-table-column prop="size_kb" label="KB" width="84" />
-              <el-table-column prop="created_at" label="Created" width="168" />
-              <el-table-column label="Action" width="92">
+              <el-table-column prop="name" label="文件" show-overflow-tooltip />
+              <el-table-column prop="size_kb" label="大小 KB" width="84" />
+              <el-table-column prop="created_at" label="创建时间" width="168" />
+              <el-table-column label="操作" width="92">
                 <template #default="scope">
                   <a
                     :href="`http://localhost:8000${scope.row.url}`"
                     download
                     class="download-link"
                   >
-                    Download
+                    下载
                   </a>
                 </template>
               </el-table-column>
@@ -5398,7 +5398,7 @@ const settingsSummaryText = computed(() => {
                 :loading="failedRunsLoading"
                 @click="fetchFailedRuns"
               >
-                Refresh
+                刷新
               </el-button>
               <span class="failed-runs-count">
                 {{ failedRunsList.length }} 条记录
@@ -5412,37 +5412,37 @@ const settingsSummaryText = computed(() => {
               empty-text="目前还没有失败记录 🎉"
               @row-click="openFailedRunDetail"
             >
-              <el-table-column label="Time" width="138">
+              <el-table-column label="时间" width="138">
                 <template #default="scope">
                   {{ formatFailedRunTime(scope.row.ts) }}
                 </template>
               </el-table-column>
               <el-table-column prop="run_id" label="Run ID" width="158" show-overflow-tooltip />
-              <el-table-column label="Goal" show-overflow-tooltip>
+              <el-table-column label="目标" show-overflow-tooltip>
                 <template #default="scope">
                   <span :title="scope.row.goal || ''">
                     {{ scope.row.goal || '—' }}
                   </span>
                 </template>
               </el-table-column>
-              <el-table-column label="Reason" show-overflow-tooltip>
+              <el-table-column label="原因" show-overflow-tooltip>
                 <template #default="scope">
                   <span class="failed-reason" :title="scope.row.reason || ''">
                     {{ scope.row.reason || '—' }}
                   </span>
                 </template>
               </el-table-column>
-              <el-table-column label="Step" width="62" align="center">
+              <el-table-column label="步数" width="62" align="center">
                 <template #default="scope">
                   {{ Number.isFinite(scope.row.step_count) ? scope.row.step_count : '—' }}
                 </template>
               </el-table-column>
-              <el-table-column label="Duration" width="86" align="center">
+              <el-table-column label="耗时" width="86" align="center">
                 <template #default="scope">
                   {{ formatFailedRunDuration(scope.row.duration_s) }}
                 </template>
               </el-table-column>
-              <el-table-column label="Action" width="118">
+              <el-table-column label="操作" width="118">
                 <template #default="scope">
                   <el-button
                     size="small"
@@ -5466,7 +5466,7 @@ const settingsSummaryText = computed(() => {
 
     <el-dialog
       v-model="authDialogOpen"
-      title="Auth Manager"
+      title="身份管理"
       width="560px"
       class="auth-dialog"
       destroy-on-close
@@ -5482,7 +5482,7 @@ const settingsSummaryText = computed(() => {
         </div>
 
         <div class="field-group">
-          <label>Save as Profile</label>
+          <label>保存为 Profile</label>
           <el-input
             v-model="authProfileName"
             clearable
@@ -5520,7 +5520,7 @@ const settingsSummaryText = computed(() => {
           <div class="field-title-row">
             <label>已保存 Profiles</label>
             <el-button text size="small" :icon="Refresh" @click="loadAuthProfiles">
-              Refresh
+              刷新
             </el-button>
           </div>
           <div v-if="authProfileOptions.length" class="profile-tags">
