@@ -50,6 +50,11 @@ _QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|met
 _RESUME_RE = re.compile(r"\bresume\b|\bcontinue\s+(the\s+)?(last|previous|prior)\b|continue\s+where|left\s+off|pick\s+up\s+where|断点续跑|断点续传|接着上次|继续上次|上次没做完|上次没完成|接着之前|继续之前", re.I)
 _BROWSER_RE = re.compile(r"\b(click|scroll|hover|tab|cookie|storage|console|screenshot|browser|locator|selector|similar)\b|点击|滚动|悬停|标签页|浏览器|选择器|相似元素", re.I)
 _AUTH_RE = re.compile(r"\b(login|signin|auth|captcha|2fa|otp)\b|登录|认证|验证码|短信", re.I)
+_CHALLENGE_RE = re.compile(
+    r"\b(cloudflare|turnstile|recaptcha|hcaptcha|datadome|perimeterx|akamai|anti[- ]?bot|bot[- ]?detection|bot[- ]?challenge|waf)\b"
+    r"|人机验证|滑块|拼图|点选验证|反爬|风控|五秒盾|防护盾",
+    re.I,
+)
 
 _TASK_TEMPLATE_REGISTRY = TaskTemplateRegistry()
 
@@ -508,6 +513,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     resume = bool(_RESUME_RE.search(text))
     browser_interaction = bool(_BROWSER_RE.search(text) or form or chat or file_io)
     auth = bool(_AUTH_RE.search(text))
+    bot_challenge = bool(_CHALLENGE_RE.search(text))
     output_contract = strategy_context.get("output_contract") or infer_goal_output_contract(text)
     return {
         "structured": structured,
@@ -524,6 +530,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "resume_preferred": resume,
         "browser_interaction": browser_interaction,
         "auth_or_captcha": auth,
+        "bot_challenge": bot_challenge,
         "visual_required": browser_interaction and not (api or crawl),
         "domain": parsed.netloc.split('@')[-1].split(':', 1)[0] if parsed.netloc else "",
         "output_mode": strategy_context.get("output_mode") or output_contract.get("mode") or "default",
@@ -567,8 +574,19 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "selector_generator", "locator_recovery", "Y26", ["POST /api/browser_control/selector", "POST /api/browser_control/similar"], "Generate stable selectors and similar element refs when DOM shifts or visual target needs recovery.", "deterministic_router")
     if selected_tools:
         _add(plan, "action_registry_macros", "agent_tools", "legacy+Y18", [tool.get("name", "") for tool in selected_tools[:6]], "Use registered deterministic macros/tools selected from the full task goal before generic VLM browsing.", "deterministic_router")
-    if signals.get("auth_or_captcha"):
-        _add(plan, "human_guard", "safety", "existing", ["ask_human", "prelogin/session guards"], "Auth walls, CAPTCHA, 2FA, and stale sessions must escalate instead of blind retries.", "runtime_guards", risk="medium")
+    if signals.get("bot_challenge") or signals.get("auth_or_captcha"):
+        _add(
+            plan,
+            "bot_challenge_guard",
+            "anti_bot_guard",
+            "BOT-CHL",
+            ["bot_challenge_guard.probe_bot_challenge", "handle_bot_challenge_step"],
+            "Deterministically probe Cloudflare/Turnstile/reCAPTCHA/hCaptcha/滑块 every perception step, passive-wait then optional third-party solver then HITL escalation, harvest cleared storage_state for reuse, and reroute proxy on persistent blocks — never feed a challenge/风控 page to the VLM as a normal page.",
+            "runtime_guards",
+            risk="medium",
+        )
+    if signals.get("auth_or_captcha") or signals.get("bot_challenge"):
+        _add(plan, "human_guard", "safety", "existing", ["ask_human", "prelogin/session guards"], "Auth walls, CAPTCHA, 2FA, bot challenges, and stale sessions must escalate instead of blind retries.", "runtime_guards", risk="medium")
     _add(plan, "semantic_planner_reflector", "model_reasoning", "existing", ["VLMClient.make_plan", "VLMClient.reflect"], "Use text model for task decomposition and stalled-run audit, not low-level endpoint selection.", "semantic_model")
     _add(plan, "vision_agent", "visual_grounding", "existing", ["VLMClient.ask with screenshot+AX"], "Use vision model for final visual grounding when deterministic routes cannot complete safely.", "vision_model", risk="medium")
     return plan
@@ -598,6 +616,8 @@ def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], b
         ])
     if signals.get("artifact_required"):
         chain.append(_step("feed_export", "Export only after item validation passes."))
+    if signals.get("bot_challenge") or signals.get("auth_or_captcha"):
+        chain.append(_step("bot_challenge_guard", "Probe vendor, passive-wait, optional third-party solver, then HITL; reuse harvested storage_state and reroute proxy before blind retries."))
     chain.extend([
         _step("semantic_reflector", "Ask semantic model to audit failure signals and choose continue/retry/abort."),
         _step("vision_agent", "Use screenshot+AX VLM for ambiguous visual grounding."),

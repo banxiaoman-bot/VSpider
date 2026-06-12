@@ -282,6 +282,8 @@ def _risk_flags(signals: dict[str, Any], steps: list[PlanStep], planner_feedback
     feedback = dict(planner_feedback or {})
     if signals.get("auth_or_captcha"):
         flags.append("auth_or_captcha_requires_guard")
+    if signals.get("bot_challenge"):
+        flags.append("anti_bot_challenge_guarded")
     if any(step.risk != "low" for step in steps):
         flags.append("medium_or_higher_risk_step")
     if any(not step.deterministic for step in steps):

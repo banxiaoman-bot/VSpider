@@ -3090,3 +3090,21 @@ anchors, token reuse order lock, page-level token resolution with
 about:srcdoc evidence, nested-host token walk via a querying host frame
 stub, stale-token fallback to src, legacy fixtures emit no token query,
 unresolvable srcdoc keeps the original result).
+
+## Slice BOT-CHL: anti-bot challenge route + full-loop fixture regression
+
+- 能力名: bot_challenge_guard (Cloudflare/Turnstile/reCAPTCHA/hCaptcha/滑块/风控)。
+- 影响层: intent_planning (capability_router 新增 `_CHALLENGE_RE` + `bot_challenge`
+  信号 → backend_plan / fallback_chain 注入 bot_challenge_guard，仅在 auth/反爬
+  goal 触发，普通抓取 goal 不注入)；runtime_guards (capability_manifest 注册
+  `bot_challenge_guard` CapabilitySpec；planner_contract 新增 risk_flag
+  `anti_bot_challenge_guarded`)。main loop 感知阶段早已固定调用
+  handle_bot_challenge_step（每 step probe → 被动等待 → 可选第三方解 → HITL →
+  storage_state 复用 → 代理重路由），本 slice 把对应的确定性路由契约补齐。
+- 新增 contract 字段: signals.bot_challenge；risk_flags.anti_bot_challenge_guarded；
+  capability bot_challenge_guard（向下兼容，仅新增）。
+- Tests: tests/test_bot_challenge_vendor_routing.py（19 例：vendor 分类分流、
+  reCAPTCHA/hCaptcha 跳过 solver 直接 HITL、Cloudflare/captcha solver 成功/失败
+  分支、max_hitl 预算、router 反爬 goal 路由 + 普通 goal 不路由）；
+  tests/test_agent_loop_stub_e2e.py（2 例：VLM stub 驱动 run_agent 全链路跑
+  Alpha fixture 站点，make_plan/ask 被真实调用、done 收口返回 True、落 run 痕迹）。
