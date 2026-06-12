@@ -1,12 +1,13 @@
 """Single config entry for cross-system switching (mission §一-B cross_system).
 
 Folds the cross-system feature's previously-inline environment parses into one
-pure, side-effect-free module so every gate reads the *same* rule and the
-default-off path stays byte-identical:
+pure, side-effect-free module so every gate reads the *same* rule:
 
 - ``VSPIDER_CROSS_SYSTEM_SWITCH``  -- the master on/off flag (was parsed inline
-  in five places in ``main.py`` as
-  ``os.getenv(name, "").strip().lower() in ("1","true","yes","on")``);
+  in five places in ``main.py``). **Default ON since S11**: the M2 chain
+  (input_contract systems -> graph auth_profiles -> session pre-acquire ->
+  data-bus relay) is E2E-covered, so multi-system goals work with zero
+  configuration; set the env var to ``0`` to opt out;
 - ``VSPIDER_PROFILE_TTL_HOURS``    -- the profile-dir GC TTL (was an inline
   ``float(os.getenv(name, "24") or 24)`` parse with a 24h fallback);
 - ``VSPIDER_SESSION_POOL_PER_RUN`` / ``VSPIDER_SESSION_POOL_TOTAL`` -- the
@@ -96,9 +97,17 @@ def env_float(name: str, default: float) -> float:
 
 
 def cross_system_enabled() -> bool:
-    """Master gate: is cross-system switching turned on right now?"""
+    """Master gate: is cross-system switching turned on right now?
 
-    return env_flag(CROSS_SYSTEM_SWITCH_ENV)
+    S11: defaults to ON. The whole M2 chain (contract-declared systems ->
+    graph auth_profiles -> pre-acquired sessions -> data bus relay) is
+    flag-stable and E2E-covered, so a user goal that spans two systems must
+    work with zero configuration (mission §简便). Set
+    ``VSPIDER_CROSS_SYSTEM_SWITCH=0`` (or ``false``/``no``/``off``) to
+    fall back to single-system behaviour.
+    """
+
+    return env_flag(CROSS_SYSTEM_SWITCH_ENV, default=True)
 
 
 def profile_ttl_hours() -> float:
@@ -132,7 +141,7 @@ def session_pool_caps() -> tuple[int, int]:
 class CrossSystemConfig:
     """Immutable snapshot of the cross-system knobs (for callers wanting one object)."""
 
-    enabled: bool = False
+    enabled: bool = True
     profile_ttl_hours: float = DEFAULT_PROFILE_TTL_HOURS
     pool_per_run: int = DEFAULT_POOL_PER_RUN
     pool_total: int = DEFAULT_POOL_TOTAL

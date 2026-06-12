@@ -177,6 +177,43 @@ class SessionRouter:
 
         return _get_active_session(self.run_id, system_id, auth_profile=profile)
 
+    def pre_acquire_sessions(
+        self,
+        system_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """S9: pool-acquire one session per planned system, up-front.
+
+        Mirrors ``route_executor._build_session_plan`` entry-for-entry
+        (``system_id / auth_profile / domain``) and extends each entry with
+        ``session_id / acquired`` so main's hot loop can pre-stage every
+        system before the first cross-system hop instead of cold-starting
+        at switch time. Acquisition is idempotent per
+        ``(run_id, system_id, auth_profile)`` and never raises — a failed
+        acquire is reported in the entry's ``error`` so the run continues
+        with on-demand acquisition for that system.
+        """
+
+        ids = [str(s or "").strip() for s in (system_ids or self.plan.known_system_ids())]
+        out: list[dict[str, Any]] = []
+        for system_id in ids:
+            if not system_id:
+                continue
+            entry: dict[str, Any] = {
+                "system_id": system_id,
+                "auth_profile": self.resolved_auth_profile(system_id),
+                "domain": self.plan.domain_for(system_id),
+                "session_id": "",
+                "acquired": False,
+            }
+            try:
+                session = self.acquire(system_id)
+                entry["session_id"] = session.session_id
+                entry["acquired"] = True
+            except Exception as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            out.append(entry)
+        return out
+
     def plan_switch(
         self,
         *,

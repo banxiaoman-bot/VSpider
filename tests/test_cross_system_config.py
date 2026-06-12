@@ -93,14 +93,21 @@ class TestEnvFloat:
 
 
 class TestAccessors:
-    def test_cross_system_disabled_by_default(self, monkeypatch):
+    def test_cross_system_enabled_by_default(self, monkeypatch):
+        # S11: the M2 chain is stable, so multi-system goals work with zero
+        # configuration; the env var is now an opt-out.
         monkeypatch.delenv("VSPIDER_CROSS_SYSTEM_SWITCH", raising=False)
-        assert cfg.cross_system_enabled() is False
+        assert cfg.cross_system_enabled() is True
 
     @pytest.mark.parametrize("raw", ["1", "true", "yes", "on", "ON"])
     def test_cross_system_enabled_tokens(self, monkeypatch, raw):
         monkeypatch.setenv("VSPIDER_CROSS_SYSTEM_SWITCH", raw)
         assert cfg.cross_system_enabled() is True
+
+    @pytest.mark.parametrize("raw", ["0", "false", "no", "off", "OFF"])
+    def test_cross_system_opt_out_tokens(self, monkeypatch, raw):
+        monkeypatch.setenv("VSPIDER_CROSS_SYSTEM_SWITCH", raw)
+        assert cfg.cross_system_enabled() is False
 
     def test_profile_ttl_hours_default(self, monkeypatch):
         monkeypatch.delenv("VSPIDER_PROFILE_TTL_HOURS", raising=False)
@@ -142,7 +149,7 @@ class TestCrossSystemConfigSnapshot:
         for key in _ALL_ENV:
             monkeypatch.delenv(key, raising=False)
         snap = cfg.CrossSystemConfig.from_env()
-        assert snap.enabled is False
+        assert snap.enabled is True
         assert snap.profile_ttl_hours == 24.0
         assert snap.pool_per_run == 4
         assert snap.pool_total == 16

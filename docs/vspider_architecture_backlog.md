@@ -3186,4 +3186,51 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   cf_clearance 自行通过（零 HITL；async loop 跑在 worker 线程，避开 sync
   Playwright 占用主线程 event loop）；
   C4 跨系统接力：Alpha 抓 SKU → Beta 过盾→登录→下单写回 store，
-  cf_clearance / beta_session 仅存于 Beta origin、不泄漏 Alpha。
+  cf_clearance / beta_session 仅存于 Beta origin、不泄漏 Alpha；
+  C5 HITL 失败路径（store.waf_autopass=False 渲染无自动过盾脚本的顽固
+  interstitial）：HITL 调用但人工未解（cleared=False/action=hitl）、人工经
+  /cdn-cgi/challenge 手动过盾（cleared_after_hitl=True）、HITL 预算耗尽
+  （action=max_hitl、回调不触发）、HITL 回调抛异常 guard 不崩溃。
+
+## Slice S6-S11 (M2 跨系统贯通): input_contract → graph → session → data bus 一条龙
+
+- 能力名: cross_system_contract_chain（契约声明系统 → 图谱携带 auth_profile →
+  会话预取 → WorkflowDataEdge 运行时数据接力 → 开关默认开启）。
+- 影响层: intent_planning + execution_kernel + data_plane。
+- S6 workflow_graph.py: `WorkflowSystem` 新增 `auth_profile` 字段（to_dict 同步，
+  仅新增向下兼容）；`_build_systems` 新增最高优先级候选源
+  `_contract_url_candidates`（读 route/context 的 input_contract.urls[]，显式
+  system_id 按 id 去重、可同域双系统，声明的 auth_profile 隐含 auth_required）；
+  sessions 继承具体 profile（无声明保持 required/default 旧语义）。
+  SessionRouter.SystemAuthPlan 原本就读 systems[].auth_profile，自此不再恒 auto。
+- S7 io_contract/input_contract.py: 新增 `assign_system_ids`——多 host 契约给
+  system_id=auto 的条目按 host 派发确定性 `sys_<host_slug>`（单 host 保持 auto，
+  字节不变）；build_input_contract 收口处统一调用。main.py route 调用点改为
+  读回 runs/<id>/input_contract.json 并以 context.input_contract 注入
+  route_capabilities_for_task（capability_api 路径原本已注入）。
+- S8 新模块 workflow_data_bus.py（workflow_data_bus.v1）: 按 workflow_graph
+  data_edges 建 run 内存总线，publish（按节点/按 capability，含
+  extractor_select→generic_extractor 别名）→ consume（一次性投递，可 peek）；
+  snapshot 永不含 payload；get_run_bus/clear_run_bus 跨调用共享同 run 总线。
+  route_executor 接线：完成态 `_finish` 经 `_wire_data_bus` 把 result 发布到
+  对应节点出边，返回结构新增 `data_handoff`（run_id/published_edges/bus 快照）。
+- S9 session_router.py: 新增 `pre_acquire_sessions`（与 route_executor
+  session_plan 同形 + session_id/acquired/error，逐系统容错）；main.py 在
+  session_router 构建后、flag=on 且图谱含 >1 web 系统时预取全部规划会话并
+  emit `session_plan_preacquired` 事件。
+- S10 tests/test_xsys_contract_to_relay_e2e.py: flag=on 单场景全链 E2E——
+  双 URL 契约 → 图谱系统/节点归属/auth_profile → 预取 2 会话 → A→B 切换仅注入
+  B 的 cookie 子集 → bus 把 A 行集内存接力给 B（一次性投递、快照无 payload）
+  → release_all 同 run 收口。
+- S11 cross_system_config.py: `cross_system_enabled` 默认改 **on**
+  （env_flag default=True），`VSPIDER_CROSS_SYSTEM_SWITCH=0/false/no/off` 退出；
+  CrossSystemConfig.enabled 默认 True；模块/函数文档同步。
+- 新增 contract 字段: workflow_graph.systems[].auth_profile；
+  route_executor 返回 data_handoff；event_stream 新事件 session_plan_preacquired
+  （均仅新增，向下兼容）。
+- Tests: tests/test_workflow_graph_input_contract.py（S6+S7，15 例）、
+  tests/test_workflow_data_bus.py（S8，17 例）、test_session_router.py 新增
+  TestSessionRouterPreAcquire（S9，4 例）、tests/test_xsys_contract_to_relay_e2e.py
+  （S10+S11，2 例）、test_cross_system_config.py 默认值翻转 + opt-out 矩阵。
+  validate_y s6_s11_cross_system: 定向 112✓ / npm build✓；全量 pytest
+  3284 通过 0 失败（排除并行重构中的 test_timeline_replay_search.py，同 M1）。

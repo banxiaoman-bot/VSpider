@@ -156,6 +156,48 @@ class TestSessionRouterAcquire:
 
 
 # ---------------------------------------------------------------------------
+# S9: pre_acquire_sessions — stage every planned system up-front
+# ---------------------------------------------------------------------------
+
+
+class TestSessionRouterPreAcquire:
+    def test_pre_acquire_stages_all_known_systems(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        plan = router.pre_acquire_sessions()
+        assert [item["system_id"] for item in plan] == ["system_1", "system_2"]
+        assert all(item["acquired"] for item in plan)
+        assert all(item["session_id"] for item in plan)
+        # entries mirror route_executor's session_plan shape + resolution
+        assert plan[0]["auth_profile"] == "alpha_login"
+        assert plan[0]["domain"] == "alpha.com"
+        assert pool.total_acquired == 2
+
+    def test_pre_acquire_explicit_subset(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        plan = router.pre_acquire_sessions(["system_2"])
+        assert [item["system_id"] for item in plan] == ["system_2"]
+        assert pool.total_acquired == 1
+
+    def test_pre_acquire_is_idempotent(self) -> None:
+        pool = _pool()
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        first = router.pre_acquire_sessions()
+        second = router.pre_acquire_sessions()
+        assert [i["session_id"] for i in first] == [i["session_id"] for i in second]
+        assert pool.total_acquired == 2
+
+    def test_pre_acquire_failure_degrades_per_system(self) -> None:
+        pool = BrowserSessionPool(env_factory=_stub_factory, max_sessions_per_run=1)
+        router = SessionRouter(run_id="r1", plan=SystemAuthPlan(systems=_SYSTEMS), pool=pool)
+        plan = router.pre_acquire_sessions()
+        assert plan[0]["acquired"] is True
+        assert plan[1]["acquired"] is False
+        assert "cap reached" in plan[1]["error"]
+
+
+# ---------------------------------------------------------------------------
 # build_session_router: tolerant construction from a capability route
 # ---------------------------------------------------------------------------
 

@@ -52,6 +52,7 @@ try:
         ensure_contract_skeleton,
         ensure_input_contract_skeleton,
         infer_output_contract,
+        read_input_contract,
         write_output_contract,
     )
     from .data_sanitizer import (
@@ -121,6 +122,7 @@ except ImportError:
         ensure_contract_skeleton,
         ensure_input_contract_skeleton,
         infer_output_contract,
+        read_input_contract,
         write_output_contract,
     )
     from data_sanitizer import (
@@ -8242,9 +8244,21 @@ async def run_agent(
             requested_fields=_parse_goal_requested_fields(goal),
         )
         try:
+            # S7: feed the persisted input_contract.json (urls[].system_id /
+            # auth_profile) into the router so workflow_graph._build_systems
+            # plans systems from the user's declared URLs instead of
+            # re-deriving everything from goal text.
+            _route_context: dict[str, Any] = {}
+            try:
+                _persisted_input_contract = read_input_contract(_run_ts)
+            except Exception:
+                _persisted_input_contract = None
+            if isinstance(_persisted_input_contract, dict):
+                _route_context["input_contract"] = _persisted_input_contract
             _capability_route = route_capabilities_for_task(
                 goal,
                 url=start_url,
+                context=_route_context or None,
                 limit=12,
             )
             event_stream.emit(
@@ -8317,6 +8331,35 @@ async def run_agent(
             cross_system_enabled as _xsys_enabled,
             profile_ttl_hours as _xsys_profile_ttl_hours,
         )
+        # S9: multi-system runs pre-acquire one pool session per planned web
+        # system so the first cross-system hop rebinds an existing session
+        # instead of cold-starting one mid-flow. Failure of any single
+        # acquire degrades to the legacy on-demand path for that system.
+        try:
+            if _session_router is not None and _xsys_enabled():
+                _planned_web_systems = [
+                    str(s.get("id") or "")
+                    for s in ((_capability_route.get("workflow_graph") or {}).get("systems") or [])
+                    if isinstance(s, dict) and s.get("type") == "web" and s.get("id")
+                ]
+                if len(_planned_web_systems) > 1:
+                    _preacquired_plan = _session_router.pre_acquire_sessions(_planned_web_systems)
+                    event_stream.emit(
+                        "session_plan_preacquired",
+                        run_id=_run_ts,
+                        plan=_preacquired_plan,
+                    )
+                    logger.info(
+                        "[SESSION ROUTER] pre-acquired %s/%s planned system sessions: %s",
+                        sum(1 for item in _preacquired_plan if item.get("acquired")),
+                        len(_preacquired_plan),
+                        [
+                            f"{item['system_id']}@{item['auth_profile']}"
+                            for item in _preacquired_plan
+                        ],
+                    )
+        except Exception as _preacquire_err:
+            logger.debug("[SESSION ROUTER] pre-acquire skipped: %s", _preacquire_err)
         _selected_tools = action_registry.select_for_goal(
             goal,
             strategy_context=_initial_strategy_context,
