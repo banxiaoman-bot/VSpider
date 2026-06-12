@@ -3664,7 +3664,7 @@ const settingsSummaryText = computed(() => {
         size="440px"
         class="settings-drawer"
       >
-          <el-collapse v-model="settingsActivePanels" class="advanced-collapse">
+          <el-collapse v-model="settingsActivePanels" class="advanced-collapse drawer-collapse">
           <el-collapse-item name="models">
             <template #title>
               <span>双脑调度中心</span>
@@ -8163,5 +8163,64 @@ const settingsSummaryText = computed(() => {
   color: var(--vsp-text-2);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* C2: 抽屉视觉打磨 — 卡片化分组、与主面板同一套 token */
+:global(.settings-drawer.el-drawer) {
+  background: var(--vsp-surface);
+  border-left: 1px solid var(--vsp-border);
+  box-shadow: -18px 0 42px rgb(var(--rgb-black) / 0.45);
+}
+
+:global(.settings-drawer .el-drawer__header) {
+  margin-bottom: 0;
+  padding: 16px 20px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--vsp-text);
+  border-bottom: 1px solid var(--vsp-border);
+}
+
+:global(.settings-drawer .el-drawer__body) {
+  padding: 14px 20px 20px;
+}
+
+.drawer-collapse {
+  --el-collapse-border-color: transparent;
+  border-top: none;
+  border-bottom: none;
+}
+
+.drawer-collapse :deep(.el-collapse-item) {
+  margin-bottom: 12px;
+  overflow: hidden;
+  background: rgb(var(--rgb-surface-2) / 0.6);
+  border: 1px solid var(--vsp-border);
+  border-radius: 10px;
+}
+
+.drawer-collapse :deep(.el-collapse-item__header) {
+  height: 44px;
+  padding: 0 14px;
+  font-weight: 600;
+  background: transparent;
+  border-bottom: none;
+}
+
+.drawer-collapse :deep(.el-collapse-item.is-active .el-collapse-item__header) {
+  border-bottom: 1px solid var(--vsp-border);
+}
+
+.drawer-collapse :deep(.el-collapse-item__content) {
+  padding: 12px 14px 14px;
+}
+
+.drawer-collapse :deep(.el-collapse-item__wrap) {
+  background: transparent;
+  border-bottom: none;
+}
+
+.drawer-collapse .field-group {
+  margin-bottom: 0;
 }
 </style>
