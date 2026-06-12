@@ -121,6 +121,40 @@ def _build_session_plan(
     return plan
 
 
+def _wire_data_bus(
+    outcome: dict[str, Any],
+    route: dict[str, Any],
+    completed: dict[str, Any],
+    *,
+    run_id: str,
+) -> None:
+    """S8: publish a completed capability's result onto the run's data bus.
+
+    The bus turns ``workflow_graph.data_edges`` from declaration into
+    runtime: downstream steps (possibly on another system, possibly in a
+    later executor call of the same run) can ``consume()`` these items
+    from memory instead of re-reading a file. Best-effort — a bus failure
+    must never fail the route itself.
+    """
+
+    try:
+        from .workflow_data_bus import get_run_bus
+
+        bus = get_run_bus(run_id, workflow_graph=route.get("workflow_graph"))
+        if bus is None:
+            return
+        capability = str(completed.get("capability") or "")
+        packets = bus.publish_by_capability(capability, completed.get("result"))
+        outcome["data_handoff"] = {
+            "run_id": run_id,
+            "published_capability": capability,
+            "published_edges": [p.edge_id for p in packets],
+            "bus": bus.snapshot(),
+        }
+    except Exception:
+        pass
+
+
 def _attempt_error(capability: str, exc: Exception) -> dict[str, Any]:
     item: dict[str, Any] = {"capability": capability, "status": "error", "reason": str(exc)}
     action_trace = getattr(exc, "action_trace", None)
@@ -153,22 +187,29 @@ class DeterministicRouteExecutor:
         source = payload.get("source")
         if source is None:
             source = payload.get("html")
+        run_id = str(payload.get("run_id") or "route_executor")
+
+        def _finish(completed_payload: dict[str, Any]) -> dict[str, Any]:
+            outcome = self._completed(route, attempts, completed_payload, capability_to_system)
+            _wire_data_bus(outcome, route, completed_payload, run_id=run_id)
+            return outcome
+
         if source not in (None, ""):
             selector_result = self._try_selector(payload, source, route, attempts)
             if selector_result is not None:
-                return self._completed(route, attempts, selector_result, capability_to_system)
+                return _finish(selector_result)
             extract_result = self._try_extract(payload, source, route, attempts)
             if extract_result is not None:
-                return self._completed(route, attempts, extract_result, capability_to_system)
+                return _finish(extract_result)
         else:
             attempts.append({"capability": "generic_extractor", "status": "skipped", "reason": "source/html not provided"})
         if bool(payload.get("allow_network")):
             api_result = self._try_api_replay(payload, route, attempts)
             if api_result is not None:
-                return self._completed(route, attempts, api_result, capability_to_system)
+                return _finish(api_result)
             spider_result = self._try_spider(payload, route, attempts)
             if spider_result is not None:
-                return self._completed(route, attempts, spider_result, capability_to_system)
+                return _finish(spider_result)
         else:
             if _api_replay_candidates(payload):
                 attempts.append({"capability": "api_replay", "status": "skipped", "reason": "allow_network is false"})

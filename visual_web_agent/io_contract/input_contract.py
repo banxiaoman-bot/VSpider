@@ -296,6 +296,39 @@ def parse_urls_field(raw: Any) -> list[UrlSpec]:
     return []
 
 
+def _url_host(url: str) -> str:
+    try:
+        return urlparse(url).netloc.split("@")[-1].split(":")[0].strip().lower()
+    except Exception:
+        return ""
+
+
+def assign_system_ids(url_specs: list[UrlSpec]) -> list[UrlSpec]:
+    """S7: give multi-host contracts deterministic per-host ``system_id``s.
+
+    When a contract spans more than one host, every ``system_id="auto"``
+    entry gets ``sys_<host-slug>`` (same host -> same id) so the workflow
+    graph and SessionRouter can treat each host as a first-class system.
+    Single-host contracts and user-provided ids are left untouched, keeping
+    the legacy single-system behaviour byte-identical. Mutates in place and
+    returns the same list for chaining.
+    """
+
+    hosts = {_url_host(spec.url) for spec in url_specs if _url_host(spec.url)}
+    if len(hosts) <= 1:
+        return url_specs
+    for spec in url_specs:
+        if (spec.system_id or "auto") != "auto":
+            continue
+        host = _url_host(spec.url)
+        if not host:
+            continue
+        slug = re.sub(r"[^a-z0-9]+", "_", host).strip("_")
+        if slug:
+            spec.system_id = f"sys_{slug}"
+    return url_specs
+
+
 def _url_from_dict(item: dict[str, Any]) -> UrlSpec:
     return UrlSpec(
         url=str(item.get("url") or "").strip(),
@@ -628,6 +661,10 @@ def build_input_contract(
 
     for spec in url_specs:
         spec.role = spec.role if spec.role in URL_ROLES else "unknown"
+
+    # S7: multi-host submissions get deterministic per-host system ids so
+    # cross-system scheduling has stable identities from the contract on.
+    assign_system_ids(url_specs)
 
     attachment_specs: list[AttachmentSpec] = []
     for raw in attachments or []:
