@@ -22,6 +22,12 @@ Two independent HTTP apps (each on its own 127.0.0.1 / localhost port):
   - ``/orders``: requires the auth cookie (302 to /login otherwise);
     lists recorded orders and offers a "new order" relay form.
   - ``POST /orders/new``: requires the cookie; appends to the store.
+  - Optional WAF gate (``make_beta_handler(store, challenge=True)``):
+    every request without a ``cf_clearance`` cookie gets a Cloudflare-style
+    403 interstitial ("Just a moment...", ``#challenge-form``) whose JS
+    auto-passes via ``/cdn-cgi/challenge`` — that endpoint issues the
+    ``cf_clearance`` cookie and 302s back to the original path. Block /
+    clearance counts are recorded on the store for assertions.
 
 Everything is deterministic and offline; no external network access.
 """
@@ -103,6 +109,8 @@ class ScenarioStore:
     submissions: list[dict[str, Any]] = field(default_factory=list)
     orders: list[dict[str, Any]] = field(default_factory=list)
     beta_logins: list[str] = field(default_factory=list)
+    waf_blocks: int = 0
+    waf_clearances: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +441,33 @@ def make_alpha_handler(store: ScenarioStore):
 
 BETA_COOKIE = "beta_session=beta-ok"
 
+CLEARANCE_COOKIE = "cf_clearance=fixture-cleared"
+
+# How long the interstitial waits before auto-passing (ms); long enough for a
+# probe to observe the challenge, short enough for passive-wait tests.
+CHALLENGE_AUTOPASS_MS = 700
+
+
+def _beta_challenge_html(next_path: str) -> bytes:
+    """Cloudflare-style interstitial the bot_challenge_guard probe must flag."""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Just a moment...</title></head>
+<body data-ray="fixture-ray-0001">
+  <h1>Checking your browser before accessing Beta 订单系统</h1>
+  <p>This process is automatic. Please wait while we verify you are human.</p>
+  <form id="challenge-form" action="/cdn-cgi/challenge" method="get">
+    <input type="hidden" name="next" value="{next_path}">
+  </form>
+  <script>
+    setTimeout(function () {{
+      window.location.href = '/cdn-cgi/challenge?next=' +
+        encodeURIComponent('{next_path}');
+    }}, {CHALLENGE_AUTOPASS_MS});
+  </script>
+</body></html>"""
+    return html.encode("utf-8")
+
 
 def _beta_login_html(error: str = "") -> bytes:
     err = f"<p id='login-error'>{error}</p>" if error else ""
@@ -467,7 +502,7 @@ def _beta_orders_html(orders: list[dict[str, Any]]) -> bytes:
     return _page_shell("Beta 订单", body)
 
 
-def make_beta_handler(store: ScenarioStore):
+def make_beta_handler(store: ScenarioStore, challenge: bool = False):
     class BetaHandler(BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
@@ -486,8 +521,38 @@ def make_beta_handler(store: ScenarioStore):
             cookie = self.headers.get("Cookie") or ""
             return BETA_COOKIE in cookie.replace(" ", "")
 
+        def _cleared(self) -> bool:
+            cookie = self.headers.get("Cookie") or ""
+            return CLEARANCE_COOKIE.split("=", 1)[0] + "=" in cookie.replace(" ", "")
+
+        def _waf_gate(self, path: str) -> bool:
+            """Serve the interstitial / clearance endpoint. True = handled."""
+            if not challenge:
+                return False
+            if path == "/cdn-cgi/challenge":
+                store.waf_clearances += 1
+                query = parse_qs(urlparse(self.path).query)
+                next_path = (query.get("next") or ["/orders"])[0]
+                if not next_path.startswith("/"):
+                    next_path = "/orders"
+                self._send(
+                    b"", status=302,
+                    extra={
+                        "Location": next_path,
+                        "Set-Cookie": f"{CLEARANCE_COOKIE}; Path=/",
+                    },
+                )
+                return True
+            if not self._cleared():
+                store.waf_blocks += 1
+                self._send(_beta_challenge_html(path), status=403)
+                return True
+            return False
+
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if self._waf_gate(path):
+                return
             if path == "/login":
                 return self._send(_beta_login_html())
             if path == "/orders":
@@ -502,6 +567,8 @@ def make_beta_handler(store: ScenarioStore):
 
         def do_POST(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
+            if self._waf_gate(path):
+                return
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length).decode("utf-8", "replace")
             fields = {

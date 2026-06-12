@@ -3168,3 +3168,22 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   分支、max_hitl 预算、router 反爬 goal 路由 + 普通 goal 不路由）；
   tests/test_agent_loop_stub_e2e.py（2 例：VLM stub 驱动 run_agent 全链路跑
   Alpha fixture 站点，make_plan/ask 被真实调用、done 收口返回 True、落 run 痕迹）。
+
+## Slice BOT-CHL-2: cross-system anti-bot scenarios on the dual-system fixture
+
+- 影响层: 仅测试资产（tests/），运行时零改动。
+- tests/scenario_site.py: Beta 订单系统新增可选 WAF 盾
+  （make_beta_handler(store, challenge=True)，默认关闭、既有消费方不受影响）：
+  无 cf_clearance cookie 的 GET/POST 一律 403 Cloudflare 风格 interstitial
+  （"Just a moment..." + #challenge-form + data-ray），页面 JS 700ms 后经
+  /cdn-cgi/challenge 自动过盾——该端点颁发 cf_clearance 并 302 回原路径；
+  store 记 waf_blocks / waf_clearances 供断言。
+- tests/test_cross_system_bot_challenge.py（7 例）:
+  C1 HTTP 层拦截/颁发/放行（GET+POST 同拦）；
+  C2 _PROBE_JS 真 Chromium 探针：interstitial→cloudflare、Alpha 干净页与
+  过盾后 Beta 页→无挑战；
+  C3 handle_bot_challenge_step 走 async Chromium 全链路，被动等待窗口内靠
+  cf_clearance 自行通过（零 HITL；async loop 跑在 worker 线程，避开 sync
+  Playwright 占用主线程 event loop）；
+  C4 跨系统接力：Alpha 抓 SKU → Beta 过盾→登录→下单写回 store，
+  cf_clearance / beta_session 仅存于 Beta origin、不泄漏 Alpha。
