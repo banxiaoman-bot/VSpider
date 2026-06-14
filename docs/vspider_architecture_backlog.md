@@ -3459,4 +3459,23 @@ editor-API routing + readback mismatch + plain-input keyboard path).
 - Tests: tests/test_selector_cache_vlm_budget_e6.py TestE6Routing
   （3 例：api_goal fallback 含 api_replay/network_intelligence + selector
   cache signal 注入 + form 信号正确识别）；capability_router 回归 41/41 全绿。
-- Out of scope (next): E7 效率基线 benchmark。
+
+## Slice E7 (M3 高效): 效率基线 benchmark efficiency_baseline (done)
+
+- 能力名: efficiency_baseline（锁住 E1-E3 感知优化收益，防回退）。
+- 影响层: 仅测试资产。
+- tests/test_efficiency_baseline.py 3 例：
+  - 8 回合序列基线（20 行 AX 树 stub，T1 全量 + T2-T4 复用 + T5 逃生阀
+    + T6/T8 签名变更 diff + T7 复用）：断言 full_perception ≤ 4、reuse ≥ 3、
+    total_ax_chars < naive×50%、screenshot ≤ 5。
+  - AX diff 体积缩减断言（第二轮 ax_lines < 第一轮）。
+  - 逃生阀后 AX diff 基线重置（全量非增量）。
+  任何后续 PR 导致效率指标超出基线即测试红。
+- 验证: E7 3✓ + E3 7✓ + E1 8✓ + P1 4✓ + E2 12✓ + E4 23✓ = 57 通过 0 失败。
+
+## M3「高效」里程碑收口
+
+P0✓ P1✓ E1✓ E2✓ E3✓ E4✓ E5✓ E6✓ E7✓ — 全部 9 个 slice 完成。
+宗旨「高效」四个分句覆盖：最少回合(E5)、局部感知(E1/E2/E3/E7)、
+API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
+（E1 逃生阀、E2 full 回退、E4 命中仍出全套 evidence）。
