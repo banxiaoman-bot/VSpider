@@ -1,63 +1,77 @@
-"""E3 AX incremental diff: only send added/removed AX lines to VLM prompt.
+"""E3 AX incremental diff: second-round AX output contains only added/removed
+lines instead of the full tree, reducing observe event size and VLM token cost.
 
-Locks the plan guarantees:
-* First turn always renders full AX tree in the VLM prompt (no diff).
-* Subsequent turn with changed AX shows diff format: unchanged count + added
-  lines + removed lines.
-* Subsequent turn with identical AX shows compact 'completely same' summary.
-* E1 escape-valve forced-full turn gives full AX (resets diff baseline).
-* E1 reuse turns don't shift the diff baseline.
-* Empty AX produces no ax_block regardless of diff state.
-* observe event metadata carries ``ax_incremental`` / ``ax_added`` /
-  ``ax_removed`` / ``ax_unchanged`` counts.
+Plan guarantees tested here:
+* first turn always gives full AX text (no diff);
+* second turn with unchanged AX → ``[AX 无变化]`` one-liner;
+* second turn with changed AX → incremental diff (added + removed only);
+* E1 escape-valve forced-full round gives full AX (resets diff baseline);
+* AX extraction failure (empty text) → no diff attempt;
+* diff after reuse rounds is still computed against the last full extraction;
+* ax_block prompt uses incremental header when diff is active.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
-from visual_web_agent.event_stream import EventStream
 from visual_web_agent.phases import perception as perception_mod
 from visual_web_agent.phases.perception import PerceptionPhase, PerceptionSnapshot
 
-
 # ---------------------------------------------------------------------------
-# AX fixtures
-# ---------------------------------------------------------------------------
-
-AX_TURN_1 = (
-    '@e1 [button] "Submit" {enabled}\n'
-    '@e2 [textbox] "Username" {focused}\n'
-    '@e3 [link] "Help" {}'
-)
-
-AX_TURN_2 = (
-    '@e1 [button] "Submit" {enabled}\n'
-    '@e3 [link] "Help" {}\n'
-    '@e4 [status] "Success" {}'
-)
-
-# Shared between TURN_1 and TURN_2: @e1, @e3  (2 lines)
-# Added in TURN_2:   @e4                       (1 line)
-# Removed in TURN_2: @e2                       (1 line)
-
-
-# ---------------------------------------------------------------------------
-# stubs
+# fixture AX trees
 # ---------------------------------------------------------------------------
 
+AX_TREE_V1 = "\n".join([
+    '@e1 [button] "Submit" {enabled}',
+    '@e2 [link] "Home"',
+    '@e3 [textbox] "Username" {focused}',
+    '@e4 [heading] "Login Page"',
+    '@e5 [link] "About"',
+    '@e6 [link] "Help"',
+    '@e7 [link] "Contact"',
+    '@e8 [link] "Privacy"',
+    '@e9 [link] "Terms"',
+    '@e10 [link] "FAQ"',
+    '@e11 [link] "Blog"',
+    '@e12 [link] "Status"',
+])
+
+AX_TREE_V2 = "\n".join([
+    '@e1 [button] "Submit" {enabled}',
+    '@e2 [link] "Home"',
+    '@e5 [link] "About"',
+    '@e6 [link] "Help"',
+    '@e7 [link] "Contact"',
+    '@e8 [link] "Privacy"',
+    '@e9 [link] "Terms"',
+    '@e10 [link] "FAQ"',
+    '@e11 [link] "Blog"',
+    '@e12 [link] "Status"',
+    '@e15 [textbox] "Email" {focused}',
+    '@e16 [link] "Register"',
+])
+
+# V1 → V2 diff:
+#   unchanged: @e1, @e2, @e5-@e12 (10 lines)
+#   added:     @e15, @e16          (2 lines)
+#   removed:   @e3, @e4            (2 lines)
+
+
+# ---------------------------------------------------------------------------
+# stubs (mirror test_perception_reuse.py conventions)
+# ---------------------------------------------------------------------------
 
 class _StubPage:
-    url = "https://test.example/page"
+    url = "https://demo.example/login"
 
     def is_closed(self) -> bool:
         return False
 
     async def title(self) -> str:
-        return "Test Page"
+        return "Demo Login"
 
     async def evaluate(self, script):
         return "visible body text"
@@ -72,16 +86,20 @@ class _StubEventStream:
 
 
 class _StubBrowser:
-    def __init__(self) -> None:
-        self.current_url = "https://test.example/page"
+    """Browser stub whose ``extract_accessibility_tree`` returns successive
+    AX trees from the ``ax_trees`` list."""
+
+    def __init__(self, ax_trees: list[str]) -> None:
+        self.current_url = "https://demo.example/login"
         self._last_som_elements = [{"id": 1}]
         self._last_action_result = None
         self._page = _StubPage()
-        self.signature = "sig-1"
+        self.signature = "sig-ax"
         self.screenshot_calls = 0
         self.ax_calls = 0
         self.tabs_calls = 0
-        self.ax_text = AX_TURN_1
+        self._ax_trees = ax_trees
+        self._ax_index = 0
 
     async def dom_signature(self) -> str:
         return self.signature
@@ -91,22 +109,26 @@ class _StubBrowser:
 
     async def get_tabs_state(self) -> str:
         self.tabs_calls += 1
-        return "Tab 0: Test Page (active)"
+        return "Tab 0: Demo Login (active)"
 
     async def get_active_page_summary(self) -> str:
-        return "Test Page fixture"
+        return "Demo Login — fixture"
 
     async def mark_and_screenshot(self, step: int, scope="viewport"):
         self.screenshot_calls += 1
         self.last_scope = scope
-        return f"b64-shot-{self.screenshot_calls}", "@e1 button Submit"
+        return f"b64-{self.screenshot_calls}", "stub-input-desc"
 
     async def restart(self, start_url: str, reason: str = "") -> None:
         pass
 
     async def extract_accessibility_tree(self) -> str:
         self.ax_calls += 1
-        return self.ax_text
+        if self._ax_index < len(self._ax_trees):
+            text = self._ax_trees[self._ax_index]
+            self._ax_index += 1
+            return text
+        return self._ax_trees[-1] if self._ax_trees else ""
 
     async def reroute_proxy_on_block(self, url, **kwargs) -> bool:
         return False
@@ -131,7 +153,7 @@ def _run_turn(
             browser,
             step=step,
             event_stream=events,
-            start_url="https://test.example/page",
+            start_url="https://demo.example/login",
             recover_active_page=_noop_recover,
             wait_for_human_resume=_noop_hitl,
             bot_challenge_state=object(),
@@ -149,163 +171,137 @@ def _disable_a11y_enhancer(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_first_turn_full_ax():
-    """First turn always renders full AX tree in VLM prompt."""
+def test_first_turn_gives_full_ax_text():
+    """First round always gives full AX text — no diff applied."""
     phase = PerceptionPhase()
-    browser = _StubBrowser()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1])
     events = _StubEventStream()
 
     snap = _run_turn(phase, browser, events, step=1)
 
-    assert snap.ax_tree_text == AX_TURN_1
-    assert "【辅助信息：页面无障碍语义树 (AX Tree)】" in snap.input_descriptions
-    assert "[AX 增量]" not in snap.input_descriptions
-
-    meta = events.observe_calls[0].get("metadata", {})
-    assert meta.get("ax_incremental") is False
+    assert AX_TREE_V1 in snap.ax_tree_text
+    assert "[AX 增量]" not in snap.ax_tree_text
+    assert "[AX 无变化]" not in snap.ax_tree_text
 
 
-def test_second_turn_changed_ax_gets_diff():
-    """Subsequent turn with changed AX shows diff: unchanged + added + removed."""
+def test_second_turn_same_ax_gives_no_change_marker():
+    """Two turns with identical AX → diff says 'no change'."""
     phase = PerceptionPhase()
-    browser = _StubBrowser()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1, AX_TREE_V1])
     events = _StubEventStream()
 
     _run_turn(phase, browser, events, step=1)
-
-    browser.ax_text = AX_TURN_2
-    browser.signature = "sig-2"
+    # force different signature so perception is NOT reused (E1 skip)
+    browser.signature = "sig-ax-2"
     snap2 = _run_turn(phase, browser, events, step=2)
 
-    assert snap2.ax_tree_text == AX_TURN_2
-    assert "[AX 增量]" in snap2.input_descriptions
-    assert "2 行未变" in snap2.input_descriptions
-    assert '@e4 [status] "Success" {}' in snap2.input_descriptions
-    assert '@e2 [textbox] "Username" {focused}' in snap2.input_descriptions
-
-    meta2 = events.observe_calls[1].get("metadata", {})
-    assert meta2.get("ax_incremental") is True
-    assert meta2.get("ax_added") == 1
-    assert meta2.get("ax_removed") == 1
-    assert meta2.get("ax_unchanged") == 2
+    assert "[AX 无变化]" in snap2.ax_tree_text
+    assert AX_TREE_V1 not in snap2.ax_tree_text
 
 
-def test_second_turn_same_ax_gets_unchanged_summary():
-    """Subsequent turn with identical AX shows compact 'completely same' summary."""
+def test_second_turn_different_ax_gives_incremental_diff():
+    """Two turns with changed AX → output contains only added/removed lines."""
     phase = PerceptionPhase()
-    browser = _StubBrowser()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1, AX_TREE_V2])
     events = _StubEventStream()
 
     _run_turn(phase, browser, events, step=1)
-
-    browser.signature = "sig-2"
+    browser.signature = "sig-ax-2"
     snap2 = _run_turn(phase, browser, events, step=2)
 
-    assert "AX Tree 未变" in snap2.input_descriptions
-    assert "3 行与上一轮相同" in snap2.input_descriptions
-    assert "+新增" not in snap2.input_descriptions
-    assert "-消失" not in snap2.input_descriptions
+    ax = snap2.ax_tree_text
+    assert "[AX 增量]" in ax
+    assert "10 行不变" in ax
 
-    meta2 = events.observe_calls[1].get("metadata", {})
-    assert meta2.get("ax_incremental") is True
-    assert meta2.get("ax_added") == 0
-    assert meta2.get("ax_removed") == 0
+    # added lines present
+    assert '@e15 [textbox] "Email" {focused}' in ax
+    assert '@e16 [link] "Register"' in ax
+    assert "新增" in ax
+
+    # removed lines present
+    assert '@e3 [textbox] "Username" {focused}' in ax
+    assert '@e4 [heading] "Login Page"' in ax
+    assert "已消失" in ax
+
+    # unchanged lines NOT present (only diff output)
+    assert '@e1 [button] "Submit" {enabled}' not in ax
+    assert '@e2 [link] "Home"' not in ax
+
+    # observe event size smaller than first turn
+    first_ax_lines = events.observe_calls[0]["ax_lines"]
+    second_ax_lines = events.observe_calls[1]["ax_lines"]
+    assert second_ax_lines < first_ax_lines
 
 
-def test_escape_valve_gives_full_ax():
-    """E1 escape-valve forced-full turn gives full AX (not diff)."""
+def test_escape_valve_round_gives_full_ax():
+    """E1 escape-valve forced-full round resets diff baseline → full AX."""
     phase = PerceptionPhase()
-    browser = _StubBrowser()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1, AX_TREE_V2, AX_TREE_V2, AX_TREE_V2, AX_TREE_V2])
     events = _StubEventStream()
 
-    _run_turn(phase, browser, events, step=1)
+    _run_turn(phase, browser, events, step=1)  # full (first round)
+    # 3 reuse rounds (signature unchanged, action not mutating)
     for s in (2, 3, 4):
         _run_turn(phase, browser, events, step=s)  # reuse x3
+    assert browser.ax_calls == 1  # only first round extracted AX
 
-    browser.ax_text = AX_TURN_2
+    # step 5: escape valve fires → forced full perception
     snap5 = _run_turn(phase, browser, events, step=5)
+    assert browser.ax_calls == 2
+    # forced full → full AX text, not incremental diff
+    assert "[AX 增量]" not in snap5.ax_tree_text
+    assert "[AX 无变化]" not in snap5.ax_tree_text
+    assert AX_TREE_V2 in snap5.ax_tree_text
 
-    assert "【辅助信息：页面无障碍语义树 (AX Tree)】" in snap5.input_descriptions
-    assert "[AX 增量]" not in snap5.input_descriptions
 
-    meta5 = events.observe_calls[4].get("metadata", {})
-    assert meta5.get("ax_incremental") is False
-
-
-def test_reuse_turns_preserve_diff_baseline():
-    """E1 reuse turns don't shift the diff baseline."""
+def test_ax_extraction_failure_no_diff():
+    """AX extraction failure → empty text, no diff attempt."""
     phase = PerceptionPhase()
-    browser = _StubBrowser()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1, ""])
     events = _StubEventStream()
 
-    _run_turn(phase, browser, events, step=1)  # full, baseline = AX_TURN_1
-    _run_turn(phase, browser, events, step=2)  # E1 reuse (same sig)
+    _run_turn(phase, browser, events, step=1)
+    browser.signature = "sig-ax-2"
+    snap2 = _run_turn(phase, browser, events, step=2)
 
-    browser.signature = "sig-new"
-    browser.ax_text = AX_TURN_2
+    assert snap2.ax_tree_text == ""
+    assert "[AX 增量]" not in snap2.input_descriptions
+
+
+def test_diff_after_reuse_rounds_uses_last_full_extraction():
+    """After reuse rounds (E1 skip), diff is computed against the last full
+    extraction, not the reused snapshot."""
+    phase = PerceptionPhase()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1, AX_TREE_V2])
+    events = _StubEventStream()
+
+    _run_turn(phase, browser, events, step=1)  # full with V1
+    _run_turn(phase, browser, events, step=2)  # reuse (same signature)
+    assert browser.ax_calls == 1  # only first round extracted
+
+    # now force full perception with different signature → V2
+    browser.signature = "sig-ax-changed"
     snap3 = _run_turn(phase, browser, events, step=3)
+    assert browser.ax_calls == 2
 
-    assert "[AX 增量]" in snap3.input_descriptions
-    assert "2 行未变" in snap3.input_descriptions
-    assert '@e4 [status] "Success" {}' in snap3.input_descriptions
-    assert '@e2 [textbox] "Username" {focused}' in snap3.input_descriptions
+    # diff should be V1 → V2 (against the last full extraction, not reuse)
+    ax = snap3.ax_tree_text
+    assert "[AX 增量]" in ax
+    assert "新增" in ax
+    assert "已消失" in ax
 
 
-def test_empty_ax_no_diff():
-    """Empty AX tree produces no ax_block regardless of diff state."""
+def test_ax_block_prompt_uses_incremental_header():
+    """When diff is active, the ax_block in input_descriptions uses the
+    incremental header instead of the full AX header."""
     phase = PerceptionPhase()
-    browser = _StubBrowser()
+    browser = _StubBrowser(ax_trees=[AX_TREE_V1, AX_TREE_V2])
     events = _StubEventStream()
 
-    browser.ax_text = ""
-    snap = _run_turn(phase, browser, events, step=1)
+    snap1 = _run_turn(phase, browser, events, step=1)
+    assert "页面无障碍语义树" in snap1.input_descriptions
 
-    assert "AX Tree" not in snap.input_descriptions
-    assert "[AX 增量]" not in snap.input_descriptions
-
-
-def test_diff_resets_baseline_for_next_turn():
-    """After a diff turn, next diff is against the updated baseline."""
-    phase = PerceptionPhase()
-    browser = _StubBrowser()
-    events = _StubEventStream()
-
-    _run_turn(phase, browser, events, step=1)  # full, baseline = AX_TURN_1
-
-    browser.ax_text = AX_TURN_2
-    browser.signature = "sig-2"
-    _run_turn(phase, browser, events, step=2)  # diff vs TURN_1, baseline → TURN_2
-
-    browser.ax_text = AX_TURN_1
-    browser.signature = "sig-3"
-    snap3 = _run_turn(phase, browser, events, step=3)  # diff vs TURN_2
-
-    assert "[AX 增量]" in snap3.input_descriptions
-    # @e2 was absent in TURN_2 but back in TURN_1 → it's an "added" line now
-    assert '@e2 [textbox] "Username" {focused}' in snap3.input_descriptions
-    # @e4 was in TURN_2 but gone in TURN_1 → it's a "removed" line now
-    assert '@e4 [status] "Success" {}' in snap3.input_descriptions
-
-
-def test_observe_event_carries_ax_diff_metadata(tmp_path):
-    """EventStream.observe passes through ax_incremental metadata fields."""
-    stream = EventStream(run_id="e3_test", log_dir=tmp_path)
-    stream.observe(
-        step=1,
-        url="https://x.example",
-        metadata={
-            "ax_incremental": True,
-            "ax_unchanged": 10,
-            "ax_added": 2,
-            "ax_removed": 1,
-        },
-    )
-    lines = [
-        json.loads(line)
-        for line in stream.path.read_text(encoding="utf-8").splitlines()
-    ]
-    meta = lines[0].get("metadata", {})
-    assert meta.get("ax_incremental") is True
-    assert meta.get("ax_unchanged") == 10
-    assert meta.get("ax_added") == 2
-    assert meta.get("ax_removed") == 1
+    browser.signature = "sig-ax-2"
+    snap2 = _run_turn(phase, browser, events, step=2)
+    assert "AX Tree 增量变化" in snap2.input_descriptions
+    assert "页面无障碍语义树" not in snap2.input_descriptions

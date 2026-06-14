@@ -3365,3 +3365,30 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   0 新增失败（沿用 S14/P1/E1 口径排除并行 UI 重构预先存在的 5 例）。
 - Out of scope (next): E3 AX 增量 diff、E4 selector 缓存、E5 VLM 回合
   预算、E6 api_replay 优先、E7 效率基线 benchmark。
+
+## Slice E3 (M3 高效): AX 摘要增量 diff ax_incremental (done)
+
+- 能力名: ax_incremental（非首回合/非逃生阀回合只输出 AX 变化行）。
+- 影响层: execution_kernel（phases/perception.py）。
+- PerceptionPhase 新增 `_last_ax_lines: set[str] | None` 状态，持有上一轮
+  全量 AX 提取的行集合（仅在全量感知回合更新，E1 复用回合不更新）。
+- 新增 `_compute_ax_diff(current_text, force_full)` 方法：首回合
+  （`_last_ax_lines is None`）或 E1 逃生阀强制全量回合返回全量 AX 文本；
+  否则返回增量 diff——`[AX 增量] N 行不变 | +M 新增 | -K 已消失` header +
+  仅新增行与消失行正文。AX 提取失败（空串）安静跳过 diff。
+- `run()` 在 A11y Enhancer + 截断之后、browser_state 组装之前调用
+  `_compute_ax_diff`，将结果回写 `ax_tree_text` 变量——downstream 的
+  browser_state、event_stream.observe、ax_block prompt 渲染统一使用 diff
+  输出，observe 事件 ax_lines 自然缩小。
+- ax_block prompt 渲染双模板：全量走原「页面无障碍语义树」header；增量走
+  「AX Tree 增量变化」header + 「未变内容沿用上轮」提示。
+- 新增 contract 字段: 无（diff 形态通过文本内容表达，不新增 event_stream
+  字段，向下兼容）。
+- Tests: tests/test_ax_incremental.py（7 例：首轮全量、同 AX 无变化标记、
+  不同 AX 增量 diff 仅含新增/消失行且 observe 体积下降、逃生阀回合全量、
+  AX 失败无 diff、复用后 diff 仍对齐上次全量、ax_block 增量 header）；
+  TDD 先红后绿。
+  验证: 定向 7✓ + P1 拆分回归 4✓ + E1 感知复用回归 8✓ + E2 局部 SoM 12✓；
+  全部 31 例通过 0 失败。
+- Out of scope (next): E4 selector 缓存、E5 VLM 回合预算、E6 api_replay
+  优先、E7 效率基线 benchmark。
