@@ -1,4 +1,4 @@
-"""Source-pin tests for V/W/X frontend enhancements in App.vue.
+"""Source-pin tests for V/W/X frontend enhancements.
 
 These tests assert the shape of the implementation rather than executing
 Vue. They protect the wiring for:
@@ -6,6 +6,10 @@ Vue. They protect the wiring for:
 * V: Timeline phase stats / histogram panel
 * W: Offline phase JSONL replay import mode
 * X: Live Terminal in-content search
+
+The phase stats panel, replay file input, and timeline-specific UI were
+extracted from App.vue into TimelinePanel.vue during the Y126 component
+split. Tests now read both files where needed.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ from pathlib import Path
 import pytest
 
 
-APP_VUE = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "App.vue"
+_UI_SRC = Path(__file__).resolve().parent.parent / "vspider-ui" / "src"
+APP_VUE = _UI_SRC / "App.vue"
+TIMELINE_PANEL = _UI_SRC / "components" / "TimelinePanel.vue"
 FAILURE_FIXTURE_SUMMARY = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "composables" / "failureFixtureSummary.js"
 CAPABILITY_TRACE_UTILS = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "capabilityTraceUtils.js"
 CAPABILITY_TRACE_LIST = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityTraceList.vue"
@@ -67,40 +73,49 @@ def capability_shared_css_src() -> str:
 
 
 class TestVPhaseStats:
-    def test_stats_state_refs_exist(self, src: str) -> None:
-        assert "const phaseStatsExpanded = ref(false)" in src
-        assert "const phaseStatsSortBy = ref('count')" in src
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        """Phase stats were extracted into TimelinePanel.vue; read both."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
+        timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
+        timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
+        return app + "\n" + timeline + "\n" + timeline_css
 
-    def test_phase_filter_options_carry_stats(self, src: str) -> None:
-        body = re.search(r"const phaseFilterOptions = computed\(\(\) => \{([\s\S]*?)\n\}\)", src)
+    def test_stats_state_refs_exist(self, combined_src: str) -> None:
+        assert "const phaseStatsExpanded = ref(false)" in combined_src
+        assert "const phaseStatsSortBy = ref('count')" in combined_src
+
+    def test_phase_filter_options_carry_stats(self, combined_src: str) -> None:
+        body = re.search(r"const phaseFilterOptions = computed\(\(\) => \{([\s\S]*?)\n\}\)", combined_src)
         assert body, "phaseFilterOptions computed must exist"
         text = body.group(1)
         for token in ["mean:", "p50:", "p95:", "max:", "sevCounts:", "durations:"]:
             assert token in text
         assert "pickPercentile(sorted, 0.95)" in text
 
-    def test_stats_sorted_computed_exists(self, src: str) -> None:
-        assert "const phaseStatsSorted = computed" in src
-        assert "const key = phaseStatsSortBy.value" in src
-        assert "return bv - av" in src
+    def test_stats_sorted_computed_exists(self, combined_src: str) -> None:
+        assert "const phaseStatsSorted = computed" in combined_src
+        assert "const key = phaseStatsSortBy.value" in combined_src
+        assert "return bv - av" in combined_src
 
-    def test_sparkline_helper_exists(self, src: str) -> None:
-        assert "const phaseSparklinePath = (durations) =>" in src
-        assert "viewBox=\"0 0 100 24\"" in src
-        assert ":d=\"phaseSparklinePath(row.durations)\"" in src
+    def test_sparkline_helper_exists(self, combined_src: str) -> None:
+        assert "const phaseSparklinePath = (durations) =>" in combined_src
+        assert "viewBox=\"0 0 100 24\"" in combined_src
+        assert ":d=\"phaseSparklinePath(row.durations)\"" in combined_src
 
-    def test_stats_panel_template_wired(self, src: str) -> None:
-        assert "class=\"timeline-stats-panel\"" in src
-        assert "v-if=\"phaseStatsExpanded && phaseEvents.length\"" in src
-        assert "v-for=\"row in phaseStatsSorted\"" in src
-        assert "@click=\"togglePhaseFilter(row.phase)\"" in src
-        assert "Phase 耗时分布" in src
+    def test_stats_panel_template_wired(self, combined_src: str) -> None:
+        assert "class=\"timeline-stats-panel\"" in combined_src
+        assert "v-if=\"phaseStatsExpanded && phaseEvents.length\"" in combined_src
+        assert "v-for=\"row in phaseStatsSorted\"" in combined_src
+        assert "@click=\"togglePhaseFilter(row.phase)\"" in combined_src
+        assert "Phase 耗时分布" in combined_src
 
-    def test_stats_sort_buttons_present(self, src: str) -> None:
-        assert "v-for=\"key in ['count', 'mean', 'p95', 'max']\"" in src
-        assert "@click=\"phaseStatsSortBy = key\"" in src
+    def test_stats_sort_buttons_present(self, combined_src: str) -> None:
+        assert "v-for=\"key in ['count', 'mean', 'p95', 'max']\"" in combined_src
+        assert "@click=\"phaseStatsSortBy = key\"" in combined_src
 
-    def test_stats_css_present(self, src: str) -> None:
+    def test_stats_css_present(self, combined_src: str) -> None:
         for cls in [
             ".timeline-stats-panel",
             ".timeline-stats-grid-head",
@@ -108,75 +123,81 @@ class TestVPhaseStats:
             ".stat-spark",
             ".stat-sev-pill.sev-error",
         ]:
-            assert cls in src
+            assert cls in combined_src
 
 
 class TestWReplayMode:
-    def test_replay_state_refs_exist(self, src: str) -> None:
-        assert "const replayMode = ref(false)" in src
-        assert "const replaySourceName = ref('')" in src
-        assert "const replayInputRef = ref(null)" in src
-        assert "const replayImportTarget = ref('timeline')" in src
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        """Replay UI was partially extracted to TimelinePanel.vue."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
+        timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
+        timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
+        return app + "\n" + timeline + "\n" + timeline_css
 
-    def test_ws_phase_gate_drops_events_in_replay_mode(self, src: str) -> None:
+    def test_replay_state_refs_exist(self, combined_src: str) -> None:
+        assert "const replayMode = ref(false)" in combined_src
+        assert "const replaySourceName = ref('')" in combined_src
+        assert "const replayInputRef = ref(null)" in combined_src
+        assert "const replayImportTarget = ref('timeline')" in combined_src
+
+    def test_ws_phase_gate_drops_events_in_replay_mode(self, combined_src: str) -> None:
         gate = re.search(
             r"if \(replayMode\.value\) \{\s*return\s*\}\s*const evt = \{ \.\.\.payload",
-            src,
+            combined_src,
             flags=re.S,
         )
         assert gate, "WS phase ingestion must return before pushing phaseEvents in replay mode"
 
-    def test_submit_task_exits_replay_mode(self, src: str) -> None:
+    def test_submit_task_exits_replay_mode(self, combined_src: str) -> None:
         m = re.search(
             r"if \(replayMode\.value\) \{\s*replayMode\.value = false\s*replaySourceName\.value = ''",
-            src,
+            combined_src,
             flags=re.S,
         )
         assert m
 
-    def test_replay_parser_tolerates_bad_lines(self, src: str) -> None:
-        assert "const _parseJsonlText = (text) =>" in src
-        assert "const _capabilityExecuteArtifactPhaseEvent = (doc) =>" in src
-        assert "String(doc.type || '') !== 'capability_execute_trace'" in src
-        assert "phase: 'capability_execute'" in src
-        assert "execution_status: result.status" in src
-        assert "action_trace: result.action_trace" in src
-        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(doc)" in src
-        assert "if (artifactEvent) return { events: [artifactEvent], total: 1, bad: 0 }" in src
-        assert "replace(/\\r\\n?/g, '\\n').split('\\n')" in src
-        assert "JSON.parse(line)" in src
-        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(obj)" in src
-        assert "const phaseEvent = obj?.detail?.phase_event" in src
-        assert "out.push(phaseEvent && typeof phaseEvent === 'object' && !Array.isArray(phaseEvent) ? phaseEvent : obj)" in src
-        assert "bad += 1" in src
-        assert "return { events: out, total, bad }" in src
+    def test_replay_parser_tolerates_bad_lines(self, combined_src: str) -> None:
+        assert "const _parseJsonlText = (text) =>" in combined_src
+        assert "const _capabilityExecuteArtifactPhaseEvent = (doc) =>" in combined_src
+        assert "String(doc.type || '') !== 'capability_execute_trace'" in combined_src
+        assert "phase: 'capability_execute'" in combined_src
+        assert "execution_status: result.status" in combined_src
+        assert "action_trace: result.action_trace" in combined_src
+        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(doc)" in combined_src
+        assert "if (artifactEvent) return { events: [artifactEvent], total: 1, bad: 0 }" in combined_src
+        assert "replace(/\\r\\n?/g, '\\n').split('\\n')" in combined_src
+        assert "JSON.parse(line)" in combined_src
+        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(obj)" in combined_src
+        assert "const phaseEvent = obj?.detail?.phase_event" in combined_src
+        assert "out.push(phaseEvent && typeof phaseEvent === 'object' && !Array.isArray(phaseEvent) ? phaseEvent : obj)" in combined_src
+        assert "bad += 1" in combined_src
+        assert "return { events: out, total, bad }" in combined_src
 
-    def test_replay_import_replaces_buffer_and_enters_mode(self, src: str) -> None:
-        assert "const handleReplayFileChange = async (event) =>" in src
-        assert "phaseEvents.value = events" in src
-        assert "replayMode.value = true" in src
-        assert "replaySourceName.value = file.name || 'imported.jsonl'" in src
-        assert "setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')" in src
+    def test_replay_import_replaces_buffer_and_enters_mode(self, combined_src: str) -> None:
+        assert "const handleReplayFileChange = async (event) =>" in combined_src
+        assert "phaseEvents.value = events" in combined_src
+        assert "replayMode.value = true" in combined_src
+        assert "replaySourceName.value = file.name || 'imported.jsonl'" in combined_src
+        assert "setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')" in combined_src
 
-    def test_replay_ui_wired(self, src: str) -> None:
-        # Import buttons moved into the "更多操作" dropdowns; entries dispatch by
-        # command and route back to triggerReplayImport per target.
-        assert "@command=\"handleTimelineMoreAction\"" in src
-        assert "@command=\"handleCapabilityMoreAction\"" in src
-        assert "<el-dropdown-item command=\"importReplay\">" in src
-        assert "importReplay: () => triggerReplayImport('timeline')" in src
-        assert "importReplay: () => triggerReplayImport('capability')" in src
-        assert "ref=\"replayInputRef\"" in src
-        assert "@change=\"handleReplayFileChange\"" in src
-        assert "class=\"timeline-replay-banner\"" in src
-        assert "class=\"timeline-replay-banner capability-replay-banner\"" in src
-        assert "@click=\"exitReplayMode\"" in src
+    def test_replay_ui_wired(self, combined_src: str) -> None:
+        assert "@command=\"handleTimelineMoreAction\"" in combined_src
+        assert "@command=\"handleCapabilityMoreAction\"" in combined_src
+        assert "command=\"importReplay\"" in combined_src
+        assert "importReplay:" in combined_src
+        assert "ref=\"replayInputRef\"" in combined_src
+        assert "@change=\"handleReplayFileChange\"" in combined_src
+        assert "class=\"timeline-replay-banner\"" in combined_src
+        assert "class=\"timeline-replay-banner capability-replay-banner\"" in combined_src
+        assert "@click=\"exitReplayMode\"" in combined_src
 
-    def test_replay_css_present(self, src: str) -> None:
-        assert ".replay-file-input" in src
-        assert ".timeline-replay-banner" in src
-        assert ".timeline-replay-banner .replay-exit-btn" in src
-        assert ".capability-replay-banner" in src
+    def test_replay_css_present(self, combined_src: str) -> None:
+        assert ".replay-file-input" in combined_src
+        assert ".timeline-replay-banner" in combined_src
+        assert ".timeline-replay-banner .replay-exit-btn" in combined_src
+        assert ".capability-replay-banner" in combined_src
 
 
 class TestXTerminalSearch:

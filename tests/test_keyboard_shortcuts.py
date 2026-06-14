@@ -135,14 +135,14 @@ class TestTimelineShortcuts:
 
     def test_end_scrolls_to_bottom(self, src: str) -> None:
         m = re.search(
-            r"event\.key\s*===\s*'End'.*?scrollTimelineToBottom\(\)",
+            r"event\.key\s*===\s*'End'.*?scroll(?:TimelineTo|To)Bottom\(\)",
             src, flags=re.S,
         )
         assert m
 
     def test_home_scrolls_to_top(self, src: str) -> None:
         m = re.search(
-            r"event\.key\s*===\s*'Home'.*?scrollTimelineToTop\(\)",
+            r"event\.key\s*===\s*'Home'.*?scroll(?:TimelineTo|To)Top\(\)",
             src, flags=re.S,
         )
         assert m
@@ -160,34 +160,41 @@ class TestCapabilityShortcuts:
 
 
 class TestDialogNavigation:
-    def test_arrow_left_calls_prev(self, src: str) -> None:
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        app = APP_VUE.read_text(encoding="utf-8")
+        timeline = (
+            APP_VUE.parent / "components" / "TimelinePanel.vue"
+        ).read_text(encoding="utf-8")
+        return app + "\n" + timeline
+
+    def test_arrow_left_calls_prev(self, combined_src: str) -> None:
         m = re.search(
-            r"phaseDialogVisible\.value.*?"
+            r"phaseDialogVisible.*?"
             r"event\.key\s*===\s*'ArrowLeft'.*?goToPrevPhaseEvent\(\)",
-            src, flags=re.S,
+            combined_src, flags=re.S,
         )
         assert m
 
-    def test_arrow_right_calls_next(self, src: str) -> None:
+    def test_arrow_right_calls_next(self, combined_src: str) -> None:
         m = re.search(
-            r"phaseDialogVisible\.value.*?"
+            r"phaseDialogVisible.*?"
             r"event\.key\s*===\s*'ArrowRight'.*?goToNextPhaseEvent\(\)",
-            src, flags=re.S,
+            combined_src, flags=re.S,
         )
         assert m
 
-    def test_prev_next_use_filtered_list(self, src: str) -> None:
+    def test_prev_next_use_filtered_list(self, combined_src: str) -> None:
         """←/→ should respect the user's phase/severity filter (O) —
         otherwise hiding 'info' chips and pressing → would jump straight
         back into hidden events. We assert by reading the source of the
         prev/next helpers."""
-        assert "filteredPhaseEvents.value" in src
-        # Both helpers must reference filteredPhaseEvents
+        assert "filteredPhaseEvents.value" in combined_src
         prev_block = re.search(
-            r"const goToPrevPhaseEvent\s*=.*?\n}\n", src, flags=re.S,
+            r"const goToPrevPhaseEvent\s*=.*?\n}\n", combined_src, flags=re.S,
         )
         next_block = re.search(
-            r"const goToNextPhaseEvent\s*=.*?\n}\n", src, flags=re.S,
+            r"const goToNextPhaseEvent\s*=.*?\n}\n", combined_src, flags=re.S,
         )
         assert prev_block and "filteredPhaseEvents" in prev_block.group(0)
         assert next_block and "filteredPhaseEvents" in next_block.group(0)
@@ -244,28 +251,33 @@ class TestHelpDialog:
 
 
 class TestPhaseDialogNavButtons:
-    def test_prev_button_present(self, src: str) -> None:
+    @pytest.fixture(scope="class")
+    def timeline_src(self) -> str:
+        return (
+            APP_VUE.parent / "components" / "TimelinePanel.vue"
+        ).read_text(encoding="utf-8")
+
+    def test_prev_button_present(self, timeline_src: str) -> None:
         m = re.search(
             r'@click="goToPrevPhaseEvent"',
-            src,
+            timeline_src,
         )
         assert m, "phase dialog footer must include the prev button"
 
-    def test_next_button_present(self, src: str) -> None:
+    def test_next_button_present(self, timeline_src: str) -> None:
         m = re.search(
             r'@click="goToNextPhaseEvent"',
-            src,
+            timeline_src,
         )
         assert m, "phase dialog footer must include the next button"
 
-    def test_nav_buttons_disabled_when_single_event(self, src: str) -> None:
+    def test_nav_buttons_disabled_when_single_event(self, timeline_src: str) -> None:
         """When the filtered list has <2 events there's nothing to step
         through; the buttons must visually communicate that."""
         m = re.findall(
             r':disabled="filteredPhaseEvents\.length\s*<\s*2"',
-            src,
+            timeline_src,
         )
-        # Both prev AND next buttons must carry this guard.
         assert len(m) >= 2, (
             "expected both prev/next nav buttons to be :disabled when "
             "filteredPhaseEvents.length < 2"

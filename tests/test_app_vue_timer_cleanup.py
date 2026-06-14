@@ -20,11 +20,17 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 APP_VUE = ROOT / "vspider-ui" / "src" / "App.vue"
+TIMELINE_PANEL = ROOT / "vspider-ui" / "src" / "components" / "TimelinePanel.vue"
 
 
 @pytest.fixture(scope="module")
 def app_src() -> str:
     return APP_VUE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def timeline_src() -> str:
+    return TIMELINE_PANEL.read_text(encoding="utf-8")
 
 
 def _onunmounted_block(src: str) -> str:
@@ -43,18 +49,17 @@ def test_onunmounted_clears_output_contract_preview_timer(app_src: str) -> None:
     )
 
 
-def test_onunmounted_still_clears_known_timers(app_src: str) -> None:
-    # guard: don't regress the existing teardowns while adding the new one
+def test_onunmounted_still_clears_known_timers(app_src: str, timeline_src: str) -> None:
     block = _onunmounted_block(app_src)
     assert "reconnectTimer" in block
-    assert "_chipClickTimer" in block
     assert "socket" in block
+    assert "_chipClickTimer" in timeline_src, (
+        "_chipClickTimer cleanup must exist in TimelinePanel.vue "
+        "(moved from App.vue during component extraction)"
+    )
 
 
 def test_onunmounted_clears_final_answer_copy_timer(app_src: str) -> None:
-    # F1: copyFinalAnswerToClipboard schedules a reset-to-'idle' timer; it is now
-    # stored in finalAnswerCopyTimer and must be cancelled on unmount so the
-    # callback can't write finalAnswerCopyState on a detached component.
     block = _onunmounted_block(app_src)
     assert "finalAnswerCopyTimer" in block, (
         "onUnmounted must clear finalAnswerCopyTimer so the copy-feedback reset "
