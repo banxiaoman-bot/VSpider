@@ -8,6 +8,7 @@ straight lift-and-delegate from the agent loop; no logic changes in this slice.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -49,6 +50,12 @@ class PerceptionSnapshot:
 # E1 逃生阀：连续复用达到该回合数后强制全量感知一次，防 DOM 签名碰撞死视。
 _REUSE_STREAK_LIMIT = 3
 
+# E2：滚动 / 翻页动作名（视口已变，需重新感知并用 full 选区）。
+_SCROLL_ACTION_RE = re.compile(
+    r"scroll|翻页|next_page|prev_page|paginate|page_down|page_up|load_more",
+    re.IGNORECASE,
+)
+
 
 def _action_mutated_page(result: Any) -> bool:
     """上一动作是否声明改变了 URL / DOM（ActionResult 或 dict 形态均接受）。"""
@@ -57,6 +64,21 @@ def _action_mutated_page(result: Any) -> bool:
     if isinstance(result, dict):
         return bool(result.get("changed_url") or result.get("changed_dom"))
     return bool(getattr(result, "changed_url", False) or getattr(result, "changed_dom", False))
+
+
+def _action_name(result: Any) -> str:
+    """从 ActionResult / dict 取动作名（缺失返回空串）。"""
+    if result is None:
+        return ""
+    if isinstance(result, dict):
+        return str(result.get("action") or "")
+    return str(getattr(result, "action", "") or "")
+
+
+def _action_was_scroll_or_paging(result: Any) -> bool:
+    """上一动作是否为滚动 / 翻页（DOM 签名常不变，但视口内容已变）。"""
+    name = _action_name(result)
+    return bool(name and _SCROLL_ACTION_RE.search(name))
 
 
 class PerceptionPhase:
@@ -88,9 +110,31 @@ class PerceptionPhase:
             return False
         if self._reuse_streak >= _REUSE_STREAK_LIMIT:
             return False  # 逃生阀：强制全量感知一次
-        if _action_mutated_page(getattr(browser, "_last_action_result", None)):
+        last_action = getattr(browser, "_last_action_result", None)
+        if _action_mutated_page(last_action):
+            return False
+        # E2：滚动 / 翻页后 DOM 签名常不变，但视口已移动——上一轮快照已陈旧，
+        # 必须重新感知（否则复用旧视口截图/SoM，看不到新内容）。
+        if _action_was_scroll_or_paging(last_action):
             return False
         return True
+
+    def _decide_scope(self, browser: Any, *, escape_valve: bool) -> str:
+        """E2：决定本轮 SoM 选区。默认 ``viewport``；以下情形回退 ``full``——
+        首回合、E1 逃生阀回合、上一动作为滚动 / 翻页、VLM 上一轮显式请求全页。"""
+        if self._last_snapshot is None:  # 首回合：尚无任何快照，给全页
+            return "full"
+        if escape_valve:  # E1 逃生阀：强制全量回合
+            return "full"
+        if getattr(browser, "_request_full_som", False):  # VLM 显式请求（一次性）
+            try:
+                browser._request_full_som = False
+            except Exception:
+                pass
+            return "full"
+        if _action_was_scroll_or_paging(getattr(browser, "_last_action_result", None)):
+            return "full"
+        return "viewport"
 
     def _build_reused_snapshot(self, *, step: int) -> PerceptionSnapshot:
         last = self._last_snapshot
@@ -135,6 +179,15 @@ class PerceptionPhase:
             )
             return reused
 
+        # ── E2：本轮全量感知，决定 SoM 选区（默认 viewport，必要时回退 full）──
+        _escape_valve = bool(
+            self._last_snapshot is not None
+            and _signature
+            and _signature == self._last_signature
+            and self._reuse_streak >= _REUSE_STREAK_LIMIT
+        )
+        _scope = self._decide_scope(browser, escape_valve=_escape_valve)
+
         # ════════════════════════════════════════════════════════════
         # 图文双模态融合 (Hybrid Modality)
         # 每一轮都同时采集 SoM 截图 + AX Tree 语义树（含 DOM ID 映射段），融合发送给 VLM。
@@ -151,7 +204,7 @@ class PerceptionPhase:
 
         await recover_active_page("before hybrid screenshot")
         try:
-            screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+            screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step, scope=_scope)
         except RuntimeError as screenshot_err:
             if "No active page" not in str(screenshot_err):
                 raise
@@ -159,7 +212,7 @@ class PerceptionPhase:
                 "[BROWSER RECOVERY] screenshot failed with no active page; restarting and retrying once"
             )
             await browser.restart(start_url, reason="retry hybrid screenshot")
-            screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+            screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step, scope=_scope)
         _log_screenshot_path = (
             str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
         )
@@ -177,7 +230,7 @@ class PerceptionPhase:
             if _bc_result.notice:
                 input_descriptions = _bc_result.notice + "\n" + (input_descriptions or "")
             if _bc_result.cleared_after_hitl:
-                screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+                screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step, scope=_scope)
                 _log_screenshot_path = (
                     str(Path(SCREENSHOT_DIR) / f"step_{step:02d}.png") if screenshot_b64 else None
                 )
@@ -204,7 +257,7 @@ class PerceptionPhase:
                 _rerouted = False
                 logger.debug("[BOT CHALLENGE] proxy reroute skipped: %s", _reroute_err)
             if _rerouted:
-                screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step)
+                screenshot_b64, input_descriptions = await browser.mark_and_screenshot(step, scope=_scope)
                 input_descriptions = (
                     "\n🛡️【Bot Challenge · 已切换代理并重载页面】\n"
                     + (input_descriptions or "")

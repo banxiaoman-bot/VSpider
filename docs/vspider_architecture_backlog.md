@@ -3330,3 +3330,38 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   重构预先存在的 5 例）；本 slice 零前端改动，npm build 沿用 P1 绿。
 - Out of scope (next): E2 局部 SoM（viewport scope）、E3 AX 增量 diff、
   E7 基线把 perception_reused 计入效率指标。
+
+## Slice E2 (M3 高效): 局部 SoM partial_som (done)
+
+- 能力名: partial_som（默认只标视口内元素，scroll/首回合/逃生阀回退全页）。
+- 影响层: browser_substrate（som_inject_v6.js scope 三选区 + browser_env.py
+  透传 scope + 幻觉校验带视口提示）+ execution_kernel（phases/perception.py
+  _decide_scope 选区策略）+ prompts（prompts.py 局部 SoM skill 区块）。
+- JS 层: som_inject_v6.js 入参 `{scope: "viewport"|"full"|{selector}}`；
+  viewport 模式在 Layer 3 视口边界检查 + isNotOccluded + isOccludedFinal 均
+  裁掉视口外元素；full 放行视口外；selector 只扫容器子树。向下兼容纯数字
+  startIndex（= viewport，历史行为不变）。
+- Python 层: browser_env.mark_and_screenshot 透传 scope，_last_som_scope
+  记录选区供幻觉校验；perception.py _decide_scope 默认 viewport，以下情形
+  回退 full——首回合、E1 逃生阀回合、上一动作为滚动/翻页、VLM 显式请求
+  全页（_request_full_som 一次性 flag，消费后复位）。滚动/翻页同时阻止 E1
+  复用（_action_was_scroll_or_paging 检测，DOM 签名常不变但视口已移动）。
+- 幻觉校验: viewport 局部标注下命中越界 ID → 报错补「本轮为视口局部 SoM，
+  目标可能在视口外——先 smooth_scroll 把它移入视口再操作」提示。
+- Prompts: prompts.py 新增「🔭 局部 SoM」skill 区块（六步范式第 4 步），
+  说明红框默认只覆盖视口、目标不在红框里先 scroll、首回合/翻页后自动全页。
+- 新增 contract 字段: 无新增 event_stream 字段（scope 信息通过
+  _last_som_scope 内部记录，不外泄契约）。
+- Tests: tests/test_partial_som.py（12 例）：
+  - JS 选区 5 例（真 Chromium 长页 fixture）：full 标全页、viewport ⊊ full
+    且排除折叠下方、legacy 数字参数= viewport、无参数= viewport、selector
+    只标容器子树。
+  - 感知层选区决策 5 例（stub，无需 Chromium）：首回合 full、稳定回合
+    viewport、scroll 后强制 full、逃生阀回合 full、VLM 请求一次性消费。
+  - 幻觉 scope 提示 2 例：viewport 下越界 ID 含「视口+scroll」提示、
+    full 下无视口提示。
+  验证: 定向 12✓ + P1 拆分回归 4✓ + E1 感知复用回归 8✓ +
+  test_agent_loop_stub_e2e 真 Chromium 2✓；全量 pytest 3380 通过
+  0 新增失败（沿用 S14/P1/E1 口径排除并行 UI 重构预先存在的 5 例）。
+- Out of scope (next): E3 AX 增量 diff、E4 selector 缓存、E5 VLM 回合
+  预算、E6 api_replay 优先、E7 效率基线 benchmark。

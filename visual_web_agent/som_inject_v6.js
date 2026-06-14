@@ -33,9 +33,33 @@
  *   7. ★ 健壮性加固：每个元素处理包裹 try-catch，单元素异常不中断全局
  */
 
-(startIndex = 1) => {
+(somArg) => {
     // ═══════════════════════════════════════════════════════════
-    //  0. 清理上轮标记（继承 v5）
+    //  0. 入参解析：startIndex + scope（E2 局部 SoM）
+    //     scope: "viewport"（默认，= 历史行为，向下兼容纯数字 startIndex）
+    //          | "full"（全页，含折叠下方元素）
+    //          | {selector}（只标容器子树）
+    // ═══════════════════════════════════════════════════════════
+    let startIndex = 1;
+    let scopeMode = 'viewport';
+    let scopeSelector = null;
+    if (typeof somArg === 'number') {
+        startIndex = somArg;
+    } else if (somArg && typeof somArg === 'object') {
+        if (typeof somArg.startIndex === 'number') startIndex = somArg.startIndex;
+        const _sc = somArg.scope;
+        if (typeof _sc === 'string') {
+            scopeMode = _sc;
+        } else if (_sc && typeof _sc === 'object' && _sc.selector) {
+            scopeMode = 'selector';
+            scopeSelector = String(_sc.selector);
+        }
+    }
+    // viewport 选区启用视口裁剪；full / selector 放行视口外元素。
+    const _viewportScoped = scopeMode === 'viewport';
+
+    // ═══════════════════════════════════════════════════════════
+    //  0b. 清理上轮标记（继承 v5）
     // ═══════════════════════════════════════════════════════════
     if (typeof window.__removeSomMarks === 'function') window.__removeSomMarks();
 
@@ -272,12 +296,15 @@
 
         // ── Layer 3: 视口边界 ──
         // browser-use: 元素完全在视口外 → 不可见（上下各留 threshold 容差）
-        const vw = window.innerWidth || document.documentElement.clientWidth || 0;
-        const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-        const absT = r.top + (off?.top || 0);
-        const absL = r.left + (off?.left || 0);
-        if (absT + r.height < -50 || absT > vh + 50) return false;  // 上下 50px 容差
-        if (absL + r.width < -50 || absL > vw + 50) return false;
+        // E2: 仅 viewport 选区启用视口裁剪；full / selector 选区放行视口外元素。
+        if (_viewportScoped) {
+            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            const absT = r.top + (off?.top || 0);
+            const absL = r.left + (off?.left || 0);
+            if (absT + r.height < -50 || absT > vh + 50) return false;  // 上下 50px 容差
+            if (absL + r.width < -50 || absL > vw + 50) return false;
+        }
 
         // ── Layer 4: pointer-events ──
         // 仅当元素不是 L1（表单控件）时才检查 pointer-events:none
@@ -329,10 +356,11 @@
             const cx = r.left + r.width / 2;
             const cy = r.top + r.height / 2;
 
-            // ── 中心点在视口外，直接按遮挡处理 ──
+            // ── 中心点在视口外 ──
+            // E2: viewport 选区裁掉；full / selector 选区无法物理探针，直接放行。
             const vw = window.innerWidth || 0;
             const vh = window.innerHeight || 0;
-            if (cx < 0 || cx > vw || cy < 0 || cy > vh) return false;
+            if (cx < 0 || cx > vw || cy < 0 || cy > vh) return !_viewportScoped;
 
             if (isL1) {
                 // L1 宽松检测：命中自身、后代、祖先链都通过
@@ -384,10 +412,10 @@
             const r = el.getBoundingClientRect();
             const cx = r.left + r.width / 2;
             const cy = r.top + r.height / 2;
-            // 中心点在视口外 → 遮挡
+            // 中心点在视口外：viewport 选区判遮挡（裁掉）；full / selector 保留。
             if (cx < 0 || cx > (window.innerWidth || 0) ||
                 cy < 0 || cy > (window.innerHeight || 0)) {
-                return true;
+                return _viewportScoped;
             }
             const hit = doc.elementFromPoint(cx, cy);
             if (!hit) return false;
@@ -887,11 +915,18 @@
 
     let allCandidates = [];
 
-    // 7.1 主页面（含 Shadow DOM）
-    collectFromRoot(document, document, { top: 0, left: 0 }, allCandidates);
+    // 7.1 主页面（含 Shadow DOM）——selector 选区只扫容器子树（不到则回退整页）。
+    let _scanRoot = document;
+    if (scopeMode === 'selector' && scopeSelector) {
+        try {
+            const _container = document.querySelector(scopeSelector);
+            if (_container) _scanRoot = _container;
+        } catch (_) {}
+    }
+    collectFromRoot(_scanRoot, document, { top: 0, left: 0 }, allCandidates);
 
-    // 7.2 同源 iframe
-    try {
+    // 7.2 同源 iframe（selector 选区限定容器子树，跳过跨 iframe 扫描）
+    if (scopeMode !== 'selector') try {
         const iframes = document.querySelectorAll('iframe');
         for (let idx = 0; idx < iframes.length; idx++) {
             try {

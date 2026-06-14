@@ -290,6 +290,7 @@ class BrowserEnv:
         # even though it had become a "rules / terms" page).
         self._page_titles: dict[int, str] = {}
         self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
+        self._last_som_scope: str = "full"  # E2：最近一轮 SoM 选区（viewport/full/selector）
         self._visual_blank_reloaded_urls: set[str] = set()
         self._auth_matrix_note: str = ""
         self.auth_matrix_loaded: bool = False
@@ -1517,9 +1518,15 @@ class BrowserEnv:
                     f"{_sample[:10]}...(共 {len(_sample)} 个)"
                     if len(_sample) > 10 else str(_sample)
                 )
+                _scope_note = (
+                    "（本轮为视口局部 SoM，目标可能在视口外——"
+                    "先用 smooth_scroll 把它移入视口再操作）"
+                    if getattr(self, "_last_som_scope", "full") == "viewport"
+                    else ""
+                )
                 self._last_action_error = ValueError(
                     f"target_id={target_id} 不在本轮 SoM 标记中，疑似幻觉 ID。"
-                    f"有效 ID：{_hint}。"
+                    f"有效 ID：{_hint}。{_scope_note}"
                     "请从截图红框或 @eN 快照中选一个真实存在的编号，"
                     "若页面无合适目标改用 smooth_scroll / press_key / wait。"
                 )
@@ -2579,12 +2586,18 @@ Object.defineProperty(navigator, 'languages', {
 
         return True, f"{visual_reason}; bodyText={body_len}, som={total_elements}, readyState={ready}"
 
-    async def mark_and_screenshot(self, step: int = 0) -> tuple[str, str]:
+    async def mark_and_screenshot(self, step: int = 0, *, scope="viewport") -> tuple[str, str]:
         """
         注入 SoM 标记脚本并截取全屏截图。
+
+        Args:
+            step: 当前回合编号（截图文件名 / 日志）。
+            scope: SoM 选区（E2 局部 SoM）。``"viewport"``（默认，只标视口内元素）
+                / ``"full"``（全页，含折叠下方）/ ``{"selector": "..."}``（只标容器子树）。
         Returns:
             (screenshot_b64, input_descriptions)
         """
+        _scope_label = "selector" if isinstance(scope, dict) else str(scope or "viewport")
         page = await self._ensure_active_page(reason="before screenshot")
         if not page:
             raise RuntimeError("No active page available for screenshot.")
@@ -2638,7 +2651,7 @@ Object.defineProperty(navigator, 'languages', {
         _som_t0 = time.time()
         for frame in frames_to_eval:
             try:
-                result = await frame.evaluate(self._som_js, current_id)
+                result = await frame.evaluate(self._som_js, {"startIndex": current_id, "scope": scope})
                 if result and isinstance(result, dict):
                     injected_frames += 1
                     current_id = result.get('nextId', current_id)
@@ -2656,6 +2669,8 @@ Object.defineProperty(navigator, 'languages', {
 
         # 缓存本轮 SoM 结果，供翻页引导等后续逻辑查找特定元素
         self._last_som_elements = all_som_elements
+        # E2：记录本轮选区，供 target_id 幻觉校验补「视口外」提示
+        self._last_som_scope = _scope_label
 
         # H1 性能记账：常态 INFO，慢页 / 重页升级 WARN，并通过 broadcast_phase
         # 把数据推给前端（让大页面的 perf 问题立刻可见）。
@@ -2726,7 +2741,7 @@ Object.defineProperty(navigator, 'languages', {
 
                 for frame in frames_to_eval:
                     try:
-                        result = await frame.evaluate(self._som_js, current_id)
+                        result = await frame.evaluate(self._som_js, {"startIndex": current_id, "scope": scope})
                         if result and isinstance(result, dict):
                             injected_frames += 1
                             current_id = result.get("nextId", current_id)
