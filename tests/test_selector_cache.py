@@ -1,4 +1,4 @@
-"""E4: cross-run selector cache + click_text wiring.
+"""E4: cross-run selector cache + click_text/click/type wiring.
 
 Cache hits must keep full evidence (visible + text fingerprint before the
 click); validation failure invalidates and falls back to the original
@@ -24,6 +24,8 @@ from visual_web_agent.selector_cache import (
     derive_selector,
     normalize_key,
     selector_cache_enabled,
+    som_cache_key,
+    validate_cached_target,
 )
 
 
@@ -311,3 +313,66 @@ class TestClickTextWiring:
 
         assert cached.click_calls == 0
         assert funnel.click_calls == 1
+
+
+# ════════════════════════════════════════════════════════════════════
+#                       SOM CACHE KEY & VALIDATE TARGET
+# ════════════════════════════════════════════════════════════════════
+
+
+class TestSomCacheKey:
+    def test_extracts_role_and_name(self) -> None:
+        som = [{"id": 1, "role": "button", "name": "Submit"}, {"id": 2, "role": "link", "name": "Home"}]
+        key = som_cache_key(som, 1)
+        assert "button" in key
+        assert "submit" in key
+
+    def test_missing_target_returns_empty(self) -> None:
+        som = [{"id": 1, "role": "button", "name": "Submit"}]
+        assert som_cache_key(som, 99) == ""
+
+    def test_empty_role_and_name_returns_empty(self) -> None:
+        som = [{"id": 1, "role": "", "name": ""}]
+        assert som_cache_key(som, 1) == ""
+
+    def test_normalises_key(self) -> None:
+        som = [{"id": 3, "role": "TEXTBOX", "name": "  User Name  "}]
+        key = som_cache_key(som, 3)
+        assert key == normalize_key("TEXTBOX::  User Name  ")
+
+
+class TestValidateCachedTarget:
+    def test_valid_visible_element_with_matching_text(self) -> None:
+        loc = _StubLocator(count=1, visible=True, text="Submit Form")
+        page = _StubPage(cached=loc)
+        page._cached_sel = "#btn"
+        result = asyncio.run(validate_cached_target(page, {"selector": "#btn"}, "submit"))
+        assert result is not None
+
+    def test_invisible_element_rejected(self) -> None:
+        loc = _StubLocator(count=1, visible=False, text="Submit")
+        page = _StubPage(cached=loc)
+        page._cached_sel = "#btn"
+        result = asyncio.run(validate_cached_target(page, {"selector": "#btn"}, "submit"))
+        assert result is None
+
+    def test_text_mismatch_rejected(self) -> None:
+        loc = _StubLocator(count=1, visible=True, text="Cancel")
+        page = _StubPage(cached=loc)
+        page._cached_sel = "#btn"
+        result = asyncio.run(validate_cached_target(page, {"selector": "#btn"}, "submit"))
+        assert result is None
+
+    def test_empty_name_accepts_any_text(self) -> None:
+        loc = _StubLocator(count=1, visible=True, text="anything")
+        page = _StubPage(cached=loc)
+        page._cached_sel = "#btn"
+        result = asyncio.run(validate_cached_target(page, {"selector": "#btn"}, ""))
+        assert result is not None
+
+    def test_zero_count_rejected(self) -> None:
+        loc = _StubLocator(count=0, visible=True, text="Submit")
+        page = _StubPage(cached=loc)
+        page._cached_sel = "#btn"
+        result = asyncio.run(validate_cached_target(page, {"selector": "#btn"}, "submit"))
+        assert result is None

@@ -3390,5 +3390,73 @@ editor-API routing + readback mismatch + plain-input keyboard path).
   TDD 先红后绿。
   验证: 定向 7✓ + P1 拆分回归 4✓ + E1 感知复用回归 8✓ + E2 局部 SoM 12✓；
   全部 31 例通过 0 失败。
-- Out of scope (next): E4 selector 缓存、E5 VLM 回合预算、E6 api_replay
-  优先、E7 效率基线 benchmark。
+- Out of scope (next): E7 效率基线 benchmark。
+
+## Slice E4 (M3 高效): selector 跨 run 动作缓存 selector_action_cache (done)
+
+- 能力名: selector_action_cache（批量填表/重复访问场景，首 run 发现的
+  已验证 selector→action 对跨 run 持久缓存，后续 run 直接 replay 跳 VLM）。
+- 影响层: data_plane（新模块 visual_web_agent/selector_action_cache.py）。
+- 新增 SelectorActionCache 类：per-host JSON 文件持久化，键 =
+  (page_path_pattern, selector_fingerprint)；支持 max_entries 上限驱逐
+  + max_age_s 老化驱逐；原子写 (tmp + os.replace)。
+- 仅 rpa_trail.verified=True 的动作才入缓存（准确铁律：无证据不缓存）。
+- capability_router 增强：`_apply_capture_fixture_probe` 同时探测
+  selector_action_cache，命中设 `signals.selector_cache_available`；
+  `_fallback_chain` 在 browser_interaction 链首位插入
+  selector_action_cache 步骤。
+- 新增 contract 字段: 无（缓存为旁路加速，不新增 event_stream 字段）。
+- Tests: tests/test_selector_cache_vlm_budget_e6.py TestSelectorActionCache
+  + TestSelectorFingerprint + TestPathPattern（14 例：miss/hit/跨 query
+  命中/跨 path miss/eviction/age eviction/clear/stats/factory）。
+
+### E4 扩展: selector_cache.py click/type 集成 (done)
+
+- selector_cache.py 新增 `som_cache_key(som_elements, target_id)` 从 SoM
+  元素提取 role::name 缓存键 + `validate_cached_target(page, entry,
+  expected_name)` 通过 visibility + innerText/aria-label 校验缓存元素。
+- ClickHandler: 读路径 — `_resolve_action_target` 前按 SoM 元素 role+name
+  查缓存，命中即跳过 SoM 解析直接用缓存 CSS selector（evidence 链不缺：
+  xpath / ax_signature 仍从缓存元素采集），rpa_trail 记 `method=selector_cache`；
+  写回 — 首次成功点击后 `derive_selector` 存入缓存。
+- TypeHandler: 写回 — 成功输入后 `derive_selector` 存入缓存（读路径保守
+  暂不接入，type 场景下 SoM 解析开销更低且视口锁定预检依赖 target 对象）。
+- Tests: tests/test_selector_cache.py 扩展 +9 例（TestSomCacheKey 4 例 +
+  TestValidateCachedTarget 5 例）；既有 14 例 + click_text 4 例不掉。
+  验证: 42 例通过（E4 23 + E3 7 + E1 8 + P1 4）0 失败。
+
+## Slice E5 (M3 高效): VLM 回合预算 vlm_budget (done)
+
+- 能力名: vlm_budget（per-run VLM 调用/token 预算计量 + 软硬限制）。
+- 影响层: model_plane（新模块 visual_web_agent/vlm_budget.py + vlm_client.py 接线）。
+- 新增 VlmBudget 类 + BudgetConfig：BudgetConfig(max_calls, max_tokens,
+  soft_ratio) 控制预算；VlmBudget.record() 每步 VLM 调用后累计
+  prompt/completion tokens + latency；软限警告走 broadcast_phase；
+  硬限抛 VlmBudgetExhausted 让 run 优雅终止。
+- VLMClient.__init__ 初始化 self._budget（默认无限制 = 零开销）；
+  VLMClient.ask() 成功返回后从 response.usage 提取 token 计数并 record；
+  新增 configure_budget() + budget_summary 属性供 main/API 设定和查询。
+- 新增 contract 字段: 无（budget 事件通过已有 broadcast_phase 推送，
+  不新增 event_stream 字段）。
+- Tests: tests/test_selector_cache_vlm_budget_e6.py TestVlmBudget
+  （10 例：increment/多步累计/hard_limit_calls/hard_limit_tokens/
+  no_limit/remaining/summary/step_log/soft_warning）。
+
+## Slice E6 (M3 高效): api_replay 路由优先级提升 (done)
+
+- 能力名: api_replay_priority_lift（capability_router 增强：探测
+  selector_action_cache 并注入信号 + fallback_chain 优先 replay）。
+- 影响层: intent_planning（capability_router.py）。
+- `_apply_capture_fixture_probe` 扩展：原来只探测 network_intelligence
+  capture index（api 场景），现在同时探测 selector_action_cache（form/
+  browser_interaction 场景）；selector 缓存命中设
+  `signals.selector_cache_available` + `strategy_context.selector_action_cache`
+  证据。
+- `_fallback_chain` 增强：browser_interaction 且有 selector 缓存时，
+  在 browser_backend_abstraction 之前插入 selector_action_cache 步骤，
+  让已验证的 selector 动作优先于 VLM 视觉探测。
+- 新增 contract 字段: 无。
+- Tests: tests/test_selector_cache_vlm_budget_e6.py TestE6Routing
+  （3 例：api_goal fallback 含 api_replay/network_intelligence + selector
+  cache signal 注入 + form 信号正确识别）；capability_router 回归 41/41 全绿。
+- Out of scope (next): E7 效率基线 benchmark。

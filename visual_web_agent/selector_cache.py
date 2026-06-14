@@ -173,6 +173,60 @@ class SelectorCache:
         return dict(self._data.get("entries") or {})
 
 
+def som_cache_key(som_elements: list, target_id: int) -> str:
+    """Build a normalised cache key from SoM element's role + name."""
+    for el in (som_elements or []):
+        try:
+            if int(el.get("id", -1)) == target_id:
+                role = str(el.get("role") or el.get("tag") or "")
+                name = str(el.get("name") or el.get("text") or "")
+                raw = f"{role}::{name}"
+                result = normalize_key(raw)
+                return result if result and result != "::" else ""
+        except (ValueError, TypeError):
+            continue
+    return ""
+
+
+async def validate_cached_target(
+    page: Any,
+    entry: dict[str, Any],
+    expected_name: str,
+) -> Any | None:
+    """Validate a cached selector for click/type by visibility + text match.
+
+    Returns the first-matching Playwright locator on success, ``None`` on any
+    validation failure (caller should invalidate the entry).
+    """
+    selector = str((entry or {}).get("selector") or "").strip()
+    if not selector:
+        return None
+    try:
+        loc = page.locator(selector)
+        if await loc.count() < 1:
+            return None
+        candidate = loc.first
+        if not await candidate.is_visible():
+            return None
+        if expected_name:
+            try:
+                observed = normalize_key(await candidate.inner_text())
+            except Exception:
+                observed = ""
+            if expected_name not in observed:
+                try:
+                    label = normalize_key(
+                        await candidate.get_attribute("aria-label") or ""
+                    )
+                except Exception:
+                    label = ""
+                if expected_name not in label:
+                    return None
+        return candidate
+    except Exception:
+        return None
+
+
 async def derive_selector(locator: Any) -> str:
     """Best-effort unique-CSS derivation for a Playwright locator/handle."""
     try:

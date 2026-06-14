@@ -2019,27 +2019,59 @@ class ClickHandler(ActionHandler):
         target_id = ctx.action.target_id
         selector = f'[data-som-id="{target_id}"]'
         logger.info(f"Executing click: element #{target_id} ({selector})")
+        _sc_method = ""
         try:
-            await browser._clear_som_overlays()
-            target = await browser._resolve_action_target(target_id, "click")
-            if target:
-                await target.handle.scroll_into_view_if_needed(
-                    timeout=browser._LOCATOR_TIMEOUT
+            # ── E4: selector cache read — try cached CSS selector before SoM ──
+            _sc_handle = None
+            try:
+                from visual_web_agent.selector_cache import (
+                    SelectorCache as _SelC, cache_host as _sch,
+                    selector_cache_enabled as _sce, som_cache_key as _sck,
+                    validate_cached_target as _scv, derive_selector as _scd,
                 )
+                if _sce():
+                    _sc_url = getattr(page, "url", "") or ""
+                    _sc_host = _sch(_sc_url)
+                    _sc_ckey = _sck(getattr(browser, "_last_som_elements", []), target_id) if _sc_host else ""
+                    if _sc_ckey:
+                        _sc_c = _SelC(_sc_host)
+                        _sc_e = _sc_c.lookup("click", _sc_ckey)
+                        if _sc_e:
+                            _sc_name = _sc_ckey.split("::", 1)[-1] if "::" in _sc_ckey else ""
+                            _sc_handle = await _scv(page, _sc_e, _sc_name)
+                            if _sc_handle:
+                                _sc_c.record_hit("click", _sc_ckey)
+                                _sc_method = f"selector_cache {_sc_e.get('selector', '')}"
+                                logger.info(f"[E4] click #{target_id} resolved via selector cache")
+                            else:
+                                _sc_c.invalidate("click", _sc_ckey)
+            except Exception:
+                _sc_handle = None
+
+            if _sc_handle is not None:
+                _the_handle = _sc_handle
             else:
-                raise RuntimeError(
-                    f"Element #{target_id} not found on active page or its iframes "
-                    f"(页面在上一步后发生变化导致 SoM ID 失效。下一步建议："
-                    f"(1) 用 click_text(type_value=「你 thought 里提到的可见文字」) 重试；"
-                    f"(2) 先 wait(2) 让页面稳定，再重新观察截图取最新的 SoM ID。)"
-                )
-            _pending_xpath = await browser._get_xpath(target.handle)
+                await browser._clear_som_overlays()
+                target = await browser._resolve_action_target(target_id, "click")
+                if target:
+                    _the_handle = target.handle
+                else:
+                    raise RuntimeError(
+                        f"Element #{target_id} not found on active page or its iframes "
+                        f"(页面在上一步后发生变化导致 SoM ID 失效。下一步建议："
+                        f"(1) 用 click_text(type_value=「你 thought 里提到的可见文字」) 重试；"
+                        f"(2) 先 wait(2) 让页面稳定，再重新观察截图取最新的 SoM ID。)"
+                    )
+            await _the_handle.scroll_into_view_if_needed(
+                timeout=browser._LOCATOR_TIMEOUT
+            )
+            _pending_xpath = await browser._get_xpath(_the_handle)
             _pending_ax_role, _pending_ax_name = await browser._get_accessibility_signature(
-                page, target.handle
+                page, _the_handle
             )
 
             try:
-                await target.handle.click(
+                await _the_handle.click(
                     force=True, timeout=browser._LOCATOR_TIMEOUT
                 )
             except Exception as native_err:
@@ -2047,7 +2079,7 @@ class ClickHandler(ActionHandler):
                     f"[JS CLICK FALLBACK] native click blocked for element #{target_id}: "
                     f"{native_err}"
                 )
-                await target.handle.evaluate(
+                await _the_handle.evaluate(
                     """el => {
                         el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
                         if (typeof el.click === 'function') {
@@ -2062,16 +2094,26 @@ class ClickHandler(ActionHandler):
                         }
                     }"""
                 )
+            # E4: write-back — derive CSS selector and store for future runs
+            if not _sc_method:
+                try:
+                    _scd_sel = await _scd(_the_handle)
+                    if _scd_sel and _sc_host and _sc_ckey:
+                        _SelC(_sc_host).store("click", _sc_ckey, _scd_sel,
+                                              signature=f"{_pending_ax_role}::{_pending_ax_name}")
+                except Exception:
+                    pass
             if _pending_xpath:
-                browser.rpa_trail.append(
-                    ctx.with_rpa_meta({
-                        "action": "click",
-                        "xpath": _pending_xpath,
-                        "ax_role": _pending_ax_role or "",
-                        "ax_name": _pending_ax_name or "",
-                        "type_value": "",
-                    })
-                )
+                _rpa = {
+                    "action": "click",
+                    "xpath": _pending_xpath,
+                    "ax_role": _pending_ax_role or "",
+                    "ax_name": _pending_ax_name or "",
+                    "type_value": "",
+                }
+                if _sc_method:
+                    _rpa["method"] = _sc_method
+                browser.rpa_trail.append(ctx.with_rpa_meta(_rpa))
                 logger.debug(f"[RPA] Recorded click: {_pending_xpath}")
             logger.info(f"Click element #{target_id} succeeded")
         except Exception as e:
@@ -3360,6 +3402,24 @@ class TypeHandler(ActionHandler):
                     _pending_xpath,
                     display_value if used_auth_vault else type_value,
                 )
+            # E4: write-back — derive and store CSS selector for future runs
+            try:
+                from visual_web_agent.selector_cache import (
+                    SelectorCache as _SelC, cache_host as _sch,
+                    selector_cache_enabled as _sce, som_cache_key as _sck,
+                    derive_selector as _scd,
+                )
+                if _sce():
+                    _sc_url = getattr(page, "url", "") or ""
+                    _sc_host = _sch(_sc_url)
+                    _sc_ckey = _sck(getattr(browser, "_last_som_elements", []), target_id) if _sc_host else ""
+                    if _sc_ckey:
+                        _sc_sel = await _scd(target.handle)
+                        if _sc_sel:
+                            _SelC(_sc_host).store("type", _sc_ckey, _sc_sel,
+                                                  signature=f"{_pending_ax_role}::{_pending_ax_name}")
+            except Exception:
+                pass
             logger.info(f"Type into element #{target_id} succeeded")
 
             await asyncio.sleep(0.4)
