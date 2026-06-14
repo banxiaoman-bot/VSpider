@@ -76,8 +76,9 @@ class _StubBrowser:
     async def get_active_page_summary(self) -> str:
         return "Alpha List — fixture page"
 
-    async def mark_and_screenshot(self, step: int):
+    async def mark_and_screenshot(self, step: int, scope="viewport"):
         self.screenshot_calls += 1
+        self.last_scope = scope
         return f"b64-shot-{self.screenshot_calls}", "【可交互元素】@e1 button Submit"
 
     async def restart(self, start_url: str, reason: str = "") -> None:

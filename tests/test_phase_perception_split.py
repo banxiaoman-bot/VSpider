@@ -60,8 +60,9 @@ class _StubBrowser:
     async def get_active_page_summary(self) -> str:
         return "Alpha List — fixture page"
 
-    async def mark_and_screenshot(self, step: int):
+    async def mark_and_screenshot(self, step: int, scope="viewport"):
         self.screenshot_calls += 1
+        self.last_scope = scope
         if self._screenshot_fail_first and self.screenshot_calls == 1:
             raise RuntimeError("No active page available for screenshot")
         return "b64-screenshot-data", "【可交互元素】@e1 button Submit"
