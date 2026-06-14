@@ -5093,8 +5093,40 @@ class ClickTextHandler(ActionHandler):
 
         clicked = False
         used = ""
+        derived_selector = ""
+        cache = None
+        from_cache = False
+        # ── 0. E4 跨 run selector 缓存（命中仍走可见性+文本指纹校验）──
+        try:
+            from visual_web_agent.selector_cache import (
+                SelectorCache as _SelCache,
+                cache_host as _sc_host,
+                click_cached_selector as _sc_click,
+                derive_selector as _sc_derive,
+                selector_cache_enabled as _sc_enabled,
+            )
+
+            _host = _sc_host(getattr(page, "url", "") or "")
+            if _sc_enabled() and _host:
+                cache = _SelCache(_host)
+                cached_entry = cache.lookup("click_text", text)
+                if cached_entry:
+                    async def _cache_click(loc: Any, label: str) -> str:
+                        return await _click_locator_with_js_fallback(loc, label, timeout=3000)
+
+                    used = await _sc_click(page, cached_entry, text, _cache_click)
+                    if used:
+                        clicked = True
+                        from_cache = True
+                        cache.record_hit("click_text", text)
+                    else:
+                        cache.invalidate("click_text", text)
+        except Exception as cache_err:
+            logger.debug("[CLICK_TEXT] selector cache probe skipped: %s", cache_err)
+            cache = None
 
         async def _click_first_visible(locator: Any, label: str, limit: int = 20) -> str:
+            nonlocal derived_selector
             try:
                 count = await locator.count()
             except Exception:
@@ -5111,6 +5143,8 @@ class ClickTextHandler(ActionHandler):
                     )
                     if disabled:
                         continue
+                    if cache is not None and not derived_selector:
+                        derived_selector = await _sc_derive(candidate)
                     mode = await _click_locator_with_js_fallback(
                         candidate, label, timeout=3000
                     )
@@ -5143,17 +5177,18 @@ class ClickTextHandler(ActionHandler):
             ".dropdown-menu li",
             ".dropdown-item",
         )
-        for selector in menu_selectors:
-            try:
-                loc = page.locator(selector).filter(has_text=text)
-                used = await _click_first_visible(
-                    loc, f"click_text popup {selector} {text!r}"
-                )
-                if used:
-                    clicked = True
-                    break
-            except Exception:
-                continue
+        if not clicked:
+            for selector in menu_selectors:
+                try:
+                    loc = page.locator(selector).filter(has_text=text)
+                    used = await _click_first_visible(
+                        loc, f"click_text popup {selector} {text!r}"
+                    )
+                    if used:
+                        clicked = True
+                        break
+                except Exception:
+                    continue
 
         # ── 2. 精确匹配 ──
         if not clicked:
@@ -5207,6 +5242,8 @@ class ClickTextHandler(ActionHandler):
                 try:
                     loc = page.get_by_role(role, name=text, exact=True).first
                     if await loc.count() > 0 and await loc.is_visible():
+                        if cache is not None and not derived_selector:
+                            derived_selector = await _sc_derive(loc)
                         mode = await _click_locator_with_js_fallback(
                             loc, f"click_text role={role} {text!r}", timeout=3000
                         )
@@ -5223,6 +5260,8 @@ class ClickTextHandler(ActionHandler):
             try:
                 loc = page.get_by_text(text, exact=False).first
                 if await loc.count() > 0 and await loc.is_visible():
+                    if cache is not None and not derived_selector:
+                        derived_selector = await _sc_derive(loc)
                     mode = await _click_locator_with_js_fallback(
                         loc, f"click_text substring {text!r}", timeout=3000
                     )
@@ -5238,6 +5277,16 @@ class ClickTextHandler(ActionHandler):
                 "smooth_scroll 让目标进入视口。"
             )
 
+        if cache is not None and not from_cache and derived_selector:
+            try:
+                cache.store("click_text", text, derived_selector, signature=text)
+                logger.debug(
+                    "[CLICK_TEXT] selector cache write-back: %s -> %s",
+                    text,
+                    derived_selector,
+                )
+            except Exception as store_err:
+                logger.debug("[CLICK_TEXT] selector cache write-back skipped: %s", store_err)
         logger.info(f"[CLICK_TEXT] {text!r} 命中：{used}")
         print(f"\033[1;35m🎯 [CLICK_TEXT]\033[0m {text!r} → {used}")
         browser.rpa_trail.append(
