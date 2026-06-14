@@ -2046,6 +2046,8 @@ def test_capability_router_source_wiring() -> None:
     app_src = (root / "vspider-ui" / "src" / "App.vue").read_text(encoding="utf-8")
     capability_trace_list_src = (root / "vspider-ui" / "src" / "components" / "CapabilityTraceList.vue").read_text(encoding="utf-8")
     capability_runtime_panel_src = (root / "vspider-ui" / "src" / "components" / "CapabilityRuntimePanel.vue").read_text(encoding="utf-8")
+    capability_plan_pane_src = (root / "vspider-ui" / "src" / "components" / "CapabilityPlanPane.vue").read_text(encoding="utf-8")
+    capability_diagnostics_pane_src = (root / "vspider-ui" / "src" / "components" / "CapabilityDiagnosticsPane.vue").read_text(encoding="utf-8")
 
     assert "from visual_web_agent.capability_api import CapabilityApiDeps" in api_src
     assert "create_capability_router" in api_src
@@ -2517,8 +2519,8 @@ def test_capability_router_source_wiring() -> None:
     assert "class=\"capability-trace-search\"" in capability_trace_list_src
     assert "class=\"capability-trace-search-count\"" in capability_trace_list_src
     assert "Browser Runtime" in capability_runtime_panel_src
-    assert "结构化执行计划" in app_src
-    assert "跨系统工作流图" in app_src
-    assert "Unified ActionRef" in app_src
-    assert "能力清单摘要" in app_src
+    assert "结构化执行计划" in capability_plan_pane_src
+    assert "跨系统工作流图" in capability_plan_pane_src
+    assert "Unified ActionRef" in capability_plan_pane_src
+    assert "能力清单摘要" in capability_diagnostics_pane_src
 

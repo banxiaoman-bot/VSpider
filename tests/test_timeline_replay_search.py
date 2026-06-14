@@ -22,6 +22,8 @@ CAPABILITY_TRACE_UTILS = Path(__file__).resolve().parent.parent / "vspider-ui" /
 CAPABILITY_TRACE_LIST = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityTraceList.vue"
 CAPABILITY_ALIGNMENT_CARD = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityAlignmentCard.vue"
 CAPABILITY_EFFICIENCY_PANEL = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityEfficiencyPanel.vue"
+CAPABILITY_REPLAY_PANE = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityReplayPane.vue"
+CAPABILITY_SHARED_CSS = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "styles" / "capability-shared.css"
 
 
 @pytest.fixture(scope="module")
@@ -52,6 +54,16 @@ def capability_alignment_card_src() -> str:
 @pytest.fixture(scope="module")
 def capability_efficiency_panel_src() -> str:
     return CAPABILITY_EFFICIENCY_PANEL.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def capability_replay_pane_src() -> str:
+    return CAPABILITY_REPLAY_PANE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def capability_shared_css_src() -> str:
+    return CAPABILITY_SHARED_CSS.read_text(encoding="utf-8")
 
 
 class TestVPhaseStats:
@@ -422,6 +434,7 @@ class TestY33CapabilityTracePanel:
         capability_trace_list_src: str,
         capability_alignment_card_src: str,
         capability_efficiency_panel_src: str,
+        capability_replay_pane_src: str,
     ) -> None:
         for token in [
             '<el-tab-pane name="capability">',
@@ -429,8 +442,6 @@ class TestY33CapabilityTracePanel:
             "Route-Aware Agent Guidance",
             "v-if=\"latestCapabilityRoute || latestCapabilityExecute\"",
             "@click=\"exportCapabilityTraceAsJsonl\"",
-            # Capability action buttons collapsed into a dropdown dispatched by
-            # command via handleCapabilityMoreAction (handlers unchanged).
             "@command=\"handleCapabilityMoreAction\"",
             "copySummary: copyCapabilityTraceSummary,",
             "command=\"copySummary\"",
@@ -456,35 +467,6 @@ class TestY33CapabilityTracePanel:
             "批量验证 Fixture",
             "capabilityFailureFixtureBatchReplayLoading",
             "capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'",
-            "Failure Fixture Replay",
-            "capabilityFailureFixtureReplayReport.fixture?.primary_failure",
-            "capabilityFailureFixtureReplayReport.planner_feedback?.passed ? 'passed' : 'failed'",
-            "capabilityFailureFixtureReplayReport.route?.passed ? 'passed' : 'failed'",
-            "capabilityFailureFixtureReplayReport.execution_plan?.passed ? 'passed' : 'failed'",
-            "capabilityFailureFixtureReplayChecks.length - capabilityFailureFixtureReplayFailedChecks.length",
-            "v-for=\"check in capabilityFailureFixtureReplayChecks.slice(0, 6)\"",
-            "Failure Fixture Library",
-            "capabilityFailureFixtureLibraryCount",
-            "v-for=\"item in capabilityFailureFixtureLibrary.slice(0, 5)\"",
-            "Failure Fixture Batch History",
-            "capabilityFailureFixtureBatchHistoryCount",
-            "capabilityFailureFixtureLatestBatchHistory.status || 'unknown'",
-            "capabilityFailureFixtureBatchHistoryTrendDirection",
-            "capabilityFailureFixtureBatchHistoryTrendPassRateDelta",
-            "focus changed",
-            "v-for=\"item in capabilityFailureFixtureBatchHistory.slice(0, 5)\"",
-            "Failure Fixture Batch Replay",
-            "capabilityFailureFixtureBatchReplayReport.fixture_count || 0",
-            "capabilityFailureFixtureBatchReplayReport.passed_count || 0",
-            "capabilityFailureFixtureBatchReplayFailedChecks.length",
-            "capabilityFailureFixtureBatchReplaySummary.recommended_focus",
-            "capabilityFailureFixtureBatchReplayTopPrimaryFailures[0]?.name || 'none'",
-            "capabilityFailureFixtureBatchReplayTopFailureCategories[0]?.name || 'none'",
-            "capabilityFailureFixtureBatchReplayTopFailedChecks[0]?.name || 'none'",
-            "@click=\"copyCapabilityFailureFixtureBatchReplaySummary\"",
-            "复制 Replay 摘要",
-            "v-for=\"check in capabilityFailureFixtureBatchReplayFailedChecks.slice(0, 6)\"",
-            "v-for=\"item in capabilityFailureFixtureBatchReplayItems.slice(0, 6)\"",
             "importReplay: () => triggerReplayImport('capability'),",
             "command=\"importReplay\"",
             "Capability 回放模式",
@@ -492,7 +474,7 @@ class TestY33CapabilityTracePanel:
             "v-model:filter=\"capabilityTraceFilter\"",
             "v-model:search-query=\"capabilityTraceSearchQuery\"",
             ":rows=\"capabilityFilteredTraceRows\"",
-            "@open-row=\"openPhaseDialog\"",
+            "@open-row=\"(evt) => timelinePanelRef.value?.openPhaseDialog(evt)\"",
             "capabilityTraceHealth.label",
             "route {{ capabilityTraceHealth.route }}",
             "issues {{ capabilityTraceHealth.issues }}",
@@ -512,12 +494,26 @@ class TestY33CapabilityTracePanel:
             "v-for=\"action in capabilityExecutionActionRecoveryActions\"",
             "v-for=\"(attempt, idx) in capabilityExecutionAttempts\"",
             "v-for=\"check in capabilityExecutionChecks\"",
-            "v-for=\"(item, idx) in capabilityBackendPlan\"",
-            "v-for=\"(item, idx) in capabilityFallbackChain\"",
-            "v-for=\"role in capabilityRoleRows\"",
-            "{{ capabilityTraceJson || capabilityExecuteJson }}",
+            "<CapabilityReplayPane",
+            "v-bind=\"capabilityReplayPaneProps\"",
+            "<CapabilityDiagnosticsPane",
+            ":fallback-chain=\"capabilityFallbackChain\"",
+            ":role-rows=\"capabilityRoleRows\"",
+            "capabilityTraceJson || capabilityExecuteJson",
         ]:
             assert token in src
+        for token in [
+            "Failure Fixture Replay",
+            "fixtureReplay.report.fixture?.primary_failure",
+            "fixtureReplay.report.planner_feedback?.passed",
+            "fixtureReplay.report.route?.passed",
+            "fixtureReplay.report.execution_plan?.passed",
+            "Failure Fixture Library",
+            "Failure Fixture Batch History",
+            "Failure Fixture Batch Replay",
+            "Efficiency Feedback Replay",
+        ]:
+            assert token in capability_replay_pane_src
         for token in [
             "Trace 历史",
             "v-for=\"item in filters\"",
@@ -562,12 +558,16 @@ class TestY33CapabilityTracePanel:
         capability_trace_list_src: str,
         capability_alignment_card_src: str,
         capability_efficiency_panel_src: str,
+        capability_shared_css_src: str,
     ) -> None:
         for cls in [
             ".capability-scroll",
             ".capability-hero",
-            ".capability-chain",
             ".capability-hero-actions",
+        ]:
+            assert cls in src
+        for cls in [
+            ".capability-chain",
             ".capability-export-btn",
             ".capability-section-head",
             ".capability-health-strip",
@@ -605,7 +605,7 @@ class TestY33CapabilityTracePanel:
             ".capability-role-card",
             ".capability-json",
         ]:
-            assert cls in src
+            assert cls in capability_shared_css_src
         for cls in [
             ".capability-trace-filters",
             ".capability-trace-filter",
@@ -634,7 +634,9 @@ class TestY33CapabilityTracePanel:
         ]:
             assert cls in capability_efficiency_panel_src
 
-    def test_capability_trace_export_wired(self, src: str, failure_fixture_summary_src: str) -> None:
+    def test_capability_trace_export_wired(
+        self, src: str, failure_fixture_summary_src: str, capability_replay_pane_src: str,
+    ) -> None:
         app_tokens = [
             "const exportCapabilityTraceAsJsonl = () =>",
             "capabilityTraceEvents.value",
@@ -711,16 +713,18 @@ class TestY33CapabilityTracePanel:
             "capabilityEfficiencyFeedbackReplayLibrary.value = Array.isArray(result.result?.reports)",
             "已加载 ${capabilityEfficiencyFeedbackReplayLibrary.value.length} 条 efficiency feedback replay reports",
             "读取 efficiency feedback replay library 失败",
-            "Efficiency Feedback Replay",
-            "Efficiency Feedback Replay Library",
-            "source capability/efficiency_feedback_replays",
-            "暂无 efficiency feedback replay artifacts",
             "当前没有可复制的 batch replay 摘要",
             "已复制 batch replay 摘要",
             "failure_bundle: result.failure_bundle",
         ]
         for token in app_tokens:
             assert token in src
+        for token in [
+            "Efficiency Feedback Replay",
+            "Efficiency Feedback Replay Library",
+            "source capability/efficiency_feedback_replays",
+        ]:
+            assert token in capability_replay_pane_src
         for token in [
             "# Failure Fixture Batch Replay Summary",
             "Top primary failures: ${topPrimary}",

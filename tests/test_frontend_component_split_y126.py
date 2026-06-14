@@ -68,11 +68,12 @@ def test_capability_trace_helpers_are_extracted(app_src: str, trace_utils_src: s
         "capabilityCrawlEfficiencyCandidateClass",
         "capabilityCrawlEfficiencyEvidence",
         "capabilityItemName",
-        "capabilityItemMeta",
-        "capabilityItemDetail",
         "capabilityAttemptClass",
     ]:
         assert f"  {name}," in app_src
+        assert f"export const {name}" in trace_utils_src
+        assert f"const {name}" not in app_src
+    for name in ["capabilityItemMeta", "capabilityItemDetail"]:
         assert f"export const {name}" in trace_utils_src
         assert f"const {name}" not in app_src
 
@@ -91,7 +92,7 @@ def test_capability_trace_list_component_is_used(app_src: str, trace_list_src: s
     assert 'v-model:filter="capabilityTraceFilter"' in app_src
     assert 'v-model:search-query="capabilityTraceSearchQuery"' in app_src
     assert ':rows="capabilityFilteredTraceRows"' in app_src
-    assert '@open-row="openPhaseDialog"' in app_src
+    assert '@open-row="(evt) => timelinePanelRef.value?.openPhaseDialog(evt)"' in app_src
     assert "defineEmits(['update:filter', 'update:searchQuery', 'open-row'])" in trace_list_src
     assert 'class="capability-trace-row"' in trace_list_src
     assert 'class="capability-trace-filter"' in trace_list_src
