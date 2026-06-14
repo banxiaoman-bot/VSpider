@@ -92,6 +92,7 @@ class PerceptionPhase:
         self._last_signature: str | None = None
         self._last_snapshot: PerceptionSnapshot | None = None
         self._reuse_streak: int = 0
+        self._last_ax_lines: set[str] | None = None  # E3: AX diff baseline
 
     async def _probe_signature(self, browser: Any) -> str:
         probe = getattr(browser, "dom_signature", None)
@@ -143,6 +144,55 @@ class PerceptionPhase:
         state_meta["perception_reused"] = True
         reused_state = replace(last.browser_state, step=step, metadata=state_meta)
         return replace(last, browser_state=reused_state)
+
+    def _compute_ax_display(
+        self, ax_text: str, *, force_full: bool
+    ) -> tuple[str, dict[str, Any]]:
+        """E3 AX incremental diff: full AX for first / forced-full turns,
+        compact *unchanged + added + removed* summary otherwise.
+
+        Returns ``(display_text, diff_meta)``.  The caller stores the **full**
+        ``ax_tree_text`` in ``browser_state`` for reference; only the VLM
+        prompt block uses *display_text*.
+        """
+        if not ax_text:
+            return "", {"ax_incremental": False}
+
+        current_lines = set(ax_text.splitlines())
+
+        if force_full or self._last_ax_lines is None:
+            self._last_ax_lines = current_lines
+            return ax_text, {"ax_incremental": False}
+
+        added = sorted(current_lines - self._last_ax_lines)
+        removed = sorted(self._last_ax_lines - current_lines)
+        unchanged_count = len(current_lines & self._last_ax_lines)
+
+        self._last_ax_lines = current_lines
+
+        meta: dict[str, Any] = {
+            "ax_incremental": True,
+            "ax_unchanged": unchanged_count,
+            "ax_added": len(added),
+            "ax_removed": len(removed),
+        }
+
+        if not added and not removed:
+            return (
+                f"[AX 增量] 与上一轮完全相同（{unchanged_count} 行未变），无新增/消失"
+            ), meta
+
+        parts = [f"[AX 增量] 与上一轮对比：{unchanged_count} 行未变"]
+        if added:
+            parts.append(f"[+新增 {len(added)} 行]")
+            for line in added:
+                parts.append(f"+ {line}")
+        if removed:
+            parts.append(f"[-消失 {len(removed)} 行]")
+            for line in removed:
+                parts.append(f"- {line}")
+
+        return "\n".join(parts), meta
 
     async def run(
         self,
@@ -307,6 +357,10 @@ class PerceptionPhase:
             logger.warning(
                 f"[HYBRID] AX Tree 长度 {_orig_len} 超过 15000 阈值，已截断以保护上下文窗口"
             )
+        # E3: compute AX diff for VLM prompt; full ax_tree_text preserved in browser_state
+        _ax_display, _ax_diff_meta = self._compute_ax_display(
+            ax_tree_text, force_full=_escape_valve,
+        )
         _browser_state = await BrowserStateSnapshot.from_browser(
             browser,
             step=step,
@@ -319,6 +373,11 @@ class PerceptionPhase:
                 "reasoning_text_source": _log_reasoning_text_source,
             },
         )
+        _observe_meta = {
+            "tabs": _tabs_state,
+            "reasoning_text_source": _log_reasoning_text_source,
+        }
+        _observe_meta.update(_ax_diff_meta)
         event_stream.observe(
             step=step,
             url=getattr(browser, "current_url", "") or "",
@@ -326,27 +385,40 @@ class PerceptionPhase:
             ax_lines=len(ax_tree_text.splitlines()) if ax_tree_text else 0,
             browser_state=_browser_state,
             perception_reused=False,
-            metadata={
-                "tabs": _tabs_state,
-                "reasoning_text_source": _log_reasoning_text_source,
-            },
+            metadata=_observe_meta,
         )
 
         ax_block = ""
         if ax_tree_text:
-            ax_block = (
-                "\n\n=====================================\n"
-                "【辅助信息：页面无障碍语义树 (AX Tree)】\n"
-                "以下是当前页面的纯语义结构，过滤了所有样式噪音。\n"
-                "  · 第一段 [可交互元素 @eN 语义快照] 是按阅读顺序编号的紧凑清单：\n"
-                "    `@eN [role] \"name\" {states}`，N 与截图红框数字一一对应。\n"
-                "    需要操作某元素时，target_id 直接填数字（如 @e5 → target_id=5）。\n"
-                "  · 第二段 [页面语义快照] 提供整体 AX 结构（含标题、文本等），辅助理解上下文。\n"
-                "  ⚠ 执行 extract 时，**必须从 AX Tree 中读取文本数据**（标题、数值、描述），\n"
-                "    而非仅靠截图 OCR。被浮层遮挡的元素在 AX Tree 中仍然存在。\n"
-                f"{ax_tree_text}\n"
-                "====================================="
-            )
+            if not _ax_diff_meta.get("ax_incremental"):
+                ax_block = (
+                    "\n\n=====================================\n"
+                    "【辅助信息：页面无障碍语义树 (AX Tree)】\n"
+                    "以下是当前页面的纯语义结构，过滤了所有样式噪音。\n"
+                    "  · 第一段 [可交互元素 @eN 语义快照] 是按阅读顺序编号的紧凑清单：\n"
+                    "    `@eN [role] \"name\" {states}`，N 与截图红框数字一一对应。\n"
+                    "    需要操作某元素时，target_id 直接填数字（如 @e5 → target_id=5）。\n"
+                    "  · 第二段 [页面语义快照] 提供整体 AX 结构（含标题、文本等），辅助理解上下文。\n"
+                    "  ⚠ 执行 extract 时，**必须从 AX Tree 中读取文本数据**（标题、数值、描述），\n"
+                    "    而非仅靠截图 OCR。被浮层遮挡的元素在 AX Tree 中仍然存在。\n"
+                    f"{ax_tree_text}\n"
+                    "====================================="
+                )
+            elif _ax_diff_meta.get("ax_added", 0) == 0 and _ax_diff_meta.get("ax_removed", 0) == 0:
+                ax_block = (
+                    "\n\n=====================================\n"
+                    f"【辅助信息：AX Tree 未变（{_ax_diff_meta.get('ax_unchanged', 0)} 行与上一轮相同）】\n"
+                    "====================================="
+                )
+            else:
+                ax_block = (
+                    "\n\n=====================================\n"
+                    "【辅助信息：AX Tree 增量变化】\n"
+                    "以下仅展示与上一轮对比的新增/消失行，未变行已省略。\n"
+                    "  ⚠ 未变元素仍可操作（target_id 编号不变）。\n"
+                    f"{_ax_display}\n"
+                    "====================================="
+                )
 
         input_descriptions = (
             (input_descriptions or "") + ax_block + _page_hint + _tabs_hint
