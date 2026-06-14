@@ -339,6 +339,7 @@ def route_task(
                 selected_tools = [forced, *selected_tools]
     signals = _signals(text, strategy_context)
     signals.update(_semantic_signals_patch)
+    _apply_capture_fixture_probe(signals, strategy_context, url)
     planner_feedback = _planner_feedback_from_context(route_context)
     failure_repair_feedback = {}
     failure_bundle = route_context.get("failure_bundle") or route_context.get("capability_execute_failure_bundle") or route_context.get("last_failure_bundle")
@@ -601,8 +602,42 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
     return plan
 
 
+def _apply_capture_fixture_probe(signals: dict[str, Any], strategy_context: dict[str, Any], url: str) -> None:
+    """E6: lift api_replay when this host already has a usable capture.
+
+    Probes the cross-run capture index for data-flavoured goals only; a hit
+    sets ``signals.api_replay_available`` plus ``strategy_context.
+    api_replay_capture`` evidence (both additive). Probe failures stay quiet
+    so routing never degrades because of index I/O.
+    """
+    if not (signals.get("structured") or signals.get("crawl") or signals.get("api_or_network")):
+        return
+    host = urlparse(str(url or "")).netloc.split("@")[-1].split(":", 1)[0].lower()
+    if not host:
+        return
+    try:
+        from visual_web_agent import network_intelligence as _network_intel
+
+        hits = _network_intel.find_candidates_for_host(host, limit=5)
+    except Exception:
+        return
+    if not hits:
+        return
+    top = hits[0]
+    signals["api_replay_available"] = True
+    strategy_context["api_replay_capture"] = {
+        "host": host,
+        "candidates": len(hits),
+        "source_run_id": str(top.get("run_id") or ""),
+        "top_endpoint": str(top.get("endpoint") or top.get("url") or ""),
+        "top_score": int(top.get("score") or 0),
+    }
+
+
 def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], backend_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
     chain: list[dict[str, Any]] = []
+    if signals.get("api_replay_available"):
+        chain.append(_step("api_replay", "Replay the existing capture fixture for this host before launching a browser (capture index hit)."))
     if signals.get("api_or_network"):
         chain.extend([
             _step("network_intelligence", "Use captured API/XHR candidates if present."),

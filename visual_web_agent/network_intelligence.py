@@ -320,6 +320,65 @@ def list_candidates(
     return out[:n]
 
 
+def find_candidates_for_host(
+    host: str,
+    *,
+    min_score: int = 1,
+    limit: int = 20,
+    max_age_s: float = 7 * 24 * 3600,
+    max_files: int = 200,
+    base_dir: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """E6: host-level capture index across all recorded runs.
+
+    Scans the newest ``max_files`` capture files under the network root and
+    returns score-sorted candidates whose URL host matches ``host``.
+    ``max_age_s`` gates out stale captures (0 disables the age gate). Each
+    hit keeps its originating ``run_id`` so callers can replay it directly.
+    """
+    wanted = str(host or "").strip().lower()
+    if not wanted:
+        return []
+    try:
+        root = network_root(base_dir)
+    except Exception:
+        return []
+    try:
+        files = sorted(root.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return []
+    now = time.time()
+    threshold = int(min_score or 0)
+    out: list[dict[str, Any]] = []
+    for path in files[: max(1, int(max_files or 1))]:
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    if int(obj.get("score") or 0) < threshold:
+                        continue
+                    if max_age_s and (now - float(obj.get("ts") or 0)) > float(max_age_s):
+                        continue
+                    cand_host = urlparse(str(obj.get("url") or obj.get("endpoint") or "")).netloc.lower()
+                    if cand_host.split("@")[-1].split(":", 1)[0] != wanted:
+                        continue
+                    if not obj.get("run_id"):
+                        obj["run_id"] = path.stem
+                    out.append(obj)
+        except Exception:
+            continue
+    out.sort(key=lambda x: (int(x.get("score") or 0), float(x.get("ts") or 0)), reverse=True)
+    return out[: max(1, min(int(limit or 20), 200))]
+
+
 def summarize_candidates(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     endpoints: dict[str, dict[str, Any]] = {}
     for c in candidates:
