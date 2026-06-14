@@ -11,6 +11,7 @@ import asyncio
 import json
 import re
 import logging
+import time
 from typing import Any, ClassVar, Dict, Literal, List, Optional, Union
 
 from openai import AsyncOpenAI, BadRequestError
@@ -1075,12 +1076,36 @@ class VLMClient:
                 f"[TRACKER] enabled | match≥{ELEMENT_TRACKER_MATCH_THRESHOLD} "
                 f"high≥{ELEMENT_TRACKER_HIGH_CONFIDENCE}"
             )
+        # ── VLM Budget：per-run call/token metering ──────────────────────
+        try:
+            from .vlm_budget import VlmBudget, BudgetConfig
+        except ImportError:
+            from vlm_budget import VlmBudget, BudgetConfig
+        self._budget = VlmBudget(config=BudgetConfig())
         logger.info(
             f"VLM client initialized | model={self.model} | base={self.api_base} | "
             f"semantic_model={self.semantic_model} | semantic_base={self.semantic_api_base} | "
             f"text_only={self.text_only} | "
             f"max_tokens={self.max_tokens} | temperature={self.temperature}"
         )
+
+    def configure_budget(self, max_calls: int = 0, max_tokens: int = 0, soft_ratio: float = 0.8) -> None:
+        """Set per-run VLM budget limits.  0 = unlimited on that axis."""
+        try:
+            from .vlm_budget import BudgetConfig
+        except ImportError:
+            from vlm_budget import BudgetConfig
+        self._budget.config = BudgetConfig(
+            max_calls=max_calls, max_tokens=max_tokens, soft_ratio=soft_ratio,
+        )
+        if max_calls or max_tokens:
+            logger.info("[BUDGET] configured: max_calls=%d max_tokens=%d soft=%.0f%%",
+                        max_calls, max_tokens, soft_ratio * 100)
+
+    @property
+    def budget_summary(self) -> dict:
+        """Return current VLM budget/usage snapshot."""
+        return self._budget.summary()
 
     def _build_history_summary(self) -> str:
         """构建最近 N 轮操作的历史摘要文本（含执行结果）。
@@ -1454,6 +1479,7 @@ class VLMClient:
             经过验证的决策字典列表（连招批次），每个元素包含
             thought/action/target_id/type_value/memory_key/status 等字段
         """
+        self._ask_t0 = time.time()
         history_text = self._build_history_summary()
         # ── Cache Replay：命中即返回，绕过真实 LLM 调用 ───────────────────
         if self._response_cache.mode == CacheMode.REPLAY:
@@ -1670,6 +1696,18 @@ class VLMClient:
 
                 # 记录到历史
                 self._record_history(step, decisions)
+
+                # ── Budget Meter：记录本步 VLM 消耗 ───────────────────────
+                _usage = getattr(response, "usage", None)
+                _prompt_tk = int(getattr(_usage, "prompt_tokens", 0) or 0)
+                _compl_tk = int(getattr(_usage, "completion_tokens", 0) or 0)
+                _vlm_latency = int((time.time() - (self._ask_t0 or time.time())) * 1000)
+                self._budget.record(
+                    step=step,
+                    prompt_tokens=_prompt_tk,
+                    completion_tokens=_compl_tk,
+                    latency_ms=_vlm_latency,
+                )
 
                 # ── Cache Record：把本步 (输入哈希, 输出) 落盘 ────────────
                 self._response_cache.store(

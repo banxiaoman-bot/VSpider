@@ -609,29 +609,45 @@ def _apply_capture_fixture_probe(signals: dict[str, Any], strategy_context: dict
     sets ``signals.api_replay_available`` plus ``strategy_context.
     api_replay_capture`` evidence (both additive). Probe failures stay quiet
     so routing never degrades because of index I/O.
+
+    Also probes the selector_action_cache for browser-interaction tasks:
+    a cache hit signals that selector replay can skip VLM rounds.
     """
-    if not (signals.get("structured") or signals.get("crawl") or signals.get("api_or_network")):
-        return
     host = urlparse(str(url or "")).netloc.split("@")[-1].split(":", 1)[0].lower()
     if not host:
         return
-    try:
-        from visual_web_agent import network_intelligence as _network_intel
+    if signals.get("structured") or signals.get("crawl") or signals.get("api_or_network"):
+        try:
+            from visual_web_agent import network_intelligence as _network_intel
 
-        hits = _network_intel.find_candidates_for_host(host, limit=5)
-    except Exception:
-        return
-    if not hits:
-        return
-    top = hits[0]
-    signals["api_replay_available"] = True
-    strategy_context["api_replay_capture"] = {
-        "host": host,
-        "candidates": len(hits),
-        "source_run_id": str(top.get("run_id") or ""),
-        "top_endpoint": str(top.get("endpoint") or top.get("url") or ""),
-        "top_score": int(top.get("score") or 0),
-    }
+            hits = _network_intel.find_candidates_for_host(host, limit=5)
+        except Exception:
+            hits = []
+        if hits:
+            top = hits[0]
+            signals["api_replay_available"] = True
+            strategy_context["api_replay_capture"] = {
+                "host": host,
+                "candidates": len(hits),
+                "source_run_id": str(top.get("run_id") or ""),
+                "top_endpoint": str(top.get("endpoint") or top.get("url") or ""),
+                "top_score": int(top.get("score") or 0),
+            }
+    if signals.get("browser_interaction") or signals.get("form"):
+        try:
+            from visual_web_agent.selector_action_cache import get_cache as _get_sel_cache
+
+            cache = _get_sel_cache(url)
+            stats = cache.stats()
+            if stats.get("entries", 0) > 0:
+                signals["selector_cache_available"] = True
+                strategy_context["selector_action_cache"] = {
+                    "host": host,
+                    "cached_entries": stats["entries"],
+                    "total_hits": stats["total_hits"],
+                }
+        except Exception:
+            pass
 
 
 def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], backend_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -651,6 +667,8 @@ def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], b
             _step("spider_lite", "Follow links/pages and extract items with cache/pipeline support."),
         ])
     if signals.get("browser_interaction"):
+        if signals.get("selector_cache_available"):
+            chain.append(_step("selector_action_cache", "Replay verified selector→action pairs from cache before VLM probing (cross-run cache hit)."))
         chain.extend([
             _step("browser_backend_abstraction", "Check active browser backend and configured remote/stealth backend slots."),
             _step("action_registry_macros", "Try selected deterministic browser macro/tool."),

@@ -1,176 +1,190 @@
-"""E5: per-run VLM call budget + metering (vlm_budget.v1).
+"""vlm_budget.v1: VLM round / token budget tracker with soft & hard limits.
 
-Every real VLM/LLM call routed through ``VLMClient`` (ask / extract / judge /
-plan / reflect) is metered here. The meter is **observe-only** by default: it
-counts calls per kind, tracks the primary "turn" budget (``ask`` calls), and
-flags when usage crosses the warn ratio or exceeds the budget. It never raises
-and never blocks a call -- the agent loop reads :meth:`VlmBudget.snapshot` to
-feed efficiency / planner feedback and decide whether to switch to a cheaper
-path (api_replay, deterministic actions). Accuracy is never traded for the
-budget; the budget only informs efficiency.
+Provides a lightweight meter that VLMClient hooks into at every ``ask()``
+call.  The main loop (or API caller) can set a per-run budget; once the
+soft limit is hit the tracker emits a warning event; at the hard limit it
+raises ``VlmBudgetExhausted`` so the run terminates gracefully instead of
+burning unlimited tokens.
 
-Opt-out: ``VSPIDER_VLM_BUDGET=0`` (metering becomes a no-op).
-Tune via env:
-  - ``VSPIDER_VLM_MAX_CALLS``  total real VLM calls before over-budget (default 120)
-  - ``VSPIDER_VLM_MAX_TURNS``  ask() turns before over-budget (default 60)
-  - ``VSPIDER_VLM_BUDGET_WARN_RATIO``  warn threshold 0..1 (default 0.8)
+Design constraints (mission 高效):
+- Zero overhead when no budget is configured (all checks are O(1) ints).
+- Thread-safe via simple atomics (no locks needed for single-writer).
+- Emits structured events for the event_stream so the UI can show spend.
 """
+
 from __future__ import annotations
 
-import os
-import threading
+import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
-BUDGET_VERSION = "vlm_budget.v1"
-
-# A VLM "turn" is one ask() call (the per-step perception/action decision);
-# extract/judge/plan/reflect are auxiliary calls that still consume budget.
-TURN_KIND = "ask"
-KNOWN_KINDS = ("ask", "extract", "judge", "plan", "reflect", "other")
-
-_DEFAULT_MAX_CALLS = 120
-_DEFAULT_MAX_TURNS = 60
-_DEFAULT_WARN_RATIO = 0.8
+logger = logging.getLogger("vspider.vlm_budget")
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        raw = str(os.environ.get(name, "")).strip()
-        return int(raw) if raw else int(default)
-    except Exception:
-        return int(default)
+class VlmBudgetExhausted(Exception):
+    """Raised when the hard budget limit is reached."""
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        raw = str(os.environ.get(name, "")).strip()
-        return float(raw) if raw else float(default)
-    except Exception:
-        return float(default)
+@dataclass
+class BudgetConfig:
+    """Per-run VLM budget knobs.
 
-
-def budget_enabled() -> bool:
-    return str(os.environ.get("VSPIDER_VLM_BUDGET", "1")).strip().lower() not in {
-        "0", "false", "no", "off",
-    }
-
-
-def normalize_kind(kind: str) -> str:
-    k = str(kind or "other").strip().lower()
-    return k if k in KNOWN_KINDS else "other"
-
-
-class VlmBudget:
-    """Thread-safe per-run VLM call meter with a *soft* budget.
-
-    :meth:`record` returns a status dict each call; callers log / surface it.
-    The budget is soft: ``over_budget`` is a flag, never an exception, so a
-    runaway loop is reported (and can be cut short by the agent loop) without
-    a hard failure that would abort a legitimately long task mid-flight.
+    Set ``max_calls=0`` or ``max_tokens=0`` to disable that axis.
+    ``soft_ratio`` (0..1) controls when the warning fires relative to the
+    hard limit (default 0.8 = warn at 80%).
     """
+    max_calls: int = 0
+    max_tokens: int = 0
+    soft_ratio: float = 0.8
 
-    def __init__(
+
+@dataclass
+class VlmBudget:
+    """Accumulates VLM usage for one run and enforces limits."""
+
+    config: BudgetConfig = field(default_factory=BudgetConfig)
+
+    # counters
+    total_calls: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    total_latency_ms: int = 0
+
+    # per-step log (kept lean: step + tokens + latency)
+    _log: list[dict[str, Any]] = field(default_factory=list)
+
+    # internal
+    _soft_warned_calls: bool = False
+    _soft_warned_tokens: bool = False
+
+    # -- recording ---------------------------------------------------------
+
+    def record(
         self,
-        *,
-        max_calls: int | None = None,
-        max_turns: int | None = None,
-        warn_ratio: float | None = None,
-        enabled: bool | None = None,
+        step: int,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: int = 0,
     ) -> None:
-        self.enabled = budget_enabled() if enabled is None else bool(enabled)
-        self.max_calls = max(
-            0,
-            int(max_calls if max_calls is not None else _env_int("VSPIDER_VLM_MAX_CALLS", _DEFAULT_MAX_CALLS)),
-        )
-        self.max_turns = max(
-            0,
-            int(max_turns if max_turns is not None else _env_int("VSPIDER_VLM_MAX_TURNS", _DEFAULT_MAX_TURNS)),
-        )
-        ratio = warn_ratio if warn_ratio is not None else _env_float(
-            "VSPIDER_VLM_BUDGET_WARN_RATIO", _DEFAULT_WARN_RATIO
-        )
-        self.warn_ratio = min(1.0, max(0.0, float(ratio)))
-        self._lock = threading.Lock()
-        self.total = 0
-        self.turns = 0
-        self.by_kind: dict[str, int] = {}
-        self.started_at = time.time()
-        self.last_step = 0
-        self._warned = False
-        self._warned_over = False
+        """Record one VLM call.  Raises ``VlmBudgetExhausted`` on hard limit."""
+        self.total_calls += 1
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        self.total_tokens += prompt_tokens + completion_tokens
+        self.total_latency_ms += latency_ms
 
-    def _over_locked(self) -> bool:
-        over_calls = self.max_calls > 0 and self.total > self.max_calls
-        over_turns = self.max_turns > 0 and self.turns > self.max_turns
-        return bool(over_calls or over_turns)
+        self._log.append({
+            "step": step,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "latency_ms": latency_ms,
+            "ts": time.time(),
+        })
 
-    def record(self, kind: str, step: int = 0) -> dict[str, Any]:
-        k = normalize_kind(kind)
-        if not self.enabled:
-            return {"enabled": False, "kind": k, "warn": False, "over_budget": False}
-        with self._lock:
-            self.total += 1
-            self.by_kind[k] = self.by_kind.get(k, 0) + 1
-            if k == TURN_KIND:
-                self.turns += 1
-            try:
-                self.last_step = max(self.last_step, int(step or 0))
-            except Exception:
-                pass
-            over = self._over_locked()
-            call_ratio = (self.total / self.max_calls) if self.max_calls > 0 else 0.0
-            turn_ratio = (self.turns / self.max_turns) if self.max_turns > 0 else 0.0
-            warn = bool(max(call_ratio, turn_ratio) >= self.warn_ratio) if self.warn_ratio > 0 else False
-            status: dict[str, Any] = {
-                "enabled": True,
-                "version": BUDGET_VERSION,
-                "kind": k,
-                "step": int(step or 0),
-                "total": self.total,
-                "turns": self.turns,
-                "max_calls": self.max_calls,
-                "max_turns": self.max_turns,
-                "remaining_calls": (max(0, self.max_calls - self.total) if self.max_calls > 0 else -1),
-                "remaining_turns": (max(0, self.max_turns - self.turns) if self.max_turns > 0 else -1),
-                "warn": warn,
-                "over_budget": over,
-                "first_warn": False,
-                "first_over": False,
-            }
-            # Edge-trigger the one-shot flags so callers log exactly once.
-            if over and not self._warned_over:
-                self._warned_over = True
-                status["first_over"] = True
-            if warn and not self._warned:
-                self._warned = True
-                status["first_warn"] = True
-            return status
+        self._check_soft()
+        self._check_hard()
 
-    def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "version": BUDGET_VERSION,
-                "enabled": self.enabled,
-                "total": self.total,
-                "turns": self.turns,
-                "by_kind": dict(self.by_kind),
-                "max_calls": self.max_calls,
-                "max_turns": self.max_turns,
-                "remaining_calls": (max(0, self.max_calls - self.total) if self.max_calls > 0 else -1),
-                "remaining_turns": (max(0, self.max_turns - self.turns) if self.max_turns > 0 else -1),
-                "warn_ratio": self.warn_ratio,
-                "over_budget": self._over_locked(),
-                "elapsed_s": round(time.time() - self.started_at, 3),
-                "last_step": self.last_step,
-            }
+    # -- checks ------------------------------------------------------------
 
-    def reset(self) -> None:
-        with self._lock:
-            self.total = 0
-            self.turns = 0
-            self.by_kind = {}
-            self.started_at = time.time()
-            self.last_step = 0
-            self._warned = False
-            self._warned_over = False
+    def _check_soft(self) -> None:
+        cfg = self.config
+        ratio = max(0.0, min(1.0, cfg.soft_ratio))
+        if cfg.max_calls > 0 and not self._soft_warned_calls:
+            threshold = int(cfg.max_calls * ratio)
+            if self.total_calls >= threshold:
+                self._soft_warned_calls = True
+                logger.warning(
+                    "[VLM_BUDGET] soft limit: %d/%d calls (%.0f%%)",
+                    self.total_calls, cfg.max_calls,
+                    100 * self.total_calls / cfg.max_calls,
+                )
+                self._emit_event("vlm_budget_soft", {
+                    "axis": "calls",
+                    "current": self.total_calls,
+                    "limit": cfg.max_calls,
+                })
+        if cfg.max_tokens > 0 and not self._soft_warned_tokens:
+            threshold = int(cfg.max_tokens * ratio)
+            if self.total_tokens >= threshold:
+                self._soft_warned_tokens = True
+                logger.warning(
+                    "[VLM_BUDGET] soft limit: %d/%d tokens (%.0f%%)",
+                    self.total_tokens, cfg.max_tokens,
+                    100 * self.total_tokens / cfg.max_tokens,
+                )
+                self._emit_event("vlm_budget_soft", {
+                    "axis": "tokens",
+                    "current": self.total_tokens,
+                    "limit": cfg.max_tokens,
+                })
+
+    def _check_hard(self) -> None:
+        cfg = self.config
+        if cfg.max_calls > 0 and self.total_calls >= cfg.max_calls:
+            msg = (
+                f"VLM call budget exhausted: {self.total_calls}/{cfg.max_calls} calls, "
+                f"{self.total_tokens} tokens total"
+            )
+            logger.error("[VLM_BUDGET] HARD LIMIT: %s", msg)
+            self._emit_event("vlm_budget_hard", {
+                "axis": "calls",
+                "current": self.total_calls,
+                "limit": cfg.max_calls,
+            })
+            raise VlmBudgetExhausted(msg)
+        if cfg.max_tokens > 0 and self.total_tokens >= cfg.max_tokens:
+            msg = (
+                f"VLM token budget exhausted: {self.total_tokens}/{cfg.max_tokens} tokens, "
+                f"{self.total_calls} calls total"
+            )
+            logger.error("[VLM_BUDGET] HARD LIMIT: %s", msg)
+            self._emit_event("vlm_budget_hard", {
+                "axis": "tokens",
+                "current": self.total_tokens,
+                "limit": cfg.max_tokens,
+            })
+            raise VlmBudgetExhausted(msg)
+
+    # -- event bridge ------------------------------------------------------
+
+    @staticmethod
+    def _emit_event(event_type: str, data: dict[str, Any]) -> None:
+        try:
+            from api_server import broadcast_phase
+            broadcast_phase(event_type, severity="warn", **data)
+        except Exception:
+            pass
+
+    # -- query -------------------------------------------------------------
+
+    def remaining_calls(self) -> int | None:
+        if self.config.max_calls <= 0:
+            return None
+        return max(0, self.config.max_calls - self.total_calls)
+
+    def remaining_tokens(self) -> int | None:
+        if self.config.max_tokens <= 0:
+            return None
+        return max(0, self.config.max_tokens - self.total_tokens)
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "total_calls": self.total_calls,
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_tokens": self.total_tokens,
+            "total_latency_ms": self.total_latency_ms,
+            "avg_latency_ms": (
+                self.total_latency_ms // self.total_calls
+                if self.total_calls > 0 else 0
+            ),
+            "budget_max_calls": self.config.max_calls,
+            "budget_max_tokens": self.config.max_tokens,
+            "remaining_calls": self.remaining_calls(),
+            "remaining_tokens": self.remaining_tokens(),
+        }
+
+    def step_log(self) -> list[dict[str, Any]]:
+        return list(self._log)
