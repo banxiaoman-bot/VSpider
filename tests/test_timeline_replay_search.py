@@ -147,8 +147,13 @@ class TestWReplayMode:
         assert "setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')" in src
 
     def test_replay_ui_wired(self, src: str) -> None:
-        assert "@click=\"triggerReplayImport\"" in src
-        assert "@click=\"triggerReplayImport('capability')\"" in src
+        # Import buttons moved into the "更多操作" dropdowns; entries dispatch by
+        # command and route back to triggerReplayImport per target.
+        assert "@command=\"handleTimelineMoreAction\"" in src
+        assert "@command=\"handleCapabilityMoreAction\"" in src
+        assert "<el-dropdown-item command=\"importReplay\">" in src
+        assert "importReplay: () => triggerReplayImport('timeline')" in src
+        assert "importReplay: () => triggerReplayImport('capability')" in src
         assert "ref=\"replayInputRef\"" in src
         assert "@change=\"handleReplayFileChange\"" in src
         assert "class=\"timeline-replay-banner\"" in src
@@ -424,21 +429,30 @@ class TestY33CapabilityTracePanel:
             "Route-Aware Agent Guidance",
             "v-if=\"latestCapabilityRoute || latestCapabilityExecute\"",
             "@click=\"exportCapabilityTraceAsJsonl\"",
-            "@click=\"copyCapabilityTraceSummary\"",
+            # Capability action buttons collapsed into a dropdown dispatched by
+            # command via handleCapabilityMoreAction (handlers unchanged).
+            "@command=\"handleCapabilityMoreAction\"",
+            "copySummary: copyCapabilityTraceSummary,",
+            "command=\"copySummary\"",
             "复制摘要",
-            "@click=\"generateCapabilityFailureFixture\"",
+            "generateFixture: generateCapabilityFailureFixture,",
+            "command=\"generateFixture\"",
             "生成 Fixture",
             "capabilityFailureFixtureLoading",
-            "@click=\"replayCapabilityFailureFixture\"",
+            "replayFixture: replayCapabilityFailureFixture,",
+            "command=\"replayFixture\"",
             "验证 Fixture",
             "capabilityFailureFixtureReplayLoading",
-            "@click=\"fetchCapabilityFailureFixtures\"",
+            "refreshFixtures: fetchCapabilityFailureFixtures,",
+            "command=\"refreshFixtures\"",
             "刷新 Fixture 库",
             "capabilityFailureFixtureLibraryLoading",
-            "@click=\"fetchCapabilityFailureFixtureBatchHistory\"",
+            "refreshBatchHistory: fetchCapabilityFailureFixtureBatchHistory,",
+            "command=\"refreshBatchHistory\"",
             "刷新 Replay 历史",
             "capabilityFailureFixtureBatchHistoryLoading",
-            "@click=\"batchReplayCapabilityFailureFixtures\"",
+            "batchReplay: batchReplayCapabilityFailureFixtures,",
+            "command=\"batchReplay\"",
             "批量验证 Fixture",
             "capabilityFailureFixtureBatchReplayLoading",
             "capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'",
@@ -471,7 +485,8 @@ class TestY33CapabilityTracePanel:
             "复制 Replay 摘要",
             "v-for=\"check in capabilityFailureFixtureBatchReplayFailedChecks.slice(0, 6)\"",
             "v-for=\"item in capabilityFailureFixtureBatchReplayItems.slice(0, 6)\"",
-            "@click=\"triggerReplayImport('capability')\"",
+            "importReplay: () => triggerReplayImport('capability'),",
+            "command=\"importReplay\"",
             "Capability 回放模式",
             "<CapabilityTraceList",
             "v-model:filter=\"capabilityTraceFilter\"",
