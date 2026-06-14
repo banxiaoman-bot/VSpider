@@ -1,0 +1,136 @@
+.terminal-log-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.terminal-heading {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.terminal-heading-spacer {
+  flex: 1;
+}
+
+.terminal-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.terminal-search-input {
+  width: 220px;
+}
+
+.terminal-search-count {
+  min-width: 48px;
+  text-align: center;
+  color: var(--vsp-text-muted);
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+.terminal-search-open-btn {
+  font-size: 12px;
+}
+
+.log-line,
+.empty-log {
+  margin: 0;
+  color: var(--vsp-success-vivid);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.empty-log {
+  color: var(--vsp-text-dim-alt);
+}
+
+.log-line--error {
+  color: var(--vsp-danger-vivid);
+}
+
+.log-line--warn {
+  color: var(--vsp-warn);
+}
+
+.log-line--phase {
+  color: var(--vsp-info-200);
+}
+
+.log-line--done {
+  color: var(--vsp-success);
+  font-weight: 600;
+}
+
+.log-line--hitl {
+  color: var(--vsp-purple-400);
+  font-weight: 600;
+}
+
+.log-line--artifact {
+  color: var(--vsp-cyan-300);
+}
+
+.log-line--system {
+  color: var(--vsp-text-muted);
+}
+
+.terminal-search-hit,
+.terminal-search-current {
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.terminal-search-hit {
+  background: rgb(var(--rgb-yellow) / 0.28);
+  color: var(--vsp-warn-pale);
+}
+
+.terminal-search-current {
+  background: var(--vsp-warn-strong);
+  color: var(--vsp-gray-900);
+  box-shadow: 0 0 0 1px rgb(var(--rgb-warn-soft) / 0.7);
+}
+
+.status-pill {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.status-pill.connected {
+  color: var(--vsp-success);
+  background: rgb(var(--rgb-success) / 0.12);
+  border: 1px solid rgb(var(--rgb-success) / 0.3);
+}
+
+.status-pill.connecting {
+  color: var(--vsp-warn);
+  background: rgb(var(--rgb-warn-soft) / 0.12);
+  border: 1px solid rgb(var(--rgb-warn-soft) / 0.3);
+}
+
+.status-pill.disconnected {
+  color: var(--vsp-danger-vivid);
+  background: rgb(var(--rgb-danger) / 0.12);
+  border: 1px solid rgb(var(--rgb-danger) / 0.3);
+}
+
+.terminal-scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 8px 12px;
+  background: var(--vsp-bg-deep);
+  border-radius: 8px;
+  font-family: Consolas, 'JetBrains Mono', monospace;
+}

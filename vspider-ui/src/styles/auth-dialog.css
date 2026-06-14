@@ -1,0 +1,76 @@
+.auth-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.field-group label {
+  color: var(--vsp-text-label);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.field-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.field-title-row label {
+  color: var(--vsp-text-label);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.auth-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+  margin: 4px 0 16px;
+}
+
+.profile-list {
+  padding-top: 14px;
+  border-top: 1px solid var(--vsp-border);
+}
+
+.profile-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.profile-tags button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  color: var(--vsp-text-label);
+  background: var(--vsp-bg);
+  border: 1px solid var(--vsp-border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.profile-tags button:hover {
+  color: var(--vsp-accent);
+  border-color: rgb(var(--rgb-accent) / 0.55);
+}
+
+.profile-tags small,
+.empty-profile {
+  color: var(--vsp-text-faint);
+  font-size: 12px;
+}
+
+.empty-profile {
+  margin: 10px 0 0;
+}

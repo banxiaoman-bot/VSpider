@@ -33,6 +33,8 @@ import CapabilityDiagnosticsPane from './components/CapabilityDiagnosticsPane.vu
 import TimelinePanel from './components/TimelinePanel.vue'
 import FailedRunsPane from './components/FailedRunsPane.vue'
 import FinalAnswerPane from './components/FinalAnswerPane.vue'
+import TerminalLogPane from './components/TerminalLogPane.vue'
+import AuthDialog from './components/AuthDialog.vue'
 import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
@@ -85,14 +87,11 @@ const {
   clear: clearTerminalLogs,
 } = createTerminalLogBuffer({ onFlush: () => { scrollToBottom() } })
 const currentImageBase64 = ref('')
-const terminalRef = ref(null)
+const terminalLogPaneRef = ref(null)
 const wsStatus = ref('connecting')
 
 const authDialogOpen = ref(false)
-const authLoginUrl = ref('')
-const authProfileName = ref('')
 const authProfileOptions = ref([])
-const isAuthRecording = ref(false)
 const selectedModel = ref('backend-default')
 const selectedSemanticModel = ref('backend-default')
 const modelSettingsOpen = ref(false)
@@ -217,10 +216,7 @@ const replayImportTarget = ref('timeline')
 // list of "global" keys: Ctrl+F is only meaningful while the Live
 // Terminal tab is active, and trying to grab it globally would break
 // the user's expectation of the browser's native page-search.
-const terminalSearchVisible = ref(false)
-const terminalSearchQuery = ref('')
-const terminalSearchCurrent = ref(0)
-const terminalSearchInputRef = ref(null)
+
 
 // ── P: Timeline auto-scroll ──
 // timelineRef: reference to the el-scrollbar of the timeline panel.
@@ -519,180 +515,9 @@ const exportFinalAnswerAsMarkdown = () => {
 // "[ERROR" later in the message must NOT recolor a benign line).
 // Matches both legacy tags ("[ERROR]", "[WARN]") and the G2/H1/I phase
 // tags ("[PHASE]", "[PHASE/WARN]", "[PHASE/ERR]").
-function logLineClass(line) {
-  if (!line) return ''
-  const head = String(line).slice(0, 32)
-  if (head.startsWith('[ERROR')) return 'log-line--error'
-  if (head.startsWith('[PHASE/ERR')) return 'log-line--error'
-  if (head.startsWith('[WARN')) return 'log-line--warn'
-  if (head.startsWith('[PHASE/WARN')) return 'log-line--warn'
-  if (head.startsWith('[PHASE]')) return 'log-line--phase'
-  if (head.startsWith('[DONE')) return 'log-line--done'
-  if (head.startsWith('[HITL')) return 'log-line--hitl'
-  if (head.startsWith('[ARTIFACT')) return 'log-line--artifact'
-  if (head.startsWith('[CAPTCHA')) return 'log-line--warn'
-  if (head.startsWith('[SYSTEM')) return 'log-line--system'
-  if (head.startsWith('[AUTH')) return 'log-line--system'
-  return ''
-}
 
-// ── X: Live Terminal in-content search ──────────────────────────────
-//
-// Three computeds form the search pipeline:
-//
-//   terminalSearchActive   → true when the bar is visible AND query
-//                            has at least one non-whitespace char.
-//                            Renders the highlight overlay only when
-//                            this is true; otherwise log lines render
-//                            as plain text (cheaper).
-//
-//   terminalSearchMatches  → flat array of {lineIdx, start, end} in
-//                            the order matches appear (top-to-bottom,
-//                            left-to-right). Drives the "x of y"
-//                            counter and the n / Shift+n nav.
-//
-//   terminalSearchSegments → Map(lineIdx → list of {text, kind})
-//                            consumed by the v-for renderer. ``kind``
-//                            is one of 'plain' | 'hit' | 'current'.
-//
-// We compute matches case-insensitively because users typing "[error"
-// don't want to also type the bracket-aware case. Regex is escaped so
-// literal special chars (.*?+()|^$) don't accidentally match nothing.
-const _escapeRegex = (s) =>
-  String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
-const terminalSearchActive = computed(
-  () => terminalSearchVisible.value
-    && String(terminalSearchQuery.value || '').trim().length > 0,
-)
-
-const terminalSearchMatches = computed(() => {
-  if (!terminalSearchActive.value) return []
-  const q = String(terminalSearchQuery.value).toLowerCase()
-  const out = []
-  for (let li = 0; li < logs.value.length; li += 1) {
-    const line = String(logs.value[li] || '').toLowerCase()
-    if (!q.length) continue
-    let from = 0
-    while (from < line.length) {
-      const idx = line.indexOf(q, from)
-      if (idx === -1) break
-      out.push({ lineIdx: li, start: idx, end: idx + q.length })
-      // Step forward by at least 1 even when the query is empty (shouldn't
-      // happen because of the active guard above, but defensive).
-      from = idx + Math.max(1, q.length)
-    }
-  }
-  return out
-})
-
-const terminalSearchSegments = computed(() => {
-  const map = new Map()
-  if (!terminalSearchActive.value) return map
-  const matches = terminalSearchMatches.value
-  if (!matches.length) return map
-  // Group matches by line for O(N) per-line splitting.
-  const byLine = new Map()
-  for (let i = 0; i < matches.length; i += 1) {
-    const m = matches[i]
-    if (!byLine.has(m.lineIdx)) byLine.set(m.lineIdx, [])
-    byLine.get(m.lineIdx).push({ ...m, gIdx: i })
-  }
-  const cur = terminalSearchCurrent.value
-  for (const [lineIdx, list] of byLine.entries()) {
-    const line = String(logs.value[lineIdx] || '')
-    const segs = []
-    let cursor = 0
-    for (const m of list) {
-      if (m.start > cursor) {
-        segs.push({ text: line.slice(cursor, m.start), kind: 'plain' })
-      }
-      segs.push({
-        text: line.slice(m.start, m.end),
-        kind: m.gIdx === cur ? 'current' : 'hit',
-      })
-      cursor = m.end
-    }
-    if (cursor < line.length) {
-      segs.push({ text: line.slice(cursor), kind: 'plain' })
-    }
-    map.set(lineIdx, segs)
-  }
-  return map
-})
-
-const terminalSearchTotal = computed(() => terminalSearchMatches.value.length)
-
-const openTerminalSearch = () => {
-  terminalSearchVisible.value = true
-  // nextTick + DOM dive: the el-input is rendered conditionally by
-  // v-if, so we have to wait for Vue to mount it before .focus()
-  // can hit a real element.
-  nextTick(() => {
-    const inp = terminalSearchInputRef.value
-    if (!inp) return
-    try {
-      if (typeof inp.focus === 'function') {
-        inp.focus()
-        if (typeof inp.select === 'function') inp.select()
-      } else if (inp.$el && inp.$el.querySelector) {
-        const ta = inp.$el.querySelector('input, textarea')
-        if (ta && typeof ta.focus === 'function') {
-          ta.focus()
-          ta.select()
-        }
-      }
-    } catch (err) {
-      // Quiet — focus failures aren't fatal
-    }
-  })
-}
-
-const closeTerminalSearch = () => {
-  terminalSearchVisible.value = false
-  // Keep the query around so re-opening with Ctrl+F shows the previous
-  // search (matches Chrome/VS Code behavior). Reset the cursor though
-  // so a re-open with stale query lands on the first match.
-  terminalSearchCurrent.value = 0
-}
-
-const terminalSearchNext = () => {
-  const total = terminalSearchTotal.value
-  if (total === 0) return
-  terminalSearchCurrent.value = (terminalSearchCurrent.value + 1) % total
-}
-
-const terminalSearchPrev = () => {
-  const total = terminalSearchTotal.value
-  if (total === 0) return
-  terminalSearchCurrent.value =
-    (terminalSearchCurrent.value - 1 + total) % total
-}
-
-watch(terminalSearchQuery, () => {
-  terminalSearchCurrent.value = 0
-})
-
-// Watch the ref itself (not .length): the log buffer replaces the array on
-// every flush, so this fires even when ring-trim keeps length constant at
-// LOG_LIMIT while matched lines get trimmed away.
-watch(logs, () => {
-  if (terminalSearchCurrent.value >= terminalSearchTotal.value) {
-    terminalSearchCurrent.value = 0
-  }
-})
-
-const scrollToBottom = async () => {
-  await nextTick()
-  const el = terminalRef.value
-  if (!el) return
-  if (typeof el.setScrollTop === 'function') {
-    el.setScrollTop(Number.MAX_SAFE_INTEGER)
-    return
-  }
-  const wrap = el.wrapRef || el
-  if (wrap) wrap.scrollTop = wrap.scrollHeight
-}
+const scrollToBottom = () => terminalLogPaneRef.value?.scrollToBottom()
 
 const connectWebSocket = () => {
   if (isUnmounted) return
@@ -954,77 +779,6 @@ const useAuthProfile = (name) => {
   if (!name) return
   if (!selectedAuthProfiles.value.includes(name)) {
     selectedAuthProfiles.value = [...selectedAuthProfiles.value, name]
-  }
-}
-
-const startManualAuth = async () => {
-  const target = (authLoginUrl.value || url.value).trim()
-  if (!target) {
-    ElMessage.warning('请先填写登录 URL 或目标 URL')
-    return
-  }
-
-  const formData = new FormData()
-  formData.append('target_url', target)
-  if (authProfileName.value.trim()) {
-    formData.append('profile', authProfileName.value.trim())
-  }
-
-  try {
-    const response = await apiFetch('/api/auth/manual/start', {
-      method: 'POST',
-      body: formData,
-    })
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '打开人工登录窗口失败')
-    }
-    isAuthRecording.value = true
-    authProfileName.value = result.profile || authProfileName.value
-    useAuthProfile(result.profile)
-    ElMessage.success('登录窗口已打开')
-    await appendLog(`[AUTH] 登录窗口已打开，完成登录后点击保存: ${result.profile}`)
-  } catch (err) {
-    ElMessage.error(`打开登录窗口失败: ${String(err)}`)
-    await appendLog(`[ERROR] 打开登录窗口失败: ${String(err)}`)
-  }
-}
-
-const saveManualAuth = async () => {
-  try {
-    const response = await apiFetch('/api/auth/manual/save', {
-      method: 'POST',
-    })
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '保存登录态失败')
-    }
-    isAuthRecording.value = false
-    useAuthProfile(result.profile)
-    await loadAuthProfiles()
-    ElMessage.success('登录态已保存')
-    await appendLog(`[AUTH] ${result.message}`)
-  } catch (err) {
-    ElMessage.error(`保存登录态失败: ${String(err)}`)
-    await appendLog(`[ERROR] 保存登录态失败: ${String(err)}`)
-  }
-}
-
-const cancelManualAuth = async () => {
-  try {
-    const response = await apiFetch('/api/auth/manual/cancel', {
-      method: 'POST',
-    })
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '取消登录态录制失败')
-    }
-    isAuthRecording.value = false
-    ElMessage.info('已取消登录态录制')
-    await appendLog(`[AUTH] ${result.message}`)
-  } catch (err) {
-    ElMessage.error(`取消失败: ${String(err)}`)
-    await appendLog(`[ERROR] 取消登录态录制失败: ${String(err)}`)
   }
 }
 
@@ -2862,7 +2616,7 @@ const handleGlobalKeydown = (event) => {
     && (event.key === 'f' || event.key === 'F')
   ) {
     event.preventDefault()
-    openTerminalSearch()
+    terminalLogPaneRef.value?.openTerminalSearch()
     return
   }
 
@@ -2930,20 +2684,20 @@ const handleGlobalKeydown = (event) => {
     }
   }
 
-  if (activeBottomTab.value === 'terminal' && terminalSearchVisible.value) {
+  if (activeBottomTab.value === 'terminal' && terminalLogPaneRef.value?.searchVisible) {
     if (event.key === 'Escape') {
       event.preventDefault()
-      closeTerminalSearch()
+      terminalLogPaneRef.value?.closeTerminalSearch()
       return
     }
     if (event.key === 'Enter' && event.shiftKey) {
       event.preventDefault()
-      terminalSearchPrev()
+      terminalLogPaneRef.value?.terminalSearchPrev()
       return
     }
     if (event.key === 'Enter') {
       event.preventDefault()
-      terminalSearchNext()
+      terminalLogPaneRef.value?.terminalSearchNext()
       return
     }
   }
@@ -3640,85 +3394,13 @@ const settingsSummaryText = computed(() => {
             <template #label>
               <span>实时日志</span>
             </template>
-            <div class="terminal-heading">
-              <span class="status-pill" :class="wsStatus">
-                {{ isRunning ? 'RUNNING' : 'IDLE' }} · {{ wsStatus }}
-              </span>
-              <div class="terminal-heading-spacer" />
-              <div v-if="terminalSearchVisible" class="terminal-search-bar">
-                <el-input
-                  ref="terminalSearchInputRef"
-                  v-model="terminalSearchQuery"
-                  size="small"
-                  clearable
-                  class="terminal-search-input"
-                  placeholder="搜索日志..."
-                  @keydown.enter.prevent="event => event.shiftKey
-                    ? terminalSearchPrev()
-                    : terminalSearchNext()"
-                  @keydown.esc.stop.prevent="closeTerminalSearch"
-                />
-                <span class="terminal-search-count">
-                  {{ terminalSearchTotal
-                    ? `${terminalSearchCurrent + 1}/${terminalSearchTotal}`
-                    : '0/0' }}
-                </span>
-                <el-button
-                  size="small"
-                  plain
-                  :disabled="terminalSearchTotal === 0"
-                  title="上一个匹配 (Shift+Enter)"
-                  @click="terminalSearchPrev"
-                >↑</el-button>
-                <el-button
-                  size="small"
-                  plain
-                  :disabled="terminalSearchTotal === 0"
-                  title="下一个匹配 (Enter)"
-                  @click="terminalSearchNext"
-                >↓</el-button>
-                <el-button
-                  size="small"
-                  plain
-                  title="关闭搜索 (Esc)"
-                  @click="closeTerminalSearch"
-                >关闭</el-button>
-              </div>
-              <el-button
-                v-else
-                size="small"
-                plain
-                class="terminal-search-open-btn"
-                title="搜索 Live Terminal (Ctrl+F)"
-                @click="openTerminalSearch"
-              >搜索</el-button>
-            </div>
-            <el-scrollbar ref="terminalRef" class="terminal-scroll">
-              <p v-if="logsTrimmedCount > 0" class="log-line log-line--system">
-                [SYSTEM] 已裁剪最早 {{ logsTrimmedCount }} 行（完整日志见后端 event_stream.jsonl）
-              </p>
-              <template v-if="logs.length">
-                <p
-                  v-for="(line, idx) in logs"
-                  :key="idx"
-                  class="log-line"
-                  :class="logLineClass(line)"
-                >
-                  <template v-if="terminalSearchSegments.get(idx)">
-                    <span
-                      v-for="(seg, sidx) in terminalSearchSegments.get(idx)"
-                      :key="`${idx}-${sidx}`"
-                      :class="{
-                        'terminal-search-hit': seg.kind === 'hit',
-                        'terminal-search-current': seg.kind === 'current',
-                      }"
-                    >{{ seg.text }}</span>
-                  </template>
-                  <template v-else>{{ line }}</template>
-                </p>
-              </template>
-              <p v-else class="empty-log">等待日志流...</p>
-            </el-scrollbar>
+            <TerminalLogPane
+              ref="terminalLogPaneRef"
+              :logs="logs"
+              :logs-trimmed-count="logsTrimmedCount"
+              :ws-status="wsStatus"
+              :is-running="isRunning"
+            />
           </el-tab-pane>
 
           <el-tab-pane name="timeline">
@@ -4155,88 +3837,14 @@ const settingsSummaryText = computed(() => {
       </div>
     </section>
 
-    <el-dialog
+    <AuthDialog
       v-model="authDialogOpen"
-      title="身份管理"
-      width="560px"
-      class="auth-dialog"
-      destroy-on-close
-    >
-      <div class="auth-dialog-body">
-        <div class="field-group">
-          <label>Login URL</label>
-          <el-input
-            v-model="authLoginUrl"
-            clearable
-            placeholder="留空则使用目标 URL"
-          />
-        </div>
-
-        <div class="field-group">
-          <label>保存为 Profile</label>
-          <el-input
-            v-model="authProfileName"
-            clearable
-            placeholder="例如 zhihu_default / oa_test01"
-          />
-        </div>
-
-        <div class="auth-actions">
-          <el-button
-            type="primary"
-            plain
-            :loading="isAuthRecording"
-            @click="startManualAuth"
-          >
-            打开登录窗口
-          </el-button>
-          <el-button
-            type="success"
-            :disabled="!isAuthRecording"
-            @click="saveManualAuth"
-          >
-            保存 Profile
-          </el-button>
-          <el-button
-            type="warning"
-            plain
-            :disabled="!isAuthRecording"
-            @click="cancelManualAuth"
-          >
-            取消
-          </el-button>
-        </div>
-
-        <div class="profile-list">
-          <div class="field-title-row">
-            <label>已保存 Profiles</label>
-            <el-button text size="small" :icon="Refresh" @click="loadAuthProfiles">
-              刷新
-            </el-button>
-          </div>
-          <div v-if="authProfileOptions.length" class="profile-tags">
-            <button
-              v-for="profileItem in authProfileOptions"
-              :key="profileItem.name"
-              type="button"
-              @click="useAuthProfile(profileItem.name)"
-            >
-              <span>{{ profileItem.name }}</span>
-              <small>
-                {{ profileItem.cookies }} cookies
-                <template v-if="profileItem.cf_clearance">
-                  · CF
-                  <template v-if="profileItem.cf_clearance_expires_in_hours">
-                    ~{{ Math.round(profileItem.cf_clearance_expires_in_hours) }}h
-                  </template>
-                </template>
-              </small>
-            </button>
-          </div>
-          <p v-else class="empty-profile">暂无 profile，先打开登录窗口并保存。</p>
-        </div>
-      </div>
-    </el-dialog>
+      :profile-options="authProfileOptions"
+      :fallback-url="url"
+      @use-profile="useAuthProfile"
+      @reload-profiles="loadAuthProfiles"
+      @log="appendLog"
+    />
 
     <!-- T: Keyboard shortcuts cheat-sheet (Ctrl+/) ───────────────────── -->
     <ShortcutHelpDialog v-model:visible="helpDialogVisible" />
@@ -4466,10 +4074,6 @@ const settingsSummaryText = computed(() => {
 }
 
 
-
-
-
-
 .solver-on {
   color: var(--vsp-accent);
 }
@@ -4653,86 +4257,13 @@ const settingsSummaryText = computed(() => {
   box-shadow: 0 0 24px rgb(var(--rgb-success) / 0.38);
 }
 
-.terminal-scroll {
-  flex: 1;
-  min-height: 0;
-  height: 190px;
-  margin: 0;
-  padding: 12px;
-  border-radius: 8px;
-  background: var(--vsp-surface-sunken);
-  border: 1px solid rgb(var(--rgb-accent) / 0.18);
-  font-family: Consolas, 'JetBrains Mono', 'SFMono-Regular', monospace;
-}
 
 /* ── M: Phase timeline panel ───────────────────────────────────────── */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 .capability-replay-banner {
   margin: 0;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 .capability-scroll {
@@ -4820,39 +4351,12 @@ const settingsSummaryText = computed(() => {
   height: 100%;
 }
 
-.terminal-heading,
 .artifact-toolbar {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
   margin-bottom: 8px;
-}
-
-.terminal-heading-spacer {
-  flex: 1;
-}
-
-.terminal-search-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.terminal-search-input {
-  width: 220px;
-}
-
-.terminal-search-count {
-  min-width: 48px;
-  text-align: center;
-  color: var(--vsp-text-muted);
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 12px;
-}
-
-.terminal-search-open-btn {
-  font-size: 12px;
 }
 
 .artifact-badge {
@@ -4873,27 +4377,6 @@ const settingsSummaryText = computed(() => {
  * full JSON dump. Width is wide enough to keep JSON unwrapped at
  * 80 columns without horizontal scroll for typical traces.
  */
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 .artifact-table {
@@ -4930,123 +4413,6 @@ const settingsSummaryText = computed(() => {
 
 .download-link:hover {
   color: var(--vsp-info-soft);
-}
-
-.log-line,
-.empty-log {
-  margin: 0;
-  color: var(--vsp-success-vivid);
-  font-size: 13px;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.empty-log {
-  color: var(--vsp-text-dim-alt);
-}
-
-/* ── R: Severity-aware coloring for terminal log lines ────────────── */
-/* Default green (.log-line above) is reserved for "successful action"
-   lines emitted by the agent. Tag-prefixed lines override that.        */
-.log-line--error {
-  color: var(--vsp-danger-vivid);
-}
-
-.log-line--warn {
-  color: var(--vsp-warn);
-}
-
-/* phase / info — desaturated blue, distinct from action-success green */
-.log-line--phase {
-  color: var(--vsp-info-200);
-}
-
-.log-line--done {
-  color: var(--vsp-success);
-  font-weight: 600;
-}
-
-.log-line--hitl {
-  color: var(--vsp-purple-400);
-  font-weight: 600;
-}
-
-.log-line--artifact {
-  color: var(--vsp-cyan-300);
-}
-
-.log-line--system {
-  color: var(--vsp-text-muted); /* slate */
-}
-
-.terminal-search-hit,
-.terminal-search-current {
-  border-radius: 2px;
-  padding: 0 1px;
-}
-
-.terminal-search-hit {
-  background: rgb(var(--rgb-yellow) / 0.28);
-  color: var(--vsp-warn-pale);
-}
-
-.terminal-search-current {
-  background: var(--vsp-warn-strong);
-  color: var(--vsp-gray-900);
-  box-shadow: 0 0 0 1px rgb(var(--rgb-warn-soft) / 0.7);
-}
-
-.auth-dialog-body {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.auth-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 10px;
-  margin: 4px 0 16px;
-}
-
-.profile-list {
-  padding-top: 14px;
-  border-top: 1px solid var(--vsp-border);
-}
-
-.profile-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 10px;
-}
-
-.profile-tags button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 9px;
-  color: var(--vsp-text-label);
-  background: var(--vsp-bg);
-  border: 1px solid var(--vsp-border);
-  border-radius: 8px;
-  cursor: pointer;
-}
-
-.profile-tags button:hover {
-  color: var(--vsp-accent);
-  border-color: rgb(var(--rgb-accent) / 0.55);
-}
-
-.profile-tags small,
-.empty-profile {
-  color: var(--vsp-text-faint);
-  font-size: 12px;
-}
-
-.empty-profile {
-  margin: 10px 0 0;
 }
 
 :deep(.el-input__wrapper),
@@ -5089,12 +4455,6 @@ const settingsSummaryText = computed(() => {
 }
 
 /* ── N: Phase event detail dialog ──────────────────────────────────── */
-
-
-
-
-
-
 
 
 /* ── Final Answer 面板 ──
@@ -5161,29 +4521,7 @@ const settingsSummaryText = computed(() => {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 /* 状态 B：Markdown 渲染区 */
-
-
-
-
-
-
-
-
-
 
 
 @keyframes pulse-live {
