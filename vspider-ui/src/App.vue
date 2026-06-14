@@ -30,6 +30,9 @@ import CapabilityEfficiencyPanel from './components/CapabilityEfficiencyPanel.vu
 import CapabilityPlanPane from './components/CapabilityPlanPane.vue'
 import CapabilityReplayPane from './components/CapabilityReplayPane.vue'
 import CapabilityDiagnosticsPane from './components/CapabilityDiagnosticsPane.vue'
+import TimelinePanel from './components/TimelinePanel.vue'
+import FailedRunsPane from './components/FailedRunsPane.vue'
+import FinalAnswerPane from './components/FinalAnswerPane.vue'
 import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
@@ -122,35 +125,8 @@ const browserRuntimeLoading = ref(false)
 // step_count/paths/paths_exist (the last is added by list_failed_runs
 // based on filesystem presence; we use it to grey out the HTML log
 // button when the underlying file was deleted/rotated).
-const failedRunsList = ref([])
-// hasNewFailures: pulse the tab badge dot when a fresh failure lands
-// while the user is on a different tab, mirroring hasNewArtifacts.
 const hasNewFailures = ref(false)
-// failedRunsLoading: prevent overlapping refresh spinners — fetchFailedRuns
-// can be triggered both by the manual Refresh button AND by the WS done
-// handler (success=false), so back-to-back triggers are common.
-const failedRunsLoading = ref(false)
 
-// ── K6: Failed-run detail dialog ──────────────────────────────────
-// Click any row in the 失败记录 table → open a dialog showing all
-// archive fields + a pretty-printed JSON dump + a fetched preview of
-// the related phase events (the historic ``phase_<run_id>.jsonl``).
-//
-//   selectedFailedRun:        the record dict (same shape list endpoint
-//                             returns) currently displayed in the dialog
-//   failedRunDialogVisible:   v-model for the dialog
-//   failedRunPhaseEvents:     fetched phase events array (may be empty
-//                             when the .jsonl file no longer exists)
-//   failedRunPhaseStatus:     'idle' | 'loading' | 'ok' | 'missing' | 'error'
-//                             — drives the preview area's UI state
-//   failedRunPhaseTotal:      total events on disk (>= length of preview)
-//   failedRunPhaseTruncated:  True iff backend hit its tail-only cap
-const selectedFailedRun = ref(null)
-const failedRunDialogVisible = ref(false)
-const failedRunPhaseEvents = ref([])
-const failedRunPhaseStatus = ref('idle')
-const failedRunPhaseTotal = ref(0)
-const failedRunPhaseTruncated = ref(false)
 
 // ── M: Phase timeline ──
 // phaseEvents: list of {type, phase, severity, message, step, duration_ms,
@@ -185,8 +161,6 @@ const PHASE_LIMIT = 500
 // ── N: Phase event detail dialog ──
 // Click a timeline chip → open a dialog with the full event payload
 // (pretty-printed JSON + key fields summary).
-const phaseDialogVisible = ref(false)
-const selectedPhaseEvent = ref(null)
 
 // ── T: Keyboard shortcuts ─────────────────────────────────────────
 // helpDialogVisible: toggled by Ctrl+/ — shows a cheat-sheet table.
@@ -228,6 +202,8 @@ const phaseStatsSortBy = ref('count')
 const replayMode = ref(false)
 const replaySourceName = ref('')
 const replayInputRef = ref(null)
+const timelinePanelRef = ref(null)
+const failedRunsPaneRef = ref(null)
 const replayImportTarget = ref('timeline')
 
 // X: Live Terminal in-content search ──────────────────────────────────
@@ -762,7 +738,7 @@ const connectWebSocket = () => {
         // isn't already viewing the panel. Fire-and-forget — we don't
         // await it so the rest of the done-handler stays responsive.
         if (payload.success === false) {
-          fetchFailedRuns()
+          failedRunsPaneRef.value?.fetchFailedRuns()
           if (activeBottomTab.value !== 'failed') {
             hasNewFailures.value = true
           }
@@ -849,7 +825,7 @@ const connectWebSocket = () => {
         // them where they are and let the floating "回到底部" button
         // bring them back manually.
         if (timelineAutoScroll.value && activeBottomTab.value === 'timeline') {
-          await scrollTimelineToBottom()
+          await timelinePanelRef.value?.scrollToBottom()
         }
         return
       }
@@ -938,220 +914,6 @@ const loadCaptchaSolverStatus = async () => {
   } catch (err) {
     // non-critical
     console.warn('[captcha_solver] status fetch failed:', err)
-  }
-}
-
-// ── K3: failed-runs fetch helpers ─────────────────────────────────────
-// Backend returns {status, count, items}. Items already arrive newest-
-// first courtesy of failure_archive.list_failed_runs.
-const fetchFailedRuns = async () => {
-  if (failedRunsLoading.value) return
-  failedRunsLoading.value = true
-  try {
-    const response = await apiFetch('/api/failed_runs?limit=50')
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '加载失败 run 列表失败')
-    }
-    failedRunsList.value = Array.isArray(result.items) ? result.items : []
-    if (activeBottomTab.value === 'failed') {
-      hasNewFailures.value = false
-    }
-  } catch (err) {
-    // Quiet: this panel is non-critical and the API is brand new (K2).
-    // A fetch failure shouldn't surface a toast each time the WS reconnects.
-    // eslint-disable-next-line no-console
-    console.warn('[failed_runs] fetch failed:', err)
-  } finally {
-    failedRunsLoading.value = false
-  }
-}
-
-// Format a unix-epoch ts (seconds, possibly fractional) as
-// "MM-DD HH:MM:SS" — short enough for the table column, still
-// unambiguous within a year. Falls back to '—' on bad input.
-const formatFailedRunTime = (ts) => {
-  if (!Number.isFinite(ts)) return '—'
-  try {
-    const d = new Date(ts * 1000)
-    const pad = (n) => String(n).padStart(2, '0')
-    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
-      + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  } catch (err) {
-    return '—'
-  }
-}
-
-// Format duration_s as "12.3s" / "1m24s" / "—". Keep it terse so the
-// column doesn't blow out on long runs.
-const formatFailedRunDuration = (sec) => {
-  if (!Number.isFinite(sec) || sec < 0) return '—'
-  if (sec < 60) return `${sec.toFixed(1)}s`
-  const m = Math.floor(sec / 60)
-  const s = Math.round(sec - m * 60)
-  return `${m}m${String(s).padStart(2, '0')}s`
-}
-
-// Open the HTML trajectory log for a failed run in a new browser tab.
-// FastAPI route is /api/failed_runs/{run_id}/log — it 404s if the file
-// was deleted, in which case we fall back to a friendly message instead
-// of the raw "Detail" JSON body.
-const openFailedRunLog = (rec) => {
-  if (!rec || !rec.run_id) return
-  // Defensive: if the backend already told us the log is gone, don't
-  // even open the tab — show a toast.
-  const exists = rec.paths_exist && rec.paths_exist.html_log
-  if (exists === false) {
-    ElMessage.warning('HTML 日志文件已被清理，无法打开')
-    return
-  }
-  const url = `${API_BASE}/api/failed_runs/${encodeURIComponent(rec.run_id)}/log`
-  window.open(url, '_blank', 'noopener')
-}
-
-// ── K6: failed-run detail dialog helpers ──────────────────────────────
-
-// Pretty-print the currently-selected record's JSON. Two-space indent
-// matches the on-disk archive format so a copy from this dialog is a
-// drop-in for ``cat runs/failed/<id>.json | jq .``.
-const selectedFailedRunJson = computed(() => {
-  if (!selectedFailedRun.value) return ''
-  try {
-    return JSON.stringify(selectedFailedRun.value, null, 2)
-  } catch (err) {
-    return String(err)
-  }
-})
-
-// Fetch the historic phase events for this run from the K6 backend
-// endpoint. Best-effort: a 404 means the .jsonl file was rotated /
-// cleared, which we surface via failedRunPhaseStatus='missing' (not
-// 'error') so the UI shows a friendly "已被清理" message instead of a
-// red banner.
-const fetchFailedRunPhaseEvents = async (rec) => {
-  if (!rec || !rec.run_id) {
-    failedRunPhaseStatus.value = 'idle'
-    failedRunPhaseEvents.value = []
-    return
-  }
-  // Skip the request entirely when paths_exist already says no.
-  const exists = rec.paths_exist && rec.paths_exist.phase_jsonl
-  if (exists === false) {
-    failedRunPhaseStatus.value = 'missing'
-    failedRunPhaseEvents.value = []
-    failedRunPhaseTotal.value = 0
-    failedRunPhaseTruncated.value = false
-    return
-  }
-  failedRunPhaseStatus.value = 'loading'
-  failedRunPhaseEvents.value = []
-  failedRunPhaseTotal.value = 0
-  failedRunPhaseTruncated.value = false
-  try {
-    const url = `${API_BASE}/api/failed_runs/${encodeURIComponent(rec.run_id)}/phase_events?limit=200`
-    const response = await fetch(url)
-    if (response.status === 404) {
-      failedRunPhaseStatus.value = 'missing'
-      return
-    }
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.detail || result.message || '加载 phase 事件失败')
-    }
-    failedRunPhaseEvents.value = Array.isArray(result.events) ? result.events : []
-    failedRunPhaseTotal.value = Number.isFinite(result.total) ? result.total : 0
-    failedRunPhaseTruncated.value = Boolean(result.truncated)
-    failedRunPhaseStatus.value = 'ok'
-  } catch (err) {
-    // Quiet the console — this panel is non-critical. Display the
-    // error inside the dialog instead of bubbling a toast that would
-    // distract from the JSON the user already came here to read.
-    // eslint-disable-next-line no-console
-    console.warn('[failed_runs] phase events fetch failed:', err)
-    failedRunPhaseStatus.value = 'error'
-  }
-}
-
-// Open the detail dialog for a clicked row. Idempotent — calling it
-// with the same rec just refreshes the phase preview, which is what the
-// "刷新" button in the dialog does.
-const openFailedRunDetail = (rec) => {
-  if (!rec) return
-  selectedFailedRun.value = rec
-  failedRunDialogVisible.value = true
-  fetchFailedRunPhaseEvents(rec)
-}
-
-const closeFailedRunDetail = () => {
-  failedRunDialogVisible.value = false
-  // Don't clear selectedFailedRun immediately — the dialog's close
-  // transition reads it while fading out. Vue handles the GC.
-}
-
-// Prev/next navigation within the dialog so the user can step through
-// the failure list without closing+reopening. Uses the current order of
-// failedRunsList (already newest-first per the backend).
-const _findCurrentFailedRunIndex = () => {
-  const cur = selectedFailedRun.value
-  if (!cur) return -1
-  const list = failedRunsList.value
-  let idx = list.indexOf(cur)
-  if (idx !== -1) return idx
-  // Fall back to run_id match for cases where the list was refetched
-  // (object identity changes even though it's the same logical record).
-  const curRid = cur.run_id
-  for (let i = 0; i < list.length; i += 1) {
-    if (list[i] && list[i].run_id === curRid) return i
-  }
-  return -1
-}
-
-const goToPrevFailedRun = () => {
-  const list = failedRunsList.value
-  if (!list.length) return
-  const idx = _findCurrentFailedRunIndex()
-  const next = idx <= 0 ? list.length - 1 : idx - 1
-  openFailedRunDetail(list[next])
-}
-
-const goToNextFailedRun = () => {
-  const list = failedRunsList.value
-  if (!list.length) return
-  const idx = _findCurrentFailedRunIndex()
-  const next = idx === -1 || idx >= list.length - 1 ? 0 : idx + 1
-  openFailedRunDetail(list[next])
-}
-
-// Copy the selected record's JSON to clipboard. Same fallback chain
-// as copyPhaseJson + the F1 Final Answer copy button.
-const copyFailedRunJson = async () => {
-  const text = selectedFailedRunJson.value
-  if (!text) return
-  const ok = await _writeToClipboard(text)
-  if (ok) {
-    ElMessage.success('已复制 JSON')
-  } else {
-    ElMessage.error('复制失败：浏览器拒绝了剪贴板写入')
-  }
-}
-
-// Helpers shared with the phase preview list. We keep them tiny so the
-// template stays declarative.
-const formatPhasePreviewSeverity = (sev) => {
-  const s = String(sev || 'info').toLowerCase()
-  if (s === 'warn' || s === 'warning') return 'warn'
-  if (s === 'error' || s === 'err') return 'error'
-  return 'info'
-}
-
-const formatPhasePreviewTs = (ts) => {
-  if (!Number.isFinite(ts)) return ''
-  try {
-    const d = new Date(ts * 1000)
-    const pad = (n) => String(n).padStart(2, '0')
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  } catch (err) {
-    return ''
   }
 }
 
@@ -2246,47 +2008,6 @@ const clearPhaseEvents = () => {
 // Honors the active filter (severity/phase exclude) so the user gets
 // exactly what they see. Strip the synthetic _ts field (added by M for
 // internal use) so the file contains only over-the-wire payloads.
-// Empty buffer → no-op + toast.
-const exportPhaseEventsAsJsonl = () => {
-  const src = filteredPhaseEvents.value
-  if (!src.length) {
-    ElMessage.warning('当前没有可导出的 phase 事件')
-    return
-  }
-  const lines = []
-  for (const e of src) {
-    const clone = {}
-    for (const k of Object.keys(e)) {
-      if (k === '_ts') continue
-      clone[k] = e[k]
-    }
-    try {
-      lines.push(JSON.stringify(clone))
-    } catch (err) {
-      // Skip un-serializable events but don't abort the whole export
-      lines.push(JSON.stringify({ phase: 'unknown', error: String(err) }))
-    }
-  }
-  const ts = new Date()
-  const stamp =
-    `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}` +
-    `${String(ts.getDate()).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}` +
-    `${String(ts.getMinutes()).padStart(2, '0')}${String(ts.getSeconds()).padStart(2, '0')}`
-  // Trailing newline keeps tools like `jq -c` and pandas.read_json(lines=True) happy
-  const blob = new Blob([lines.join('\n') + '\n'], {
-    type: 'application/x-ndjson;charset=utf-8',
-  })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `phase_events_${stamp}.jsonl`
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-  ElMessage.success(`已导出 ${lines.length} 条事件`)
-}
-
 const exportCapabilityTraceAsJsonl = () => {
   const src = capabilityTraceEvents.value
   if (!src.length) {
@@ -2934,6 +2655,28 @@ const exitReplayMode = () => {
   ElMessage.info('已退出回放模式')
 }
 
+const handleTimelineImportReplay = (rawText, filename) => {
+  const { events, total, bad } = _parseJsonlText(rawText)
+  if (events.length === 0) {
+    ElMessage.warning('文件中没有可识别的 phase 事件')
+    return
+  }
+  for (const e of events) {
+    if (typeof e._ts !== 'number') e._ts = Number.isFinite(e.ts) ? e.ts : Date.now() / 1000
+  }
+  phaseEvents.value = events
+  replayMode.value = true
+  replaySourceName.value = filename
+  phaseFilterExclude.value = new Set()
+  severityFilterExclude.value = new Set()
+  setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')
+  if (bad > 0) {
+    ElMessage.warning(`已导入 ${events.length} / ${total} 条事件（跳过 ${bad} 行损坏数据）`)
+  } else {
+    ElMessage.success(`已导入 ${events.length} 条事件，进入回放模式`)
+  }
+}
+
 // ── P: Timeline scroll helpers ─────────────────────────────────────────
 // Get the inner wrap element of el-scrollbar so we can read scrollTop /
 // scrollHeight / clientHeight directly. el-scrollbar exposes wrapRef in
@@ -2992,31 +2735,7 @@ const onTimelineScroll = () => {
   timelineAutoScroll.value = _isAtBottom(wrap)
 }
 
-// ── N: Phase event detail dialog helpers ─────────────────────────────
-// openPhaseDialog: assign the chip's event to selectedPhaseEvent and show
-// the modal. Always pass a structured-clone-friendly object (raw payload
-// is already a plain dict from JSON.parse).
-const openPhaseDialog = (evt) => {
-  selectedPhaseEvent.value = evt || null
-  phaseDialogVisible.value = !!evt
-}
-
-// ── S: Timeline chip double-click → copy JSON shortcut ────────────────
-// Power-user affordance: dbl-click a chip and we copy its full event JSON
-// straight to the clipboard, skipping the dialog. Single-click still opens
-// the dialog. Browser's native click handler fires BEFORE dblclick, so we
-// defer single-click dialog-open by 220 ms; if a second click arrives in
-// that window we cancel the open and do the copy instead.
-//
-// The 220 ms threshold matches typical OS-level double-click windows
-// (Windows default = 500 ms but most users tap much faster); a longer
-// delay would make the single-click feel sluggish.
-const _CHIP_DBLCLICK_WINDOW_MS = 220
-let _chipClickTimer = null
-
-// Build the same _ts-stripped JSON string the dialog body uses, but for an
-// ARBITRARY event (the dialog's selectedPhaseJson computed is tied to
-// selectedPhaseEvent). Returns '' on bad input.
+// Build the same _ts-stripped JSON string for an arbitrary event.
 const buildPhaseEventJsonString = (evt) => {
   if (!evt || typeof evt !== 'object') return ''
   const clone = {}
@@ -3052,92 +2771,6 @@ const _writeToClipboard = async (text) => {
   }
 }
 
-const onChipClick = (evt) => {
-  // Defer the dialog open; dblclick handler may cancel us.
-  if (_chipClickTimer) {
-    clearTimeout(_chipClickTimer)
-    _chipClickTimer = null
-  }
-  _chipClickTimer = setTimeout(() => {
-    _chipClickTimer = null
-    openPhaseDialog(evt)
-  }, _CHIP_DBLCLICK_WINDOW_MS)
-}
-
-const onChipDblClick = async (evt) => {
-  // Suppress the pending single-click dialog-open.
-  if (_chipClickTimer) {
-    clearTimeout(_chipClickTimer)
-    _chipClickTimer = null
-  }
-  const text = buildPhaseEventJsonString(evt)
-  if (!text) return
-  const ok = await _writeToClipboard(text)
-  if (ok) {
-    // Short toast — explicit "dblclick" word so the user learns the gesture
-    // is intentional (vs. assuming they triggered a duplicate by accident).
-    const phaseName = String(evt && evt.phase || 'phase')
-    ElMessage.success(`已复制 ${phaseName} 事件 JSON (双击)`)
-  }
-}
-
-// Pretty JSON for the dialog body. Strips the internal _ts field so the
-// user only sees what actually came over the wire.
-const selectedPhaseJson = computed(() => {
-  const e = selectedPhaseEvent.value
-  if (!e) return ''
-  // Shallow-copy and drop the synthetic _ts key
-  const clone = {}
-  for (const k of Object.keys(e)) {
-    if (k === '_ts') continue
-    clone[k] = e[k]
-  }
-  try {
-    return JSON.stringify(clone, null, 2)
-  } catch (err) {
-    return String(err)
-  }
-})
-
-// Human-readable timestamp for the dialog header. Falls back to '—'
-// when ts is missing or invalid.
-const selectedPhaseTime = computed(() => {
-  const e = selectedPhaseEvent.value
-  const ts = e && Number.isFinite(e.ts) ? e.ts : null
-  if (ts == null) return '—'
-  try {
-    const d = new Date(ts * 1000)
-    // YYYY-MM-DD HH:MM:SS.mmm
-    const pad = (n, w = 2) => String(n).padStart(w, '0')
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
-      + `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-      + `.${pad(d.getMilliseconds(), 3)}`
-  } catch (err) {
-    return '—'
-  }
-})
-
-// Copy the full JSON to clipboard. Same fallback chain as the F1 Final
-// Answer copy button (clipboard API → execCommand → manual textarea).
-const copyPhaseJson = async () => {
-  const text = selectedPhaseJson.value
-  if (!text) return
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    ElMessage.success('已复制 JSON')
-  } catch (err) {
-    ElMessage.error(`复制失败: ${String(err)}`)
-  }
-}
 
 // ── T: Keyboard shortcuts dispatcher ──────────────────────────────────
 // A single window-level keydown listener routes to handlers based on the
@@ -3174,7 +2807,7 @@ const setActiveBottomTab = (name) => {
   if (name === 'final') hasNewFinalAnswer.value = false
   if (name === 'timeline') {
     hasNewPhase.value = false
-    if (timelineAutoScroll.value) scrollTimelineToBottom()
+    if (timelineAutoScroll.value) timelinePanelRef.value?.scrollToBottom()
   }
   if (name === 'capability') hasNewCapability.value = false
   if (name === 'failed') hasNewFailures.value = false
@@ -3198,47 +2831,6 @@ const focusPromptInput = () => {
     // Quiet — focus failures are non-fatal and almost always mean the
     // input was unmounted between scheduling and dispatch.
   }
-}
-
-// Phase event navigation in the JSON detail dialog.
-// Uses filteredPhaseEvents (the same view the user sees) so ←/→ skips
-// over events the user has hidden via O's phase/severity filters.
-const _findCurrentEventIndex = () => {
-  const cur = selectedPhaseEvent.value
-  if (!cur) return -1
-  const list = filteredPhaseEvents.value
-  // Identity match first (same object ref) — fast path when the dialog
-  // was opened from the visible chip list.
-  let idx = list.indexOf(cur)
-  if (idx !== -1) return idx
-  // Fall back to ts + phase match (covers re-render cases where the
-  // proxy identity changed but the underlying event is the same).
-  const curTs = cur.ts
-  const curPhase = cur.phase
-  for (let i = 0; i < list.length; i += 1) {
-    const e = list[i]
-    if (e && e.ts === curTs && e.phase === curPhase) return i
-  }
-  return -1
-}
-
-const goToPrevPhaseEvent = () => {
-  const list = filteredPhaseEvents.value
-  if (!list.length) return
-  const idx = _findCurrentEventIndex()
-  // If current event isn't in the filtered list, idx === -1 → land on
-  // the LAST event (treat ← as "show me the newest").
-  const next = idx <= 0 ? list.length - 1 : idx - 1
-  selectedPhaseEvent.value = list[next]
-}
-
-const goToNextPhaseEvent = () => {
-  const list = filteredPhaseEvents.value
-  if (!list.length) return
-  const idx = _findCurrentEventIndex()
-  // idx === -1 → land on the FIRST event (treat → as "show me the oldest").
-  const next = idx === -1 || idx >= list.length - 1 ? 0 : idx + 1
-  selectedPhaseEvent.value = list[next]
 }
 
 // Should the current focus suppress global shortcuts? True when the user
@@ -3307,15 +2899,15 @@ const handleGlobalKeydown = (event) => {
   }
 
   // ── Phase dialog navigation: ← / → between events ──
-  if (phaseDialogVisible.value) {
+  if (timelinePanelRef.value?.phaseDialogVisible) {
     if (event.key === 'ArrowLeft') {
       event.preventDefault()
-      goToPrevPhaseEvent()
+      timelinePanelRef.value?.goToPrevPhaseEvent()
       return
     }
     if (event.key === 'ArrowRight') {
       event.preventDefault()
-      goToNextPhaseEvent()
+      timelinePanelRef.value?.goToNextPhaseEvent()
       return
     }
   }
@@ -3325,15 +2917,15 @@ const handleGlobalKeydown = (event) => {
   // keep this branch separate (not unified with phaseDialog) because
   // the two dialogs are mutually exclusive in practice and combining
   // them would obscure which list is being navigated.
-  if (failedRunDialogVisible.value) {
+  if (failedRunsPaneRef.value?.failedRunDialogVisible) {
     if (event.key === 'ArrowLeft') {
       event.preventDefault()
-      goToPrevFailedRun()
+      failedRunsPaneRef.value?.goToPrevFailedRun()
       return
     }
     if (event.key === 'ArrowRight') {
       event.preventDefault()
-      goToNextFailedRun()
+      failedRunsPaneRef.value?.goToNextFailedRun()
       return
     }
   }
@@ -3367,13 +2959,13 @@ const handleGlobalKeydown = (event) => {
     // End: jump to bottom + resume auto-follow
     if (event.key === 'End' && !primary) {
       event.preventDefault()
-      scrollTimelineToBottom()
+      timelinePanelRef.value?.scrollToBottom()
       return
     }
     // Home: jump to top + pause auto-follow
     if (event.key === 'Home' && !primary) {
       event.preventDefault()
-      scrollTimelineToTop()
+      timelinePanelRef.value?.scrollToTop()
       return
     }
   }
@@ -3546,7 +3138,7 @@ onMounted(() => {
   fetchBrowserRuntimeStatus()
   // K3: seed the failed-runs drawer with historic records so the
   // tab is informative even before the user runs anything in this session.
-  fetchFailedRuns()
+  failedRunsPaneRef.value?.fetchFailedRuns()
   // T: register the global keyboard shortcut dispatcher. ``window`` (not
   // document) so the listener fires regardless of which element has
   // focus and even when the page has a click-outside-the-app gesture.
@@ -3566,10 +3158,6 @@ onUnmounted(() => {
   // S: cancel any pending Timeline chip single-click dialog-open so the
   // callback doesn't fire after the component is gone (would touch
   // selectedPhaseEvent/phaseDialogVisible refs and crash on detached state).
-  if (_chipClickTimer) {
-    clearTimeout(_chipClickTimer)
-    _chipClickTimer = null
-  }
   // U: cancel the pending output-contract preview debounce so its callback
   // can't fire after unmount (it issues a fetch and writes refs on a now
   // detached component).
@@ -3604,14 +3192,6 @@ const handleCapabilityMoreAction = (command) => {
   handlers[command]?.()
 }
 
-const handleTimelineMoreAction = (command) => {
-  const handlers = {
-    exportJsonl: exportPhaseEventsAsJsonl,
-    importReplay: () => triggerReplayImport('timeline'),
-    clear: clearPhaseEvents,
-  }
-  handlers[command]?.()
-}
 // C2: 抽屉关闭时在左栏回显当前配置概要
 const settingsSummaryText = computed(() => {
   const identity = selectedAuthProfiles.value.length
@@ -4047,7 +3627,7 @@ const settingsSummaryText = computed(() => {
               // P: when re-entering the Timeline tab, snap to bottom if
               // auto-scroll is still on so the user lands on the freshest
               // events instead of stale earlier-step rows.
-              if (timelineAutoScroll) scrollTimelineToBottom()
+              if (timelineAutoScroll) timelinePanelRef.value?.scrollToBottom()
             }
             // K3: clear the failures badge dot when the user actually
             // opens the panel. We don't auto-refresh here — the user can
@@ -4141,344 +3721,21 @@ const settingsSummaryText = computed(() => {
             </el-scrollbar>
           </el-tab-pane>
 
-          <!-- M: Phase timeline panel — chip per phase event, grouped by step -->
           <el-tab-pane name="timeline">
             <template #label>
               <el-badge :is-dot="hasNewPhase" class="artifact-badge">
                 <span>时间线</span>
               </el-badge>
             </template>
-            <div class="timeline-panel">
-              <div class="timeline-toolbar">
-                <span class="timeline-summary">
-                  <strong>{{ phaseSummary.total }}</strong>
-                  <span v-if="phaseFilterActive" class="timeline-filter-frac">
-                    / {{ phaseEvents.length }}
-                  </span>
-                  events
-                  <span v-if="phaseSummary.warn" class="timeline-warn-pill">
-                    {{ phaseSummary.warn }} warn
-                  </span>
-                  <span v-if="phaseSummary.error" class="timeline-err-pill">
-                    {{ phaseSummary.error }} err
-                  </span>
-                </span>
-                <div class="timeline-toolbar-spacer" />
-                <el-button
-                  v-if="phaseFilterActive"
-                  size="small"
-                  plain
-                  class="timeline-clear-btn"
-                  @click="resetPhaseFilters"
-                >
-                  重置筛选
-                </el-button>
-                <el-button
-                  v-if="phaseEvents.length"
-                  size="small"
-                  plain
-                  class="timeline-clear-btn"
-                  :class="{ 'is-active': phaseStatsExpanded }"
-                  :title="phaseStatsExpanded
-                    ? '收起 phase 统计面板'
-                    : '展开 phase 统计面板（耗时分布 / 严重度细分）'"
-                  @click="phaseStatsExpanded = !phaseStatsExpanded"
-                >
-                  统计 {{ phaseStatsExpanded ? '▴' : '▾' }}
-                </el-button>
-                <el-button
-                  v-if="phaseEvents.length"
-                  size="small"
-                  plain
-                  class="timeline-clear-btn"
-                  :class="{ 'is-active': timelineFiltersExpanded }"
-                  :title="timelineFiltersExpanded ? '收起筛选条件' : '展开 severity / phase 筛选'"
-                  @click="timelineFiltersExpanded = !timelineFiltersExpanded"
-                >
-                  筛选 {{ timelineFiltersExpanded ? '▴' : '▾' }}
-                </el-button>
-                <el-dropdown
-                  trigger="click"
-                  @command="handleTimelineMoreAction"
-                >
-                  <el-button size="small" plain class="timeline-clear-btn">
-                    更多 ⋯
-                  </el-button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <el-dropdown-item command="exportJsonl" :disabled="!phaseEvents.length">
-                        导出 JSONL
-                      </el-dropdown-item>
-                      <el-dropdown-item command="importReplay">
-                        导入回放
-                      </el-dropdown-item>
-                      <el-dropdown-item command="clear" divided :disabled="!phaseEvents.length">
-                        清空
-                      </el-dropdown-item>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
-                <input
-                  ref="replayInputRef"
-                  type="file"
-                  accept=".jsonl,.json,application/x-ndjson,text/plain"
-                  class="replay-file-input"
-                  @change="handleReplayFileChange"
-                />
-              </div>
-              <!-- O: phase + severity filter chips. Click to toggle in/out. -->
-              <div
-                v-if="phaseEvents.length && (timelineFiltersExpanded || phaseFilterActive)"
-                class="timeline-filter-row"
-              >
-                <div
-                  v-if="severityFilterOptions.length > 1"
-                  class="timeline-filter-group"
-                >
-                  <span class="timeline-filter-label">severity</span>
-                  <button
-                    v-for="opt in severityFilterOptions"
-                    :key="'sev-' + opt.severity"
-                    type="button"
-                    class="timeline-filter-pill"
-                    :class="['sev-' + opt.severity, {
-                      'is-off': severityFilterExclude.has(opt.severity),
-                    }]"
-                    @click="toggleSeverityFilter(opt.severity)"
-                  >
-                    {{ opt.severity }}
-                    <span class="timeline-filter-pill-count">{{ opt.count }}</span>
-                  </button>
-                </div>
-                <div class="timeline-filter-group">
-                  <span class="timeline-filter-label">phase</span>
-                  <button
-                    v-for="opt in phaseFilterOptions"
-                    :key="'phase-' + opt.phase"
-                    type="button"
-                    class="timeline-filter-pill"
-                    :class="{ 'is-off': phaseFilterExclude.has(opt.phase) }"
-                    @click="togglePhaseFilter(opt.phase)"
-                  >
-                    {{ opt.phase }}
-                    <span class="timeline-filter-pill-count">{{ opt.count }}</span>
-                  </button>
-                </div>
-              </div>
-
-              <!-- V: Phase histogram / stats panel ─────────────────
-                   Toggled by the toolbar "统计 ▾" button. Reuses the
-                   same exclude-set semantics as the chip row (clicking
-                   a phase row toggles its filter), so this is "the
-                   filter chips with extra detail" rather than a
-                   separate UI surface. -->
-              <div
-                v-if="phaseStatsExpanded && phaseEvents.length"
-                class="timeline-stats-panel"
-              >
-                <header class="timeline-stats-header">
-                  <span class="timeline-stats-title">Phase 耗时分布</span>
-                  <span class="timeline-stats-sort-label">排序</span>
-                  <button
-                    v-for="key in ['count', 'mean', 'p95', 'max']"
-                    :key="`sort-${key}`"
-                    type="button"
-                    class="timeline-stats-sort-btn"
-                    :class="{ 'is-active': phaseStatsSortBy === key }"
-                    @click="phaseStatsSortBy = key"
-                  >
-                    {{ key }}
-                  </button>
-                </header>
-                <div class="timeline-stats-grid">
-                  <div class="timeline-stats-grid-head">
-                    <span>phase</span>
-                    <span>分布</span>
-                    <span class="num">count</span>
-                    <span class="num">mean</span>
-                    <span class="num">p50</span>
-                    <span class="num">p95</span>
-                    <span class="num">max</span>
-                    <span>severity</span>
-                  </div>
-                  <button
-                    v-for="row in phaseStatsSorted"
-                    :key="`stat-${row.phase}`"
-                    type="button"
-                    class="timeline-stats-row"
-                    :class="{ 'is-off': phaseFilterExclude.has(row.phase) }"
-                    :title="phaseFilterExclude.has(row.phase)
-                      ? `点击重新显示 ${row.phase}`
-                      : `点击隐藏 ${row.phase}`"
-                    @click="togglePhaseFilter(row.phase)"
-                  >
-                    <span class="stat-phase">{{ row.phase }}</span>
-                    <svg
-                      class="stat-spark"
-                      viewBox="0 0 100 24"
-                      preserveAspectRatio="none"
-                      aria-hidden="true"
-                    >
-                      <path
-                        v-if="row.durations && row.durations.length"
-                        :d="phaseSparklinePath(row.durations)"
-                        fill="currentColor"
-                      />
-                      <text
-                        v-else
-                        x="50"
-                        y="16"
-                        text-anchor="middle"
-                        class="stat-spark-empty"
-                      >no duration</text>
-                    </svg>
-                    <span class="num">{{ row.count }}</span>
-                    <span class="num">{{ formatPhaseStatMs(row.mean) }}</span>
-                    <span class="num">{{ formatPhaseStatMs(row.p50) }}</span>
-                    <span class="num">{{ formatPhaseStatMs(row.p95) }}</span>
-                    <span class="num">{{ formatPhaseStatMs(row.max) }}</span>
-                    <span class="stat-sev">
-                      <span
-                        v-if="row.sevCounts.error"
-                        class="stat-sev-pill sev-error"
-                        :title="`${row.sevCounts.error} 条 error`"
-                      >{{ row.sevCounts.error }}E</span>
-                      <span
-                        v-if="row.sevCounts.warn"
-                        class="stat-sev-pill sev-warn"
-                        :title="`${row.sevCounts.warn} 条 warn`"
-                      >{{ row.sevCounts.warn }}W</span>
-                      <span
-                        v-if="row.sevCounts.info"
-                        class="stat-sev-pill sev-info"
-                        :title="`${row.sevCounts.info} 条 info`"
-                      >{{ row.sevCounts.info }}I</span>
-                    </span>
-                  </button>
-                </div>
-                <p class="timeline-stats-footnote">
-                  分布柱状图按时间顺序展示该 phase 每次执行的耗时；高度归一到本 phase 的最大值。点击行可切换该 phase 在 Timeline 的显示。
-                </p>
-              </div>
-
-              <!-- W: Replay-mode banner ───────────────────────────────
-                   Indicates that the Timeline is showing imported
-                   events instead of live WS data, and offers a button
-                   to bail out. We don't auto-hide this — staying in
-                   replay should be a sticky decision the user owns. -->
-              <div v-if="replayMode" class="timeline-replay-banner">
-                <span class="replay-icon" aria-hidden="true">▶</span>
-                <span class="replay-text">
-                  回放模式
-                  <span v-if="replaySourceName" class="replay-source">
-                    · {{ replaySourceName }}
-                  </span>
-                </span>
-                <el-button
-                  size="small"
-                  plain
-                  class="replay-exit-btn"
-                  title="退出回放，清空 Timeline 并重新接收实时事件"
-                  @click="exitReplayMode"
-                >退出回放</el-button>
-              </div>
-
-              <div v-if="completionEvidence" class="completion-evidence-panel">
-                <div class="completion-evidence-panel__head">
-                  <strong>完成判定</strong>
-                  <el-tag
-                    size="small"
-                    :type="completionEvidence.status === 'complete' ? 'success' : 'warning'"
-                  >
-                    {{ completionEvidence.guard }}
-                  </el-tag>
-                </div>
-                <p v-if="completionEvidence.message" class="completion-evidence-panel__msg">
-                  {{ completionEvidence.message }}
-                </p>
-                <div v-if="completionEvidence.evidence.length" class="completion-evidence-panel__row">
-                  <span class="completion-evidence-panel__label">证据</span>
-                  <span>{{ completionEvidence.evidence.join(' · ') }}</span>
-                </div>
-                <div v-if="completionEvidence.reasons.length" class="completion-evidence-panel__row">
-                  <span class="completion-evidence-panel__label">原因</span>
-                  <span>{{ completionEvidence.reasons.join(' · ') }}</span>
-                </div>
-                <div
-                  v-if="completionEvidence.streak != null"
-                  class="completion-evidence-panel__row"
-                >
-                  <span class="completion-evidence-panel__label">无进展 streak</span>
-                  <span>{{ completionEvidence.streak }}</span>
-                </div>
-              </div>
-
-              <el-scrollbar
-                ref="timelineRef"
-                class="timeline-scroll"
-                @scroll="onTimelineScroll"
-              >
-                <p v-if="!phaseEvents.length" class="empty-log">
-                  暂无 phase 事件 — 启动任务后会在这里实时显示 VLM /
-                  action / SoM / guard / finalize 的时间线
-                </p>
-                <p
-                  v-else-if="!phaseTimelineGroups.length"
-                  class="empty-log"
-                >
-                  当前筛选下没有匹配事件 ·
-                  <a
-                    href="#"
-                    class="tab-jump"
-                    @click.prevent="resetPhaseFilters"
-                  >重置筛选</a>
-                </p>
-                <div
-                  v-for="(group, gi) in phaseTimelineGroups"
-                  :key="gi"
-                  class="timeline-row"
-                >
-                  <div class="timeline-step-tag">
-                    {{ Number.isFinite(group.step) ? 'step ' + group.step : '—' }}
-                  </div>
-                  <div class="timeline-chips">
-                    <button
-                      v-for="(evt, ei) in group.events"
-                      :key="ei"
-                      type="button"
-                      class="timeline-chip"
-                      :style="{
-                        background: phaseChipStyle(evt).background,
-                        color: phaseChipStyle(evt).color,
-                        borderColor: phaseChipStyle(evt).border,
-                      }"
-                      :title="(phaseChipDetail(evt) || '') + ' (单击查看 / 双击复制 JSON)'"
-                      @click="onChipClick(evt)"
-                      @dblclick="onChipDblClick(evt)"
-                    >
-                      <span class="timeline-chip-label">{{ phaseChipLabel(evt) }}</span>
-                      <span
-                        v-if="phaseChipDetail(evt)"
-                        class="timeline-chip-detail"
-                      >
-                        {{ phaseChipDetail(evt) }}
-                      </span>
-                    </button>
-                  </div>
-                </div>
-              </el-scrollbar>
-              <!-- P: floating "回到底部" button — visible only when the
-                   user has scrolled away from the tail and there's still
-                   content to follow. Click resumes auto-scroll. -->
-              <button
-                v-if="!timelineAutoScroll && phaseTimelineGroups.length"
-                type="button"
-                class="timeline-jump-bottom"
-                @click="scrollTimelineToBottom"
-              >
-                ↓ 回到底部
-              </button>
-            </div>
+            <TimelinePanel
+              ref="timelinePanelRef"
+              :phase-events="phaseEvents"
+              :replay-mode="replayMode"
+              :replay-source-name="replaySourceName"
+              @clear="clearPhaseEvents"
+              @import-replay="handleTimelineImportReplay"
+              @exit-replay="exitReplayMode"
+            />
           </el-tab-pane>
 
           <el-tab-pane name="capability">
@@ -4618,7 +3875,7 @@ const settingsSummaryText = computed(() => {
                   :rows="capabilityFilteredTraceRows"
                   :total-rows="capabilityTraceRows.length"
                   :summary="capabilityTraceSummary"
-                  @open-row="openPhaseDialog"
+                  @open-row="(evt) => timelinePanelRef.value?.openPhaseDialog(evt)"
                 />
 
                 <CapabilityAlignmentCard
@@ -4826,121 +4083,13 @@ const settingsSummaryText = computed(() => {
                 <span>最终答案</span>
               </el-badge>
             </template>
-            <el-scrollbar class="final-scroll">
-              <!-- 状态 A：执行中 / 等待中 -->
-              <div
-                v-if="finalAnswerStatus === 'pending'"
-                class="final-pending"
-              >
-                <div class="typing-dots" aria-hidden="true">
-                  <span /><span /><span />
-                </div>
-                <p class="final-pending-text">
-                  Agent 正在思考并提取结论...
-                </p>
-              </div>
-
-              <!-- 状态 C：结构化数据导出，提示去 Artifacts 下载 -->
-              <div
-                v-else-if="finalAnswerStatus === 'file'"
-                class="final-fallback"
-              >
-                <!-- 后端如果带回了文件摘要（_synthesize_file_mode_summary 合成），
-                     优先以 Markdown 渲染；否则只显示固定 CTA -->
-                <div
-                  v-if="finalAnswerText && finalAnswerText.trim()"
-                  class="final-md final-file-summary"
-                  v-html="finalAnswerHtml"
-                />
-                <p class="final-fallback-text">
-                  本次任务产出为结构化数据，请前往
-                  <a
-                    href="#"
-                    class="tab-jump"
-                    @click.prevent="activeBottomTab = 'artifacts'"
-                  >产物</a>
-                  面板下载
-                </p>
-              </div>
-
-              <!-- 状态 B：纯文本答案，Markdown 渲染 + 工具栏 + 折叠 -->
-              <div v-else-if="finalAnswerStatus === 'text'" class="final-text-wrap">
-                <!-- F3: 域卡片 — 后端识别为 weather/stock/recipe/flight 时显示 -->
-                <div
-                  v-if="finalAnswerDomainMeta"
-                  class="final-domain-card"
-                  :style="{
-                    borderColor: finalAnswerDomainMeta.accent,
-                    background: 'linear-gradient(135deg, ' +
-                      finalAnswerDomainMeta.accent + '14, transparent 65%)',
-                  }"
-                >
-                  <span class="final-domain-icon" aria-hidden="true">
-                    {{ finalAnswerDomainMeta.icon }}
-                  </span>
-                  <div class="final-domain-meta">
-                    <span
-                      class="final-domain-label"
-                      :style="{ color: finalAnswerDomainMeta.accent }"
-                    >
-                      {{ finalAnswerDomainMeta.label }}
-                    </span>
-                    <span class="final-domain-hint">
-                      由 Agent 自动识别为该领域，答案已按领域格式精简
-                    </span>
-                  </div>
-                </div>
-
-                <!-- F1: 工具栏（复制 / 导出 / 字数统计） -->
-                <div class="final-toolbar">
-                  <span class="final-meta">
-                    {{ finalAnswerCharCount }} 字 · {{ finalAnswerLineCount }} 行
-                  </span>
-                  <div class="final-toolbar-spacer" />
-                  <el-button
-                    size="small"
-                    plain
-                    class="final-toolbar-btn"
-                    :type="
-                      finalAnswerCopyState === 'ok' ? 'success'
-                      : finalAnswerCopyState === 'err' ? 'danger' : 'default'
-                    "
-                    @click="copyFinalAnswerToClipboard"
-                  >
-                    <span v-if="finalAnswerCopyState === 'ok'">已复制 ✓</span>
-                    <span v-else-if="finalAnswerCopyState === 'err'">复制失败</span>
-                    <span v-else>复制 Markdown</span>
-                  </el-button>
-                  <el-button
-                    size="small"
-                    plain
-                    class="final-toolbar-btn"
-                    @click="exportFinalAnswerAsMarkdown"
-                  >
-                    导出 .md
-                  </el-button>
-                </div>
-
-                <!-- 正文（折叠/展开） -->
-                <div class="final-md" v-html="displayedFinalAnswerHtml" />
-
-                <!-- F2: 长答案展开/收起按钮 -->
-                <div v-if="isFinalAnswerLong" class="final-toggle-wrap">
-                  <button
-                    class="final-toggle-btn"
-                    type="button"
-                    @click="finalAnswerExpanded = !finalAnswerExpanded"
-                  >
-                    {{ finalAnswerExpanded ? '收起' : `展开全部 (${finalAnswerCharCount} 字)` }}
-                  </button>
-                </div>
-              </div>
-
-              <!-- 初始 idle -->
-              <p v-else class="final-empty">
-                提交任务后，Agent 的最终结论会显示在这里
-              </p>
-            </el-scrollbar>
+            <FinalAnswerPane
+              :status="finalAnswerStatus"
+              :text="finalAnswerText"
+              :html="finalAnswerHtml"
+              :domain="finalAnswerDomain"
+              @jump-to-artifacts="activeBottomTab = 'artifacts'"
+            />
           </el-tab-pane>
 
           <el-tab-pane name="artifacts">
@@ -4998,75 +4147,9 @@ const settingsSummaryText = computed(() => {
                 <span>失败记录</span>
               </el-badge>
             </template>
-            <div class="artifact-toolbar">
-              <el-button
-                size="small"
-                plain
-                :icon="Refresh"
-                :loading="failedRunsLoading"
-                @click="fetchFailedRuns"
-              >
-                刷新
-              </el-button>
-              <span class="failed-runs-count">
-                {{ failedRunsList.length }} 条记录
-              </span>
-            </div>
-            <el-table
-              :data="failedRunsList"
-              height="190"
-              class="artifact-table failed-runs-table failed-runs-clickable"
-              header-cell-class-name="dark-table-header"
-              empty-text="目前还没有失败记录 🎉"
-              @row-click="openFailedRunDetail"
-            >
-              <el-table-column label="时间" width="138">
-                <template #default="scope">
-                  {{ formatFailedRunTime(scope.row.ts) }}
-                </template>
-              </el-table-column>
-              <el-table-column prop="run_id" label="Run ID" width="158" show-overflow-tooltip />
-              <el-table-column label="目标" show-overflow-tooltip>
-                <template #default="scope">
-                  <span :title="scope.row.goal || ''">
-                    {{ scope.row.goal || '—' }}
-                  </span>
-                </template>
-              </el-table-column>
-              <el-table-column label="原因" show-overflow-tooltip>
-                <template #default="scope">
-                  <span class="failed-reason" :title="scope.row.reason || ''">
-                    {{ scope.row.reason || '—' }}
-                  </span>
-                </template>
-              </el-table-column>
-              <el-table-column label="步数" width="62" align="center">
-                <template #default="scope">
-                  {{ Number.isFinite(scope.row.step_count) ? scope.row.step_count : '—' }}
-                </template>
-              </el-table-column>
-              <el-table-column label="耗时" width="86" align="center">
-                <template #default="scope">
-                  {{ formatFailedRunDuration(scope.row.duration_s) }}
-                </template>
-              </el-table-column>
-              <el-table-column label="操作" width="118">
-                <template #default="scope">
-                  <el-button
-                    size="small"
-                    type="primary"
-                    plain
-                    :disabled="scope.row.paths_exist && scope.row.paths_exist.html_log === false"
-                    :title="scope.row.paths_exist && scope.row.paths_exist.html_log === false
-                      ? 'HTML 日志文件已被清理'
-                      : '在新标签页打开完整 HTML 轨迹日志'"
-                    @click.stop="openFailedRunLog(scope.row)"
-                  >
-                    HTML 日志
-                  </el-button>
-                </template>
-              </el-table-column>
-            </el-table>
+            <FailedRunsPane
+              ref="failedRunsPaneRef"
+            />
           </el-tab-pane>
         </el-tabs>
       </div>
@@ -5155,232 +4238,10 @@ const settingsSummaryText = computed(() => {
       </div>
     </el-dialog>
 
-    <!-- N: Phase event detail dialog — opens on chip click -->
-    <el-dialog
-      v-model="phaseDialogVisible"
-      title="Phase Event"
-      width="640px"
-      class="phase-dialog"
-      destroy-on-close
-    >
-      <div v-if="selectedPhaseEvent" class="phase-dialog-body">
-        <div class="phase-dialog-header">
-          <span
-            class="phase-dialog-pill"
-            :style="{
-              background: phaseChipStyle(selectedPhaseEvent).background,
-              color: phaseChipStyle(selectedPhaseEvent).color,
-              borderColor: phaseChipStyle(selectedPhaseEvent).border,
-            }"
-          >
-            {{ String(selectedPhaseEvent.phase || 'unknown') }}
-          </span>
-          <span class="phase-dialog-sev">
-            severity: <strong>{{ String(selectedPhaseEvent.severity || 'info') }}</strong>
-          </span>
-          <!-- U: surface notice_severity when present + different from severity. -->
-          <span
-            v-if="selectedPhaseEvent.notice_severity &&
-                  selectedPhaseEvent.notice_severity !== selectedPhaseEvent.severity"
-            class="phase-dialog-sev"
-            title="BrowserEnv _last_notice_severity at emit time — drives chip color when higher than the phase severity."
-          >
-            notice: <strong>{{ String(selectedPhaseEvent.notice_severity) }}</strong>
-          </span>
-          <span
-            v-if="Number.isFinite(selectedPhaseEvent.step)"
-            class="phase-dialog-step"
-          >
-            step <strong>{{ selectedPhaseEvent.step }}</strong>
-          </span>
-          <span
-            v-if="Number.isFinite(selectedPhaseEvent.duration_ms)"
-            class="phase-dialog-dur"
-          >
-            duration <strong>{{ selectedPhaseEvent.duration_ms }}ms</strong>
-          </span>
-        </div>
-        <div class="phase-dialog-time">
-          {{ selectedPhaseTime }}
-        </div>
-        <p
-          v-if="selectedPhaseEvent.message"
-          class="phase-dialog-message"
-        >
-          {{ selectedPhaseEvent.message }}
-        </p>
-        <pre class="phase-dialog-json"><code>{{ selectedPhaseJson }}</code></pre>
-      </div>
-      <template #footer>
-        <!-- T: prev/next nav so the user can step through events without
-             closing the dialog (also bound to ← / → keys). The buttons
-             are always rendered so the keyboard hint is discoverable
-             even on first open. -->
-        <el-button
-          size="small"
-          plain
-          :disabled="filteredPhaseEvents.length < 2"
-          title="上一条事件 (←)"
-          @click="goToPrevPhaseEvent"
-        >← 上一条</el-button>
-        <el-button
-          size="small"
-          plain
-          :disabled="filteredPhaseEvents.length < 2"
-          title="下一条事件 (→)"
-          @click="goToNextPhaseEvent"
-        >下一条 →</el-button>
-        <el-button size="small" plain @click="copyPhaseJson">复制 JSON</el-button>
-        <el-button size="small" @click="phaseDialogVisible = false">关闭</el-button>
-      </template>
-    </el-dialog>
-
     <!-- T: Keyboard shortcuts cheat-sheet (Ctrl+/) ───────────────────── -->
     <ShortcutHelpDialog v-model:visible="helpDialogVisible" />
 
-    <!-- K6: Failed-run detail dialog ─────────────────────────────────
-         Opened by clicking a row in 失败记录. Two columns:
-           Left  → structured fields + JSON pretty-print
-           Right → historic phase events preview (fetched on open)
-         Wider than other dialogs (760px) so the JSON doesn't wrap.
-    -->
-    <el-dialog
-      v-model="failedRunDialogVisible"
-      :title="selectedFailedRun ? `失败 run · ${selectedFailedRun.run_id}` : '失败 run'"
-      width="760px"
-      class="failed-run-dialog"
-      destroy-on-close
-      @close="closeFailedRunDetail"
-    >
-      <div v-if="selectedFailedRun" class="failed-run-dialog-body">
-        <!-- Structured key-value summary (top section) -->
-        <dl class="failed-run-meta">
-          <div class="meta-row">
-            <dt>Run ID</dt>
-            <dd>{{ selectedFailedRun.run_id || '—' }}</dd>
-          </div>
-          <div class="meta-row">
-            <dt>Time</dt>
-            <dd>{{ formatFailedRunTime(selectedFailedRun.ts) }}</dd>
-          </div>
-          <div class="meta-row">
-            <dt>Duration</dt>
-            <dd>{{ formatFailedRunDuration(selectedFailedRun.duration_s) }}</dd>
-          </div>
-          <div class="meta-row">
-            <dt>Step</dt>
-            <dd>
-              {{ Number.isFinite(selectedFailedRun.step_count)
-                ? selectedFailedRun.step_count
-                : '—' }}
-            </dd>
-          </div>
-          <div v-if="selectedFailedRun.exception_type" class="meta-row">
-            <dt>Exception</dt>
-            <dd class="meta-mono">{{ selectedFailedRun.exception_type }}</dd>
-          </div>
-          <div v-if="selectedFailedRun.goal" class="meta-row meta-row-full">
-            <dt>Goal</dt>
-            <dd>{{ selectedFailedRun.goal }}</dd>
-          </div>
-          <div class="meta-row meta-row-full">
-            <dt>Reason</dt>
-            <dd class="meta-mono failed-reason-block">
-              {{ selectedFailedRun.reason || '—' }}
-            </dd>
-          </div>
-        </dl>
-
-        <!-- Phase events preview ------------------------------------ -->
-        <section class="failed-run-preview">
-          <header class="preview-header">
-            <h4>Phase 事件预览</h4>
-            <span v-if="failedRunPhaseStatus === 'ok'" class="preview-meta">
-              {{ failedRunPhaseEvents.length }} / {{ failedRunPhaseTotal }} 条
-              <span v-if="failedRunPhaseTruncated" class="preview-truncated">
-                · 仅显示最后 {{ failedRunPhaseEvents.length }} 条
-              </span>
-            </span>
-            <el-button
-              v-if="failedRunPhaseStatus !== 'loading'"
-              size="small"
-              plain
-              :icon="Refresh"
-              @click="fetchFailedRunPhaseEvents(selectedFailedRun)"
-            >
-              刷新
-            </el-button>
-          </header>
-
-          <div v-if="failedRunPhaseStatus === 'loading'" class="preview-status">
-            正在加载 phase 事件 …
-          </div>
-          <div v-else-if="failedRunPhaseStatus === 'missing'" class="preview-status">
-            该 run 的 phase_jsonl 已被清理，无可显示的事件。
-          </div>
-          <div v-else-if="failedRunPhaseStatus === 'error'" class="preview-status preview-status-error">
-            加载失败 — 后端日志可能已损坏或权限不可读。
-          </div>
-          <ul
-            v-else-if="failedRunPhaseEvents.length"
-            class="preview-list"
-          >
-            <li
-              v-for="(evt, idx) in failedRunPhaseEvents"
-              :key="`${evt.ts || ''}_${idx}`"
-              class="preview-item"
-              :class="`preview-sev-${formatPhasePreviewSeverity(evt.severity)}`"
-            >
-              <span class="preview-time">{{ formatPhasePreviewTs(evt.ts) }}</span>
-              <span class="preview-phase">{{ evt.phase || 'unknown' }}</span>
-              <span v-if="Number.isFinite(evt.step)" class="preview-step">
-                step {{ evt.step }}
-              </span>
-              <span v-if="Number.isFinite(evt.duration_ms)" class="preview-dur">
-                {{ evt.duration_ms }}ms
-              </span>
-              <span v-if="evt.message" class="preview-msg">{{ evt.message }}</span>
-            </li>
-          </ul>
-          <div v-else class="preview-status">
-            （这条 run 没有记录 phase 事件）
-          </div>
-        </section>
-
-        <!-- JSON dump -->
-        <section class="failed-run-json-section">
-          <h4>完整 JSON</h4>
-          <pre class="phase-dialog-json"><code>{{ selectedFailedRunJson }}</code></pre>
-        </section>
-      </div>
-
-      <template #footer>
-        <el-button
-          size="small"
-          plain
-          :disabled="failedRunsList.length < 2"
-          title="上一条 (←)"
-          @click="goToPrevFailedRun"
-        >← 上一条</el-button>
-        <el-button
-          size="small"
-          plain
-          :disabled="failedRunsList.length < 2"
-          title="下一条 (→)"
-          @click="goToNextFailedRun"
-        >下一条 →</el-button>
-        <el-button
-          size="small"
-          plain
-          :disabled="!selectedFailedRun
-            || (selectedFailedRun.paths_exist
-              && selectedFailedRun.paths_exist.html_log === false)"
-          @click="openFailedRunLog(selectedFailedRun)"
-        >打开 HTML 日志</el-button>
-        <el-button size="small" plain @click="copyFailedRunJson">复制 JSON</el-button>
-        <el-button size="small" @click="closeFailedRunDetail">关闭</el-button>
-      </template>
-    </el-dialog>
+    
   </main>
 </template>
 
