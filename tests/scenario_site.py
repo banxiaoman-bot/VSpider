@@ -2029,6 +2029,325 @@ function selectOpt(el) {
 
 
 # ---------------------------------------------------------------------------
+# K1: Tree view
+# ---------------------------------------------------------------------------
+
+TREE_DATA = {
+    "id": "root", "label": "产品目录", "children": [
+        {"id": "sensor", "label": "传感器", "children": [
+            {"id": "temp", "label": "温控器", "children": []},
+            {"id": "humid", "label": "温湿度记录仪", "children": []},
+            {"id": "vibr", "label": "振动传感器", "children": []},
+        ]},
+        {"id": "network", "label": "网络设备", "children": [
+            {"id": "gateway", "label": "工业网关", "children": []},
+            {"id": "fiber", "label": "光纤收发器", "children": []},
+        ]},
+        {"id": "compute", "label": "计算设备", "children": [
+            {"id": "edge", "label": "边缘计算盒", "children": []},
+        ]},
+    ]
+}
+
+
+def _tree_node_html(node: dict, depth: int = 0) -> str:
+    has_children = bool(node.get("children"))
+    toggle = (
+        f'<span class="tree-toggle" onclick="toggleNode(\'{node["id"]}\')">'
+        f'▶</span>' if has_children else '<span class="tree-leaf">·</span>'
+    )
+    children_html = ""
+    if has_children:
+        items = "\n".join(_tree_node_html(c, depth + 1) for c in node["children"])
+        children_html = (
+            f'<ul class="tree-children" id="children-{node["id"]}" '
+            f'style="display:none;">{items}</ul>'
+        )
+    return (
+        f'<li class="tree-node" id="node-{node["id"]}" data-depth="{depth}">'
+        f'{toggle}'
+        f'<span class="tree-label" onclick="selectNode(\'{node["id"]}\')">'
+        f'{node["label"]}</span>'
+        f'{children_html}</li>'
+    )
+
+
+def _tree_page_html() -> bytes:
+    tree_html = _tree_node_html(TREE_DATA)
+    body = f"""
+<h1 id="tree-title">树形视图</h1>
+<p>已选：<span id="tree-selected">none</span></p>
+<ul id="tree-root">{tree_html}</ul>
+<script>
+function toggleNode(id) {{
+  var children = document.getElementById('children-' + id);
+  var toggle = document.querySelector('#node-' + id + ' > .tree-toggle');
+  if (children.style.display === 'none') {{
+    children.style.display = 'block';
+    toggle.textContent = '▼';
+    document.getElementById('node-' + id).dataset.expanded = 'true';
+  }} else {{
+    children.style.display = 'none';
+    toggle.textContent = '▶';
+    document.getElementById('node-' + id).dataset.expanded = 'false';
+  }}
+}}
+function selectNode(id) {{
+  document.querySelectorAll('.tree-label').forEach(function(l) {{
+    l.style.background = '';
+  }});
+  var label = document.querySelector('#node-' + id + ' > .tree-label');
+  label.style.background = '#d4edda';
+  document.getElementById('tree-selected').textContent = label.textContent;
+}}
+</script>"""
+    return _page_shell("树形视图", body)
+
+
+# ---------------------------------------------------------------------------
+# K2: Carousel / slider
+# ---------------------------------------------------------------------------
+
+CAROUSEL_SLIDES = [
+    {"title": "智能温控器", "desc": "精度±0.1°C", "color": "#3498db"},
+    {"title": "工业网关", "desc": "Modbus/OPC UA", "color": "#2ecc71"},
+    {"title": "边缘计算盒", "desc": "ARM Cortex-A72", "color": "#e74c3c"},
+    {"title": "振动传感器", "desc": "三轴加速度", "color": "#f39c12"},
+]
+
+
+def _carousel_page_html() -> bytes:
+    slides = "\n".join(
+        f'<div class="carousel-slide" data-index="{i}" '
+        f'style="display:{"block" if i == 0 else "none"}; '
+        f'background:{s["color"]}; color:#fff; padding:40px; text-align:center;">'
+        f'<h2>{s["title"]}</h2><p>{s["desc"]}</p></div>'
+        for i, s in enumerate(CAROUSEL_SLIDES)
+    )
+    dots = " ".join(
+        f'<span class="carousel-dot" data-index="{i}" '
+        f'onclick="goTo({i})" '
+        f'style="cursor:pointer; padding:4px 8px; '
+        f'{"font-weight:bold;" if i == 0 else ""}">{i + 1}</span>'
+        for i in range(len(CAROUSEL_SLIDES))
+    )
+    body = f"""
+<h1 id="carousel-title">轮播图</h1>
+<div id="carousel-container">{slides}</div>
+<div id="carousel-dots">{dots}</div>
+<button id="carousel-prev" onclick="prev()">上一张</button>
+<button id="carousel-next" onclick="next()">下一张</button>
+<p>当前：<span id="carousel-current">0</span> / {len(CAROUSEL_SLIDES) - 1}</p>
+<script>
+var current = 0;
+var total = {len(CAROUSEL_SLIDES)};
+function goTo(idx) {{
+  document.querySelectorAll('.carousel-slide').forEach(function(s) {{
+    s.style.display = parseInt(s.dataset.index) === idx ? 'block' : 'none';
+  }});
+  document.querySelectorAll('.carousel-dot').forEach(function(d) {{
+    d.style.fontWeight = parseInt(d.dataset.index) === idx ? 'bold' : '';
+  }});
+  current = idx;
+  document.getElementById('carousel-current').textContent = current;
+}}
+function next() {{ goTo((current + 1) % total); }}
+function prev() {{ goTo((current - 1 + total) % total); }}
+</script>"""
+    return _page_shell("轮播图", body)
+
+
+# ---------------------------------------------------------------------------
+# K3: Client-side table sort
+# ---------------------------------------------------------------------------
+
+def _sortable_table_html() -> bytes:
+    rows = "\n".join(
+        f'<tr><td>{p["sku"]}</td><td>{p["name"]}</td>'
+        f'<td data-value="{p["price"]}">{p["price"]}</td>'
+        f'<td data-value="{p["stock"]}">{p["stock"]}</td></tr>'
+        for p in PRODUCTS
+    )
+    body = f"""
+<h1 id="sort-title">客户端排序表</h1>
+<p>排序列：<span id="sort-col">none</span> <span id="sort-dir">none</span></p>
+<table id="sort-table">
+  <thead><tr>
+    <th data-col="0" onclick="sortTable(0,'text')">SKU</th>
+    <th data-col="1" onclick="sortTable(1,'text')">名称</th>
+    <th data-col="2" onclick="sortTable(2,'number')">价格</th>
+    <th data-col="3" onclick="sortTable(3,'number')">库存</th>
+  </tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+<script>
+var sortState = {{}};
+function sortTable(col, type) {{
+  var dir = sortState[col] === 'asc' ? 'desc' : 'asc';
+  sortState = {{}};
+  sortState[col] = dir;
+  var tbody = document.querySelector('#sort-table tbody');
+  var rows = Array.from(tbody.querySelectorAll('tr'));
+  rows.sort(function(a, b) {{
+    var va = a.cells[col].dataset.value || a.cells[col].textContent;
+    var vb = b.cells[col].dataset.value || b.cells[col].textContent;
+    if (type === 'number') {{ va = parseFloat(va); vb = parseFloat(vb); }}
+    var cmp = va < vb ? -1 : (va > vb ? 1 : 0);
+    return dir === 'asc' ? cmp : -cmp;
+  }});
+  rows.forEach(function(r) {{ tbody.appendChild(r); }});
+  document.getElementById('sort-col').textContent = col;
+  document.getElementById('sort-dir').textContent = dir;
+}}
+</script>"""
+    return _page_shell("排序表", body)
+
+
+# ---------------------------------------------------------------------------
+# K4: Drag-and-drop file upload zone
+# ---------------------------------------------------------------------------
+
+def _dropzone_page_html() -> bytes:
+    body = """
+<h1 id="dz-title">拖拽上传</h1>
+<div id="drop-zone" style="border:2px dashed #ccc; padding:40px; text-align:center;">
+  拖拽文件到此处或 <input type="file" id="dz-input" multiple>
+</div>
+<p>已选文件：<span id="dz-count">0</span></p>
+<div id="dz-preview"></div>
+<script>
+var zone = document.getElementById('drop-zone');
+zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.style.borderColor = '#2ecc71'; });
+zone.addEventListener('dragleave', function() { zone.style.borderColor = '#ccc'; });
+zone.addEventListener('drop', function(e) {
+  e.preventDefault();
+  zone.style.borderColor = '#ccc';
+  handleFiles(e.dataTransfer.files);
+});
+document.getElementById('dz-input').addEventListener('change', function(e) {
+  handleFiles(e.target.files);
+});
+function handleFiles(files) {
+  var preview = document.getElementById('dz-preview');
+  document.getElementById('dz-count').textContent = files.length;
+  preview.innerHTML = '';
+  Array.from(files).forEach(function(f) {
+    var div = document.createElement('div');
+    div.className = 'dz-file';
+    div.textContent = f.name + ' (' + f.size + ' bytes)';
+    preview.appendChild(div);
+  });
+}
+</script>"""
+    return _page_shell("拖拽上传", body)
+
+
+# ---------------------------------------------------------------------------
+# K5: Date picker
+# ---------------------------------------------------------------------------
+
+def _datepicker_page_html() -> bytes:
+    body = """
+<h1 id="dp-title">日期选择器</h1>
+<p>已选日期：<span id="dp-selected">none</span></p>
+<div id="dp-header">
+  <button id="dp-prev-month" onclick="changeMonth(-1)">◀</button>
+  <span id="dp-month-label"></span>
+  <button id="dp-next-month" onclick="changeMonth(1)">▶</button>
+</div>
+<div id="dp-grid"></div>
+<script>
+var viewYear, viewMonth;
+(function() {
+  var now = new Date();
+  viewYear = now.getFullYear();
+  viewMonth = now.getMonth();
+  renderCalendar();
+})();
+function changeMonth(delta) {
+  viewMonth += delta;
+  if (viewMonth < 0) { viewMonth = 11; viewYear--; }
+  if (viewMonth > 11) { viewMonth = 0; viewYear++; }
+  renderCalendar();
+}
+function renderCalendar() {
+  document.getElementById('dp-month-label').textContent =
+    viewYear + '-' + String(viewMonth + 1).padStart(2, '0');
+  var grid = document.getElementById('dp-grid');
+  grid.innerHTML = '';
+  var first = new Date(viewYear, viewMonth, 1);
+  var last = new Date(viewYear, viewMonth + 1, 0);
+  for (var d = 1; d <= last.getDate(); d++) {
+    var btn = document.createElement('button');
+    btn.className = 'dp-day';
+    btn.textContent = d;
+    btn.dataset.date = viewYear + '-' +
+      String(viewMonth + 1).padStart(2, '0') + '-' +
+      String(d).padStart(2, '0');
+    btn.onclick = function() { selectDate(this.dataset.date); };
+    grid.appendChild(btn);
+  }
+}
+function selectDate(dateStr) {
+  document.querySelectorAll('.dp-day').forEach(function(b) {
+    b.style.background = '';
+  });
+  var btn = document.querySelector('.dp-day[data-date="' + dateStr + '"]');
+  if (btn) btn.style.background = '#3498db';
+  document.getElementById('dp-selected').textContent = dateStr;
+}
+</script>"""
+    return _page_shell("日期选择器", body)
+
+
+# ---------------------------------------------------------------------------
+# K6: Virtual scroll
+# ---------------------------------------------------------------------------
+
+VIRTUAL_TOTAL = 1000
+VIRTUAL_ITEM_HEIGHT = 40
+
+
+def _virtual_scroll_page_html() -> bytes:
+    body = f"""
+<h1 id="vs-title">虚拟滚动</h1>
+<p>可见范围：<span id="vs-range">0-0</span> / {VIRTUAL_TOTAL}</p>
+<div id="vs-container" style="height:400px; overflow-y:auto; border:1px solid #ccc;">
+  <div id="vs-spacer" style="height:{VIRTUAL_TOTAL * VIRTUAL_ITEM_HEIGHT}px; position:relative;">
+  </div>
+</div>
+<script>
+var TOTAL = {VIRTUAL_TOTAL};
+var ITEM_H = {VIRTUAL_ITEM_HEIGHT};
+var BUFFER = 5;
+var container = document.getElementById('vs-container');
+var spacer = document.getElementById('vs-spacer');
+function renderVisible() {{
+  var scrollTop = container.scrollTop;
+  var viewH = container.clientHeight;
+  var startIdx = Math.max(0, Math.floor(scrollTop / ITEM_H) - BUFFER);
+  var endIdx = Math.min(TOTAL, Math.ceil((scrollTop + viewH) / ITEM_H) + BUFFER);
+  document.getElementById('vs-range').textContent = startIdx + '-' + (endIdx - 1);
+  var existing = spacer.querySelectorAll('.vs-item');
+  existing.forEach(function(el) {{ el.remove(); }});
+  for (var i = startIdx; i < endIdx; i++) {{
+    var div = document.createElement('div');
+    div.className = 'vs-item';
+    div.style.cssText = 'position:absolute; top:' + (i * ITEM_H) + 'px; ' +
+      'height:' + ITEM_H + 'px; width:100%; box-sizing:border-box; ' +
+      'padding:8px; border-bottom:1px solid #eee;';
+    div.dataset.index = i;
+    div.textContent = '项目 #' + i;
+    spacer.appendChild(div);
+  }}
+}}
+container.addEventListener('scroll', renderVisible);
+renderVisible();
+</script>"""
+    return _page_shell("虚拟滚动", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -2336,6 +2655,24 @@ def make_alpha_handler(store: ScenarioStore):
             # --- J6: ARIA accessibility ---
             if path == "/aria":
                 return self._send(_aria_page_html())
+            # --- K1: Tree view ---
+            if path == "/tree":
+                return self._send(_tree_page_html())
+            # --- K2: Carousel ---
+            if path == "/carousel":
+                return self._send(_carousel_page_html())
+            # --- K3: Sortable table ---
+            if path == "/sortable":
+                return self._send(_sortable_table_html())
+            # --- K4: Drop zone ---
+            if path == "/dropzone":
+                return self._send(_dropzone_page_html())
+            # --- K5: Date picker ---
+            if path == "/datepicker":
+                return self._send(_datepicker_page_html())
+            # --- K6: Virtual scroll ---
+            if path == "/virtual-scroll":
+                return self._send(_virtual_scroll_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
