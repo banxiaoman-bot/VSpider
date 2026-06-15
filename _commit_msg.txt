@@ -1,0 +1,5 @@
+chore(ui): migrate Element Plus to auto-import and align test with TerminalLogPane extraction
+
+- Replace full ElementPlus import with unplugin-auto-import + unplugin-vue-components (tree-shaking)
+- Remove manual ElMessage imports from App.vue, AuthDialog, FailedRunsPane, TimelinePanel
+- Update test_timeline_replay_search to search combined App.vue + TerminalLogPane.vue sources

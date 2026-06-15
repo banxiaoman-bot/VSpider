@@ -1,7 +1,6 @@
 <script setup>
 import { ref } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
 import { apiFetch } from '../api/client.js'
 
 const props = defineProps({

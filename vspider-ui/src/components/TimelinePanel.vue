@@ -1,6 +1,5 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
 
 const props = defineProps({
   phaseEvents: { type: Array, required: true },

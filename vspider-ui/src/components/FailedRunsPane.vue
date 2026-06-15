@@ -1,6 +1,5 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { API_BASE, apiFetch } from '../api/client.js'
 
