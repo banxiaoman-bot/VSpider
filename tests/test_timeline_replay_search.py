@@ -23,6 +23,7 @@ import pytest
 _UI_SRC = Path(__file__).resolve().parent.parent / "vspider-ui" / "src"
 APP_VUE = _UI_SRC / "App.vue"
 TIMELINE_PANEL = _UI_SRC / "components" / "TimelinePanel.vue"
+TERMINAL_LOG_PANE = _UI_SRC / "components" / "TerminalLogPane.vue"
 FAILURE_FIXTURE_SUMMARY = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "composables" / "failureFixtureSummary.js"
 CAPABILITY_TRACE_UTILS = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "capabilityTraceUtils.js"
 CAPABILITY_TRACE_LIST = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityTraceList.vue"
@@ -201,33 +202,42 @@ class TestWReplayMode:
 
 
 class TestXTerminalSearch:
-    def test_search_state_refs_exist(self, src: str) -> None:
-        assert "const terminalSearchVisible = ref(false)" in src
-        assert "const terminalSearchQuery = ref('')" in src
-        assert "const terminalSearchCurrent = ref(0)" in src
-        assert "const terminalSearchInputRef = ref(null)" in src
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        """Terminal search was extracted into TerminalLogPane.vue + CSS."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        terminal = TERMINAL_LOG_PANE.read_text(encoding="utf-8")
+        css_path = _UI_SRC / "styles" / "terminal-log-pane.css"
+        css = css_path.read_text(encoding="utf-8") if css_path.exists() else ""
+        return app + "\n" + terminal + "\n" + css
 
-    def test_search_computeds_exist(self, src: str) -> None:
+    def test_search_state_refs_exist(self, combined_src: str) -> None:
+        assert "const terminalSearchVisible = ref(false)" in combined_src
+        assert "const terminalSearchQuery = ref('')" in combined_src
+        assert "const terminalSearchCurrent = ref(0)" in combined_src
+        assert "const terminalSearchInputRef = ref(null)" in combined_src
+
+    def test_search_computeds_exist(self, combined_src: str) -> None:
         for token in [
             "const terminalSearchActive = computed",
             "const terminalSearchMatches = computed",
             "const terminalSearchSegments = computed",
             "const terminalSearchTotal = computed",
         ]:
-            assert token in src
-        assert "line.indexOf(q, from)" in src
-        assert "kind: m.gIdx === cur ? 'current' : 'hit'" in src
+            assert token in combined_src
+        assert "line.indexOf(q, from)" in combined_src
+        assert "kind: m.gIdx === cur ? 'current' : 'hit'" in combined_src
 
-    def test_search_helpers_exist(self, src: str) -> None:
+    def test_search_helpers_exist(self, combined_src: str) -> None:
         for token in [
             "const openTerminalSearch = () =>",
             "const closeTerminalSearch = () =>",
             "const terminalSearchNext = () =>",
             "const terminalSearchPrev = () =>",
         ]:
-            assert token in src
-        assert "terminalSearchVisible.value = true" in src
-        assert "terminalSearchVisible.value = false" in src
+            assert token in combined_src
+        assert "terminalSearchVisible.value = true" in combined_src
+        assert "terminalSearchVisible.value = false" in combined_src
 
     def test_search_keyboard_shortcuts_wired(self, src: str) -> None:
         ctrl_f = re.search(
@@ -241,15 +251,15 @@ class TestXTerminalSearch:
         assert "event.key === 'Escape'" in src
         assert "event.key === 'Enter' && event.shiftKey" in src
 
-    def test_search_template_wired(self, src: str) -> None:
-        assert "v-if=\"terminalSearchVisible\"" in src
-        assert "ref=\"terminalSearchInputRef\"" in src
-        assert "v-model=\"terminalSearchQuery\"" in src
-        assert "terminalSearchSegments.get(idx)" in src
-        assert "'terminal-search-hit': seg.kind === 'hit'" in src
-        assert "'terminal-search-current': seg.kind === 'current'" in src
+    def test_search_template_wired(self, combined_src: str) -> None:
+        assert "v-if=\"terminalSearchVisible\"" in combined_src
+        assert "ref=\"terminalSearchInputRef\"" in combined_src
+        assert "v-model=\"terminalSearchQuery\"" in combined_src
+        assert "terminalSearchSegments.get(idx)" in combined_src
+        assert "'terminal-search-hit': seg.kind === 'hit'" in combined_src
+        assert "'terminal-search-current': seg.kind === 'current'" in combined_src
 
-    def test_search_css_present(self, src: str) -> None:
+    def test_search_css_present(self, combined_src: str) -> None:
         for cls in [
             ".terminal-search-bar",
             ".terminal-search-input",
@@ -257,7 +267,7 @@ class TestXTerminalSearch:
             ".terminal-search-hit",
             ".terminal-search-current",
         ]:
-            assert cls in src
+            assert cls in combined_src
 
 
 class TestY33CapabilityTracePanel:
