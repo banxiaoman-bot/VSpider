@@ -704,87 +704,11 @@ def _looks_like_login_surface(browser_state: str) -> bool:
     has_account_field = any(name in text for name in account_names)
     return has_password_field or (has_account_field and _has_any(text, ("登录", "登陆", "sign in", "signin", "login")))
 
+try:
+    from .prompt_legacy import _build_legacy_section_prompt  # noqa: F401
+except ImportError:
+    from prompt_legacy import _build_legacy_section_prompt  # noqa: F401
 
-def _build_legacy_section_prompt(
-    goal: str = "",
-    browser_state: str = "",
-    workflow_memory: dict | None = None,
-    *,
-    force_full: bool = False,
-) -> str:
-    """
-    Deprecated old dynamic prompt builder that sliced sections out of the full prompt.
-
-    SYSTEM_PROMPT/FULL_SYSTEM_PROMPT remain the full legacy prompt for compatibility.
-    The dynamic prompt intentionally reuses verbatim sections from the legacy prompt
-    so behavior changes are limited to conditional inclusion, not rewritten policy.
-    """
-    if force_full:
-        return FULL_SYSTEM_PROMPT
-
-    haystack = f"{goal}\n{browser_state}".lower()
-    login_surface = _looks_like_login_surface(browser_state)
-    sections: list[str] = [_PROMPT_INTRO]
-    sections.extend(
-        _prompt_section(FULL_SYSTEM_PROMPT, heading)
-        for heading in _CORE_SECTION_HEADINGS
-    )
-
-    if _has_any(haystack, _EXTRACT_KEYWORDS):
-        sections.extend(
-            [
-                _prompt_section(FULL_SYSTEM_PROMPT, "## ⚠️ 提取动作 (Extract) 的绝对视觉法则"),
-                _prompt_section(FULL_SYSTEM_PROMPT, "## 海量数据处理决策树（强制执行）"),
-                _prompt_section(FULL_SYSTEM_PROMPT, "## 📌 跨页提取的优雅退出法则 (Graceful Exit)"),
-            ]
-        )
-
-    if _has_any(haystack, _FORM_KEYWORDS):
-        sections.extend(
-            [
-                _prompt_section(FULL_SYSTEM_PROMPT, "## 表单筛选条件预检规则（先读后写）"),
-                _prompt_section(FULL_SYSTEM_PROMPT, "## ⚠️ 表单与搜索提交法则 (Atomic Search Submission)"),
-            ]
-        )
-    if _has_any(haystack, _DATE_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 日期选择器操作规则（强制文本注入）"))
-    if _has_any(haystack, _ASYNC_SELECT_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 异步搜索下拉框操作规则（输入-等待-点击）"))
-    if _has_any(haystack, _TREE_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 树形多选框操作规则（渐进式展开）"))
-    if _has_any(haystack, _UPLOAD_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 文件导出/下载说明"))
-
-    if login_surface or _has_any(haystack, _LOGIN_KEYWORDS):
-        sections.extend(
-            [
-                _prompt_section(FULL_SYSTEM_PROMPT, "## 核心思维路径（必须严格遵循）"),
-                _prompt_section(FULL_SYSTEM_PROMPT, "## 登录失败处理规则（必须严格遵守）"),
-                _prompt_section(FULL_SYSTEM_PROMPT, "## 登录状态自动检测（第 1 步必须执行此判断）"),
-            ]
-        )
-
-    if login_surface or _has_any(haystack, _CREDENTIAL_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 🔒 凭证安全红线（违反立即 ValidationError）"))
-        sections.append(_AUTH_VAULT_RULES)
-
-    if _has_any(haystack, _HITL_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## Additional Runtime Rules"))
-
-    if workflow_memory or _has_any(haystack, ("save_to_memory", "{{", "记忆", "跨页面", "变量")):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 跨页面记忆库（Workflow Memory）使用规则"))
-
-    if _has_any(haystack, _MULTI_TAB_KEYWORDS):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 空间与多标签页操作守则（CRITICAL）"))
-
-    if _has_any(haystack, ("语义对齐", "意图", "模糊", "hover", "拖拽", "drag", "广告", "遮挡")):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 语义对齐映射表（Semantic Mapping）"))
-
-    if _has_any(haystack, ("示例", "范例", "few-shot", "few shot")):
-        sections.append(_prompt_section(FULL_SYSTEM_PROMPT, "## 思考与决策范例（Few-Shot CoT）"))
-
-    compact = "\n\n".join(s for s in sections if s)
-    return compact if compact.strip() else FULL_SYSTEM_PROMPT
 
 
 def _text_has_any(text: str, keywords: tuple[str, ...]) -> bool:
@@ -1039,25 +963,6 @@ _RESUME_RUN_TRIGGERS = (
     "接着之前", "继续之前", "resume", "resume run", "continue last", "continue previous",
     "pick up where", "left off",
 )
-
-
-def _looks_like_login_surface(browser_state: str) -> bool:
-    """Detect login forms from AX/input snapshots, including modal and iframe login."""
-    text = (browser_state or "").lower()
-    if not text:
-        return False
-    password_markers = (
-        'type="password"', "type='password'", "type=password", "input type: password",
-        "password", "密码",
-    )
-    account_names = (
-        "username", "user name", "account", "phone", "mobile", "email",
-        "账号", "帐号", "账户", "用户名", "手机号", "手机号码", "邮箱",
-    )
-    login_words = ("登录", "登陆", "sign in", "signin", "login", "passport", "sso")
-    has_password = any(marker in text for marker in password_markers)
-    has_account = any(name in text for name in account_names)
-    return has_password or (has_account and any(word in text for word in login_words))
 
 
 def _looks_like_bulk_extract(goal: str) -> bool:
