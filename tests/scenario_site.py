@@ -2348,6 +2348,211 @@ renderVisible();
 
 
 # ---------------------------------------------------------------------------
+# L1: Breadcrumb navigation
+# ---------------------------------------------------------------------------
+
+BREADCRUMB_PAGES = {
+    "home": {"title": "首页", "parent": None, "content": "产品目录首页"},
+    "sensors": {"title": "传感器", "parent": "home", "content": "传感器分类页"},
+    "temp-sensor": {"title": "温控器", "parent": "sensors",
+                    "content": "智能温控器详情，精度±0.1°C"},
+    "network": {"title": "网络设备", "parent": "home", "content": "网络设备分类页"},
+    "gateway-detail": {"title": "工业网关", "parent": "network",
+                       "content": "工业网关详情，支持 Modbus/OPC UA"},
+}
+
+
+def _breadcrumb_html(page_id: str) -> bytes:
+    page_data = BREADCRUMB_PAGES[page_id]
+    trail = []
+    cur = page_id
+    while cur:
+        trail.insert(0, cur)
+        cur = BREADCRUMB_PAGES[cur]["parent"]
+    crumbs = " &gt; ".join(
+        f'<a class="bc-link" href="/breadcrumb/{pid}" data-page="{pid}">'
+        f'{BREADCRUMB_PAGES[pid]["title"]}</a>'
+        if pid != page_id else
+        f'<span class="bc-current" data-page="{pid}">'
+        f'{BREADCRUMB_PAGES[pid]["title"]}</span>'
+        for pid in trail
+    )
+    children = [
+        pid for pid, p in BREADCRUMB_PAGES.items()
+        if p["parent"] == page_id
+    ]
+    child_links = "".join(
+        f'<li><a class="bc-child" href="/breadcrumb/{cid}">'
+        f'{BREADCRUMB_PAGES[cid]["title"]}</a></li>'
+        for cid in children
+    )
+    body = f"""
+<h1 id="bc-title">{page_data['title']}</h1>
+<nav id="bc-trail">{crumbs}</nav>
+<p id="bc-content">{page_data['content']}</p>
+{"<ul id='bc-children'>" + child_links + "</ul>" if children else ""}
+"""
+    return _page_shell("面包屑 - " + page_data["title"], body)
+
+
+# ---------------------------------------------------------------------------
+# L2: Copy table data to clipboard
+# ---------------------------------------------------------------------------
+
+def _copy_table_page_html() -> bytes:
+    rows = "\n".join(
+        f'<tr data-id="{p["id"]}">'
+        f'<td><input type="checkbox" class="ct-check" data-id="{p["id"]}"></td>'
+        f'<td class="ct-sku">{p["sku"]}</td>'
+        f'<td class="ct-name">{p["name"]}</td>'
+        f'<td class="ct-price">{p["price"]}</td></tr>'
+        for p in PRODUCTS[:6]
+    )
+    body = f"""
+<h1 id="ct-title">复制表格数据</h1>
+<button id="ct-copy" onclick="copySelected()">复制选中行</button>
+<p>已复制：<span id="ct-copied">0</span> 行</p>
+<textarea id="ct-paste" rows="4" cols="60" placeholder="粘贴验证区"></textarea>
+<table id="ct-table">
+  <thead><tr><th></th><th>SKU</th><th>名称</th><th>价格</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+<script>
+function copySelected() {{
+  var checks = document.querySelectorAll('.ct-check:checked');
+  var lines = [];
+  checks.forEach(function(c) {{
+    var row = c.closest('tr');
+    var sku = row.querySelector('.ct-sku').textContent;
+    var name = row.querySelector('.ct-name').textContent;
+    var price = row.querySelector('.ct-price').textContent;
+    lines.push(sku + '\\t' + name + '\\t' + price);
+  }});
+  var text = lines.join('\\n');
+  navigator.clipboard.writeText(text).then(function() {{
+    document.getElementById('ct-copied').textContent = checks.length;
+  }});
+}}
+</script>"""
+    return _page_shell("复制表格", body)
+
+
+# ---------------------------------------------------------------------------
+# L3: Skeleton loading
+# ---------------------------------------------------------------------------
+
+def _skeleton_page_html() -> bytes:
+    body = """
+<h1 id="sk-title">骨架屏加载</h1>
+<div id="sk-skeleton" style="display:block;">
+  <div class="sk-line" style="background:#e0e0e0;height:20px;margin:10px 0;width:60%;"></div>
+  <div class="sk-line" style="background:#e0e0e0;height:20px;margin:10px 0;width:80%;"></div>
+  <div class="sk-line" style="background:#e0e0e0;height:20px;margin:10px 0;width:40%;"></div>
+</div>
+<div id="sk-content" style="display:none;">
+  <p id="sk-data-name">智能温控器</p>
+  <p id="sk-data-price">199.00</p>
+  <p id="sk-data-desc">工业级温度控制设备，精度±0.1°C</p>
+</div>
+<p id="sk-status">loading</p>
+<script>
+setTimeout(function() {
+  document.getElementById('sk-skeleton').style.display = 'none';
+  document.getElementById('sk-content').style.display = 'block';
+  document.getElementById('sk-status').textContent = 'loaded';
+}, 600);
+</script>"""
+    return _page_shell("骨架屏", body)
+
+
+# ---------------------------------------------------------------------------
+# L4: Multi-window popup
+# ---------------------------------------------------------------------------
+
+def _popup_parent_html() -> bytes:
+    body = """
+<h1 id="pp-title">多窗口通信</h1>
+<button id="pp-open" onclick="openPopup()">打开子窗口</button>
+<p>来自子窗口：<span id="pp-reply">none</span></p>
+<script>
+var popup = null;
+function openPopup() {
+  popup = window.open('/popup-child', 'child', 'width=400,height=300');
+}
+window.addEventListener('message', function(e) {
+  document.getElementById('pp-reply').textContent = e.data;
+});
+</script>"""
+    return _page_shell("父窗口", body)
+
+
+def _popup_child_html() -> bytes:
+    return _page_shell("子窗口", """
+<h1 id="pc-title">子窗口</h1>
+<input type="text" id="pc-input" placeholder="输入消息">
+<button id="pc-send" onclick="sendToParent()">发送给父窗口</button>
+<script>
+function sendToParent() {
+  var msg = document.getElementById('pc-input').value;
+  if (window.opener) { window.opener.postMessage(msg, '*'); }
+}
+</script>""")
+
+
+# ---------------------------------------------------------------------------
+# L5: Dynamic script injection
+# ---------------------------------------------------------------------------
+
+def _script_inject_page_html() -> bytes:
+    body = """
+<h1 id="si-title">动态脚本注入</h1>
+<p>计算结果：<span id="si-result">none</span></p>
+<button id="si-inject" onclick="injectScript()">注入脚本</button>
+<script>
+function injectScript() {
+  var s = document.createElement('script');
+  s.textContent = 'window._injectedResult = 42 * 42; ' +
+    'document.getElementById("si-result").textContent = window._injectedResult;';
+  document.body.appendChild(s);
+}
+</script>"""
+    return _page_shell("脚本注入", body)
+
+
+# ---------------------------------------------------------------------------
+# L6: Error boundary UI
+# ---------------------------------------------------------------------------
+
+def _error_boundary_page_html() -> bytes:
+    body = """
+<h1 id="eb-title">错误边界</h1>
+<div id="eb-app">
+  <p id="eb-content">正常内容区</p>
+  <button id="eb-trigger" onclick="triggerError()">触发错误</button>
+</div>
+<div id="eb-error" style="display:none; background:#fee; padding:20px; border:1px solid #c00;">
+  <h2 id="eb-error-title">出错了</h2>
+  <p id="eb-error-msg"></p>
+  <button id="eb-recover" onclick="recover()">恢复</button>
+</div>
+<p id="eb-status">normal</p>
+<script>
+function triggerError() {
+  document.getElementById('eb-app').style.display = 'none';
+  document.getElementById('eb-error').style.display = 'block';
+  document.getElementById('eb-error-msg').textContent = 'TypeError: Cannot read property of undefined';
+  document.getElementById('eb-status').textContent = 'error';
+}
+function recover() {
+  document.getElementById('eb-error').style.display = 'none';
+  document.getElementById('eb-app').style.display = 'block';
+  document.getElementById('eb-status').textContent = 'recovered';
+}
+</script>"""
+    return _page_shell("错误边界", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -2673,6 +2878,32 @@ def make_alpha_handler(store: ScenarioStore):
             # --- K6: Virtual scroll ---
             if path == "/virtual-scroll":
                 return self._send(_virtual_scroll_page_html())
+            # --- L1: Breadcrumb ---
+            if path.startswith("/breadcrumb/"):
+                page_id = path.rsplit("/", 1)[-1]
+                if page_id in BREADCRUMB_PAGES:
+                    return self._send(_breadcrumb_html(page_id))
+                return self._send(b"not found", status=404)
+            if path == "/breadcrumb":
+                return self._send(
+                    b"", status=302, extra={"Location": "/breadcrumb/home"})
+            # --- L2: Copy table ---
+            if path == "/copy-table":
+                return self._send(_copy_table_page_html())
+            # --- L3: Skeleton loading ---
+            if path == "/skeleton":
+                return self._send(_skeleton_page_html())
+            # --- L4: Popup windows ---
+            if path == "/popup":
+                return self._send(_popup_parent_html())
+            if path == "/popup-child":
+                return self._send(_popup_child_html())
+            # --- L5: Script injection ---
+            if path == "/script-inject":
+                return self._send(_script_inject_page_html())
+            # --- L6: Error boundary ---
+            if path == "/error-boundary":
+                return self._send(_error_boundary_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
