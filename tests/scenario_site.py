@@ -2553,6 +2553,212 @@ function recover() {
 
 
 # ---------------------------------------------------------------------------
+# M1: Canvas drawing
+# ---------------------------------------------------------------------------
+
+def _canvas_page_html() -> bytes:
+    body = """
+<h1 id="cv-title">Canvas 绘图</h1>
+<canvas id="cv-canvas" width="200" height="200"
+  style="border:1px solid #ccc;"></canvas>
+<p>像素颜色：<span id="cv-pixel">none</span></p>
+<button id="cv-draw" onclick="drawRect()">绘制红色矩形</button>
+<button id="cv-read" onclick="readPixel()">读取像素</button>
+<button id="cv-clear" onclick="clearCanvas()">清除</button>
+<script>
+var canvas = document.getElementById('cv-canvas');
+var ctx = canvas.getContext('2d');
+function drawRect() {
+  ctx.fillStyle = '#ff0000';
+  ctx.fillRect(10, 10, 100, 80);
+}
+function readPixel() {
+  var data = ctx.getImageData(50, 50, 1, 1).data;
+  document.getElementById('cv-pixel').textContent =
+    'rgba(' + data[0] + ',' + data[1] + ',' + data[2] + ',' + data[3] + ')';
+}
+function clearCanvas() {
+  ctx.clearRect(0, 0, 200, 200);
+  document.getElementById('cv-pixel').textContent = 'cleared';
+}
+</script>"""
+    return _page_shell("Canvas", body)
+
+
+# ---------------------------------------------------------------------------
+# M2: Web Animation API
+# ---------------------------------------------------------------------------
+
+def _animation_page_html() -> bytes:
+    body = """
+<h1 id="anim-title">Web Animation</h1>
+<div id="anim-box" style="width:50px;height:50px;background:#3498db;"></div>
+<p>状态：<span id="anim-status">idle</span></p>
+<button id="anim-start" onclick="startAnim()">开始</button>
+<button id="anim-pause" onclick="pauseAnim()">暂停</button>
+<button id="anim-resume" onclick="resumeAnim()">继续</button>
+<script>
+var anim = null;
+function startAnim() {
+  anim = document.getElementById('anim-box').animate(
+    [{ transform: 'translateX(0)' }, { transform: 'translateX(200px)' }],
+    { duration: 500, fill: 'forwards' }
+  );
+  document.getElementById('anim-status').textContent = 'running';
+  anim.onfinish = function() {
+    document.getElementById('anim-status').textContent = 'finished';
+  };
+}
+function pauseAnim() {
+  if (anim) { anim.pause(); document.getElementById('anim-status').textContent = 'paused'; }
+}
+function resumeAnim() {
+  if (anim) { anim.play(); document.getElementById('anim-status').textContent = 'running'; }
+}
+</script>"""
+    return _page_shell("动画", body)
+
+
+# ---------------------------------------------------------------------------
+# M3: Multi-form isolation
+# ---------------------------------------------------------------------------
+
+def _multiform_page_html() -> bytes:
+    body = """
+<h1 id="mf-title">多表单隔离</h1>
+<form id="mf-form-a">
+  <input type="text" id="mf-a-name" name="name" value="FormA">
+  <input type="text" id="mf-a-email" name="email" value="a@test.com">
+  <button type="button" id="mf-a-submit" onclick="submitA()">提交A</button>
+</form>
+<p>表单A结果：<span id="mf-a-result">none</span></p>
+
+<form id="mf-form-b">
+  <input type="text" id="mf-b-name" name="name" value="FormB">
+  <input type="number" id="mf-b-qty" name="qty" value="5">
+  <button type="button" id="mf-b-submit" onclick="submitB()">提交B</button>
+</form>
+<p>表单B结果：<span id="mf-b-result">none</span></p>
+
+<script>
+function submitA() {
+  var n = document.getElementById('mf-a-name').value;
+  var e = document.getElementById('mf-a-email').value;
+  document.getElementById('mf-a-result').textContent = n + '|' + e;
+}
+function submitB() {
+  var n = document.getElementById('mf-b-name').value;
+  var q = document.getElementById('mf-b-qty').value;
+  document.getElementById('mf-b-result').textContent = n + '|' + q;
+}
+</script>"""
+    return _page_shell("多表单", body)
+
+
+# ---------------------------------------------------------------------------
+# M4: Cookie management page
+# ---------------------------------------------------------------------------
+
+def _cookie_mgmt_page_html() -> bytes:
+    body = """
+<h1 id="cm-title">Cookie 管理</h1>
+<div>
+  <input type="text" id="cm-key" placeholder="键">
+  <input type="text" id="cm-value" placeholder="值">
+  <button id="cm-set" onclick="setCookie()">设置</button>
+  <button id="cm-delete" onclick="deleteCookie()">删除</button>
+</div>
+<p>当前 Cookies：<span id="cm-display">loading</span></p>
+<p>数量：<span id="cm-count">0</span></p>
+<script>
+function refreshDisplay() {
+  document.getElementById('cm-display').textContent = document.cookie || '(empty)';
+  var count = document.cookie ? document.cookie.split(';').filter(function(c){return c.trim();}).length : 0;
+  document.getElementById('cm-count').textContent = count;
+}
+function setCookie() {
+  var k = document.getElementById('cm-key').value;
+  var v = document.getElementById('cm-value').value;
+  document.cookie = k + '=' + v + '; path=/';
+  refreshDisplay();
+}
+function deleteCookie() {
+  var k = document.getElementById('cm-key').value;
+  document.cookie = k + '=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+  refreshDisplay();
+}
+refreshDisplay();
+</script>"""
+    return _page_shell("Cookie 管理", body)
+
+
+# ---------------------------------------------------------------------------
+# M5: Navigation guard (beforeunload)
+# ---------------------------------------------------------------------------
+
+def _nav_guard_page_html() -> bytes:
+    body = """
+<h1 id="ng-title">导航拦截</h1>
+<input type="text" id="ng-input" oninput="markDirty()">
+<p id="ng-dirty">clean</p>
+<a id="ng-link" href="/breadcrumb/home">离开页面</a>
+<script>
+var dirty = false;
+function markDirty() {
+  dirty = true;
+  document.getElementById('ng-dirty').textContent = 'dirty';
+}
+window.addEventListener('beforeunload', function(e) {
+  if (dirty) { e.preventDefault(); }
+});
+</script>"""
+    return _page_shell("导航拦截", body)
+
+
+# ---------------------------------------------------------------------------
+# M6: Undo/Redo
+# ---------------------------------------------------------------------------
+
+def _undoredo_page_html() -> bytes:
+    body = """
+<h1 id="ur-title">Undo / Redo</h1>
+<input type="text" id="ur-input">
+<p>历史长度：<span id="ur-history-len">0</span></p>
+<p>当前位置：<span id="ur-pos">0</span></p>
+<button id="ur-undo" onclick="undo()">撤销</button>
+<button id="ur-redo" onclick="redo()">重做</button>
+<script>
+var undoStack = [''];
+var undoPos = 0;
+document.getElementById('ur-input').addEventListener('input', function() {
+  undoStack = undoStack.slice(0, undoPos + 1);
+  undoStack.push(this.value);
+  undoPos = undoStack.length - 1;
+  updateUndoInfo();
+});
+function undo() {
+  if (undoPos > 0) {
+    undoPos--;
+    document.getElementById('ur-input').value = undoStack[undoPos];
+    updateUndoInfo();
+  }
+}
+function redo() {
+  if (undoPos < undoStack.length - 1) {
+    undoPos++;
+    document.getElementById('ur-input').value = undoStack[undoPos];
+    updateUndoInfo();
+  }
+}
+function updateUndoInfo() {
+  document.getElementById('ur-history-len').textContent = undoStack.length;
+  document.getElementById('ur-pos').textContent = undoPos;
+}
+</script>"""
+    return _page_shell("Undo/Redo", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -2904,6 +3110,24 @@ def make_alpha_handler(store: ScenarioStore):
             # --- L6: Error boundary ---
             if path == "/error-boundary":
                 return self._send(_error_boundary_page_html())
+            # --- M1: Canvas ---
+            if path == "/canvas":
+                return self._send(_canvas_page_html())
+            # --- M2: Animation ---
+            if path == "/animation":
+                return self._send(_animation_page_html())
+            # --- M3: Multi-form ---
+            if path == "/multiform":
+                return self._send(_multiform_page_html())
+            # --- M4: Cookie management ---
+            if path == "/cookie-mgmt":
+                return self._send(_cookie_mgmt_page_html())
+            # --- M5: Navigation guard ---
+            if path == "/nav-guard":
+                return self._send(_nav_guard_page_html())
+            # --- M6: Undo/Redo ---
+            if path == "/undo-redo":
+                return self._send(_undoredo_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
