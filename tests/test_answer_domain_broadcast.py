@@ -16,6 +16,7 @@ import inspect
 import pytest
 
 import api_server
+import broadcast as _broadcast_mod
 from visual_web_agent import main as main_mod
 
 
@@ -69,7 +70,7 @@ def captured_done(monkeypatch):
         finally:
             loop.close()
 
-    monkeypatch.setattr(api_server, "_schedule", _drive)
+    monkeypatch.setattr(_broadcast_mod, "_schedule", _drive)
     return payloads
 
 

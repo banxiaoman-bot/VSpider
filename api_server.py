@@ -98,8 +98,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-TEMP_UPLOAD_DIR = Path(__file__).resolve().parent / "temp_uploads"
-TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACT_DIR = artifact_root()
 _robots_policy = RobotsPolicyManager()
 _spider_lite = SpiderLiteManager(robots_policy=_robots_policy)
@@ -144,80 +142,61 @@ def _normalize_target_url(raw_url: str) -> tuple[str, str]:
     return url, ""
 
 
-class ConnectionManager:
-    """维护 WebSocket 连接并向所有客户端广播消息。"""
-
-    def __init__(self) -> None:
-        self.active: list[WebSocket] = []
-
-    async def connect(self, ws: WebSocket) -> None:
-        await ws.accept()
-        self.active.append(ws)
-        logger.info(f"[WS] 客户端已连接，当前连接数: {len(self.active)}")
-
-    def disconnect(self, ws: WebSocket) -> None:
-        if ws in self.active:
-            self.active.remove(ws)
-        logger.info(f"[WS] 客户端已断开，剩余连接数: {len(self.active)}")
-
-    async def broadcast(self, message: dict) -> None:
-        # WS-EGRESS-REDACT: mask api_key/password/secret/token + URL creds
-        # before any payload leaves over the socket. Opaque blobs (screenshot
-        # ``data``, base64) and over-long strings are skipped to keep this
-        # per-frame hot path cheap.
-        payload = json.dumps(redact_event_payload(message), ensure_ascii=False)
-        dead: list[WebSocket] = []
-        for ws in list(self.active):
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
-
-    async def send_log(self, content: str, level: str = "info") -> None:
-        await self.broadcast({"type": "log", "level": level, "content": content})
-
-    async def send_screenshot(self, step: int, b64_data: str) -> None:
-        await self.broadcast({"type": "screenshot", "step": step, "data": b64_data})
-
-    async def send_done(
-        self,
-        success: bool,
-        message: str = "",
-        *,
-        answer_type: str | None = None,
-        answer: str | None = None,
-        answer_domain: str | None = None,
-    ) -> None:
-        """广播任务结束事件。
-
-        ``answer_type`` / ``answer`` 是可选字段，用于驱动前端 Final Answer 面板：
-          * ``answer_type == "text"``：纯文本/Markdown 答案，前端会自动切到
-            Final Answer Tab 并以 Markdown 渲染 ``answer`` 内容。
-          * ``answer_type == "file"``：结构化数据导出（产物在 Artifacts 中），
-            前端会自动切到 Artifacts Tab，Final Answer 面板显示兜底文案。
-        若两个字段均缺省，前端会按“本次运行是否产生新 artifact”做兜底推断。
-        """
-        payload: dict[str, Any] = {"type": "done", "success": success, "message": message}
-        if isinstance(answer_type, str) and answer_type:
-            payload["answer_type"] = answer_type
-        if isinstance(answer, str):
-            payload["answer"] = answer
-        # F3: domain hint (e.g. "weather"/"stock"/"recipe"/"flight")
-        if isinstance(answer_domain, str) and answer_domain and answer_domain != "generic":
-            payload["answer_domain"] = answer_domain
-        await self.broadcast(payload)
-
-    async def send_status(self, status: str, **payload: Any) -> None:
-        data = {"type": "status", "status": status}
-        data.update(payload)
-        await self.broadcast(data)
-
-
-manager = ConnectionManager()
+from broadcast import (  # noqa: E402 — extracted Slice 3
+    ConnectionManager,
+    manager,
+    broadcast_log,
+    broadcast_image,
+    broadcast_done,
+    broadcast_new_artifact,
+    broadcast_status,
+    set_phase_log_run_id,
+    broadcast_phase,
+    broadcast_human_intervention,
+    wait_for_human_resume,
+    broadcast_log_async,
+    broadcast_image_async,
+    set_api_loop,
+    get_api_loop,
+    resume_human as _broadcast_resume_human,
+    _HITL_RESUME_EVENT,
+)
+from queue_core import (  # noqa: E402 — extracted Slice 3
+    _TASK_LOCK,
+    active_tasks,
+    TEMP_UPLOAD_DIR,
+    _TASK_COOLDOWN_SECONDS,
+    _RETRYABLE_RUN_STATUS,
+    _env_int,
+    _env_float,
+    _queue_heartbeat_config,
+    _queue_watchdog_scheduler_config,
+    _queue_worker_config,
+    _task_snapshot,
+    _next_task_id,
+    _public_task_item,
+    _active_queue_worker_count_locked,
+    _refresh_queue_worker_running_locked,
+    _public_worker_item,
+    _queue_snapshot,
+    _age_seconds,
+    queue_metrics,
+    _persist_queue_snapshot_safe,
+    _create_task_control,
+    _enqueue_task,
+    cancel_queued_task,
+    pause_task_queue,
+    resume_task_queue,
+    request_stop_current_task,
+    _retry_vlm_options_from_run,
+    _drop_redacted_secret_values,
+    _read_json_file_if_present,
+    _load_run_contract_bundle,
+    retry_run_as_queued_task,
+    recover_queued_tasks,
+    scan_stale_queue_workers,
+)
 _browser_control = BrowserControlManager()
-
 
 def _http_exception_detail(exc: Exception) -> Any:
     action_trace = getattr(exc, "action_trace", None)
@@ -239,70 +218,8 @@ app_browser_control_router = create_browser_control_router(BrowserControlApiDeps
 ))
 
 
-_TASK_LOCK = threading.Lock()
-active_tasks: dict[str, Any] = {
-    "current_task": None,
-    "queue": [],
-    "queue_worker_running": False,
-    "queue_paused": False,
-    "queue_paused_at": None,
-    "queue_pause_reason": "",
-    "workers": {},
-}
 _AUTH_SESSION_LOCK = asyncio.Lock()
 _AUTH_SESSION: dict[str, Any] | None = None
-_HITL_RESUME_EVENT = threading.Event()
-
-# 任务完成后冷静期（秒）：防止前端抖动 / 双击 / 重复广播触发的二次下发
-# 在这个窗口内，新的 /api/start_batch 会被拒绝并返回 cooldown 提示。
-_TASK_COOLDOWN_SECONDS = 8.0
-_RETRYABLE_RUN_STATUS = {"failed", "stopped", "error"}
-
-
-def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int = 16) -> int:
-    try:
-        value = int(os.getenv(name, str(default)))
-    except Exception:
-        value = default
-    return max(min_value, min(max_value, value))
-
-
-def _env_float(name: str, default: float, *, min_value: float = 0.01, max_value: float = 3600.0) -> float:
-    try:
-        value = float(os.getenv(name, str(default)))
-    except Exception:
-        value = default
-    return max(min_value, min(max_value, value))
-
-
-def _queue_heartbeat_config() -> dict[str, Any]:
-    interval = _env_float("VSPIDER_QUEUE_WORKER_HEARTBEAT_INTERVAL", 5.0, min_value=0.01, max_value=60.0)
-    stale_after = _env_float("VSPIDER_QUEUE_WORKER_STALE_SECONDS", 30.0, min_value=interval, max_value=3600.0)
-    return {
-        "interval_s": round(interval, 3),
-        "stale_after_s": round(stale_after, 3),
-    }
-
-
-def _queue_watchdog_scheduler_config() -> dict[str, Any]:
-    interval = _env_float("VSPIDER_QUEUE_WATCHDOG_INTERVAL", 15.0, min_value=0.1, max_value=3600.0)
-    return {
-        "enabled": _env_flag("VSPIDER_QUEUE_WATCHDOG_ENABLED", False),
-        "interval_s": round(interval, 3),
-    }
-
-
-def _queue_worker_config() -> dict[str, Any]:
-    requested = _env_int("VSPIDER_QUEUE_MAX_WORKERS", 1, min_value=1, max_value=16)
-    parallel_enabled = _env_flag("VSPIDER_EXPERIMENTAL_PARALLEL_RUNS", False)
-    effective = requested if parallel_enabled else 1
-    return {
-        "requested_max_workers": requested,
-        "effective_max_workers": effective,
-        "parallel_enabled": parallel_enabled,
-        "safety_cap_active": requested > effective,
-        "safety_note": "" if parallel_enabled else "parallel queue workers require VSPIDER_EXPERIMENTAL_PARALLEL_RUNS=true",
-    }
 
 
 def _auth_dir() -> Path:
@@ -350,429 +267,6 @@ async def _close_auth_session(session: dict[str, Any]) -> None:
             pass
 
 
-def _task_snapshot() -> dict[str, Any]:
-    with _TASK_LOCK:
-        task = active_tasks.get("current_task")
-        queue = list(active_tasks.get("queue") or [])
-        if not task:
-            return {
-                "running": False,
-                "task_id": None,
-                "status": "idle",
-                "stop_requested": False,
-                "in_cooldown": False,
-                "cooldown_remaining": 0.0,
-                "queue_length": len(queue),
-                "queue_worker_running": bool(active_tasks.get("queue_worker_running")),
-                "queue_paused": bool(active_tasks.get("queue_paused")),
-            }
-        finished_at = task.get("finished_at") or 0.0
-        running = bool(task.get("running", False))
-        if running or finished_at <= 0:
-            cooldown_remaining = 0.0
-        else:
-            cooldown_remaining = max(
-                0.0, _TASK_COOLDOWN_SECONDS - (time.time() - finished_at)
-            )
-        return {
-            "running": running,
-            "task_id": task.get("task_id"),
-            "status": task.get("status", "unknown"),
-            "stop_requested": bool(
-                task.get("stop_event") and task["stop_event"].is_set()
-            ),
-            "in_cooldown": cooldown_remaining > 0,
-            "cooldown_remaining": round(cooldown_remaining, 2),
-            "queue_length": len(queue),
-            "queue_worker_running": bool(active_tasks.get("queue_worker_running")),
-            "queue_paused": bool(active_tasks.get("queue_paused")),
-        }
-
-
-def _next_task_id() -> str:
-    return f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-
-
-def _retry_vlm_options_from_run(run: dict[str, Any]) -> dict[str, Any]:
-    options: dict[str, Any] = {}
-    for key, value in dict(run.get("vlm_options") or {}).items():
-        if value in (None, ""):
-            continue
-        if "api_key" in str(key).lower() and str(value) == "***":
-            continue
-        options[str(key)] = value
-    return options
-
-
-def _drop_redacted_secret_values(mapping: Any) -> dict[str, Any]:
-    restored: dict[str, Any] = {}
-    for key, value in dict(mapping or {}).items():
-        lowered = str(key).lower()
-        is_secret = any(part in lowered for part in ("api_key", "password", "secret", "token"))
-        if is_secret and str(value) == "***":
-            continue
-        restored[str(key)] = value
-    return restored
-
-
-def _retry_input_contract(run_id: str) -> dict[str, Any]:
-    try:
-        bundle = _load_run_contract_bundle(run_id)
-    except Exception:
-        return {}
-    contract = bundle.get("input_contract") if isinstance(bundle, dict) else None
-    return contract if isinstance(contract, dict) else {}
-
-
-def _input_contract_urls(contract: dict[str, Any]) -> list[str]:
-    urls = contract.get("urls") if isinstance(contract, dict) else []
-    out: list[str] = []
-    for item in urls or []:
-        if isinstance(item, dict):
-            value = str(item.get("url") or "").strip()
-        else:
-            value = str(item or "").strip()
-        if value and value not in out:
-            out.append(value)
-    return out
-
-
-def _url_identity(value: str) -> str:
-    return str(value or "").strip().lower().rstrip("/")
-
-
-def _input_contract_extra_urls(contract_urls: list[str], target_url: str) -> list[str]:
-    target_key = _url_identity(target_url)
-    out: list[str] = []
-    for url in contract_urls:
-        if not url:
-            continue
-        if target_key and _url_identity(url) == target_key:
-            continue
-        if url not in out:
-            out.append(url)
-    return out
-
-
-def _input_contract_auth_profiles(contract: dict[str, Any]) -> str:
-    profiles = contract.get("auth_profiles") if isinstance(contract, dict) else []
-    if isinstance(profiles, str):
-        return profiles.strip()
-    if isinstance(profiles, list):
-        return ",".join(str(p).strip() for p in profiles if str(p).strip())
-    return ""
-
-
-def _input_contract_primary_attachment(contract: dict[str, Any]) -> dict[str, Any]:
-    attachments = contract.get("attachments") if isinstance(contract, dict) else []
-    for item in attachments or []:
-        if isinstance(item, dict) and (item.get("path") or item.get("filename")):
-            return item
-    return {}
-
-
-def _public_task_item(task: dict[str, Any], *, position: int | None = None) -> dict[str, Any]:
-    item = {
-        "task_id": task.get("task_id"),
-        "status": task.get("status", "unknown"),
-        "target_url": task.get("target_url", ""),
-        "prompt": task.get("prompt", ""),
-        "mode": task.get("mode", "single"),
-        "filename": task.get("filename", ""),
-        "file_size_kb": task.get("file_size_kb", 0.0),
-        "created_at": task.get("created_at"),
-        "queued_at": task.get("queued_at"),
-        "started_at": task.get("started_at"),
-        "finished_at": task.get("finished_at"),
-    }
-    if position is not None:
-        item["position"] = position
-    return item
-
-
-def _active_queue_worker_count_locked() -> int:
-    workers = active_tasks.get("workers") or {}
-    return sum(
-        1
-        for worker in workers.values()
-        if str(worker.get("status") or "") in {"starting", "idle", "running", "paused"}
-    )
-
-
-def _refresh_queue_worker_running_locked() -> None:
-    active_tasks["queue_worker_running"] = _active_queue_worker_count_locked() > 0
-
-
-def _public_worker_item(worker: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
-    now_ts = time.time() if now is None else float(now)
-    item = dict(worker or {})
-    try:
-        age = max(0.0, now_ts - float(item.get("last_seen_at") or 0.0))
-    except Exception:
-        age = 0.0
-    status = str(item.get("status") or "")
-    stale_after = float(_queue_heartbeat_config().get("stale_after_s") or 30.0)
-    item["heartbeat_age_s"] = round(age, 3)
-    item["stale"] = status in {"starting", "idle", "running", "paused"} and age > stale_after
-    return item
-
-
-def _queue_snapshot() -> dict[str, Any]:
-    with _TASK_LOCK:
-        current = active_tasks.get("current_task")
-        queue = list(active_tasks.get("queue") or [])
-        workers = list((active_tasks.get("workers") or {}).values())
-        worker_config = _queue_worker_config()
-        heartbeat_config = _queue_heartbeat_config()
-        watchdog_config = _queue_watchdog_scheduler_config()
-        now_ts = time.time()
-        public_workers = sorted(
-            [_public_worker_item(worker, now=now_ts) for worker in workers],
-            key=lambda item: str(item.get("worker_id") or ""),
-        )
-        return {
-            "running": bool(current and current.get("running")),
-            "worker_running": bool(active_tasks.get("queue_worker_running")),
-            "queue_paused": bool(active_tasks.get("queue_paused")),
-            "queue_paused_at": active_tasks.get("queue_paused_at"),
-            "queue_pause_reason": active_tasks.get("queue_pause_reason") or "",
-            "worker_config": worker_config,
-            "heartbeat_config": heartbeat_config,
-            "watchdog_config": watchdog_config,
-            "active_worker_count": _active_queue_worker_count_locked(),
-            "stale_worker_count": sum(1 for worker in public_workers if worker.get("stale")),
-            "workers": public_workers,
-            "current": _public_task_item(current) if current else None,
-            "queue_length": len(queue),
-            "queue": [
-                _public_task_item(task, position=idx + 1)
-                for idx, task in enumerate(queue)
-            ],
-        }
-
-
-def _age_seconds(now_ts: float, value: Any) -> float | None:
-    try:
-        ts = float(value)
-    except Exception:
-        return None
-    if ts <= 0:
-        return None
-    return round(max(0.0, now_ts - ts), 3)
-
-
-def queue_metrics(*, run_limit: int = 200) -> dict[str, Any]:
-    now_ts = time.time()
-    snapshot = _queue_snapshot()
-    queue_items = [item for item in (snapshot.get("queue") or []) if isinstance(item, dict)]
-    workers = [item for item in (snapshot.get("workers") or []) if isinstance(item, dict)]
-    queued_ages = [
-        age
-        for age in (_age_seconds(now_ts, item.get("queued_at") or item.get("created_at")) for item in queue_items)
-        if age is not None
-    ]
-    current = snapshot.get("current") if isinstance(snapshot.get("current"), dict) else None
-    worker_status_counts: dict[str, int] = {}
-    for worker in workers:
-        status = str(worker.get("status") or "unknown")
-        worker_status_counts[status] = worker_status_counts.get(status, 0) + 1
-
-    try:
-        runs = _run_registry.list_runs(limit=run_limit)
-    except Exception as exc:
-        logger.debug("[QUEUE METRICS] list_runs failed: %s", exc)
-        runs = []
-    run_status_counts: dict[str, int] = {}
-    retry_count = 0
-    retryable_count = 0
-    for run in runs:
-        status = str(run.get("status") or "unknown")
-        run_status_counts[status] = run_status_counts.get(status, 0) + 1
-        if run.get("retry_of"):
-            retry_count += 1
-        if status in _RETRYABLE_RUN_STATUS:
-            retryable_count += 1
-
-    return {
-        "generated_at": now_ts,
-        "queue": {
-            "length": int(snapshot.get("queue_length") or 0),
-            "paused": bool(snapshot.get("queue_paused")),
-            "pause_reason": snapshot.get("queue_pause_reason") or "",
-            "worker_running": bool(snapshot.get("worker_running")),
-            "running": bool(snapshot.get("running")),
-        },
-        "workers": {
-            "active_count": int(snapshot.get("active_worker_count") or 0),
-            "stale_count": int(snapshot.get("stale_worker_count") or 0),
-            "status_counts": worker_status_counts,
-        },
-        "timing": {
-            "current_runtime_s": _age_seconds(now_ts, current.get("started_at")) if current else None,
-            "oldest_queued_age_s": max(queued_ages) if queued_ages else None,
-            "average_queued_age_s": round(sum(queued_ages) / len(queued_ages), 3) if queued_ages else None,
-        },
-        "registry": {
-            "sample_size": len(runs),
-            "status_counts": run_status_counts,
-            "retry_count": retry_count,
-            "retryable_count": retryable_count,
-        },
-    }
-
-
-def _persist_queue_snapshot_safe() -> None:
-    try:
-        snapshot = _queue_snapshot()
-        with _TASK_LOCK:
-            snapshot["execution_queue"] = [
-                dict(task)
-                for task in (active_tasks.get("queue") or [])
-                if isinstance(task, dict)
-            ]
-        _queue_state.save_snapshot(snapshot)
-    except Exception as exc:
-        logger.debug("[QUEUE STATE] persist failed: %s", exc)
-
-
-def _create_task_control(
-    target_url: str,
-    prompt: str,
-    file_path: str,
-    auth_profiles: str = "",
-    vlm_model: str = "",
-    semantic_model: str = "",
-    vlm_text_only: bool = False,
-    *,
-    mode: str = "single",
-    filename: str = "",
-    file_size_kb: float = 0.0,
-    vlm_model_type: str = "vl",
-    vlm_options: dict[str, Any] | None = None,
-    task_id: str | None = None,
-) -> tuple[str, threading.Event]:
-    task_id = task_id or _next_task_id()
-    stop_event = threading.Event()
-    now = time.time()
-    with _TASK_LOCK:
-        active_tasks["current_task"] = {
-            "task_id": task_id,
-            "target_url": target_url,
-            "prompt": prompt,
-            "file_path": file_path,
-            "auth_profiles": auth_profiles,
-            "vlm_model": vlm_model,
-            "semantic_model": semantic_model,
-            "vlm_text_only": vlm_text_only,
-            "status": "running",
-            "running": True,
-            "created_at": now,
-            "started_at": now,
-            "stop_event": stop_event,
-            "mode": mode,
-            "filename": filename,
-            "file_size_kb": round(float(file_size_kb or 0.0), 1),
-            "vlm_model_type": vlm_model_type,
-            "vlm_options": vlm_options or {},
-        }
-    try:
-        if _run_registry.load_run(task_id) is None:
-            _run_registry.create_run(
-                run_id=task_id,
-                target_url=target_url,
-                prompt=prompt,
-                mode=mode,
-                filename=filename,
-                file_size_kb=file_size_kb,
-                auth_profiles=auth_profiles,
-                vlm_model=vlm_model,
-                semantic_model=semantic_model,
-                vlm_model_type=vlm_model_type,
-                vlm_options=vlm_options,
-            )
-        else:
-            _run_registry.update_run(task_id, status="running", extra={"started_at": now})
-    except Exception as exc:
-        logger.debug("[RUN REGISTRY] create_run failed for %s: %s", task_id, exc)
-    return task_id, stop_event
-
-
-def _enqueue_task(
-    *,
-    target_url: str,
-    prompt: str,
-    file_path: str,
-    auth_profiles: str = "",
-    vlm_model: str = "",
-    semantic_model: str = "",
-    vlm_text_only: bool = False,
-    mode: str = "single",
-    filename: str = "",
-    file_size_kb: float = 0.0,
-    vlm_model_type: str = "vl",
-    vlm_options: dict[str, Any] | None = None,
-    urls: list[str] | None = None,
-    upload_sha256: str = "",
-    upload_mime: str = "",
-    constraints: dict[str, Any] | None = None,
-    attachment_intent: str = "",
-) -> tuple[dict[str, Any], bool]:
-    task_id = _next_task_id()
-    now = time.time()
-    item = {
-        "task_id": task_id,
-        "target_url": target_url,
-        "prompt": prompt,
-        "file_path": file_path,
-        "auth_profiles": auth_profiles,
-        "vlm_model": vlm_model,
-        "semantic_model": semantic_model,
-        "vlm_text_only": vlm_text_only,
-        "mode": mode,
-        "filename": filename,
-        "file_size_kb": round(float(file_size_kb or 0.0), 1),
-        "vlm_model_type": vlm_model_type,
-        "vlm_options": vlm_options or {},
-        "urls": list(urls or []),
-        "upload_sha256": upload_sha256,
-        "upload_mime": upload_mime,
-        "constraints": dict(constraints or {}),
-        "attachment_intent": str(attachment_intent or "").strip(),
-        "status": "queued",
-        "running": False,
-        "created_at": now,
-        "queued_at": now,
-    }
-    with _TASK_LOCK:
-        active_tasks.setdefault("queue", []).append(item)
-        should_start_worker = _active_queue_worker_count_locked() <= 0
-        if should_start_worker:
-            active_tasks["queue_worker_running"] = True
-    try:
-        _run_registry.create_run(
-            run_id=task_id,
-            target_url=target_url,
-            prompt=prompt,
-            mode=mode,
-            filename=filename,
-            file_size_kb=file_size_kb,
-            auth_profiles=auth_profiles,
-            vlm_model=vlm_model,
-            semantic_model=semantic_model,
-            vlm_model_type=vlm_model_type,
-            vlm_options=vlm_options,
-            urls=list(urls or []),
-            constraints=dict(constraints or {}),
-            upload_sha256=upload_sha256,
-            upload_mime=upload_mime,
-            status="queued",
-        )
-    except Exception as exc:
-        logger.debug("[RUN REGISTRY] queued create_run failed for %s: %s", task_id, exc)
-    _persist_queue_snapshot_safe()
-    return item, should_start_worker
-
-
 def _start_queue_workers(background_tasks: BackgroundTasks) -> tuple[list[str], dict[str, Any]]:
     config = _queue_worker_config()
     started: list[str] = []
@@ -797,558 +291,6 @@ def _start_queue_workers(background_tasks: BackgroundTasks) -> tuple[list[str], 
         background_tasks.add_task(_queue_worker, worker_id)
     _persist_queue_snapshot_safe()
     return started, config
-
-
-def cancel_queued_task(task_id: str) -> tuple[bool, str]:
-    tid = str(task_id or "").strip()
-    if not tid:
-        return False, "task_id is required"
-    cancelled = False
-    with _TASK_LOCK:
-        queue = active_tasks.get("queue") or []
-        for idx, task in enumerate(list(queue)):
-            if str(task.get("task_id") or "") == tid:
-                queue.pop(idx)
-                task["status"] = "stopped"
-                task["finished_at"] = time.time()
-                try:
-                    _run_registry.update_run(tid, status="stopped", error="cancelled before start")
-                except Exception as exc:
-                    logger.debug("[RUN REGISTRY] cancel queued update failed: %s", exc)
-                cancelled = True
-                break
-    if cancelled:
-        _persist_queue_snapshot_safe()
-        return True, "队列任务已取消"
-    return False, "队列中未找到该任务"
-
-
-def pause_task_queue(reason: str = "") -> dict[str, Any]:
-    now_ts = time.time()
-    with _TASK_LOCK:
-        active_tasks["queue_paused"] = True
-        active_tasks["queue_paused_at"] = now_ts
-        active_tasks["queue_pause_reason"] = str(reason or "").strip()
-        for worker in (active_tasks.get("workers") or {}).values():
-            if str(worker.get("status") or "") in {"starting", "idle"}:
-                worker["status"] = "paused"
-                worker["last_seen_at"] = now_ts
-        _refresh_queue_worker_running_locked()
-    _persist_queue_snapshot_safe()
-    return _queue_snapshot()
-
-
-def resume_task_queue() -> tuple[dict[str, Any], bool]:
-    with _TASK_LOCK:
-        active_tasks["queue_paused"] = False
-        active_tasks["queue_paused_at"] = None
-        active_tasks["queue_pause_reason"] = ""
-        for worker in (active_tasks.get("workers") or {}).values():
-            if str(worker.get("status") or "") == "paused":
-                worker["status"] = "idle"
-                worker["last_seen_at"] = time.time()
-        should_start_worker = bool(active_tasks.get("queue")) and _active_queue_worker_count_locked() <= 0
-        if should_start_worker:
-            active_tasks["queue_worker_running"] = True
-        else:
-            _refresh_queue_worker_running_locked()
-    _persist_queue_snapshot_safe()
-    return _queue_snapshot(), should_start_worker
-
-
-def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:
-    rid = str(run_id or "").strip()
-    if not rid:
-        return False, "run_id is required", {}
-    run = _run_registry.load_run(rid)
-    if not run:
-        return False, "run not found", {}
-    source_status = str(run.get("status") or "").lower()
-    if source_status not in _RETRYABLE_RUN_STATUS:
-        return False, f"run status is not retryable: {source_status or 'unknown'}", {"source": run}
-    input_contract = _retry_input_contract(rid)
-    contract_urls = _input_contract_urls(input_contract)
-    target_url = str(run.get("target_url") or "").strip() or (contract_urls[0] if contract_urls else "")
-    prompt = str(run.get("prompt") or "").strip() or str(input_contract.get("goal") or "").strip()
-    if not target_url or not prompt:
-        return False, "run is missing target_url or prompt", {"source": run}
-
-    contract_attachment = _input_contract_primary_attachment(input_contract)
-    attachment_path = str(contract_attachment.get("path") or "").strip()
-    mode = str(run.get("mode") or ("batch" if contract_attachment else "single"))
-    filename = (
-        str(run.get("filename") or "").strip()
-        or str(contract_attachment.get("filename") or "").strip()
-        or (Path(attachment_path).name if attachment_path else "")
-    )
-    file_size_kb = float(run.get("file_size_kb") or 0.0)
-    if not file_size_kb and contract_attachment.get("size"):
-        try:
-            file_size_kb = float(contract_attachment.get("size") or 0.0) / 1024.0
-        except Exception:
-            file_size_kb = 0.0
-    upload_sha256 = str(run.get("upload_sha256") or contract_attachment.get("sha256") or "")
-    upload_mime = str(run.get("upload_mime") or contract_attachment.get("mime") or "")
-    # input_contract.json is the reproduction baseline (§一-B): the persisted
-    # intent is this run's authoritative routing key, so the retry replays it
-    # as an explicit override ("unknown" stays an inference result, not one).
-    retry_attachment_intent = str(
-        run.get("attachment_intent") or contract_attachment.get("intent") or ""
-    ).strip()
-    if retry_attachment_intent == "unknown":
-        retry_attachment_intent = ""
-    file_path = ""
-    if mode == "batch" and (filename or attachment_path):
-        candidates: list[Path] = []
-        if filename:
-            candidates.append(TEMP_UPLOAD_DIR / filename)
-        if attachment_path:
-            candidates.append(Path(attachment_path))
-        for candidate in candidates:
-            if candidate.exists() and candidate.is_file():
-                file_path = str(candidate)
-                break
-        if not file_path:
-            return False, "batch retry file is missing", {"source": run}
-
-    retry_urls = [str(u) for u in (run.get("urls") or []) if str(u or "")]
-    if not retry_urls:
-        retry_urls = _input_contract_extra_urls(contract_urls, target_url)
-    retry_constraints = _drop_redacted_secret_values(run.get("constraints"))
-    if not retry_constraints:
-        retry_constraints = _drop_redacted_secret_values(input_contract.get("constraints"))
-
-    item, should_start_worker = _enqueue_task(
-        target_url=target_url,
-        prompt=prompt,
-        file_path=file_path,
-        auth_profiles=str(run.get("auth_profiles") or "").strip() or _input_contract_auth_profiles(input_contract),
-        vlm_model=str(run.get("vlm_model") or ""),
-        semantic_model=str(run.get("semantic_model") or ""),
-        vlm_text_only=str(run.get("vlm_model_type") or "").lower() == "text",
-        mode=mode,
-        filename=filename,
-        file_size_kb=file_size_kb,
-        vlm_model_type=str(run.get("vlm_model_type") or "vl"),
-        vlm_options=_retry_vlm_options_from_run(run),
-        urls=retry_urls,
-        constraints=retry_constraints,
-        upload_sha256=upload_sha256,
-        upload_mime=upload_mime,
-        attachment_intent=retry_attachment_intent,
-    )
-    try:
-        _run_registry.update_run(
-            str(item.get("task_id") or ""),
-            extra={
-                "retry_of": rid,
-                "retry_source_status": source_status,
-                "retry_queued_at": time.time(),
-            },
-        )
-    except Exception as exc:
-        logger.debug("[RUN REGISTRY] retry metadata update failed for %s: %s", item.get("task_id"), exc)
-    return True, "retry task queued", {
-        "source_run_id": rid,
-        "source_status": source_status,
-        "task": _public_task_item(item),
-        "task_id": item.get("task_id"),
-        "should_start_worker": should_start_worker,
-    }
-
-
-def recover_queued_tasks() -> dict[str, Any]:
-    snapshot = _queue_state.load_snapshot()
-    if not snapshot:
-        return {
-            "recovered_count": 0,
-            "interrupted_count": 0,
-            "recovered_task_ids": [],
-            "interrupted_task_ids": [],
-            "message": "no persisted queue snapshot",
-        }
-
-    recovered: list[dict[str, Any]] = []
-    for item in snapshot.get("execution_queue") or snapshot.get("queue") or []:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("status") or "").lower() != "queued":
-            continue
-        tid = str(item.get("task_id") or "").strip()
-        if not tid:
-            continue
-        recovered.append({
-            "task_id": tid,
-            "target_url": str(item.get("target_url") or ""),
-            "prompt": str(item.get("prompt") or ""),
-            "file_path": str(item.get("file_path") or ""),
-            "auth_profiles": str(item.get("auth_profiles") or ""),
-            "vlm_model": str(item.get("vlm_model") or ""),
-            "semantic_model": str(item.get("semantic_model") or ""),
-            "vlm_text_only": bool(item.get("vlm_text_only")),
-            "mode": str(item.get("mode") or "single"),
-            "filename": str(item.get("filename") or ""),
-            "file_size_kb": float(item.get("file_size_kb") or 0.0),
-            "vlm_model_type": str(item.get("vlm_model_type") or "vl"),
-            "vlm_options": _drop_redacted_secret_values(item.get("vlm_options")),
-            "urls": [str(u) for u in (item.get("urls") or []) if str(u or "")],
-            "upload_sha256": str(item.get("upload_sha256") or ""),
-            "upload_mime": str(item.get("upload_mime") or ""),
-            "constraints": _drop_redacted_secret_values(item.get("constraints")),
-            "attachment_intent": str(item.get("attachment_intent") or ""),
-            "status": "queued",
-            "running": False,
-            "created_at": item.get("created_at") or time.time(),
-            "queued_at": item.get("queued_at") or time.time(),
-        })
-
-    interrupted: list[str] = []
-    current = snapshot.get("current")
-    if isinstance(current, dict):
-        current_status = str(current.get("status") or "").lower()
-        current_id = str(current.get("task_id") or "").strip()
-        if current_id and current_status in {"running", "stopping"}:
-            interrupted.append(current_id)
-            try:
-                _run_registry.update_run(
-                    current_id,
-                    status="error",
-                    error="interrupted before queue recovery",
-                )
-            except Exception as exc:
-                logger.debug("[QUEUE RECOVERY] interrupted update failed: %s", exc)
-
-    with _TASK_LOCK:
-        existing = {
-            str(item.get("task_id") or "")
-            for item in (active_tasks.get("queue") or [])
-            if isinstance(item, dict)
-        }
-        added = []
-        for item in recovered:
-            if item["task_id"] in existing:
-                continue
-            active_tasks.setdefault("queue", []).append(item)
-            existing.add(item["task_id"])
-            added.append(item)
-        active_tasks["current_task"] = None
-        active_tasks["workers"] = {}
-        active_tasks["queue_worker_running"] = False
-
-    _persist_queue_snapshot_safe()
-    return {
-        "recovered_count": len(added),
-        "interrupted_count": len(interrupted),
-        "recovered_task_ids": [item["task_id"] for item in added],
-        "interrupted_task_ids": interrupted,
-        "message": "queue snapshot recovered",
-    }
-
-
-def scan_stale_queue_workers() -> dict[str, Any]:
-    now_ts = time.time()
-    stale_workers: list[dict[str, Any]] = []
-    affected_task_ids: list[str] = []
-    stale_error = "worker heartbeat stale"
-    with _TASK_LOCK:
-        workers = active_tasks.get("workers") or {}
-        current = active_tasks.get("current_task")
-        for worker_id, worker in workers.items():
-            public = _public_worker_item(worker, now=now_ts)
-            if not public.get("stale"):
-                continue
-            task_id = str(worker.get("task_id") or "").strip()
-            worker["status"] = "error"
-            worker["error"] = (
-                f"{stale_error}: heartbeat_age_s={public.get('heartbeat_age_s')}"
-            )
-            worker["stopped_at"] = now_ts
-            worker["last_seen_at"] = worker.get("last_seen_at") or now_ts
-            public["status"] = "error"
-            public["error"] = worker["error"]
-            public["stopped_at"] = now_ts
-            stale_workers.append(public)
-            if task_id:
-                affected_task_ids.append(task_id)
-                if current and str(current.get("task_id") or "") == task_id:
-                    current["status"] = "error"
-                    current["running"] = False
-                    current["finished_at"] = now_ts
-                    current["error"] = stale_error
-        _refresh_queue_worker_running_locked()
-
-    unique_task_ids = sorted(set(affected_task_ids))
-    for task_id in unique_task_ids:
-        try:
-            _run_registry.update_run(task_id, status="error", error=stale_error)
-        except Exception as exc:
-            logger.debug("[QUEUE WATCHDOG] stale task update failed for %s: %s", task_id, exc)
-
-    _persist_queue_snapshot_safe()
-    return {
-        "scanned_at": now_ts,
-        "stale_worker_count": len(stale_workers),
-        "affected_task_count": len(unique_task_ids),
-        "affected_task_ids": unique_task_ids,
-        "workers": stale_workers,
-        "message": "stale workers marked" if stale_workers else "no stale workers",
-    }
-
-
-def request_stop_current_task() -> tuple[bool, str]:
-    with _TASK_LOCK:
-        task = active_tasks.get("current_task")
-        if not task or not task.get("running"):
-            return False, "当前没有运行中的任务"
-
-        stop_event = task.get("stop_event")
-        if stop_event and not stop_event.is_set():
-            stop_event.set()
-            task["status"] = "stopping"
-            try:
-                _run_registry.mark_stop_requested(str(task.get("task_id") or ""))
-            except Exception as exc:
-                logger.debug("[RUN REGISTRY] mark_stop_requested failed: %s", exc)
-            return True, "停止信号已发送"
-
-        return True, "停止信号已存在，任务正在终止"
-
-
-_API_LOOP: asyncio.AbstractEventLoop | None = None
-
-# Strong refs to fire-and-forget background tasks. asyncio keeps only a *weak*
-# reference to a task, so a task with no other reference can be garbage-collected
-# mid-flight -- silently dropping the log/broadcast it was sending. Hold each task
-# here until it finishes (see CPython asyncio docs on create_task).
-_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
-
-
-def _schedule(coro: Coroutine[Any, Any, Any]) -> None:
-    """
-    把协程安全地投递到 FastAPI 事件循环。
-
-    - 当前就在 API 事件循环中：直接 `create_task`
-    - 其他线程：用 `run_coroutine_threadsafe`
-    - API 未启动：静默关闭协程，允许 CLI 独立运行
-    """
-    loop = _API_LOOP
-    if loop is None or loop.is_closed():
-        coro.close()
-        return
-
-    try:
-        current = asyncio.get_running_loop()
-    except RuntimeError:
-        current = None
-
-    if current is loop:
-        task = loop.create_task(coro)
-        _BACKGROUND_TASKS.add(task)
-        task.add_done_callback(_BACKGROUND_TASKS.discard)
-    else:
-        asyncio.run_coroutine_threadsafe(coro, loop)
-
-
-def broadcast_log(content: str, level: str = "info") -> None:
-    _schedule(manager.send_log(content, level))
-
-
-def broadcast_image(b64_data: str, step: int = 0) -> None:
-    _schedule(manager.send_screenshot(step, b64_data))
-
-
-def broadcast_done(
-    success: bool,
-    message: str = "",
-    *,
-    answer_type: str | None = None,
-    answer: str | None = None,
-    answer_domain: str | None = None,
-) -> None:
-    """线程安全地广播 done 事件，支持可选的最终答案字段。
-
-    用法（在 agent pipeline 收尾处）：
-      * 纯文本/Markdown 答案：
-            broadcast_done(True, "任务执行完成", answer_type="text", answer=md)
-      * 结构化数据导出（产物在 Artifacts 中）：
-            broadcast_done(True, "任务执行完成", answer_type="file")
-    """
-    _schedule(
-        manager.send_done(
-            success,
-            message,
-            answer_type=answer_type,
-            answer=answer,
-            answer_domain=answer_domain,
-        )
-    )
-
-
-def broadcast_new_artifact(path: str | Path) -> None:
-    try:
-        p = Path(path).resolve()
-        broadcast_status(
-            "new_artifact",
-            filename=p.name,
-            path=str(p),
-            url=artifact_url(p),
-        )
-    except Exception as exc:
-        logger.debug("[ARTIFACT] Failed to broadcast artifact %s: %s", path, exc)
-
-
-def broadcast_status(status: str, **payload: Any) -> None:
-    _schedule(manager.send_status(status, **payload))
-
-
-# ── G2 阶段事件 ──────────────────────────────────────────────────────
-# 用于让前端实时显示"agent 现在处于哪个阶段、上一阶段耗时多少"。
-# 不替代 broadcast_log（详细文字日志），而是补一条独立的、结构化的、
-# 易于前端时间轴展示的事件流。
-#
-# 推荐 phase 名（main.py 调用约定）：
-#   * "vlm_call"     - 单步调用 VLM 前/后
-#   * "action"       - 单步执行 action 前/后
-#   * "extract"      - 提取阶段开始/结束
-#   * "navigate"     - 跨页导航
-#   * "guard"        - 防回环 / Tab Guard 触发
-#   * "finalize"     - 答案合成 / 文件导出
-#
-# severity:
-#   * "info"  - 正常进度
-#   * "warn"  - 异常但已自愈（候选不唯一、自动重试、降级路径）
-#   * "error" - 致命错误已发生但 run 尚未终止（前端可加红边）
-# L: per-run phase event persistence -----------------------------------
-# When ``set_phase_log_run_id(run_ts)`` is called, every subsequent
-# ``broadcast_phase`` call also appends a JSON line to
-# ``logs/phase_<run_ts>.jsonl``. This pairs 1-to-1 with ``run_log_<run_ts>.html``
-# and unlocks offline analysis (e.g. ``scripts/scan_failed_runs.py`` can
-# build accurate per-step duration histograms).
-_PHASE_LOG_LOCK = threading.Lock()
-_PHASE_LOG_PATH: Path | None = None
-_PHASE_LOG_CONTEXT: ContextVar[Path | None] = ContextVar(
-    "vspider_phase_log_path",
-    default=None,
-)
-
-
-def set_phase_log_run_id(run_id: str | None) -> None:
-    """Open ``logs/phase_<run_id>.jsonl`` for append-only phase event writes.
-
-    Call once per run (typically right after ``_run_ts`` is generated in
-    ``main.py``). Pass ``None`` to disable file persistence.
-
-    The directory is created if missing. Existing content is preserved
-    (same run_id - same file, idempotent open).
-    """
-    global _PHASE_LOG_PATH
-    with _PHASE_LOG_LOCK:
-        if not run_id:
-            _PHASE_LOG_PATH = None
-            _PHASE_LOG_CONTEXT.set(None)
-            return
-        try:
-            log_dir = Path("logs")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            path = log_dir / f"phase_{run_id}.jsonl"
-            _PHASE_LOG_PATH = path
-            _PHASE_LOG_CONTEXT.set(path)
-            if not path.exists():
-                path.touch()
-        except Exception as e:
-            logging.getLogger("api_server").warning(
-                "set_phase_log_run_id failed: %s", e,
-            )
-            _PHASE_LOG_PATH = None
-            _PHASE_LOG_CONTEXT.set(None)
-
-
-def _persist_phase_event(payload: dict[str, Any]) -> None:
-    """Append one phase event to the active jsonl. Best-effort; failures
-    must NOT break the live broadcast path."""
-    path = _PHASE_LOG_CONTEXT.get() or _PHASE_LOG_PATH
-    if path is None:
-        return
-    try:
-        # WS-EGRESS-REDACT: mask secrets before the phase event hits disk,
-        # mirroring the WebSocket broadcast redaction.
-        line = json.dumps(
-            redact_event_payload(payload), ensure_ascii=False, separators=(",", ":")
-        )
-        with _PHASE_LOG_LOCK:
-            with path.open("a", encoding="utf-8", newline="\n") as f:
-                f.write(line + "\n")
-    except Exception as e:
-        logging.getLogger("api_server").debug(
-            "phase log persist failed (non-fatal): %s", e,
-        )
-
-
-def broadcast_phase(
-    phase: str,
-    *,
-    severity: str = "info",
-    message: str = "",
-    step: int | None = None,
-    duration_ms: int | None = None,
-    notice_severity: str | None = None,
-    extra: dict[str, Any] | None = None,
-) -> None:
-    """线程安全地广播一条阶段事件。
-
-    所有字段会被打包进 ``{"type":"phase", "phase":..., "severity":..., ...}``
-    payload。``extra`` 内的键会被合并到 payload 顶层（注意不要与保留字段冲突）。
-    保留字段：``type``, ``phase``, ``severity``, ``message``, ``step``, ``duration_ms``, ``notice_severity``, ``ts``。
-
-    U: ``notice_severity`` carries the BrowserEnv ``_last_notice_severity`` snapshot at emit time. It reflects the agent-visible notice the next VLM step will read (set via ``set_tab_notice``). The frontend Timeline uses ``max(severity, notice_severity)`` to color chips so a technically-successful action that raised a *warn* notice still appears amber instead of green. Callers pass ``notice_severity=browser._last_notice_severity`` when a BrowserEnv is in scope; ``None`` means "field omitted from payload" (back-compat).
-    """
-    if severity not in ("info", "warn", "error"):
-        severity = "info"
-    payload: dict[str, Any] = {
-        "type": "phase",
-        "phase": str(phase or "unknown"),
-        "severity": severity,
-        "message": str(message or ""),
-        "ts": time.time(),
-    }
-    if step is not None:
-        payload["step"] = int(step)
-    if duration_ms is not None:
-        payload["duration_ms"] = int(duration_ms)
-    # U: only include notice_severity when caller actually passed
-    # one (None = "no browser context" — keep payload lean).
-    if notice_severity is not None:
-        if notice_severity not in ("info", "warn", "error"):
-            notice_severity = "info"
-        payload["notice_severity"] = notice_severity
-    if extra:
-        for k, v in extra.items():
-            if k not in payload:
-                payload[k] = v
-    _persist_phase_event(payload)
-    _schedule(manager.broadcast(payload))
-
-
-def broadcast_human_intervention(reason: str = "") -> bool:
-    if _API_LOOP is None or _API_LOOP.is_closed():
-        return False
-    _HITL_RESUME_EVENT.clear()
-    broadcast_status("human_intervention", reason=reason)
-    broadcast_log(f"[HITL] Agent 已挂起，等待人工处理：{reason or 'manual intervention required'}", level="warn")
-    return True
-
-
-async def wait_for_human_resume() -> None:
-    await asyncio.to_thread(_HITL_RESUME_EVENT.wait)
-    _HITL_RESUME_EVENT.clear()
-
-
-async def broadcast_log_async(msg: str, level: str = "info") -> None:
-    await manager.send_log(msg, level)
-
-
-async def broadcast_image_async(b64_string: str, step: int = 0) -> None:
-    await manager.send_screenshot(step, b64_string)
 
 
 async def _run_batch_task(
@@ -1586,10 +528,9 @@ async def _queue_watchdog_scheduler(stop_signal: asyncio.Event) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """捕获 FastAPI 事件循环，供跨线程广播使用。"""
-    global _API_LOOP
     # Agent 内「连续失败按回车继续」在无 TTY 时会 EOF 并拖垮进程；API 模式默认非交互。
     os.environ.setdefault("VSPIDER_NON_INTERACTIVE", "1")
-    _API_LOOP = asyncio.get_running_loop()
+    set_api_loop(asyncio.get_running_loop())
     watchdog_stop = asyncio.Event()
     watchdog_task: asyncio.Task | None = None
     watchdog_config = _queue_watchdog_scheduler_config()
@@ -1609,7 +550,7 @@ async def lifespan(app: FastAPI):
                 await watchdog_task
             except Exception as exc:
                 logger.debug("[QUEUE WATCHDOG] scheduler stop failed: %s", exc)
-        _API_LOOP = None
+        set_api_loop(None)
         logger.info("VSpider API 服务关闭")
 
 
@@ -1923,7 +864,7 @@ async def cancel_manual_auth() -> dict:
 
 @app.post("/api/human/resume", summary="人工处理完成后恢复 Agent")
 async def resume_human_intervention() -> dict:
-    _HITL_RESUME_EVENT.set()
+    _broadcast_resume_human()
     await manager.send_status("human_resumed")
     await manager.send_log("[HITL] 操作员确认完成，Agent 恢复执行", level="info")
     return {"status": "success", "message": "Agent resume signal sent"}
@@ -1958,418 +899,39 @@ async def get_artifacts_list() -> dict:
 
 
 
-def _write_capability_execute_artifact(payload: dict[str, Any], result: dict[str, Any]) -> dict[str, str]:
-    run_id = str(payload.get("run_id") or payload.get("trace_id") or "manual")
-    safe_run_id = re.sub(r"[^a-zA-Z0-9_.-]+", "_", run_id).strip("._-") or "manual"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = resolve_artifact_path(f"capability_execute_{safe_run_id}_{stamp}.json", subdir="capability")
-    safe_request = {
-        key: payload.get(key)
-        for key in ("goal", "prompt", "url", "target_url", "start_url", "run_id", "trace_id")
-        if payload.get(key) not in (None, "")
-    }
-    doc = {
-        "type": "capability_execute_trace",
-        "created_at": time.time(),
-        "request": safe_request,
-        "result": result,
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _register_capability_execute_trace_artifact(path, payload)
-    return {"path": str(path), "url": artifact_url(path)}
+
+# Capability artifact persistence helpers (extracted to own module)
+from capability_artifact_persistence import (
+    _write_capability_execute_artifact,
+    _capability_payload_text,
+    _register_capability_report_artifact,
+    _register_capability_execute_trace_artifact,
+    _capability_failure_fixture_source,
+    _capability_failure_fixture_replay_source,
+    _efficiency_feedback_replay_source,
+    _write_efficiency_feedback_replay_artifact,
+    _write_efficiency_feedback_replay_batch_artifact,
+    _efficiency_feedback_replay_artifact_dir,
+    _read_efficiency_feedback_replay_artifact,
+    _efficiency_feedback_replay_summary,
+    _list_efficiency_feedback_replay_artifacts,
+    _list_efficiency_feedback_replay_sources,
+    _capability_failure_fixture_artifact_dir,
+    _read_capability_failure_fixture_artifact,
+    _capability_failure_fixture_summary,
+    _list_capability_failure_fixture_artifacts,
+    _write_capability_failure_fixture_artifact,
+    _write_capability_failure_fixture_replay_artifact,
+    _write_capability_failure_fixture_replay_batch_artifact,
+    _capability_failure_fixture_replay_batch_artifact_dir,
+    _read_capability_failure_fixture_replay_batch_artifact,
+    _capability_failure_fixture_replay_batch_summary,
+    _list_capability_failure_fixture_replay_batch_artifacts,
+    _capability_failure_fixture_replay_batch_pass_rate,
+    _capability_failure_fixture_replay_batch_history_trend,
+)
 
 
-def _capability_payload_text(payload: Any, keys: tuple[str, ...], *, _depth: int = 0) -> str:
-    if _depth > 6:
-        return ""
-    if isinstance(payload, dict):
-        for key in keys:
-            value = payload.get(key)
-            if value not in (None, ""):
-                return str(value).strip()
-        for value in payload.values():
-            found = _capability_payload_text(value, keys, _depth=_depth + 1)
-            if found:
-                return found
-    elif isinstance(payload, list):
-        for value in payload:
-            found = _capability_payload_text(value, keys, _depth=_depth + 1)
-            if found:
-                return found
-    return ""
-
-
-def _register_capability_report_artifact(
-    path: Path,
-    payload: dict[str, Any],
-    *,
-    produced_by: str,
-    step_id: str,
-) -> None:
-    raw_run_id = _capability_payload_text(payload, ("run_id", "trace_id"))
-    run_manifest_id = re.sub(r"[^0-9A-Za-z_-]+", "_", raw_run_id).strip("_")
-    if not run_manifest_id:
-        register_artifact(path)
-        return
-    source_url = _capability_payload_text(payload, ("url", "target_url", "start_url"))
-    try:
-        register_artifact(
-            path,
-            run_id=run_manifest_id,
-            kind="log",
-            mime="application/json",
-            source_url=source_url,
-            produced_by=produced_by,
-            step_id=step_id,
-        )
-    except TypeError:
-        register_artifact(path)
-
-
-def _register_capability_execute_trace_artifact(path: Path, payload: dict[str, Any]) -> None:
-    _register_capability_report_artifact(
-        path,
-        payload,
-        produced_by="capability_execute",
-        step_id="trace_artifact",
-    )
-
-
-def _capability_failure_fixture_source(payload: dict[str, Any]) -> dict[str, Any]:
-    for key in ("source", "trace", "artifact", "detail", "result", "failure_bundle", "phase_event"):
-        item = payload.get(key)
-        if isinstance(item, dict):
-            if key in {"failure_bundle", "phase_event"}:
-                return {key: item}
-            return dict(item)
-    return dict(payload)
-
-
-def _capability_failure_fixture_replay_source(payload: dict[str, Any]) -> dict[str, Any]:
-    for key in ("fixture", "source", "report_source"):
-        item = payload.get(key)
-        if isinstance(item, dict):
-            return dict(item)
-    return dict(payload)
-
-
-def _efficiency_feedback_replay_source(payload: dict[str, Any]) -> dict[str, Any]:
-    for key in ("efficiency_correlation_report", "planner_feedback", "source", "report_source", "result", "detail", "artifact", "phase_event"):
-        item = payload.get(key)
-        if isinstance(item, dict):
-            if key in {"efficiency_correlation_report", "planner_feedback"}:
-                source = {key: item}
-                for text_key in ("goal", "prompt", "task", "url", "target_url", "start_url"):
-                    if payload.get(text_key):
-                        source[text_key] = payload.get(text_key)
-                return source
-            return dict(item)
-    return dict(payload)
-
-
-def _write_efficiency_feedback_replay_artifact(report: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
-    feedback = dict(report.get("planner_feedback") or {}) if isinstance(report.get("planner_feedback"), dict) else {}
-    raw_name = str(payload.get("name") or feedback.get("primary_failure") or payload.get("run_id") or "efficiency_feedback_replay")
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_name).strip("._-") or "efficiency_feedback_replay"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/efficiency_feedback_replays")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _register_capability_report_artifact(
-        path,
-        payload,
-        produced_by="efficiency_feedback_replay",
-        step_id="replay_report",
-    )
-    return {"path": str(path), "url": artifact_url(path)}
-
-
-def _write_efficiency_feedback_replay_batch_artifact(report: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
-    raw_name = str(payload.get("name") or payload.get("run_id") or "efficiency_feedback_replay_batch")
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_name).strip("._-") or "efficiency_feedback_replay_batch"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/efficiency_feedback_replay_batches")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _register_capability_report_artifact(
-        path,
-        payload,
-        produced_by="efficiency_feedback_replay",
-        step_id="replay_batch_report",
-    )
-    return {"path": str(path), "url": artifact_url(path)}
-
-
-def _efficiency_feedback_replay_artifact_dir() -> Path:
-    return resolve_artifact_path("_efficiency_feedback_replay_dir_probe", subdir="capability/efficiency_feedback_replays").parent
-
-
-def _read_efficiency_feedback_replay_artifact(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    if isinstance(data, dict) and str(data.get("version") or "") == "efficiency_feedback_replay_report.v1":
-        return dict(data)
-    return {}
-
-
-def _efficiency_feedback_replay_summary(path: Path, report: dict[str, Any]) -> dict[str, Any]:
-    feedback = dict(report.get("planner_feedback") or {}) if isinstance(report.get("planner_feedback"), dict) else {}
-    execution_plan = dict(report.get("execution_plan") or {}) if isinstance(report.get("execution_plan"), dict) else {}
-    feedback_step = dict(execution_plan.get("feedback_step") or {}) if isinstance(execution_plan.get("feedback_step"), dict) else {}
-    failed_checks = [
-        str(item.get("name") or "")
-        for item in (report.get("failed_checks") or [])
-        if isinstance(item, dict) and str(item.get("name") or "")
-    ]
-    stat = path.stat()
-    return {
-        "name": path.stem,
-        "path": str(path),
-        "url": artifact_url(path),
-        "modified_at": stat.st_mtime,
-        "passed": bool(report.get("passed")),
-        "primary_failure": str(feedback.get("primary_failure") or ""),
-        "recommended_action": str(feedback.get("recommended_action") or ""),
-        "preferred_capabilities": [str(item) for item in (feedback.get("preferred_capabilities") or []) if str(item or "")][:8],
-        "avoid_actions": [str(item) for item in (feedback.get("avoid_actions") or []) if str(item or "")][:8],
-        "failed_check_count": len(failed_checks),
-        "failed_checks": failed_checks[:8],
-        "feedback_step": str(feedback_step.get("capability") or ""),
-    }
-
-
-def _list_efficiency_feedback_replay_artifacts(limit: int = 50) -> list[dict[str, Any]]:
-    root = _efficiency_feedback_replay_artifact_dir()
-    if not root.exists():
-        return []
-    items: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        if len(items) >= max(0, limit):
-            break
-        report = _read_efficiency_feedback_replay_artifact(path)
-        if not report:
-            continue
-        items.append(_efficiency_feedback_replay_summary(path, report))
-    return items
-
-
-def _list_efficiency_feedback_replay_sources(limit: int = 100) -> list[dict[str, Any]]:
-    root = _efficiency_feedback_replay_artifact_dir()
-    if not root.exists():
-        return []
-    items: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        if len(items) >= max(0, limit):
-            break
-        report = _read_efficiency_feedback_replay_artifact(path)
-        feedback = dict(report.get("planner_feedback") or {}) if isinstance(report.get("planner_feedback"), dict) else {}
-        if not feedback:
-            continue
-        items.append({
-            "name": path.stem,
-            "planner_feedback": feedback,
-            "artifact": {"path": str(path), "url": artifact_url(path)},
-        })
-    return items
-
-
-def _capability_failure_fixture_artifact_dir() -> Path:
-    return resolve_artifact_path("_fixture_dir_probe", subdir="capability/failure_fixtures").parent
-
-
-def _read_capability_failure_fixture_artifact(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    if isinstance(data, dict) and str(data.get("version") or "") == "capability_failure_regression_fixture.v1":
-        return dict(data)
-    return {}
-
-
-def _capability_failure_fixture_summary(path: Path, fixture: dict[str, Any]) -> dict[str, Any]:
-    expected = dict(fixture.get("expected") or {}) if isinstance(fixture.get("expected"), dict) else {}
-    stat = path.stat()
-    return {
-        "name": str(fixture.get("name") or path.stem),
-        "path": str(path),
-        "url": artifact_url(path),
-        "modified_at": stat.st_mtime,
-        "primary_failure": str(expected.get("primary_failure") or ""),
-        "failure_category": str(expected.get("failure_category") or ""),
-        "action": str(expected.get("action") or ""),
-        "capability": str(expected.get("capability") or ""),
-        "tags": [str(item) for item in (fixture.get("tags") or []) if str(item or "")],
-    }
-
-
-def _list_capability_failure_fixture_artifacts(limit: int = 100) -> list[dict[str, Any]]:
-    root = _capability_failure_fixture_artifact_dir()
-    if not root.exists():
-        return []
-    items: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        if len(items) >= max(0, limit):
-            break
-        fixture = _read_capability_failure_fixture_artifact(path)
-        if not fixture:
-            continue
-        summary = _capability_failure_fixture_summary(path, fixture)
-        summary["fixture"] = fixture
-        items.append(summary)
-    return items
-
-
-def _write_capability_failure_fixture_artifact(fixture: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
-    raw_name = str(payload.get("name") or fixture.get("name") or payload.get("run_id") or "capability_failure")
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_name).strip("._-") or "capability_failure"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/failure_fixtures")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(fixture, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _register_capability_report_artifact(
-        path,
-        payload,
-        produced_by="capability_failure_fixture",
-        step_id="failure_fixture",
-    )
-    return {"path": str(path), "url": artifact_url(path)}
-
-
-def _write_capability_failure_fixture_replay_artifact(report: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
-    fixture = dict(report.get("fixture") or {}) if isinstance(report.get("fixture"), dict) else {}
-    raw_name = str(payload.get("name") or fixture.get("name") or payload.get("run_id") or "capability_failure_replay")
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_name).strip("._-") or "capability_failure_replay"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/failure_fixture_replays")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _register_capability_report_artifact(
-        path,
-        payload,
-        produced_by="capability_failure_fixture_replay",
-        step_id="replay_report",
-    )
-    return {"path": str(path), "url": artifact_url(path)}
-
-
-def _write_capability_failure_fixture_replay_batch_artifact(report: dict[str, Any], payload: dict[str, Any]) -> dict[str, str]:
-    raw_name = str(payload.get("name") or payload.get("run_id") or "capability_failure_replay_batch")
-    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw_name).strip("._-") or "capability_failure_replay_batch"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = resolve_artifact_path(f"{safe_name}_{stamp}.json", subdir="capability/failure_fixture_replay_batches")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _register_capability_report_artifact(
-        path,
-        payload,
-        produced_by="capability_failure_fixture_replay",
-        step_id="replay_batch_report",
-    )
-    return {"path": str(path), "url": artifact_url(path)}
-
-
-def _capability_failure_fixture_replay_batch_artifact_dir() -> Path:
-    return resolve_artifact_path("_batch_replay_dir_probe", subdir="capability/failure_fixture_replay_batches").parent
-
-
-def _read_capability_failure_fixture_replay_batch_artifact(path: Path) -> dict[str, Any]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    if isinstance(data, dict) and str(data.get("version") or "") == "capability_failure_fixture_replay_batch_report.v1":
-        return dict(data)
-    return {}
-
-
-def _capability_failure_fixture_replay_batch_summary(path: Path, report: dict[str, Any]) -> dict[str, Any]:
-    summary = dict(report.get("summary") or {}) if isinstance(report.get("summary"), dict) else {}
-    stat = path.stat()
-    return {
-        "name": path.stem,
-        "path": str(path),
-        "url": artifact_url(path),
-        "modified_at": stat.st_mtime,
-        "fixture_count": int(report.get("fixture_count") or 0),
-        "passed_count": int(report.get("passed_count") or 0),
-        "failed_count": int(report.get("failed_count") or 0),
-        "passed": bool(report.get("passed")),
-        "status": str(summary.get("status") or ("passed" if report.get("passed") else "failed")),
-        "recommended_focus": str(summary.get("recommended_focus") or ""),
-        "top_primary_failures": list(summary.get("top_primary_failures") or [])[:5],
-        "top_failed_checks": list(summary.get("top_failed_checks") or [])[:5],
-    }
-
-
-def _list_capability_failure_fixture_replay_batch_artifacts(limit: int = 50) -> list[dict[str, Any]]:
-    root = _capability_failure_fixture_replay_batch_artifact_dir()
-    if not root.exists():
-        return []
-    items: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
-        if len(items) >= max(0, limit):
-            break
-        report = _read_capability_failure_fixture_replay_batch_artifact(path)
-        if not report:
-            continue
-        items.append(_capability_failure_fixture_replay_batch_summary(path, report))
-    return items
-
-
-def _capability_failure_fixture_replay_batch_pass_rate(report: dict[str, Any]) -> float:
-    fixture_count = int(report.get("fixture_count") or 0)
-    if fixture_count <= 0:
-        return 0.0
-    return round(float(int(report.get("passed_count") or 0)) / float(fixture_count), 4)
-
-
-def _capability_failure_fixture_replay_batch_history_trend(reports: list[dict[str, Any]]) -> dict[str, Any]:
-    latest = dict(reports[0]) if reports else {}
-    previous = dict(reports[1]) if len(reports) > 1 else {}
-    latest_failed = int(latest.get("failed_count") or 0)
-    previous_failed = int(previous.get("failed_count") or 0)
-    latest_pass_rate = _capability_failure_fixture_replay_batch_pass_rate(latest)
-    previous_pass_rate = _capability_failure_fixture_replay_batch_pass_rate(previous)
-    failed_delta = latest_failed - previous_failed if previous else 0
-    pass_rate_delta = round(latest_pass_rate - previous_pass_rate, 4) if previous else 0.0
-    if not latest:
-        direction = "empty"
-    elif not previous:
-        direction = "baseline"
-    elif failed_delta < 0:
-        direction = "improved"
-    elif failed_delta > 0:
-        direction = "regressed"
-    elif pass_rate_delta > 0:
-        direction = "improved"
-    elif pass_rate_delta < 0:
-        direction = "regressed"
-    else:
-        direction = "stable"
-    latest_focus = str(latest.get("recommended_focus") or "")
-    previous_focus = str(previous.get("recommended_focus") or "")
-    return {
-        "version": "capability_failure_fixture_replay_batch_history_trend.v1",
-        "report_count": len(reports),
-        "direction": direction,
-        "latest_report": str(latest.get("name") or ""),
-        "previous_report": str(previous.get("name") or ""),
-        "latest_status": str(latest.get("status") or ""),
-        "previous_status": str(previous.get("status") or ""),
-        "latest_failed_count": latest_failed,
-        "previous_failed_count": previous_failed,
-        "failed_count_delta": failed_delta,
-        "latest_pass_rate": latest_pass_rate,
-        "previous_pass_rate": previous_pass_rate,
-        "pass_rate_delta": pass_rate_delta,
-        "latest_recommended_focus": latest_focus,
-        "previous_recommended_focus": previous_focus,
-        "focus_changed": bool(previous and latest_focus != previous_focus),
-    }
 
 
 app.include_router(create_capability_failure_fixture_router(CapabilityFailureFixtureApiDeps(
@@ -2435,240 +997,26 @@ async def replay_efficiency_feedback_batch_route(payload: dict[str, Any] = Body(
     return {"status": "success", "result": {"report": report, "artifact": artifact}}
 
 
-def _capability_execute_runtime_context() -> dict[str, Any]:
-    runtime = _get_browser_runtime_status(
-        pool_status=_get_browser_pool_status(),
-        backend_status=_browser_control.backend_status(),
-    )
-    return {
-        "runtime_snapshot": runtime,
-        "runtime_preflight": _build_browser_runtime_preflight(runtime),
-    }
 
+# Capability execute runtime helpers (extracted to own module)
+from capability_execute_helpers import (
+    _capability_execute_runtime_context,
+    _capability_execute_runtime_summary,
+    _capability_execute_action_trace,
+    _capability_execute_exception_action_trace,
+    _capability_execute_failed_action_result,
+    _capability_execute_failure_bundle,
+    _capability_execute_phase_event,
+    _capability_execute_phase_event_extra,
+    _capability_execute_failure_detail,
+)
 
-def _capability_execute_runtime_summary(context: dict[str, Any]) -> dict[str, Any]:
-    runtime = dict(context.get("runtime_snapshot") or {})
-    preflight = dict(context.get("runtime_preflight") or {})
-    summary = dict(runtime.get("backend_summary") or {})
-    capacity = dict(runtime.get("capacity") or {})
-    return {
-        "runtime_status": str(runtime.get("status") or "unknown"),
-        "preflight_status": str(preflight.get("status") or "unknown"),
-        "preflight_blocking": bool(preflight.get("blocking")),
-        "recommended_action": str(preflight.get("recommended_action") or ""),
-        "warnings": list(preflight.get("warnings") or []),
-        "active_backend": str(summary.get("active_name") or ""),
-        "backend_health": str(summary.get("health_status") or ""),
-        "available_contexts": capacity.get("available_contexts"),
-        "max_contexts": capacity.get("max_contexts"),
-        "cache_stale": bool(summary.get("health_cache_stale")),
-    }
-
-
-def _capability_execute_action_trace(result: dict[str, Any] | None = None) -> dict[str, Any]:
-    data = dict(result or {})
-    candidates: list[Any] = [data.get("action_trace")]
-    nested = data.get("result")
-    if isinstance(nested, dict):
-        candidates.append(nested.get("action_trace"))
-    attempts = data.get("attempts")
-    if isinstance(attempts, list):
-        for item in reversed(attempts):
-            if isinstance(item, dict):
-                candidates.append(item.get("action_trace"))
-    for item in candidates:
-        if isinstance(item, dict) and str(item.get("version") or "") == "browser_action_trace.v1":
-            return dict(item)
-    return {}
-
-
-def _capability_execute_exception_action_trace(exc: Exception) -> dict[str, Any]:
-    item = getattr(exc, "action_trace", None)
-    if isinstance(item, dict) and str(item.get("version") or "") == "browser_action_trace.v1":
-        return dict(item)
-    return {}
-
-
-def _capability_execute_failed_action_result(
-    exc: Exception,
-    action_trace: dict[str, Any],
-    runtime_before: dict[str, Any],
-    runtime_after: dict[str, Any],
-) -> dict[str, Any]:
-    action_issue_summary = getattr(exc, "action_issue_summary", None) or action_trace.get("issue_summary")
-    if not isinstance(action_issue_summary, dict):
-        action_issue_summary = {}
-    attempt = {
-        "capability": "browser_control",
-        "status": "error",
-        "reason": str(exc),
-        "action_trace": dict(action_trace),
-        "action_issue_summary": dict(action_issue_summary),
-    }
-    result: dict[str, Any] = {
-        "status": "error",
-        "completed": False,
-        "route": {},
-        "attempts": [attempt],
-        "capability": "browser_control",
-        "result": None,
-        "artifact": None,
-        "verification": {"passed": False, "summary": str(exc)},
-        "fallback_reason": str(exc),
-        "action_trace": dict(action_trace),
-        "action_issue_summary": dict(action_issue_summary),
-    }
-    result["runtime_context"] = {
-        "version": "capability_execute_runtime_context.v1",
-        "before": runtime_before,
-        "after": runtime_after,
-    }
-    result["runtime_summary"] = {
-        "before": _capability_execute_runtime_summary(runtime_before),
-        "after": _capability_execute_runtime_summary(runtime_after),
-    }
-    result["runtime_drift"] = _build_browser_runtime_drift(
-        runtime_before.get("runtime_snapshot"),
-        runtime_after.get("runtime_snapshot"),
-    )
-    result["runtime_issue_summary"] = _build_browser_runtime_issue_summary(
-        before_preflight=runtime_before.get("runtime_preflight"),
-        after_preflight=runtime_after.get("runtime_preflight"),
-        drift=result.get("runtime_drift"),
-    )
-    return result
-
-
-def _capability_execute_failure_bundle(result: dict[str, Any] | None = None) -> dict[str, Any]:
-    data = dict(result or {})
-    action_trace = _capability_execute_action_trace(data)
-    if not action_trace or str(action_trace.get("status") or "").lower() != "error":
-        return {}
-    action_issue_summary = data.get("action_issue_summary") or action_trace.get("issue_summary")
-    if not isinstance(action_issue_summary, dict):
-        action_issue_summary = {}
-    result_summary = dict(action_trace.get("result_summary") or {})
-    warning_codes = [str(item) for item in (action_trace.get("warning_codes") or []) if str(item or "")]
-    primary_failure = str(result_summary.get("failure_code") or "")
-    if not primary_failure:
-        primary_failure = next((code for code in warning_codes if code != "action_failed"), "")
-    if not primary_failure:
-        primary_failure = "action_error"
-    recovery_actions: list[str] = []
-    for item in result_summary.get("recovery_actions") or []:
-        action_item = str(item or "")
-        if action_item and action_item != "continue":
-            recovery_actions.append(action_item)
-    for item in action_issue_summary.get("recommended_actions") or []:
-        action_item = str(item or "")
-        if action_item and action_item != "continue":
-            recovery_actions.append(action_item)
-    recommended_action = str(action_issue_summary.get("recommended_action") or action_trace.get("recommended_action") or "")
-    if recommended_action and recommended_action != "continue":
-        recovery_actions.append(recommended_action)
-    attempts = data.get("attempts")
-    if not isinstance(attempts, list):
-        attempts = []
-    runtime_issue_summary = data.get("runtime_issue_summary")
-    if not isinstance(runtime_issue_summary, dict):
-        runtime_issue_summary = {}
-    runtime_drift = data.get("runtime_drift")
-    if not isinstance(runtime_drift, dict):
-        runtime_drift = {}
-    trace_artifact = data.get("trace_artifact")
-    if not isinstance(trace_artifact, dict):
-        trace_artifact = {}
-    return {
-        "version": "capability_execute_failure_bundle.v1",
-        "source": "capability_execute",
-        "status": "error",
-        "blocking": bool(action_issue_summary.get("blocking") or runtime_issue_summary.get("blocking")),
-        "primary_failure": primary_failure,
-        "failure_category": str(result_summary.get("failure_category") or ""),
-        "action": str(action_trace.get("action") or ""),
-        "capability": data.get("capability"),
-        "completed": bool(data.get("completed")),
-        "fallback_reason": data.get("fallback_reason"),
-        "attempt_count": len(attempts),
-        "recommended_action": recommended_action or (recovery_actions[0] if recovery_actions else "inspect_browser_action"),
-        "recommended_actions": list(dict.fromkeys(recovery_actions)),
-        "action_trace": dict(action_trace),
-        "action_issue_summary": dict(action_issue_summary),
-        "runtime_issue_summary": dict(runtime_issue_summary),
-        "runtime_drift": dict(runtime_drift),
-        "attempts": list(attempts),
-        "trace_artifact": dict(trace_artifact),
-    }
-
-
-def _capability_execute_phase_event(
-    result: dict[str, Any],
-    *,
-    severity: str,
-    message: str,
-    completed: bool,
-) -> dict[str, Any]:
-    return {
-        "type": "phase",
-        "phase": "capability_execute",
-        "severity": str(severity or "info"),
-        "message": str(message or ""),
-        "execution_status": result.get("status"),
-        "completed": bool(completed),
-        "capability": result.get("capability"),
-        "attempts": result.get("attempts") or [],
-        "verification": result.get("verification"),
-        "fallback_reason": result.get("fallback_reason"),
-        "artifact": result.get("artifact"),
-        "trace_artifact": result.get("trace_artifact"),
-        "runtime_summary": result.get("runtime_summary"),
-        "runtime_drift": result.get("runtime_drift"),
-        "runtime_issue_summary": result.get("runtime_issue_summary"),
-        "action_trace": result.get("action_trace"),
-        "action_issue_summary": result.get("action_issue_summary"),
-        "failure_bundle": result.get("failure_bundle"),
-        "crawl_efficiency_plan": result.get("crawl_efficiency_plan"),
-        "efficiency_correlation_report": result.get("efficiency_correlation_report"),
-        "route_intent": (result.get("route") or {}).get("intent"),
-    }
-
-
-def _capability_execute_phase_event_extra(phase_event: dict[str, Any]) -> dict[str, Any]:
-    reserved = {"type", "phase", "severity", "message", "step", "duration_ms", "notice_severity", "ts"}
-    return {key: value for key, value in phase_event.items() if key not in reserved}
-
-
-def _capability_execute_failure_detail(
-    result: dict[str, Any],
-    *,
-    phase_event: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    detail: dict[str, Any] = {"message": "capability route execution failed"}
-    if isinstance(result.get("action_trace"), dict):
-        detail["action_trace"] = dict(result.get("action_trace") or {})
-    if isinstance(result.get("action_issue_summary"), dict):
-        detail["action_issue_summary"] = dict(result.get("action_issue_summary") or {})
-    if isinstance(result.get("trace_artifact"), dict):
-        detail["trace_artifact"] = dict(result.get("trace_artifact") or {})
-    if isinstance(result.get("failure_bundle"), dict):
-        detail["failure_bundle"] = dict(result.get("failure_bundle") or {})
-    if isinstance(result.get("efficiency_correlation_report"), dict):
-        detail["efficiency_correlation_report"] = dict(result.get("efficiency_correlation_report") or {})
-    if phase_event is None:
-        phase_event = _capability_execute_phase_event(
-            result,
-            severity="error",
-            message=str(result.get("fallback_reason") or "capability route execution failed"),
-            completed=False,
-        )
-    detail["phase_event"] = dict(phase_event)
-    return detail
 
 
 @app.post("/api/capabilities/execute", summary="执行低风险确定性能力路由（Y31）")
 async def execute_capability_route(payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
     t0 = time.time()
-    runtime_before = _capability_execute_runtime_context()
+    runtime_before = _capability_execute_runtime_context(_browser_control.backend_status())
     try:
         result = execute_route(payload, spider_lite=_spider_lite)
     except ValueError as exc:
@@ -2677,7 +1025,7 @@ async def execute_capability_route(payload: dict[str, Any] = Body(default_factor
         logger.warning("[CAPABILITY EXECUTOR] failed: %s", exc)
         action_trace = _capability_execute_exception_action_trace(exc)
         if action_trace:
-            runtime_after = _capability_execute_runtime_context()
+            runtime_after = _capability_execute_runtime_context(_browser_control.backend_status())
             result = _capability_execute_failed_action_result(exc, action_trace, runtime_before, runtime_after)
             result["crawl_efficiency_plan"] = _capability_crawl_efficiency_plan(
                 payload,
@@ -2714,7 +1062,7 @@ async def execute_capability_route(payload: dict[str, Any] = Body(default_factor
                 logger.debug("[CAPABILITY EXECUTOR] telemetry skipped: %s", telemetry_exc)
             raise HTTPException(status_code=500, detail=_capability_execute_failure_detail(result, phase_event=phase_event)) from exc
         raise HTTPException(status_code=500, detail="capability route execution failed") from exc
-    runtime_after = _capability_execute_runtime_context()
+    runtime_after = _capability_execute_runtime_context(_browser_control.backend_status())
     result["runtime_context"] = {
         "version": "capability_execute_runtime_context.v1",
         "before": runtime_before,
@@ -3670,103 +2018,6 @@ async def replay_run_network_candidate(
         logger.warning("[API REPLAY] replay failed for %s: %s", run_id, exc)
         raise HTTPException(status_code=502, detail=f"api replay failed: {type(exc).__name__}") from exc
     return result
-
-
-def _read_json_file_if_present(path: Path) -> dict[str, Any] | None:
-    if not path.exists() or not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _load_run_contract_bundle(run_id: str) -> dict[str, Any]:
-    """Read run-scoped contracts without creating missing run directories."""
-
-    try:
-        rid = _run_registry._safe_run_id(run_id)  # type: ignore[attr-defined]
-    except Exception:
-        return {
-            "input_contract": None,
-            "output_contract": None,
-            "manifest": None,
-            "summary": {
-                "has_input_contract": False,
-                "has_output_contract": False,
-                "has_manifest": False,
-                "manifest_items": 0,
-                "child_runs": 0,
-            },
-            "paths": {},
-        }
-
-    try:
-        from visual_web_agent.io_contract import persistence as _io_persistence
-
-        runs_root = _io_persistence.default_runs_root()
-        run_path = runs_root / rid
-        read_paths = {
-            "input_contract": run_path / _io_persistence.INPUT_CONTRACT_FILENAME,
-            "output_contract": run_path / _io_persistence.OUTPUT_CONTRACT_FILENAME,
-            "manifest": run_path / _io_persistence.MANIFEST_FILENAME,
-            "artifacts_dir": run_path / _io_persistence.ARTIFACTS_DIRNAME,
-        }
-        paths = {
-            "input_contract": f"runs/{rid}/{_io_persistence.INPUT_CONTRACT_FILENAME}",
-            "output_contract": f"runs/{rid}/{_io_persistence.OUTPUT_CONTRACT_FILENAME}",
-            "manifest": f"runs/{rid}/{_io_persistence.MANIFEST_FILENAME}",
-            "artifacts_dir": f"runs/{rid}/{_io_persistence.ARTIFACTS_DIRNAME}",
-        }
-    except Exception:
-        return {
-            "input_contract": None,
-            "output_contract": None,
-            "manifest": None,
-            "summary": {
-                "has_input_contract": False,
-                "has_output_contract": False,
-                "has_manifest": False,
-                "manifest_items": 0,
-                "child_runs": 0,
-            },
-            "paths": {},
-        }
-
-    input_contract = _read_json_file_if_present(read_paths["input_contract"])
-    output_contract = _read_json_file_if_present(read_paths["output_contract"])
-    manifest = _read_json_file_if_present(read_paths["manifest"])
-
-    items = manifest.get("items") if isinstance(manifest, dict) else []
-    item_list = [item for item in (items or []) if isinstance(item, dict)] if isinstance(items, list) else []
-    child_runs = [
-        item for item in item_list
-        if isinstance(item.get("extra"), dict)
-        and item.get("extra", {}).get("entry_type") == "child_run"
-    ]
-    artifacts_dir = read_paths["artifacts_dir"]
-    artifact_count = 0
-    if artifacts_dir.exists() and artifacts_dir.is_dir():
-        try:
-            artifact_count = sum(1 for p in artifacts_dir.rglob("*") if p.is_file())
-        except Exception:
-            artifact_count = 0
-
-    return {
-        "input_contract": input_contract,
-        "output_contract": output_contract,
-        "manifest": manifest,
-        "summary": {
-            "has_input_contract": input_contract is not None,
-            "has_output_contract": output_contract is not None,
-            "has_manifest": manifest is not None,
-            "manifest_items": len(item_list),
-            "child_runs": len(child_runs),
-            "artifacts": artifact_count,
-        },
-        "paths": paths,
-    }
 
 
 @app.get("/api/runs/{run_id}", summary="读取单个任务运行记录")

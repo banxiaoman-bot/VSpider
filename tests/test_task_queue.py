@@ -957,35 +957,36 @@ def test_task_queue_recover_api(api_with_tmp_registry, local_tmp_path: Path) -> 
 def test_task_queue_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    qc_src = (root / "queue_core.py").read_text(encoding="utf-8")
 
-    assert "active_tasks: dict[str, Any] = {" in api_src
-    assert '"queue_worker_running": False' in api_src
-    assert '"queue_paused": False' in api_src
-    assert '"workers": {}' in api_src
-    assert "def _queue_worker_config() -> dict[str, Any]:" in api_src
-    assert "def _queue_heartbeat_config() -> dict[str, Any]:" in api_src
-    assert "def _queue_watchdog_scheduler_config() -> dict[str, Any]:" in api_src
+    assert "active_tasks: dict[str, Any] = {" in qc_src
+    assert '"queue_worker_running": False' in qc_src
+    assert '"queue_paused": False' in qc_src
+    assert '"workers": {}' in qc_src
+    assert "def _queue_worker_config() -> dict[str, Any]:" in qc_src
+    assert "def _queue_heartbeat_config() -> dict[str, Any]:" in qc_src
+    assert "def _queue_watchdog_scheduler_config() -> dict[str, Any]:" in qc_src
     assert "def _start_queue_workers(background_tasks: BackgroundTasks)" in api_src
-    assert "def pause_task_queue(reason: str = \"\") -> dict[str, Any]:" in api_src
-    assert "def resume_task_queue() -> tuple[dict[str, Any], bool]:" in api_src
-    assert "def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:" in api_src
-    assert "def queue_metrics(*, run_limit: int = 200) -> dict[str, Any]:" in api_src
-    assert "def _persist_queue_snapshot_safe() -> None:" in api_src
+    assert "def pause_task_queue(reason: str = \"\") -> dict[str, Any]:" in qc_src
+    assert "def resume_task_queue() -> tuple[dict[str, Any], bool]:" in qc_src
+    assert "def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:" in qc_src
+    assert "def queue_metrics(*, run_limit: int = 200) -> dict[str, Any]:" in qc_src
+    assert "def _persist_queue_snapshot_safe() -> None:" in qc_src
     assert "async def _queue_worker_heartbeat(worker_id: str, stop_signal: asyncio.Event) -> None:" in api_src
     assert "async def _queue_watchdog_scheduler(stop_signal: asyncio.Event) -> None:" in api_src
-    assert '"heartbeat_config": heartbeat_config' in api_src
-    assert '"watchdog_config": watchdog_config' in api_src
-    assert '"stale_worker_count": sum(1 for worker in public_workers if worker.get("stale"))' in api_src
-    assert "def scan_stale_queue_workers() -> dict[str, Any]:" in api_src
-    assert 'VSPIDER_QUEUE_WATCHDOG_ENABLED' in api_src
-    assert "def recover_queued_tasks() -> dict[str, Any]:" in api_src
-    assert "from visual_web_agent import queue_state as _queue_state" in api_src
+    assert '"heartbeat_config": heartbeat_config' in qc_src
+    assert '"watchdog_config": watchdog_config' in qc_src
+    assert '"stale_worker_count": sum(1 for worker in public_workers if worker.get("stale"))' in qc_src
+    assert "def scan_stale_queue_workers() -> dict[str, Any]:" in qc_src
+    assert 'VSPIDER_QUEUE_WATCHDOG_ENABLED' in qc_src
+    assert "def recover_queued_tasks() -> dict[str, Any]:" in qc_src
+    assert "from visual_web_agent import queue_state as _queue_state" in qc_src
     assert "async def _queue_worker(worker_id: str = \"worker_default\") -> None:" in api_src
-    assert "def _enqueue_task(" in api_src
+    assert "def _enqueue_task(" in qc_src
     assert '@app.get("/api/task_queue"' in api_src
     assert '@app.get("/api/task_queue/metrics"' in api_src
     assert '"persisted": _queue_state.load_public_snapshot()' in api_src
-    assert 'snapshot["execution_queue"]' in api_src
+    assert 'snapshot["execution_queue"]' in qc_src
     assert '@app.post("/api/task_queue/pause"' in api_src
     assert '@app.post("/api/task_queue/resume"' in api_src
     assert '@app.post("/api/task_queue/recover"' in api_src

@@ -136,12 +136,13 @@ def test_public_snapshot_sanitizes_legacy_private_fields() -> None:
 def test_queue_state_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    qc_src = (root / "queue_core.py").read_text(encoding="utf-8")
     state_src = (root / "visual_web_agent" / "queue_state.py").read_text(encoding="utf-8")
 
-    assert "from visual_web_agent import queue_state as _queue_state" in api_src
-    assert "def _persist_queue_snapshot_safe() -> None:" in api_src
-    assert 'snapshot["execution_queue"]' in api_src
-    assert "_queue_state.save_snapshot(snapshot)" in api_src
+    assert "from visual_web_agent import queue_state as _queue_state" in qc_src
+    assert "def _persist_queue_snapshot_safe() -> None:" in qc_src
+    assert 'snapshot["execution_queue"]' in qc_src
+    assert "_queue_state.save_snapshot(snapshot)" in qc_src
     assert "\"persisted\": _queue_state.load_public_snapshot()" in api_src
     assert "def save_snapshot(" in state_src
     assert "def load_snapshot(" in state_src

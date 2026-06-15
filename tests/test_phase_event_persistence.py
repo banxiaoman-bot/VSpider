@@ -27,6 +27,7 @@ import pytest
 
 # Re-import for a clean module state per test session
 api_server = importlib.import_module("api_server")
+_broadcast_mod = importlib.import_module("broadcast")
 
 
 @pytest.fixture
@@ -43,7 +44,7 @@ def quiet_broadcast(monkeypatch):
         except Exception:
             pass
 
-    monkeypatch.setattr(api_server, "_schedule", _drop)
+    monkeypatch.setattr(_broadcast_mod, "_schedule", _drop)
     yield
 
 
@@ -155,7 +156,7 @@ class TestPayloadShape:
         def _schedule_sync(coro):
             asyncio.new_event_loop().run_until_complete(coro)
 
-        monkeypatch.setattr(api_server, "_schedule", _schedule_sync)
+        monkeypatch.setattr(_broadcast_mod, "_schedule", _schedule_sync)
 
         api_server.set_phase_log_run_id("20260601_120000")
         api_server.broadcast_phase(
@@ -273,7 +274,7 @@ class TestSafety:
         def _boom(*_a, **_kw):
             raise PermissionError("simulated disk full")
 
-        path_obj = api_server._PHASE_LOG_PATH
+        path_obj = _broadcast_mod._PHASE_LOG_PATH
         assert path_obj is not None
         monkeypatch.setattr(type(path_obj), "open", _boom, raising=False)
         # Should NOT raise — best-effort persistence

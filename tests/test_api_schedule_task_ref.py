@@ -14,54 +14,51 @@ import gc
 
 import pytest
 
-import api_server
+import api_server  # noqa: F401 — ensure module imported
+import broadcast as _broadcast_mod
 
 
 @pytest.fixture(autouse=True)
 def _restore_api_loop():
-    saved_loop = api_server._API_LOOP
-    saved_tasks = set(api_server._BACKGROUND_TASKS)
+    saved_loop = _broadcast_mod._API_LOOP
+    saved_tasks = set(_broadcast_mod._BACKGROUND_TASKS)
     try:
         yield
     finally:
-        api_server._API_LOOP = saved_loop
-        api_server._BACKGROUND_TASKS.clear()
-        api_server._BACKGROUND_TASKS.update(saved_tasks)
+        _broadcast_mod._API_LOOP = saved_loop
+        _broadcast_mod._BACKGROUND_TASKS.clear()
+        _broadcast_mod._BACKGROUND_TASKS.update(saved_tasks)
 
 
 def test_schedule_keeps_strong_ref_and_runs_to_completion() -> None:
     ran: list[str] = []
 
     async def scenario() -> None:
-        api_server._API_LOOP = asyncio.get_running_loop()
-        api_server._BACKGROUND_TASKS.clear()
+        _broadcast_mod._API_LOOP = asyncio.get_running_loop()
+        _broadcast_mod._BACKGROUND_TASKS.clear()
 
         async def work() -> None:
             await asyncio.sleep(0.02)
             ran.append("done")
 
-        api_server._schedule(work())
-        # Referenced immediately so a GC pass can't drop the in-flight task.
-        assert len(api_server._BACKGROUND_TASKS) == 1
+        _broadcast_mod._schedule(work())
+        assert len(_broadcast_mod._BACKGROUND_TASKS) == 1
         gc.collect()
-        assert len(api_server._BACKGROUND_TASKS) == 1
+        assert len(_broadcast_mod._BACKGROUND_TASKS) == 1
 
         await asyncio.sleep(0.1)
-        # The task ran to completion AND was discarded from the registry.
         assert ran == ["done"]
-        assert len(api_server._BACKGROUND_TASKS) == 0
+        assert len(_broadcast_mod._BACKGROUND_TASKS) == 0
 
     asyncio.run(scenario())
 
 
 def test_schedule_is_noop_when_loop_missing() -> None:
-    # With no event loop registered, _schedule must close the coroutine and
-    # return without scheduling anything (CLI-only mode), and never crash.
-    api_server._API_LOOP = None
-    before = len(api_server._BACKGROUND_TASKS)
+    _broadcast_mod._API_LOOP = None
+    before = len(_broadcast_mod._BACKGROUND_TASKS)
 
-    async def work() -> None:  # pragma: no cover - must never run
+    async def work() -> None:  # pragma: no cover
         raise AssertionError("coroutine should not run without a loop")
 
-    api_server._schedule(work())
-    assert len(api_server._BACKGROUND_TASKS) == before
+    _broadcast_mod._schedule(work())
+    assert len(_broadcast_mod._BACKGROUND_TASKS) == before
