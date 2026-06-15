@@ -1749,6 +1749,286 @@ function updateCount() {{
 
 
 # ---------------------------------------------------------------------------
+# J1: Tab panel navigation
+# ---------------------------------------------------------------------------
+
+J1_TABS = [
+    {"id": "tab-overview", "label": "概览", "content": "产品概览：共 12 款工业设备在售。"},
+    {"id": "tab-specs", "label": "规格", "content": "温控器规格：精度±0.1°C，量程-20~200°C。"},
+    {"id": "tab-reviews", "label": "评价", "content": "用户好评率 96%，共 328 条评价。"},
+]
+
+
+def _tab_page_html() -> bytes:
+    btns = " ".join(
+        f'<button class="tab-btn" data-tab="{t["id"]}" '
+        f'aria-selected="{str(i == 0).lower()}" '
+        f'onclick="switchTab(\'{t["id"]}\')">{t["label"]}</button>'
+        for i, t in enumerate(J1_TABS)
+    )
+    panels = "\n".join(
+        f'<div class="tab-panel" id="{t["id"]}" '
+        f'style="display:{"block" if i == 0 else "none"};">'
+        f'{t["content"]}</div>'
+        for i, t in enumerate(J1_TABS)
+    )
+    body = f"""
+<h1 id="tab-title">标签页面板</h1>
+<div id="tab-bar" role="tablist">{btns}</div>
+<div id="tab-content">{panels}</div>
+<script>
+function switchTab(tabId) {{
+  document.querySelectorAll('.tab-panel').forEach(function(p) {{
+    p.style.display = p.id === tabId ? 'block' : 'none';
+  }});
+  document.querySelectorAll('.tab-btn').forEach(function(b) {{
+    b.setAttribute('aria-selected', b.dataset.tab === tabId ? 'true' : 'false');
+  }});
+  location.hash = tabId;
+}}
+window.addEventListener('hashchange', function() {{
+  var h = location.hash.slice(1);
+  if (h) switchTab(h);
+}});
+if (location.hash) switchTab(location.hash.slice(1));
+</script>"""
+    return _page_shell("标签页", body)
+
+
+# ---------------------------------------------------------------------------
+# J2: Inline table editing
+# ---------------------------------------------------------------------------
+
+def _inline_edit_page_html() -> bytes:
+    rows_html = "\n".join(
+        f'<tr data-id="{p["id"]}">'
+        f'<td class="ie-sku">{p["sku"]}</td>'
+        f'<td class="ie-name" data-field="name" ondblclick="startEdit(this)">{p["name"]}</td>'
+        f'<td class="ie-price" data-field="price" ondblclick="startEdit(this)">{p["price"]}</td>'
+        f'</tr>'
+        for p in PRODUCTS[:5]
+    )
+    body = f"""
+<h1 id="ie-title">内联编辑表格</h1>
+<p>最后编辑：<span id="ie-last-edit">none</span></p>
+<table id="ie-table">
+  <thead><tr><th>SKU</th><th>名称</th><th>价格</th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+<script>
+var editingCell = null;
+function startEdit(td) {{
+  if (editingCell) return;
+  editingCell = td;
+  var original = td.textContent;
+  td.dataset.original = original;
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.value = original;
+  input.className = 'ie-input';
+  input.onkeydown = function(e) {{
+    if (e.key === 'Enter') {{ saveEdit(td, input.value); }}
+    if (e.key === 'Escape') {{ cancelEdit(td); }}
+  }};
+  input.onblur = function() {{ saveEdit(td, input.value); }};
+  td.textContent = '';
+  td.appendChild(input);
+  input.focus();
+}}
+function saveEdit(td, value) {{
+  td.textContent = value;
+  editingCell = null;
+  var row = td.closest('tr');
+  document.getElementById('ie-last-edit').textContent =
+    row.dataset.id + ':' + td.dataset.field + '=' + value;
+}}
+function cancelEdit(td) {{
+  td.textContent = td.dataset.original;
+  editingCell = null;
+}}
+</script>"""
+    return _page_shell("内联编辑", body)
+
+
+# ---------------------------------------------------------------------------
+# J3: Typeahead autocomplete
+# ---------------------------------------------------------------------------
+
+def _autocomplete_page_html() -> bytes:
+    products_json = json.dumps(
+        [{"sku": p["sku"], "name": p["name"]} for p in PRODUCTS],
+        ensure_ascii=False,
+    )
+    body = f"""
+<h1 id="ac-title">自动补全搜索</h1>
+<input type="text" id="ac-input" placeholder="输入产品名..." autocomplete="off">
+<div id="ac-suggestions" style="border:1px solid #ccc; display:none;"></div>
+<p>已选：<span id="ac-selected">none</span></p>
+<script>
+var ALL = {products_json};
+var timer = null;
+document.getElementById('ac-input').addEventListener('input', function() {{
+  clearTimeout(timer);
+  var q = this.value.trim().toLowerCase();
+  timer = setTimeout(function() {{
+    var box = document.getElementById('ac-suggestions');
+    if (!q) {{ box.style.display = 'none'; return; }}
+    var matches = ALL.filter(function(p) {{
+      return p.name.toLowerCase().indexOf(q) >= 0 ||
+             p.sku.toLowerCase().indexOf(q) >= 0;
+    }});
+    if (matches.length === 0) {{ box.style.display = 'none'; return; }}
+    box.innerHTML = matches.map(function(p) {{
+      return '<div class="ac-option" data-sku="' + p.sku + '" ' +
+        'onclick="selectOption(this)">' + p.sku + ' - ' + p.name + '</div>';
+    }}).join('');
+    box.style.display = 'block';
+  }}, 150);
+}});
+function selectOption(el) {{
+  document.getElementById('ac-input').value = el.textContent;
+  document.getElementById('ac-selected').textContent = el.dataset.sku;
+  document.getElementById('ac-suggestions').style.display = 'none';
+}}
+</script>"""
+    return _page_shell("自动补全", body)
+
+
+# ---------------------------------------------------------------------------
+# J4: Toast notifications
+# ---------------------------------------------------------------------------
+
+def _toast_page_html() -> bytes:
+    body = """
+<h1 id="toast-title">Toast 通知</h1>
+<button id="toast-success" onclick="showToast('success','操作成功')">成功</button>
+<button id="toast-error" onclick="showToast('error','操作失败')">错误</button>
+<button id="toast-warning" onclick="showToast('warning','请注意')">警告</button>
+<div id="toast-container" style="position:fixed;top:10px;right:10px;z-index:9999;"></div>
+<p>历史计数：<span id="toast-count">0</span></p>
+<script>
+var toastCount = 0;
+function showToast(type, msg) {
+  toastCount++;
+  document.getElementById('toast-count').textContent = toastCount;
+  var el = document.createElement('div');
+  el.className = 'toast toast-' + type;
+  el.textContent = msg;
+  el.style.cssText = 'padding:10px 20px;margin:5px 0;border-radius:4px;' +
+    'color:#fff;font-size:14px;opacity:1;transition:opacity 0.3s;';
+  el.style.background = type === 'success' ? '#28a745' :
+    type === 'error' ? '#dc3545' : '#ffc107';
+  if (type === 'warning') el.style.color = '#333';
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(function() {
+    el.style.opacity = '0';
+    setTimeout(function() { el.remove(); }, 300);
+  }, 800);
+}
+</script>"""
+    return _page_shell("Toast", body)
+
+
+# ---------------------------------------------------------------------------
+# J5: URL hash navigation
+# ---------------------------------------------------------------------------
+
+J5_SECTIONS = [
+    {"hash": "home", "title": "首页", "content": "欢迎来到首页"},
+    {"hash": "about", "title": "关于", "content": "关于我们的公司介绍"},
+    {"hash": "contact", "title": "联系", "content": "联系方式：support@example.com"},
+]
+
+
+def _hash_nav_page_html() -> bytes:
+    links = " ".join(
+        f'<a href="#{s["hash"]}" class="hash-link">{s["title"]}</a>'
+        for s in J5_SECTIONS
+    )
+    sections_json = json.dumps(
+        {s["hash"]: s for s in J5_SECTIONS}, ensure_ascii=False
+    )
+    body = f"""
+<h1 id="hash-title">Hash 导航</h1>
+<nav id="hash-nav">{links}</nav>
+<div id="hash-content">
+  <h2 id="hash-section-title">首页</h2>
+  <p id="hash-section-body">欢迎来到首页</p>
+</div>
+<script>
+var SECTIONS = {sections_json};
+function navigate() {{
+  var h = location.hash.slice(1) || 'home';
+  var sec = SECTIONS[h];
+  if (sec) {{
+    document.getElementById('hash-section-title').textContent = sec.title;
+    document.getElementById('hash-section-body').textContent = sec.content;
+  }}
+}}
+window.addEventListener('hashchange', navigate);
+navigate();
+</script>"""
+    return _page_shell("Hash 导航", body)
+
+
+# ---------------------------------------------------------------------------
+# J6: ARIA accessibility
+# ---------------------------------------------------------------------------
+
+def _aria_page_html() -> bytes:
+    body = """
+<h1 id="aria-title">无障碍测试</h1>
+
+<div id="aria-accordion">
+  <button class="acc-header" aria-expanded="false" aria-controls="acc-panel-1"
+    onclick="toggleAcc(this, 'acc-panel-1')">
+    产品信息
+  </button>
+  <div id="acc-panel-1" class="acc-panel" role="region" aria-hidden="true"
+    style="display:none;">
+    工业级传感器系列，支持多种协议。
+  </div>
+
+  <button class="acc-header" aria-expanded="false" aria-controls="acc-panel-2"
+    onclick="toggleAcc(this, 'acc-panel-2')">
+    技术规格
+  </button>
+  <div id="acc-panel-2" class="acc-panel" role="region" aria-hidden="true"
+    style="display:none;">
+    温度范围 -40°C ~ 125°C，精度 ±0.5%。
+  </div>
+</div>
+
+<div id="aria-listbox" role="listbox" aria-label="产品选择">
+  <div role="option" id="opt-1" aria-selected="false" tabindex="0"
+    onclick="selectOpt(this)">智能温控器</div>
+  <div role="option" id="opt-2" aria-selected="false" tabindex="0"
+    onclick="selectOpt(this)">工业网关</div>
+  <div role="option" id="opt-3" aria-selected="false" tabindex="0"
+    onclick="selectOpt(this)">边缘计算盒</div>
+</div>
+<p>已选产品：<span id="aria-selected">none</span></p>
+
+<script>
+function toggleAcc(btn, panelId) {
+  var panel = document.getElementById(panelId);
+  var expanded = btn.getAttribute('aria-expanded') === 'true';
+  btn.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+  panel.setAttribute('aria-hidden', expanded ? 'true' : 'false');
+  panel.style.display = expanded ? 'none' : 'block';
+}
+function selectOpt(el) {
+  document.querySelectorAll('[role=option]').forEach(function(o) {
+    o.setAttribute('aria-selected', 'false');
+  });
+  el.setAttribute('aria-selected', 'true');
+  document.getElementById('aria-selected').textContent = el.textContent;
+}
+</script>"""
+    return _page_shell("无障碍", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -2038,6 +2318,24 @@ def make_alpha_handler(store: ScenarioStore):
             # --- I6: Data attributes page ---
             if path == "/data-attr":
                 return self._send(_data_attr_page_html())
+            # --- J1: Tab panel ---
+            if path == "/tabs":
+                return self._send(_tab_page_html())
+            # --- J2: Inline table editing ---
+            if path == "/inline-edit":
+                return self._send(_inline_edit_page_html())
+            # --- J3: Autocomplete ---
+            if path == "/autocomplete":
+                return self._send(_autocomplete_page_html())
+            # --- J4: Toast notifications ---
+            if path == "/toast":
+                return self._send(_toast_page_html())
+            # --- J5: Hash navigation ---
+            if path == "/hash-nav":
+                return self._send(_hash_nav_page_html())
+            # --- J6: ARIA accessibility ---
+            if path == "/aria":
+                return self._send(_aria_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
