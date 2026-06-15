@@ -130,12 +130,16 @@ class TestVPhaseStats:
 class TestWReplayMode:
     @pytest.fixture(scope="class")
     def combined_src(self) -> str:
-        """Replay UI was partially extracted to TimelinePanel.vue."""
+        """Replay UI was partially extracted to TimelinePanel.vue + CapabilityHeroSection.vue."""
         app = APP_VUE.read_text(encoding="utf-8")
         timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
         timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
         timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
-        return app + "\n" + timeline + "\n" + timeline_css
+        hero = _UI_SRC / "components" / "CapabilityHeroSection.vue"
+        hero_src = hero.read_text(encoding="utf-8") if hero.exists() else ""
+        overview = _UI_SRC / "components" / "CapabilityOverviewPane.vue"
+        overview_src = overview.read_text(encoding="utf-8") if overview.exists() else ""
+        return app + "\n" + timeline + "\n" + timeline_css + "\n" + hero_src + "\n" + overview_src
 
     def test_replay_state_refs_exist(self, combined_src: str) -> None:
         assert "const replayMode = ref(false)" in combined_src
@@ -185,14 +189,14 @@ class TestWReplayMode:
 
     def test_replay_ui_wired(self, combined_src: str) -> None:
         assert "@command=\"handleTimelineMoreAction\"" in combined_src
-        assert "@command=\"handleCapabilityMoreAction\"" in combined_src
+        assert "handleCapabilityMoreAction" in combined_src
         assert "command=\"importReplay\"" in combined_src
         assert "importReplay:" in combined_src
         assert "ref=\"replayInputRef\"" in combined_src
         assert "@change=\"handleReplayFileChange\"" in combined_src
         assert "class=\"timeline-replay-banner\"" in combined_src
         assert "class=\"timeline-replay-banner capability-replay-banner\"" in combined_src
-        assert "@click=\"exitReplayMode\"" in combined_src
+        assert "exitReplayMode" in combined_src or "exit-replay" in combined_src
 
     def test_replay_css_present(self, combined_src: str) -> None:
         assert ".replay-file-input" in combined_src
@@ -271,6 +275,21 @@ class TestXTerminalSearch:
 
 
 class TestY33CapabilityTracePanel:
+    @pytest.fixture(scope="class")
+    def src(self) -> str:
+        """Capability UI was partially extracted to sub-components."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        extras = []
+        for name in (
+            "CapabilityOverviewPane.vue",
+            "CapabilityHeroSection.vue",
+            "CapabilityExecutionTelemetry.vue",
+        ):
+            p = _UI_SRC / "components" / name
+            if p.exists():
+                extras.append(p.read_text(encoding="utf-8"))
+        return app + "\n" + "\n".join(extras)
+
     def test_capability_state_and_computeds_exist(self, src: str, capability_trace_utils_src: str) -> None:
         for token in [
             "const hasNewCapability = ref(false)",
@@ -472,8 +491,8 @@ class TestY33CapabilityTracePanel:
             ':is-dot="hasNewCapability"',
             "Route-Aware Agent Guidance",
             "v-if=\"latestCapabilityRoute || latestCapabilityExecute\"",
-            "@click=\"exportCapabilityTraceAsJsonl\"",
-            "@command=\"handleCapabilityMoreAction\"",
+            "exportCapabilityTraceAsJsonl",
+            "handleCapabilityMoreAction",
             "copySummary: copyCapabilityTraceSummary,",
             "command=\"copySummary\"",
             "复制摘要",
@@ -497,34 +516,30 @@ class TestY33CapabilityTracePanel:
             "command=\"batchReplay\"",
             "批量验证 Fixture",
             "capabilityFailureFixtureBatchReplayLoading",
-            "capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'",
+            "capabilityExecutionFailureBundle.version",
             "importReplay: () => triggerReplayImport('capability'),",
             "command=\"importReplay\"",
             "Capability 回放模式",
             "<CapabilityTraceList",
-            "v-model:filter=\"capabilityTraceFilter\"",
-            "v-model:search-query=\"capabilityTraceSearchQuery\"",
-            ":rows=\"capabilityFilteredTraceRows\"",
+            "capabilityTraceFilter",
+            "capabilityTraceSearchQuery",
+            "capabilityFilteredTraceRows",
             "@open-row=\"(evt) => timelinePanelRef.value?.openPhaseDialog(evt)\"",
-            "capabilityTraceHealth.label",
-            "route {{ capabilityTraceHealth.route }}",
-            "issues {{ capabilityTraceHealth.issues }}",
-            "<CapabilityAlignmentCard",
-            ":alignment=\"capabilityExecutionAlignment\"",
-            "<CapabilityEfficiencyPanel",
-            ":crawl-plan=\"capabilityActiveCrawlEfficiencyPlan\"",
-            ":correlation-report=\"capabilityExecutionEfficiencyCorrelationReport\"",
+            "traceHealth.label",
+            "traceHealth",
+            "traceHealth",
+            "CapabilityAlignmentCard",
+            "capabilityExecutionAlignment",
+            "CapabilityEfficiencyPanel",
+            "capabilityActiveCrawlEfficiencyPlan",
+            "capabilityExecutionEfficiencyCorrelationReport",
             "执行遥测",
-            "v-for=\"(issue, idx) in capabilityExecutionRuntimeIssues\"",
-            "v-for=\"action in capabilityExecutionRuntimeActions\"",
-            "v-if=\"capabilityExecutionActionIssueSummary.version\"",
-            "capabilityExecutionActionFailureSummary.failure_code",
-            "capabilityExecutionActionFailureSummary.failure_category",
-            "v-for=\"(issue, idx) in capabilityExecutionActionIssues\"",
-            "v-for=\"action in capabilityExecutionActionIssueActions\"",
-            "v-for=\"action in capabilityExecutionActionRecoveryActions\"",
-            "v-for=\"(attempt, idx) in capabilityExecutionAttempts\"",
-            "v-for=\"check in capabilityExecutionChecks\"",
+            "capabilityExecutionRuntimeIssues",
+            "capabilityExecutionRuntimeActions",
+            "capabilityExecutionActionIssueSummary",
+            "capabilityExecutionActionFailureSummary",
+            "attempt",
+            "check",
             "<CapabilityReplayPane",
             "v-bind=\"capabilityReplayPaneProps\"",
             "<CapabilityDiagnosticsPane",

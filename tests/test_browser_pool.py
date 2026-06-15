@@ -363,7 +363,9 @@ def test_browser_pool_source_wiring() -> None:
     main_src = (root / "visual_web_agent" / "main.py").read_text(encoding="utf-8")
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
     pool_src = (root / "visual_web_agent" / "browser_pool.py").read_text(encoding="utf-8")
-    app_src = (root / "vspider-ui" / "src" / "App.vue").read_text(encoding="utf-8")
+    _app_raw = (root / "vspider-ui" / "src" / "App.vue").read_text(encoding="utf-8")
+    _overview_pane = root / "vspider-ui" / "src" / "components" / "CapabilityOverviewPane.vue"
+    app_src = _app_raw + ("\n" + _overview_pane.read_text(encoding="utf-8") if _overview_pane.exists() else "")
     runtime_panel_src = (root / "vspider-ui" / "src" / "components" / "CapabilityRuntimePanel.vue").read_text(encoding="utf-8")
 
     assert "from .browser_pool import acquire_browser, release_browser" in main_src
