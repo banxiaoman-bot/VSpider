@@ -121,6 +121,15 @@ class ScenarioStore:
     beta_session_version: int = 0
     # D5: flaky endpoint tracking — first N requests return 500
     flaky_fail_remaining: int = 0
+    # E1: wizard submissions
+    wizard_submissions: list[dict[str, Any]] = field(default_factory=list)
+    # E5: polling counter (increments on each /api/status call)
+    poll_counter: int = 0
+    # E6: batch items (mutable list for batch ops)
+    batch_items: list[dict[str, Any]] = field(default_factory=lambda: [
+        {"id": i, "sku": p["sku"], "name": p["name"], "selected": False}
+        for i, p in enumerate(PRODUCTS[:8], start=1)
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +555,245 @@ PROTECTED_PDF_BYTES = b"%PDF-1.4 PROTECTED\n1 0 obj\n<</Type/Catalog>>\nendobj\n
 
 
 # ---------------------------------------------------------------------------
+# E1: Multi-step wizard (3 steps with inter-step validation)
+# ---------------------------------------------------------------------------
+
+def _wizard_step_html(step: int, data: dict[str, Any] | None = None) -> bytes:
+    data = data or {}
+    if step == 1:
+        body = """
+<h1 id="wizard-title">采购向导 - 第1步：基本信息</h1>
+<form id="wizard-form" method="post" action="/wizard/step/2">
+  <label>公司名称 <input type="text" name="company" id="w-company" required></label>
+  <label>联系人 <input type="text" name="contact" id="w-contact" required></label>
+  <label>电话 <input type="tel" name="phone" id="w-phone"></label>
+  <button type="submit" id="w-next">下一步</button>
+</form>
+<p id="wizard-progress">步骤 1/3</p>"""
+    elif step == 2:
+        body = f"""
+<h1 id="wizard-title">采购向导 - 第2步：选择商品</h1>
+<p id="w-company-echo">公司：{data.get('company', '')}</p>
+<form id="wizard-form" method="post" action="/wizard/step/3">
+  <input type="hidden" name="company" value="{data.get('company', '')}">
+  <input type="hidden" name="contact" value="{data.get('contact', '')}">
+  <input type="hidden" name="phone" value="{data.get('phone', '')}">
+  <label>商品 SKU <input type="text" name="sku" id="w-sku" required></label>
+  <label>数量 <input type="number" name="qty" id="w-qty" min="1" required></label>
+  <a href="/wizard/step/1" id="w-back">上一步</a>
+  <button type="submit" id="w-next">下一步</button>
+</form>
+<p id="wizard-progress">步骤 2/3</p>"""
+    else:
+        body = f"""
+<h1 id="wizard-title">采购向导 - 第3步：确认提交</h1>
+<dl id="wizard-review">
+  <dt>公司</dt><dd id="r-company">{data.get('company', '')}</dd>
+  <dt>联系人</dt><dd id="r-contact">{data.get('contact', '')}</dd>
+  <dt>SKU</dt><dd id="r-sku">{data.get('sku', '')}</dd>
+  <dt>数量</dt><dd id="r-qty">{data.get('qty', '')}</dd>
+</dl>
+<form id="wizard-form" method="post" action="/wizard/submit">
+  <input type="hidden" name="company" value="{data.get('company', '')}">
+  <input type="hidden" name="contact" value="{data.get('contact', '')}">
+  <input type="hidden" name="phone" value="{data.get('phone', '')}">
+  <input type="hidden" name="sku" value="{data.get('sku', '')}">
+  <input type="hidden" name="qty" value="{data.get('qty', '')}">
+  <a href="/wizard/step/2" id="w-back">上一步</a>
+  <button type="submit" id="w-submit">确认提交</button>
+</form>
+<p id="wizard-progress">步骤 3/3</p>"""
+    return _page_shell(f"采购向导 - 步骤{step}", body)
+
+
+# ---------------------------------------------------------------------------
+# E2: Dynamic form validation + conditional fields
+# ---------------------------------------------------------------------------
+
+def _validated_form_html() -> bytes:
+    body = """
+<h1 id="vform-title">动态校验表单</h1>
+<form id="vform" method="post" action="/validated-form/submit" novalidate>
+  <label>姓名 <input type="text" name="name" id="vf-name" required></label>
+  <span class="error" id="err-name" style="display:none;color:red">姓名必填</span>
+
+  <label>邮箱 <input type="email" name="email" id="vf-email" required></label>
+  <span class="error" id="err-email" style="display:none;color:red">邮箱格式不正确</span>
+
+  <label>客户类型
+    <select name="client_type" id="vf-type">
+      <option value="personal">个人</option>
+      <option value="enterprise">企业</option>
+    </select>
+  </label>
+
+  <div id="enterprise-fields" style="display:none">
+    <label>企业税号 <input type="text" name="tax_id" id="vf-taxid"></label>
+    <label>营业执照号 <input type="text" name="license" id="vf-license"></label>
+  </div>
+
+  <button type="submit" id="vf-submit">提交</button>
+  <p id="vf-result" style="display:none"></p>
+</form>
+<script>
+document.getElementById('vf-type').addEventListener('change', function() {
+  document.getElementById('enterprise-fields').style.display =
+    this.value === 'enterprise' ? 'block' : 'none';
+});
+document.getElementById('vform').addEventListener('submit', function(e) {
+  var valid = true;
+  var name = document.getElementById('vf-name');
+  var email = document.getElementById('vf-email');
+  document.getElementById('err-name').style.display =
+    name.value.trim() ? 'none' : (valid = false, 'inline');
+  var emailRe = /^[^@]+@[^@]+\\.[^@]+$/;
+  document.getElementById('err-email').style.display =
+    emailRe.test(email.value) ? 'none' : (valid = false, 'inline');
+  if (!valid) { e.preventDefault(); }
+});
+</script>"""
+    return _page_shell("动态校验表单", body)
+
+
+# ---------------------------------------------------------------------------
+# E3: Browser dialog triggers (alert / confirm / prompt)
+# ---------------------------------------------------------------------------
+
+def _dialog_page_html() -> bytes:
+    body = """
+<h1 id="dialog-title">浏览器弹窗测试</h1>
+<button id="btn-alert" onclick="alert('操作成功！')">触发 Alert</button>
+<button id="btn-confirm" onclick="
+  var ok = confirm('确认删除此记录？');
+  document.getElementById('confirm-result').textContent = ok ? '已确认' : '已取消';
+">触发 Confirm</button>
+<button id="btn-prompt" onclick="
+  var val = prompt('请输入备注：', '默认备注');
+  document.getElementById('prompt-result').textContent = val !== null ? val : '(取消)';
+">触发 Prompt</button>
+<p id="confirm-result"></p>
+<p id="prompt-result"></p>"""
+    return _page_shell("弹窗测试", body)
+
+
+# ---------------------------------------------------------------------------
+# E4: SPA-like pushState navigation
+# ---------------------------------------------------------------------------
+
+def _spa_page_html() -> bytes:
+    body = """
+<h1 id="spa-title">SPA 导航演示</h1>
+<nav id="spa-nav">
+  <a href="/spa/home" class="spa-link" data-page="home">首页</a>
+  <a href="/spa/products" class="spa-link" data-page="products">产品</a>
+  <a href="/spa/about" class="spa-link" data-page="about">关于</a>
+</nav>
+<div id="spa-content">
+  <section id="page-home" class="spa-page">首页内容：欢迎使用 VSpider</section>
+  <section id="page-products" class="spa-page" style="display:none">产品列表：智能温控器、工业网关</section>
+  <section id="page-about" class="spa-page" style="display:none">关于我们：VSpider 团队</section>
+</div>
+<script>
+function showPage(name) {
+  document.querySelectorAll('.spa-page').forEach(function(el) {
+    el.style.display = 'none';
+  });
+  var target = document.getElementById('page-' + name);
+  if (target) target.style.display = 'block';
+}
+document.querySelectorAll('.spa-link').forEach(function(link) {
+  link.addEventListener('click', function(e) {
+    e.preventDefault();
+    var page = this.getAttribute('data-page');
+    history.pushState({page: page}, '', this.href);
+    showPage(page);
+  });
+});
+window.addEventListener('popstate', function(e) {
+  var page = (e.state && e.state.page) || 'home';
+  showPage(page);
+});
+</script>"""
+    return _page_shell("SPA 导航", body)
+
+
+# ---------------------------------------------------------------------------
+# E5: Polling updates (counter increments on each API call)
+# ---------------------------------------------------------------------------
+
+def _polling_page_html() -> bytes:
+    body = """
+<h1 id="poll-title">实时状态监控</h1>
+<p>任务进度：<span id="poll-value">0</span></p>
+<p id="poll-status">运行中</p>
+<script>
+var interval = setInterval(function() {
+  fetch('/api/status').then(function(r) { return r.json(); }).then(function(d) {
+    document.getElementById('poll-value').textContent = d.progress;
+    if (d.done) {
+      document.getElementById('poll-status').textContent = '已完成';
+      clearInterval(interval);
+    }
+  });
+}, 500);
+</script>"""
+    return _page_shell("轮询监控", body)
+
+
+# ---------------------------------------------------------------------------
+# E6: Batch operations (select all / partial select + delete / export)
+# ---------------------------------------------------------------------------
+
+def _batch_page_html(items: list[dict[str, Any]]) -> bytes:
+    rows = "\n".join(
+        "<tr data-id='{id}'>"
+        "<td><input type='checkbox' class='item-check' value='{id}'></td>"
+        "<td>{sku}</td><td>{name}</td></tr>".format(**it)
+        for it in items
+    )
+    body = f"""
+<h1 id="batch-title">批量操作</h1>
+<div id="batch-toolbar">
+  <label><input type="checkbox" id="select-all"> 全选</label>
+  <button id="btn-delete" onclick="batchAction('delete')">批量删除</button>
+  <button id="btn-export" onclick="batchAction('export')">批量导出</button>
+  <span id="batch-status"></span>
+</div>
+<table id="batch-table">
+  <thead><tr><th></th><th>SKU</th><th>名称</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+<script>
+document.getElementById('select-all').addEventListener('change', function() {{
+  document.querySelectorAll('.item-check').forEach(function(cb) {{
+    cb.checked = document.getElementById('select-all').checked;
+  }});
+}});
+function batchAction(action) {{
+  var ids = [];
+  document.querySelectorAll('.item-check:checked').forEach(function(cb) {{
+    ids.push(parseInt(cb.value));
+  }});
+  if (ids.length === 0) {{ alert('请先选择项目'); return; }}
+  fetch('/api/batch', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{action: action, ids: ids}})
+  }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+    document.getElementById('batch-status').textContent = d.message;
+    if (action === 'delete') {{
+      ids.forEach(function(id) {{
+        var row = document.querySelector('tr[data-id=\"' + id + '\"]');
+        if (row) row.remove();
+      }});
+    }}
+  }});
+}}
+</script>"""
+    return _page_shell("批量操作", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -674,6 +922,32 @@ def make_alpha_handler(store: ScenarioStore):
   <button type="submit" id="al-submit">登录</button>
 </form>"""
                 return self._send(_page_shell("Alpha 登录", body))
+            # --- E1: wizard ---
+            if path == "/wizard/step/1":
+                return self._send(_wizard_step_html(1))
+            # --- E2: validated form ---
+            if path == "/validated-form":
+                return self._send(_validated_form_html())
+            # --- E3: dialog triggers ---
+            if path == "/dialogs":
+                return self._send(_dialog_page_html())
+            # --- E4: SPA navigation ---
+            if path.startswith("/spa"):
+                return self._send(_spa_page_html())
+            # --- E5: polling page + API ---
+            if path == "/polling":
+                return self._send(_polling_page_html())
+            if path == "/api/status":
+                store.poll_counter += 1
+                done = store.poll_counter >= 5
+                payload = json.dumps({
+                    "progress": store.poll_counter,
+                    "done": done,
+                }).encode("utf-8")
+                return self._send(payload, mime="application/json")
+            # --- E6: batch operations page ---
+            if path == "/batch":
+                return self._send(_batch_page_html(store.batch_items))
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
@@ -708,7 +982,68 @@ def make_alpha_handler(store: ScenarioStore):
                     _page_shell("登录失败",
                                 '<p id="alpha-login-err">用户名或密码错误</p>'),
                     status=401)
+            # --- E1: wizard POST steps ---
+            if path == "/wizard/step/2":
+                data = self._parse_form(body)
+                if not data.get("company") or not data.get("contact"):
+                    return self._send(
+                        _page_shell("校验失败",
+                                    '<p id="wizard-err">公司名称和联系人必填</p>'),
+                        status=400)
+                return self._send(_wizard_step_html(2, data))
+            if path == "/wizard/step/3":
+                data = self._parse_form(body)
+                if not data.get("sku") or not data.get("qty"):
+                    return self._send(
+                        _page_shell("校验失败",
+                                    '<p id="wizard-err">商品和数量必填</p>'),
+                        status=400)
+                return self._send(_wizard_step_html(3, data))
+            if path == "/wizard/submit":
+                data = self._parse_form(body)
+                store.wizard_submissions.append(data)
+                result_body = f"""
+<h1 id="wizard-done">采购单已提交</h1>
+<p id="wizard-order-no">单号：WZ-{len(store.wizard_submissions):04d}</p>
+<p>公司：{data.get('company', '')}</p>
+<p>SKU：{data.get('sku', '')} x {data.get('qty', '')}</p>"""
+                return self._send(_page_shell("提交成功", result_body))
+            # --- E2: validated form POST ---
+            if path == "/validated-form/submit":
+                data = self._parse_form(body)
+                result = f"""
+<h1 id="vf-done">表单提交成功</h1>
+<p id="vf-echo-name">姓名：{data.get('name', '')}</p>
+<p id="vf-echo-type">类型：{data.get('client_type', '')}</p>
+<p id="vf-echo-taxid">税号：{data.get('tax_id', '')}</p>"""
+                return self._send(_page_shell("提交成功", result))
+            # --- E6: batch API ---
+            if path == "/api/batch":
+                data = json.loads(body.decode("utf-8"))
+                action = data.get("action", "")
+                ids = data.get("ids", [])
+                if action == "delete":
+                    store.batch_items = [
+                        it for it in store.batch_items if it["id"] not in ids
+                    ]
+                    msg = f"已删除 {len(ids)} 项"
+                elif action == "export":
+                    msg = f"已导出 {len(ids)} 项"
+                else:
+                    msg = "未知操作"
+                payload = json.dumps({"message": msg, "action": action,
+                                      "affected": ids}).encode("utf-8")
+                return self._send(payload, mime="application/json")
             return self._send(b"not found", status=404)
+
+        def _parse_form(self, body: bytes) -> dict[str, str]:
+            return {
+                k: unquote(v[0]).replace("+", " ")
+                for k, v in parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                ).items()
+            }
 
     return AlphaHandler
 
