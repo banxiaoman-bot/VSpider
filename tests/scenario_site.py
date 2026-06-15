@@ -136,6 +136,14 @@ class ScenarioStore:
     ])
     # F3: cookie consent tracking
     consent_given: int = 0
+    # G2: rate limiting — first N requests return 429
+    rate_limit_remaining: int = 0
+    # G4: iframe message log (postMessage results)
+    iframe_messages: list[dict[str, Any]] = field(default_factory=list)
+    # G5: localStorage write-back log
+    localstorage_writes: list[dict[str, Any]] = field(default_factory=list)
+    # G6: server-side paginated table export log
+    csv_exports: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1008,294 @@ function batchAction(action) {{
 
 
 # ---------------------------------------------------------------------------
+# G1: Server-Sent Events (SSE) streaming page
+# ---------------------------------------------------------------------------
+
+SSE_EVENTS = [
+    {"id": 1, "type": "price_update", "sku": "ALP-001", "price": "189.00"},
+    {"id": 2, "type": "stock_alert", "sku": "ALP-003", "stock": 1},
+    {"id": 3, "type": "price_update", "sku": "ALP-002", "price": "1199.00"},
+    {"id": 4, "type": "new_order", "order_no": "BO-LIVE-001", "sku": "ALP-001"},
+    {"id": 5, "type": "done", "message": "stream_complete"},
+]
+
+
+def _sse_page_html() -> bytes:
+    events_json = json.dumps(SSE_EVENTS, ensure_ascii=False)
+    body = f"""
+<h1 id="sse-title">实时数据面板</h1>
+<p>事件计数：<span id="sse-count">0</span></p>
+<table id="sse-events">
+  <thead><tr><th>ID</th><th>类型</th><th>详情</th></tr></thead>
+  <tbody></tbody>
+</table>
+<p id="sse-status">connecting</p>
+<script>
+var EVENTS = {events_json};
+var count = 0;
+var tbody = document.querySelector('#sse-events tbody');
+var statusEl = document.getElementById('sse-status');
+statusEl.textContent = 'streaming';
+function processEvent(idx) {{
+  if (idx >= EVENTS.length) return;
+  var d = EVENTS[idx];
+  count++;
+  document.getElementById('sse-count').textContent = count;
+  var tr = document.createElement('tr');
+  tr.innerHTML = '<td>' + d.id + '</td><td>' + d.type +
+    '</td><td>' + JSON.stringify(d) + '</td>';
+  tr.dataset.eventId = d.id;
+  tbody.appendChild(tr);
+  if (d.type === 'done') {{
+    statusEl.textContent = 'complete';
+  }} else {{
+    setTimeout(function() {{ processEvent(idx + 1); }}, 80);
+  }}
+}}
+setTimeout(function() {{ processEvent(0); }}, 100);
+</script>"""
+    return _page_shell("SSE 实时面板", body)
+
+
+# ---------------------------------------------------------------------------
+# G2: Rate limiting page (429 + Retry-After)
+# ---------------------------------------------------------------------------
+
+def _rate_limit_page_html() -> bytes:
+    body = """
+<h1 id="rl-title">限流测试页</h1>
+<p id="rl-status">idle</p>
+<p>成功响应：<span id="rl-success">0</span></p>
+<p>429 次数：<span id="rl-blocked">0</span></p>
+<button id="rl-fetch" onclick="doFetch()">发起请求</button>
+<script>
+var success = 0, blocked = 0;
+function doFetch() {
+  document.getElementById('rl-status').textContent = 'fetching';
+  fetch('/api/rate-limited').then(function(r) {
+    if (r.status === 429) {
+      blocked++;
+      document.getElementById('rl-blocked').textContent = blocked;
+      document.getElementById('rl-status').textContent = 'rate_limited';
+      var ra = r.headers.get('Retry-After');
+      document.getElementById('rl-status').dataset.retryAfter = ra || '1';
+    } else {
+      return r.json().then(function(d) {
+        success++;
+        document.getElementById('rl-success').textContent = success;
+        document.getElementById('rl-status').textContent = 'ok';
+        document.getElementById('rl-status').dataset.payload = JSON.stringify(d);
+      });
+    }
+  });
+}
+</script>"""
+    return _page_shell("限流测试", body)
+
+
+# ---------------------------------------------------------------------------
+# G3: Lazy-loading images
+# ---------------------------------------------------------------------------
+
+LAZY_IMAGES = [
+    {"src": f"/img/lazy-{i}.png", "alt": f"lazy-img-{i}"} for i in range(1, 9)
+]
+
+
+def _lazy_images_page_html() -> bytes:
+    imgs = "\n".join(
+        f'<div class="lazy-card" style="height:300px;margin:20px 0;">'
+        f'<img data-src="{im["src"]}" alt="{im["alt"]}" class="lazy" '
+        f'style="width:100px;height:100px;" /></div>'
+        for im in LAZY_IMAGES
+    )
+    body = f"""
+<h1 id="lazy-title">懒加载图片</h1>
+<p>已加载：<span id="lazy-loaded">0</span> / {len(LAZY_IMAGES)}</p>
+{imgs}
+<script>
+var loaded = 0;
+var observer = new IntersectionObserver(function(entries) {{
+  entries.forEach(function(entry) {{
+    if (entry.isIntersecting) {{
+      var img = entry.target;
+      img.src = img.dataset.src;
+      img.classList.add('loaded');
+      loaded++;
+      document.getElementById('lazy-loaded').textContent = loaded;
+      observer.unobserve(img);
+    }}
+  }});
+}}, {{ threshold: 0.1 }});
+document.querySelectorAll('img.lazy').forEach(function(img) {{
+  observer.observe(img);
+}});
+</script>"""
+    return _page_shell("懒加载", body)
+
+
+# ---------------------------------------------------------------------------
+# G4: Multi-iframe postMessage communication
+# ---------------------------------------------------------------------------
+
+def _iframe_parent_html(alpha_base: str) -> bytes:
+    body = f"""
+<h1 id="iframe-title">跨框架通信</h1>
+<p>收到回复：<span id="iframe-replies">0</span></p>
+<div id="iframe-results"></div>
+<iframe id="frame-a" src="/iframe/child-a" style="width:300px;height:200px;"></iframe>
+<iframe id="frame-b" src="/iframe/child-b" style="width:300px;height:200px;"></iframe>
+<button id="iframe-send" onclick="sendAll()">广播消息</button>
+<script>
+var replies = 0;
+var results = document.getElementById('iframe-results');
+window.addEventListener('message', function(e) {{
+  replies++;
+  document.getElementById('iframe-replies').textContent = replies;
+  var p = document.createElement('p');
+  p.className = 'iframe-reply';
+  p.dataset.from = e.data.from;
+  p.textContent = e.data.from + ': ' + e.data.result;
+  results.appendChild(p);
+}});
+function sendAll() {{
+  var frames = document.querySelectorAll('iframe');
+  frames.forEach(function(f) {{
+    f.contentWindow.postMessage({{action: 'compute', value: 42}}, '*');
+  }});
+}}
+</script>"""
+    return _page_shell("跨框架通信", body)
+
+
+def _iframe_child_html(child_id: str, multiplier: int) -> bytes:
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Child {child_id}</title></head>
+<body>
+<p id="child-label">Child {child_id}</p>
+<p id="child-status">waiting</p>
+<script>
+window.addEventListener('message', function(e) {{
+  if (e.data && e.data.action === 'compute') {{
+    var result = e.data.value * {multiplier};
+    document.getElementById('child-status').textContent = 'computed: ' + result;
+    e.source.postMessage({{from: '{child_id}', result: result}}, '*');
+  }}
+}});
+</script>
+</body></html>""".encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# G5: localStorage persistence page
+# ---------------------------------------------------------------------------
+
+def _localstorage_page_html() -> bytes:
+    body = """
+<h1 id="ls-title">本地存储管理</h1>
+<form id="ls-form">
+  <label>键 <input type="text" id="ls-key" name="key"></label>
+  <label>值 <input type="text" id="ls-value" name="value"></label>
+  <button type="button" id="ls-save" onclick="saveItem()">保存</button>
+</form>
+<p>已存储：<span id="ls-count">0</span></p>
+<table id="ls-table">
+  <thead><tr><th>键</th><th>值</th></tr></thead>
+  <tbody></tbody>
+</table>
+<button id="ls-clear" onclick="clearAll()">清空</button>
+<script>
+function refreshTable() {
+  var tbody = document.querySelector('#ls-table tbody');
+  tbody.innerHTML = '';
+  var count = 0;
+  for (var i = 0; i < localStorage.length; i++) {
+    var k = localStorage.key(i);
+    if (k.startsWith('ls_')) {
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td class="ls-k">' + k.slice(3) + '</td>' +
+        '<td class="ls-v">' + localStorage.getItem(k) + '</td>';
+      tbody.appendChild(tr);
+      count++;
+    }
+  }
+  document.getElementById('ls-count').textContent = count;
+}
+function saveItem() {
+  var k = document.getElementById('ls-key').value;
+  var v = document.getElementById('ls-value').value;
+  if (k) {
+    localStorage.setItem('ls_' + k, v);
+    refreshTable();
+  }
+}
+function clearAll() {
+  var keys = [];
+  for (var i = 0; i < localStorage.length; i++) {
+    var k = localStorage.key(i);
+    if (k.startsWith('ls_')) keys.push(k);
+  }
+  keys.forEach(function(k) { localStorage.removeItem(k); });
+  refreshTable();
+}
+refreshTable();
+</script>"""
+    return _page_shell("本地存储", body)
+
+
+# ---------------------------------------------------------------------------
+# G6: Server-side paginated + filterable + exportable table
+# ---------------------------------------------------------------------------
+
+G6_RECORDS = [
+    {"id": i, "sku": p["sku"], "name": p["name"],
+     "price": float(p["price"]), "category": p["category"]}
+    for i, p in enumerate(PRODUCTS, start=1)
+]
+
+G6_PAGE_SIZE = 3
+
+
+def _g6_table_html(records: list[dict], page: int, total_pages: int,
+                   category: str, sort_by: str) -> bytes:
+    rows = "\n".join(
+        f'<tr data-id="{r["id"]}"><td>{r["sku"]}</td><td>{r["name"]}</td>'
+        f'<td>{r["price"]}</td><td>{r["category"]}</td></tr>'
+        for r in records
+    )
+    cats = sorted({r["category"] for r in G6_RECORDS})
+    cat_opts = '<option value="">全部</option>' + "".join(
+        f'<option value="{c}"{"selected" if c == category else ""}>{c}</option>'
+        for c in cats
+    )
+    prev_disabled = "disabled" if page <= 1 else ""
+    next_disabled = "disabled" if page >= total_pages else ""
+    body = f"""
+<h1 id="g6-title">服务端分页表</h1>
+<form id="g6-filter" method="get" action="/server-table">
+  <select name="category" id="g6-cat">{cat_opts}</select>
+  <select name="sort" id="g6-sort">
+    <option value="id"{"selected" if sort_by == "id" else ""}>默认</option>
+    <option value="price_asc"{"selected" if sort_by == "price_asc" else ""}>价格↑</option>
+    <option value="price_desc"{"selected" if sort_by == "price_desc" else ""}>价格↓</option>
+  </select>
+  <button type="submit" id="g6-apply">筛选</button>
+</form>
+<table id="g6-table">
+  <thead><tr><th>SKU</th><th>名称</th><th>价格</th><th>类目</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+<p id="g6-page-info">第 {page} 页 / 共 {total_pages} 页</p>
+<a id="g6-prev" href="/server-table?page={page-1}&category={category}&sort={sort_by}"
+   {"" if prev_disabled else ""}>{" " if prev_disabled else "上一页"}</a>
+<a id="g6-next" href="/server-table?page={page+1}&category={category}&sort={sort_by}"
+   {"" if next_disabled else ""}>{" " if next_disabled else "下一页"}</a>
+<a id="g6-export" href="/api/export-csv?category={category}&sort={sort_by}">导出 CSV</a>
+"""
+    return _page_shell("服务端分页", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -1169,6 +1465,73 @@ def make_alpha_handler(store: ScenarioStore):
             # --- F6: clipboard page ---
             if path == "/clipboard":
                 return self._send(_clipboard_page_html())
+            # --- G1: SSE-style streaming page (client-side simulation) ---
+            if path == "/sse":
+                return self._send(_sse_page_html())
+            # --- G2: rate limiting page + API ---
+            if path == "/rate-limit":
+                return self._send(_rate_limit_page_html())
+            if path == "/api/rate-limited":
+                if store.rate_limit_remaining > 0:
+                    store.rate_limit_remaining -= 1
+                    return self._send(
+                        b'{"error":"rate_limited"}', status=429,
+                        mime="application/json",
+                        extra={"Retry-After": "1"})
+                return self._send(
+                    json.dumps({"status": "ok", "data": "rate_limit_passed"})
+                    .encode("utf-8"),
+                    mime="application/json")
+            # --- G3: lazy images page ---
+            if path == "/lazy-images":
+                return self._send(_lazy_images_page_html())
+            if path.startswith("/img/lazy-") and path.endswith(".png"):
+                return self._send(PNG_BYTES, mime="image/png")
+            # --- G4: iframe communication ---
+            if path == "/iframe-comm":
+                return self._send(
+                    _iframe_parent_html(f"http://127.0.0.1:{self.server.server_address[1]}"))
+            if path == "/iframe/child-a":
+                return self._send(_iframe_child_html("child-a", 2))
+            if path == "/iframe/child-b":
+                return self._send(_iframe_child_html("child-b", 3))
+            # --- G5: localStorage page ---
+            if path == "/localstorage":
+                return self._send(_localstorage_page_html())
+            # --- G6: server-side paginated table ---
+            if path == "/server-table":
+                category = (qs.get("category") or [""])[0]
+                sort_by = (qs.get("sort") or ["id"])[0]
+                page_num = int((qs.get("page") or ["1"])[0])
+                filtered = [r for r in G6_RECORDS
+                            if not category or r["category"] == category]
+                if sort_by == "price_asc":
+                    filtered.sort(key=lambda r: r["price"])
+                elif sort_by == "price_desc":
+                    filtered.sort(key=lambda r: r["price"], reverse=True)
+                total_p = max(1, (len(filtered) + G6_PAGE_SIZE - 1) // G6_PAGE_SIZE)
+                page_num = max(1, min(page_num, total_p))
+                start = (page_num - 1) * G6_PAGE_SIZE
+                page_data = filtered[start:start + G6_PAGE_SIZE]
+                return self._send(
+                    _g6_table_html(page_data, page_num, total_p, category, sort_by))
+            if path == "/api/export-csv":
+                store.csv_exports += 1
+                category = (qs.get("category") or [""])[0]
+                sort_by = (qs.get("sort") or ["id"])[0]
+                filtered = [r for r in G6_RECORDS
+                            if not category or r["category"] == category]
+                if sort_by == "price_asc":
+                    filtered.sort(key=lambda r: r["price"])
+                elif sort_by == "price_desc":
+                    filtered.sort(key=lambda r: r["price"], reverse=True)
+                lines = ["sku,name,price,category"]
+                for r in filtered:
+                    lines.append(f'{r["sku"]},{r["name"]},{r["price"]},{r["category"]}')
+                csv_body = "\n".join(lines).encode("utf-8")
+                return self._send(
+                    csv_body, mime="text/csv",
+                    extra={"Content-Disposition": "attachment; filename=export.csv"})
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
