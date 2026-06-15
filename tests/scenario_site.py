@@ -1296,6 +1296,253 @@ def _g6_table_html(records: list[dict], page: int, total_pages: int,
 
 
 # ---------------------------------------------------------------------------
+# H1: Shadow DOM deep interaction (custom element with internal form)
+# ---------------------------------------------------------------------------
+
+def _shadow_dom_page_html() -> bytes:
+    body = """
+<h1 id="shadow-title">Shadow DOM 深度交互</h1>
+<div id="shadow-host"></div>
+<p>提交结果：<span id="shadow-result">none</span></p>
+<script>
+class ProductCard extends HTMLElement {
+  constructor() {
+    super();
+    var shadow = this.attachShadow({mode: 'open'});
+    shadow.innerHTML = `
+      <style>
+        :host { display: block; border: 1px solid #ccc; padding: 12px; }
+        .title { font-weight: bold; color: #333; }
+        input { padding: 4px; }
+      </style>
+      <div class="title"><slot name="heading">默认标题</slot></div>
+      <form id="inner-form">
+        <label>数量 <input type="number" id="qty-input" name="qty" value="1"></label>
+        <label>备注 <input type="text" id="note-input" name="note" placeholder="可选"></label>
+        <button type="button" id="submit-btn">提交</button>
+      </form>
+      <p id="inner-status">waiting</p>
+    `;
+    shadow.getElementById('submit-btn').addEventListener('click', () => {
+      var qty = shadow.getElementById('qty-input').value;
+      var note = shadow.getElementById('note-input').value;
+      shadow.getElementById('inner-status').textContent = 'submitted: ' + qty + '/' + note;
+      this.dispatchEvent(new CustomEvent('card-submit', {
+        detail: { qty: qty, note: note },
+        bubbles: true
+      }));
+    });
+  }
+}
+customElements.define('product-card', ProductCard);
+var host = document.getElementById('shadow-host');
+host.innerHTML = '<product-card><span slot="heading">测试商品卡</span></product-card>';
+document.addEventListener('card-submit', function(e) {
+  document.getElementById('shadow-result').textContent =
+    e.detail.qty + '|' + e.detail.note;
+});
+</script>"""
+    return _page_shell("Shadow DOM", body)
+
+
+# ---------------------------------------------------------------------------
+# H2: Web Worker computation
+# ---------------------------------------------------------------------------
+
+WORKER_JS = """
+self.onmessage = function(e) {
+  var n = e.data.n;
+  var sum = 0;
+  for (var i = 1; i <= n; i++) { sum += i; }
+  self.postMessage({ n: n, sum: sum });
+};
+"""
+
+
+def _worker_page_html() -> bytes:
+    body = """
+<h1 id="worker-title">Web Worker 计算</h1>
+<p>状态：<span id="worker-status">idle</span></p>
+<p>结果：<span id="worker-result">none</span></p>
+<button id="worker-start" onclick="startWorker()">开始计算</button>
+<script>
+function startWorker() {
+  document.getElementById('worker-status').textContent = 'computing';
+  var blob = new Blob([document.getElementById('worker-src').textContent],
+    {type: 'application/javascript'});
+  var url = URL.createObjectURL(blob);
+  var w = new Worker(url);
+  w.onmessage = function(e) {
+    document.getElementById('worker-result').textContent =
+      'sum(1..' + e.data.n + ')=' + e.data.sum;
+    document.getElementById('worker-status').textContent = 'done';
+    w.terminate();
+    URL.revokeObjectURL(url);
+  };
+  w.postMessage({n: 100});
+}
+</script>
+<script type="text/plain" id="worker-src">
+self.onmessage = function(e) {
+  var n = e.data.n;
+  var sum = 0;
+  for (var i = 1; i <= n; i++) { sum += i; }
+  self.postMessage({ n: n, sum: sum });
+};
+</script>"""
+    return _page_shell("Web Worker", body)
+
+
+# ---------------------------------------------------------------------------
+# H3: MutationObserver page
+# ---------------------------------------------------------------------------
+
+def _mutation_observer_page_html() -> bytes:
+    body = """
+<h1 id="mo-title">MutationObserver 监听</h1>
+<p>突变计数：<span id="mo-count">0</span></p>
+<div id="mo-target"></div>
+<button id="mo-add" onclick="addNode()">添加节点</button>
+<button id="mo-modify" onclick="modifyNode()">修改节点</button>
+<script>
+var moCount = 0;
+var target = document.getElementById('mo-target');
+var observer = new MutationObserver(function(mutations) {
+  moCount += mutations.length;
+  document.getElementById('mo-count').textContent = moCount;
+});
+observer.observe(target, { childList: true, subtree: true, attributes: true });
+var nodeIdx = 0;
+function addNode() {
+  nodeIdx++;
+  var p = document.createElement('p');
+  p.className = 'mo-item';
+  p.id = 'mo-item-' + nodeIdx;
+  p.textContent = '节点 ' + nodeIdx;
+  target.appendChild(p);
+}
+function modifyNode() {
+  var last = target.querySelector('.mo-item:last-child');
+  if (last) {
+    last.setAttribute('data-modified', 'true');
+    last.textContent = last.textContent + ' (已修改)';
+  }
+}
+</script>"""
+    return _page_shell("MutationObserver", body)
+
+
+# ---------------------------------------------------------------------------
+# H4: Theme switching (dark/light mode)
+# ---------------------------------------------------------------------------
+
+def _theme_page_html() -> bytes:
+    body = """
+<h1 id="theme-title">主题切换</h1>
+<button id="theme-toggle" onclick="toggleTheme()">切换主题</button>
+<p id="theme-label">当前主题：light</p>
+<div id="theme-box" style="padding:20px; background:#fff; color:#000;">
+  示例内容
+</div>
+<style>
+  body.dark { background: #1a1a1a; color: #eee; }
+  body.dark #theme-box { background: #333; color: #eee; }
+</style>
+<script>
+var saved = localStorage.getItem('theme');
+if (saved === 'dark') { applyDark(); }
+function toggleTheme() {
+  if (document.body.classList.contains('dark')) {
+    document.body.classList.remove('dark');
+    localStorage.setItem('theme', 'light');
+    document.getElementById('theme-label').textContent = '当前主题：light';
+  } else {
+    applyDark();
+  }
+}
+function applyDark() {
+  document.body.classList.add('dark');
+  localStorage.setItem('theme', 'dark');
+  document.getElementById('theme-label').textContent = '当前主题：dark';
+}
+</script>"""
+    return _page_shell("主题切换", body)
+
+
+# ---------------------------------------------------------------------------
+# H5: Tooltip / hover interactions
+# ---------------------------------------------------------------------------
+
+TOOLTIP_ITEMS = [
+    {"id": "tip-1", "label": "智能温控器", "tip": "工业级温度控制设备，精度±0.1°C"},
+    {"id": "tip-2", "label": "工业网关", "tip": "支持 Modbus/OPC UA 协议转换"},
+    {"id": "tip-3", "label": "边缘计算盒", "tip": "ARM Cortex-A72, 8GB RAM, -20~70°C"},
+]
+
+
+def _tooltip_page_html() -> bytes:
+    items = "\n".join(
+        f'<div class="tip-trigger" id="{t["id"]}" '
+        f'data-tooltip="{t["tip"]}" '
+        f'onmouseenter="showTip(this)" onmouseleave="hideTip()">'
+        f'{t["label"]}</div>'
+        for t in TOOLTIP_ITEMS
+    )
+    body = f"""
+<h1 id="tip-title">Tooltip 提示</h1>
+<div id="tip-container">{items}</div>
+<div id="tooltip-box" style="display:none; position:absolute;
+  background:#333; color:#fff; padding:8px; border-radius:4px;
+  font-size:13px; max-width:240px; z-index:9999;"></div>
+<script>
+function showTip(el) {{
+  var box = document.getElementById('tooltip-box');
+  box.textContent = el.dataset.tooltip;
+  box.style.display = 'block';
+  var rect = el.getBoundingClientRect();
+  box.style.left = rect.left + 'px';
+  box.style.top = (rect.bottom + 4) + 'px';
+}}
+function hideTip() {{
+  document.getElementById('tooltip-box').style.display = 'none';
+}}
+</script>"""
+    return _page_shell("Tooltip", body)
+
+
+# ---------------------------------------------------------------------------
+# H6: Multi-step file processing (upload → process → download)
+# ---------------------------------------------------------------------------
+
+def _file_process_page_html() -> bytes:
+    body = """
+<h1 id="fp-title">文件处理流水线</h1>
+<form id="fp-form" method="post" action="/api/file-process" enctype="multipart/form-data">
+  <input type="file" id="fp-file" name="file">
+  <select id="fp-action" name="action">
+    <option value="uppercase">转大写</option>
+    <option value="reverse">反转内容</option>
+    <option value="linecount">行数统计</option>
+  </select>
+  <button type="submit" id="fp-submit">处理</button>
+</form>
+<p id="fp-status">waiting</p>
+<div id="fp-result"></div>"""
+    return _page_shell("文件处理", body)
+
+
+def _file_process_result_html(action: str, filename: str, result: str) -> bytes:
+    body = f"""
+<h1 id="fp-done">处理完成</h1>
+<p id="fp-action">操作：{action}</p>
+<p id="fp-filename">文件：{filename}</p>
+<pre id="fp-output">{result}</pre>
+<a id="fp-download" href="/api/file-download?content={result}"
+   download="result.txt">下载结果</a>"""
+    return _page_shell("处理结果", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -1532,6 +1779,29 @@ def make_alpha_handler(store: ScenarioStore):
                 return self._send(
                     csv_body, mime="text/csv",
                     extra={"Content-Disposition": "attachment; filename=export.csv"})
+            # --- H1: Shadow DOM page ---
+            if path == "/shadow-dom":
+                return self._send(_shadow_dom_page_html())
+            # --- H2: Web Worker page ---
+            if path == "/worker":
+                return self._send(_worker_page_html())
+            # --- H3: MutationObserver page ---
+            if path == "/mutation-observer":
+                return self._send(_mutation_observer_page_html())
+            # --- H4: Theme switching page ---
+            if path == "/theme":
+                return self._send(_theme_page_html())
+            # --- H5: Tooltip page ---
+            if path == "/tooltip":
+                return self._send(_tooltip_page_html())
+            # --- H6: File processing page ---
+            if path == "/file-process":
+                return self._send(_file_process_page_html())
+            if path == "/api/file-download":
+                content = (qs.get("content") or [""])[0]
+                return self._send(
+                    content.encode("utf-8"), mime="text/plain",
+                    extra={"Content-Disposition": "attachment; filename=result.txt"})
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
@@ -1624,6 +1894,27 @@ def make_alpha_handler(store: ScenarioStore):
                     f'|{data.get("field3","")}</p>'
                 )
                 return self._send(_page_shell("键盘提交成功", result))
+            # --- H6: file processing API ---
+            if path == "/api/file-process":
+                ct = self.headers.get("Content-Type") or ""
+                fields = parse_multipart(body, ct)
+                action = fields.get("action", "uppercase")
+                file_entry = fields.get("file", {})
+                filename = "uploaded"
+                text = ""
+                if isinstance(file_entry, dict):
+                    filename = file_entry.get("filename", "uploaded")
+                    raw = file_entry.get("content", b"")
+                    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+                if action == "uppercase":
+                    result = text.upper()
+                elif action == "reverse":
+                    result = text[::-1]
+                elif action == "linecount":
+                    result = str(text.count("\n") + (1 if text else 0))
+                else:
+                    result = text
+                return self._send(_file_process_result_html(action, filename, result))
             # --- E6: batch API ---
             if path == "/api/batch":
                 data = json.loads(body.decode("utf-8"))
