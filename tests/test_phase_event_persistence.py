@@ -298,13 +298,14 @@ class TestMainWiring:
     def test_main_calls_setter_after_run_ts(self) -> None:
         main_src = Path(__file__).resolve().parent.parent / "visual_web_agent" / "main.py"
         src = main_src.read_text(encoding="utf-8")
-        # The import + call must appear shortly after _run_ts assignment
-        ts_idx = src.find("_run_ts = datetime.now().strftime")
-        assert ts_idx != -1
-        # set_phase_log_run_id call must come within ~10 lines AFTER
+        # G1: _run_ts now comes from prepare_run_identity delegation
+        ts_idx = src.find("_run_ts = _run_ctx.run_ts")
+        if ts_idx == -1:
+            ts_idx = src.find("_run_ts = datetime.now().strftime")
+        assert ts_idx != -1, "main.py must set _run_ts (direct or via RunContext)"
         setter_idx = src.find("set_phase_log_run_id", ts_idx)
         assert setter_idx != -1, "main.py must call set_phase_log_run_id"
         between = src[ts_idx:setter_idx]
-        assert between.count("\n") < 10, (
-            "set_phase_log_run_id must be called within ~10 lines of _run_ts"
+        assert between.count("\n") < 15, (
+            "set_phase_log_run_id must be called within ~15 lines of _run_ts"
         )

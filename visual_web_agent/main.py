@@ -7674,13 +7674,10 @@ async def run_agent(
     _prompt_images = list(prompt_images or [])
     _last_prompt_image_url: str | None = None
 
-    # Prefer the caller-provided run_id so API task ids, run contracts, logs,
-    # and artifacts all point at the same runs/<id>/ directory. Standalone CLI
-    # calls still get a timestamp id.
-    _caller_run_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(run_id or "").strip()).strip("_")
-    _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    if _caller_run_id:
-        _run_ts = _caller_run_id
+    # G1: run identity delegated to phases/startup.py
+    from visual_web_agent.phases.startup import prepare_run_identity as _prepare_run_id
+    _run_ctx = _prepare_run_id(run_id=run_id)
+    _run_ts = _run_ctx.run_ts
     _registry_record_owned = False
     # L: open per-run phase event jsonl right after run_ts is known so
     # every broadcast_phase call from this run lands in logs/phase_<ts>.jsonl
@@ -7690,10 +7687,10 @@ async def run_agent(
         _set_phase_run(_run_ts)
     except Exception:
         pass
-    _vlm_output = f"output_{_run_ts}.xlsx"       # VLM extract 提取的结果
-    _xhr_output = f"xhr_{_run_ts}.xlsx"           # XHR 拦截到的 API 数据（分开存）
-    _goal_output_mode = "default"
-    _goal_output_contract: dict[str, Any] = {}
+    _vlm_output = _run_ctx.vlm_output
+    _xhr_output = _run_ctx.xhr_output
+    _goal_output_mode = _run_ctx.goal_output_mode
+    _goal_output_contract: dict[str, Any] = _run_ctx.goal_output_contract
     # ── 新一次 run：清空上一次 run 残留的 Final Answer 状态 ──
     _reset_run_answer()
     # K4: stash run identity so a failure inside this run lands in
@@ -11483,27 +11480,13 @@ async def run_agent(
         # by the post-ask_human resume handler to goto back automatically.
         _last_business_url: str = ""
         _pending_session_return_url: str = ""
-        # ── Failure Classifier：统一失败统计 ─────────────────────────
-        _failure_stats = _FailureStatsClass()
-        # ── Judge：任务完成验证 ──────────────────────────────────────
-        _judge = TaskJudge(vlm_client=vlm, config=JudgeConfig(
-            enabled=JUDGE_ENABLED,
-            max_retries_after_fail=2,
-        ))
-        _judge_rejections = 0  # done 被 Judge 驳回的次数
-        # ── Loop Detector：统一循环检测 ──────────────────────────────
-        _loop_detector = ActionLoopDetector(config=LoopDetectorConfig(
-            window_size=8,
-            action_repeat_threshold=3,
-            stagnation_threshold=4,
-        ))
-        # ── Element Tracker：清空上一任务的追踪条目 ──────────────────
-        # 新任务开始时显式 reset，避免上次任务的 last_click 等别名串到本次。
-        # 开关关闭时 reset_element_tracker() 是 no-op，不需要额外判断。
-        try:
-            vlm.reset_element_tracker()
-        except Exception as _trk_reset_err:
-            logger.debug(f"[TRACKER] reset failed: {_trk_reset_err}")
+        # G1: loop guards delegated to phases/startup.py
+        from visual_web_agent.phases.startup import init_loop_guards as _init_guards
+        _guards = _init_guards(vlm)
+        _failure_stats = _guards.failure_stats
+        _judge = _guards.judge
+        _judge_rejections = _guards.judge_rejections
+        _loop_detector = _guards.loop_detector
 
         # ── Wave 2：Planner / Reflector 状态 ──────────────────────────
         _task_plan: "TaskPlan | None" = None

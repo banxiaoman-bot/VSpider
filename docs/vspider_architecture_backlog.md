@@ -3479,3 +3479,28 @@ P0✓ P1✓ E1✓ E2✓ E3✓ E4✓ E5✓ E6✓ E7✓ — 全部 9 个 slice 完
 宗旨「高效」四个分句覆盖：最少回合(E5)、局部感知(E1/E2/E3/E7)、
 API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 （E1 逃生阀、E2 full 回退、E4 命中仍出全套 evidence）。
+
+---
+
+# M4「通用·治理」里程碑
+
+## Slice G0 (M4 通用): 清理 actions.py.bak (done)
+
+- actions.py.bak 已在 actions/ 拆分后删除，Glob 确认不存在。
+- 验证: 无残留文件。
+
+## Slice G1 (M4 通用): main.py → phases/startup.py (done)
+
+- 能力名: startup_phase_split（RunContext + 循环守卫工厂）。
+- 影响层: main.py 初始化段 → phases/startup.py 纯平移。
+- 新模块 `visual_web_agent/phases/startup.py`：
+  - `RunContext` 数据类：run_ts / vlm_output / xhr_output / goal_output_mode 等核心状态。
+  - `prepare_run_identity(run_id=)` → RunContext：run_id 清洗、时间戳、输出文件名。
+  - `init_loop_guards(vlm)` → LoopGuards：Judge / LoopDetector / FailureStats / Tracker reset。
+- main.py 两处委托：
+  - run_id 计算 → `_run_ctx = _prepare_run_id(run_id=run_id)`
+  - Guard 创建 → `_guards = _init_guards(vlm)` + 字段回填
+- 适配 test_phase_event_persistence 断言（_run_ts 来源兼容直接/RunContext）。
+- 新增 contract 字段: 无。
+- Tests: tests/test_phase_startup_split.py 7 例（RunContext 字段/默认值、LoopGuards 完整性/配置、run_id 清洗）。
+- 验证: G1 7✓ + P1 4✓ + e2e 2✓ + M3 全系 53✓ + 全量 pytest 3491 passed 0 failed 2 skipped。
