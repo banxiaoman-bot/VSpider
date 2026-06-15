@@ -3504,3 +3504,31 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 新增 contract 字段: 无。
 - Tests: tests/test_phase_startup_split.py 7 例（RunContext 字段/默认值、LoopGuards 完整性/配置、run_id 清洗）。
 - 验证: G1 7✓ + P1 4✓ + e2e 2✓ + M3 全系 53✓ + 全量 pytest 3491 passed 0 failed 2 skipped。
+
+## Slice G2 (M4 通用): main.py → phases/planning.py (done)
+
+- 能力名: planning_phase_split（PlanningPhase — Planner / Reflector 状态机）。
+- 影响层: main.py Planner/Reflector 段 → phases/planning.py 纯平移。
+- 新模块 `visual_web_agent/phases/planning.py`：
+  - `PlanningPhase` 类：task_plan / reflect_count / steps_since_reflect / abort_requested 等状态。
+  - `make_initial_plan(vlm, goal, ...)` async → TaskPlan | None：起手子目标生成，失败静默降级。
+  - `maybe_reflect(vlm, current_url, goal, ...)` async → ReflectDecision | None：信号驱动反思。
+- main.py 三处委托：
+  - 状态变量 → `_planning = _PlanningPhase()`
+  - 起手 Plan → `_planning.make_initial_plan(...)`
+  - 循环内 Reflector → `_planning.maybe_reflect(...)`
+- 新增 contract 字段: 无。
+- Tests: tests/test_phase_planning_split.py 6 例。
+
+## Slice G3 (M4 通用): main.py → phases/decision.py (done)
+
+- 能力名: decision_phase_split（VLM ask 封装 + prompt image policy）。
+- 影响层: main.py VLM 决策调用 → phases/decision.py 纯平移。
+- 新模块 `visual_web_agent/phases/decision.py`：
+  - `VlmDecisionResult` 数据类：decisions + prompt_images_sent。
+  - `make_vlm_decision(vlm, ...)` async → VlmDecisionResult：封装 vlm.ask + prompt image policy。
+- main.py 一处委托：vlm.ask → `_vlm_decide(...)`
+- 新增 contract 字段: 无。
+- Tests: tests/test_phase_decision_split.py 3 例。
+- 验证: G2 6✓ + G3 3✓ + G1 7✓ + P1 4✓ + e2e 2✓ = 22 通过 0 失败；
+  全量 pytest（排除 api_server.py 预存在问题）3399 passed 0 failed 2 skipped。
