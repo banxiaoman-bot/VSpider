@@ -2996,6 +2996,195 @@ function submitCF() {
 
 
 # ---------------------------------------------------------------------------
+# O1: Step indicator
+# ---------------------------------------------------------------------------
+
+O1_STEPS = ["基本信息", "选择商品", "确认支付", "完成"]
+
+
+def _step_indicator_page_html() -> bytes:
+    steps_html = " ".join(
+        f'<span class="si-step" data-step="{i}" '
+        f'style="padding:8px 16px; {"font-weight:bold; background:#3498db; color:#fff;" if i == 0 else ""}">'
+        f'{i+1}. {s}</span>'
+        for i, s in enumerate(O1_STEPS)
+    )
+    body = f"""
+<h1 id="si-title">步骤指示器</h1>
+<div id="si-bar">{steps_html}</div>
+<p>当前步骤：<span id="si-current">0</span></p>
+<button id="si-prev" onclick="goStep(-1)">上一步</button>
+<button id="si-next" onclick="goStep(1)">下一步</button>
+<script>
+var curStep = 0;
+function goStep(delta) {{
+  var next = curStep + delta;
+  if (next < 0 || next >= {len(O1_STEPS)}) return;
+  curStep = next;
+  document.querySelectorAll('.si-step').forEach(function(s, i) {{
+    s.style.fontWeight = i === curStep ? 'bold' : '';
+    s.style.background = i === curStep ? '#3498db' : '';
+    s.style.color = i === curStep ? '#fff' : '';
+  }});
+  document.getElementById('si-current').textContent = curStep;
+}}
+</script>"""
+    return _page_shell("步骤指示器", body)
+
+
+# ---------------------------------------------------------------------------
+# O2: Tag input
+# ---------------------------------------------------------------------------
+
+def _tag_input_page_html() -> bytes:
+    body = """
+<h1 id="ti-title">标签输入</h1>
+<div id="ti-tags"></div>
+<input type="text" id="ti-input" placeholder="输入标签后按回车">
+<p>标签数：<span id="ti-count">0</span></p>
+<script>
+var tags = [];
+document.getElementById('ti-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && this.value.trim()) {
+    e.preventDefault();
+    var tag = this.value.trim();
+    if (tags.indexOf(tag) >= 0) return;
+    tags.push(tag);
+    renderTags();
+    this.value = '';
+  }
+});
+function removeTag(idx) {
+  tags.splice(idx, 1);
+  renderTags();
+}
+function renderTags() {
+  var container = document.getElementById('ti-tags');
+  container.innerHTML = tags.map(function(t, i) {
+    return '<span class="ti-tag" data-tag="' + t + '">' +
+      t + ' <button class="ti-remove" onclick="removeTag(' + i + ')">×</button></span>';
+  }).join(' ');
+  document.getElementById('ti-count').textContent = tags.length;
+}
+</script>"""
+    return _page_shell("标签输入", body)
+
+
+# ---------------------------------------------------------------------------
+# O3: Range slider
+# ---------------------------------------------------------------------------
+
+def _range_slider_page_html() -> bytes:
+    body = """
+<h1 id="rs-title">范围滑块</h1>
+<input type="range" id="rs-slider" min="0" max="100" value="50"
+  oninput="updateSlider()">
+<p>当前值：<span id="rs-value">50</span></p>
+<p>最小：0 / 最大：100</p>
+<script>
+function updateSlider() {
+  document.getElementById('rs-value').textContent =
+    document.getElementById('rs-slider').value;
+}
+</script>"""
+    return _page_shell("范围滑块", body)
+
+
+# ---------------------------------------------------------------------------
+# O4: Color picker
+# ---------------------------------------------------------------------------
+
+def _color_picker_page_html() -> bytes:
+    body = """
+<h1 id="cp-title">颜色选择器</h1>
+<input type="color" id="cp-input" value="#3498db"
+  oninput="updateColor()">
+<div id="cp-preview" style="width:100px;height:100px;background:#3498db;"></div>
+<p>HEX：<span id="cp-hex">#3498db</span></p>
+<script>
+function updateColor() {
+  var c = document.getElementById('cp-input').value;
+  document.getElementById('cp-preview').style.background = c;
+  document.getElementById('cp-hex').textContent = c;
+}
+</script>"""
+    return _page_shell("颜色选择器", body)
+
+
+# ---------------------------------------------------------------------------
+# O5: Notification badge
+# ---------------------------------------------------------------------------
+
+def _badge_page_html() -> bytes:
+    body = """
+<h1 id="bd-title">通知徽章</h1>
+<div id="bd-icon" style="position:relative; display:inline-block; padding:10px;">
+  📬 通知
+  <span id="bd-badge" style="position:absolute; top:0; right:0;
+    background:red; color:white; border-radius:50%; padding:2px 6px;
+    font-size:12px;">0</span>
+</div>
+<button id="bd-add" onclick="addNotif()">新通知</button>
+<button id="bd-clear" onclick="clearNotif()">清除</button>
+<p>总计：<span id="bd-total">0</span></p>
+<script>
+var notifCount = 0;
+function addNotif() {
+  notifCount++;
+  document.getElementById('bd-badge').textContent = notifCount;
+  document.getElementById('bd-total').textContent = notifCount;
+}
+function clearNotif() {
+  notifCount = 0;
+  document.getElementById('bd-badge').textContent = '0';
+  document.getElementById('bd-total').textContent = '0';
+}
+</script>"""
+    return _page_shell("通知徽章", body)
+
+
+# ---------------------------------------------------------------------------
+# O6: Nested accordion
+# ---------------------------------------------------------------------------
+
+def _nested_accordion_page_html() -> bytes:
+    body = """
+<h1 id="na-title">嵌套手风琴</h1>
+<div class="na-group" id="na-g1">
+  <button class="na-toggle" onclick="toggleNA('na-c1')">一级：产品类别</button>
+  <div class="na-content" id="na-c1" style="display:none; padding-left:20px;">
+    <div class="na-group" id="na-g1-1">
+      <button class="na-toggle" onclick="toggleNA('na-c1-1')">二级：传感器</button>
+      <div class="na-content" id="na-c1-1" style="display:none; padding-left:20px;">
+        <p class="na-leaf">温控器</p>
+        <p class="na-leaf">振动传感器</p>
+      </div>
+    </div>
+    <div class="na-group" id="na-g1-2">
+      <button class="na-toggle" onclick="toggleNA('na-c1-2')">二级：网络设备</button>
+      <div class="na-content" id="na-c1-2" style="display:none; padding-left:20px;">
+        <p class="na-leaf">工业网关</p>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="na-group" id="na-g2">
+  <button class="na-toggle" onclick="toggleNA('na-c2')">一级：技术文档</button>
+  <div class="na-content" id="na-c2" style="display:none; padding-left:20px;">
+    <p class="na-leaf">安装指南</p>
+    <p class="na-leaf">API 文档</p>
+  </div>
+</div>
+<script>
+function toggleNA(id) {
+  var el = document.getElementById(id);
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+</script>"""
+    return _page_shell("嵌套手风琴", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -3383,6 +3572,19 @@ def make_alpha_handler(store: ScenarioStore):
             # --- N6: Conditional form ---
             if path == "/conditional-form":
                 return self._send(_conditional_form_page_html())
+            # --- O1-O6 ---
+            if path == "/step-indicator":
+                return self._send(_step_indicator_page_html())
+            if path == "/tag-input":
+                return self._send(_tag_input_page_html())
+            if path == "/range-slider":
+                return self._send(_range_slider_page_html())
+            if path == "/color-picker":
+                return self._send(_color_picker_page_html())
+            if path == "/badge":
+                return self._send(_badge_page_html())
+            if path == "/nested-accordion":
+                return self._send(_nested_accordion_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
