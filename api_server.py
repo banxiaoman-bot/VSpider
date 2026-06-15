@@ -159,6 +159,7 @@ from broadcast import (  # noqa: E402 — extracted Slice 3
     set_api_loop,
     get_api_loop,
     resume_human as _broadcast_resume_human,
+    submit_hitl_form as _broadcast_submit_hitl_form,
     _HITL_RESUME_EVENT,
 )
 from queue_core import (  # noqa: E402 — extracted Slice 3
@@ -868,6 +869,18 @@ async def resume_human_intervention() -> dict:
     await manager.send_status("human_resumed")
     await manager.send_log("[HITL] 操作员确认完成，Agent 恢复执行", level="info")
     return {"status": "success", "message": "Agent resume signal sent"}
+
+
+@app.post("/api/human/form_submit", summary="前端 HITL 表单提交")
+async def submit_hitl_form_endpoint(payload: dict) -> dict:
+    fields = payload.get("fields", {})
+    if not fields:
+        return {"status": "error", "message": "No fields provided"}
+    _broadcast_submit_hitl_form(fields)
+    await manager.send_status("human_resumed")
+    filled = ", ".join(f"{k}=***" for k in fields)
+    await manager.send_log(f"[HITL] 用户通过前端表单提交了 {len(fields)} 个字段: {filled}", level="info")
+    return {"status": "success", "message": f"Form submitted with {len(fields)} fields"}
 
 
 @app.get("/api/artifacts", summary="列出 VSpider 产出文件")

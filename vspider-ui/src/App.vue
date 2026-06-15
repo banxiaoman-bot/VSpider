@@ -28,6 +28,8 @@ import CapabilityEfficiencyPanel from './components/CapabilityEfficiencyPanel.vu
 import CapabilityPlanPane from './components/CapabilityPlanPane.vue'
 import CapabilityReplayPane from './components/CapabilityReplayPane.vue'
 import CapabilityDiagnosticsPane from './components/CapabilityDiagnosticsPane.vue'
+import CapabilityHeroSection from './components/CapabilityHeroSection.vue'
+import CapabilityOverviewPane from './components/CapabilityOverviewPane.vue'
 import TimelinePanel from './components/TimelinePanel.vue'
 import FailedRunsPane from './components/FailedRunsPane.vue'
 import FinalAnswerPane from './components/FinalAnswerPane.vue'
@@ -35,6 +37,7 @@ import TerminalLogPane from './components/TerminalLogPane.vue'
 import AuthDialog from './components/AuthDialog.vue'
 import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
+import HitlFormDialog from './components/HitlFormDialog.vue'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import {
@@ -101,6 +104,13 @@ const semanticBaseUrl = ref('')
 const semanticApiKey = ref('')
 const isHumanInterventionRequired = ref(false)
 const humanInterventionReason = ref('')
+const hitlFormVisible = ref(false)
+const hitlFormFields = ref([])
+const hitlFormReason = ref('')
+const hitlFormScreenshot = ref('')
+const hitlFormLoading = ref(false)
+const hitlScreenshot = ref('')
+const hitlScreenshotExpanded = ref(false)
 const activeBottomTab = ref('terminal')
 // A: Capability 页签内部二级子页签（概览/计划/回放/诊断）
 const capabilitySubTab = ref('overview')
@@ -664,11 +674,23 @@ const connectWebSocket = () => {
         if (payload.status === 'human_intervention') {
           isHumanInterventionRequired.value = true
           humanInterventionReason.value = payload.reason || 'Agent 遇到需要人工处理的障碍'
+          hitlScreenshot.value = payload.screenshot || currentImageBase64.value || ''
+          hitlScreenshotExpanded.value = false
           await appendLog(`[HITL] ${humanInterventionReason.value}`)
+        }
+        if (payload.status === 'hitl_form') {
+          hitlFormFields.value = Array.isArray(payload.fields) ? payload.fields : []
+          hitlFormReason.value = payload.reason || '请填写以下信息'
+          hitlFormScreenshot.value = payload.screenshot || ''
+          hitlFormLoading.value = false
+          hitlFormVisible.value = true
+          await appendLog(`[HITL] 需要人工输入 ${hitlFormFields.value.length} 个字段`)
         }
         if (payload.status === 'human_resumed') {
           isHumanInterventionRequired.value = false
           humanInterventionReason.value = ''
+          hitlFormVisible.value = false
+          hitlFormLoading.value = false
           await appendLog('[HITL] Agent resumed')
         }
       }
@@ -797,6 +819,35 @@ const resumeAgentExecution = async () => {
     ElMessage.error(`恢复执行失败: ${String(err)}`)
     await appendLog(`[ERROR] 恢复执行失败: ${String(err)}`)
   }
+}
+
+const submitHitlForm = async (formData) => {
+  hitlFormLoading.value = true
+  try {
+    const response = await apiFetch('/api/human/form_submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fields: formData }),
+    })
+    const result = await response.json()
+    if (!response.ok || result.status !== 'success') {
+      throw new Error(result.message || '表单提交失败')
+    }
+    hitlFormVisible.value = false
+    hitlFormLoading.value = false
+    ElMessage.success('已提交表单数据，Agent 继续执行')
+    await appendLog(`[HITL] 表单数据已提交，${Object.keys(formData).length} 个字段`)
+  } catch (err) {
+    hitlFormLoading.value = false
+    ElMessage.error(`表单提交失败: ${String(err)}`)
+    await appendLog(`[ERROR] HITL 表单提交失败: ${String(err)}`)
+  }
+}
+
+const skipHitlForm = async () => {
+  hitlFormVisible.value = false
+  hitlFormLoading.value = false
+  await appendLog('[HITL] 用户选择跳过前端表单，请去浏览器窗口操作')
 }
 
 // ── M: Phase timeline computeds & helpers ─────────────────────────────
@@ -2956,6 +3007,7 @@ const settingsSummaryText = computed(() => {
 
 <template>
   <main class="app-shell">
+    <div v-if="isRunning" class="global-progress-bar" />
     <section class="control-panel vspider-panel">
       <header class="brand-header">
         <div class="brand-mark">
@@ -3323,9 +3375,9 @@ const settingsSummaryText = computed(() => {
             <h2>实时画面</h2>
             <p>Agent 实时视觉画面</p>
           </div>
-          <span class="live-indicator">
+          <span class="live-indicator" :class="`ws-${wsStatus}`">
             <i />
-            LIVE
+            {{ wsStatus === 'connected' ? 'LIVE' : wsStatus === 'connecting' ? 'CONNECTING' : 'OFFLINE' }}
           </span>
         </div>
         <div class="preview-stage">
@@ -3335,7 +3387,19 @@ const settingsSummaryText = computed(() => {
             alt="实时画面"
           />
           <div v-else class="preview-placeholder">
-            等待首帧画面
+            <div class="skeleton-preview">
+              <div class="skeleton-browser-bar">
+                <span class="skeleton-dot" /><span class="skeleton-dot" /><span class="skeleton-dot" />
+                <div class="skeleton-url-bar" />
+              </div>
+              <div class="skeleton-content">
+                <div class="skeleton-line skeleton-line--title" />
+                <div class="skeleton-line skeleton-line--short" />
+                <div class="skeleton-line" />
+                <div class="skeleton-line skeleton-line--medium" />
+              </div>
+              <p class="skeleton-hint">等待首帧画面</p>
+            </div>
           </div>
           <div v-if="isHumanInterventionRequired" class="hitl-overlay">
             <div class="hitl-card">
@@ -3348,6 +3412,18 @@ const settingsSummaryText = computed(() => {
                 <template v-else>
                   Agent is paused. Complete captcha, slider, QR scan, or 2FA in the browser window.
                 </template>
+              </div>
+              <div v-if="hitlScreenshot" class="hitl-screenshot-wrap">
+                <img
+                  :src="hitlScreenshot"
+                  alt="当前页面截图"
+                  class="hitl-screenshot"
+                  :class="{ 'is-expanded': hitlScreenshotExpanded }"
+                  @click="hitlScreenshotExpanded = !hitlScreenshotExpanded"
+                />
+                <span class="hitl-screenshot-hint">
+                  {{ hitlScreenshotExpanded ? '点击缩小' : '点击放大查看当前页面' }}
+                </span>
               </div>
               <div v-if="humanInterventionReason" class="hitl-reason">
                 {{ humanInterventionReason }}
@@ -3426,304 +3502,45 @@ const settingsSummaryText = computed(() => {
             </template>
             <el-scrollbar class="capability-scroll">
               <div v-if="latestCapabilityRoute || latestCapabilityExecute" class="capability-panel">
-                <section class="capability-hero">
-                  <div>
-                    <div class="capability-kicker">Route-Aware Agent Guidance</div>
-                    <h3>{{ capabilityIntent.task_type || 'unknown task' }}</h3>
-                    <p>
-                      输出模式：{{ capabilityIntent.output_mode || 'default' }}
-                      <span v-if="capabilityIntent.requires_artifact"> · 需要产物</span>
-                      <span v-if="capabilityIntent.requires_visual_grounding"> · 需要视觉定位</span>
-                    </p>
-                  </div>
-                  <div class="capability-hero-actions">
-                    <span class="capability-count">
-                      {{ capabilityTraceEvents.length }} events
-                    </span>
-                    <el-button
-                      size="small"
-                      plain
-                      class="capability-export-btn"
-                      :disabled="!capabilityTraceEvents.length"
-                      title="导出 capability_route / capability_execute 为 JSONL (Ctrl+E)"
-                      @click="exportCapabilityTraceAsJsonl"
-                    >
-                      导出 JSONL
-                    </el-button>
-                    <el-dropdown
-                      trigger="click"
-                      @command="handleCapabilityMoreAction"
-                    >
-                      <el-button size="small" plain class="capability-export-btn">
-                        更多操作 ⋯
-                      </el-button>
-                      <template #dropdown>
-                        <el-dropdown-menu>
-                          <el-dropdown-item command="copySummary" :disabled="!capabilityTraceEvents.length">
-                            复制摘要
-                          </el-dropdown-item>
-                          <el-dropdown-item command="importReplay">
-                            导入回放
-                          </el-dropdown-item>
-                          <el-dropdown-item
-                            command="generateFixture"
-                            divided
-                            :disabled="capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'"
-                          >
-                            生成 Fixture
-                          </el-dropdown-item>
-                          <el-dropdown-item
-                            command="replayFixture"
-                            :disabled="capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'"
-                          >
-                            验证 Fixture
-                          </el-dropdown-item>
-                          <el-dropdown-item command="refreshFixtures">
-                            刷新 Fixture 库
-                          </el-dropdown-item>
-                          <el-dropdown-item command="refreshBatchHistory">
-                            刷新 Replay 历史
-                          </el-dropdown-item>
-                          <el-dropdown-item command="batchReplay" :disabled="capabilityFailureFixtureBatchReplayLoading">
-                            批量验证 Fixture
-                          </el-dropdown-item>
-                          <el-dropdown-item
-                            command="replayEfficiency"
-                            divided
-                            :disabled="capabilityExecutionEfficiencyCorrelationReport.version !== 'efficiency_correlation_report.v1'"
-                          >
-                            验证 Efficiency
-                          </el-dropdown-item>
-                          <el-dropdown-item command="refreshEfficiencyReplays">
-                            刷新 Efficiency Replay
-                          </el-dropdown-item>
-                        </el-dropdown-menu>
-                      </template>
-                    </el-dropdown>
-                  </div>
-                </section>
-
-                <div v-if="replayMode" class="timeline-replay-banner capability-replay-banner">
-                  <span class="replay-icon" aria-hidden="true">▶</span>
-                  <span class="replay-text">
-                    Capability 回放模式
-                    <span v-if="replaySourceName" class="replay-source">
-                      · {{ replaySourceName }}
-                    </span>
-                  </span>
-                  <el-button
-                    size="small"
-                    plain
-                    class="replay-exit-btn"
-                    title="退出回放，清空导入事件并重新接收实时事件"
-                    @click="exitReplayMode"
-                  >退出回放</el-button>
-                </div>
+                <CapabilityHeroSection
+                  :intent="capabilityIntent"
+                  :event-count="capabilityTraceEvents.length"
+                  :export-disabled="!capabilityTraceEvents.length"
+                  :replay-mode="replayMode"
+                  :replay-source-name="replaySourceName"
+                  :batch-replay-loading="capabilityFailureFixtureBatchReplayLoading"
+                  :failure-bundle-valid="capabilityExecutionFailureBundle.version === 'capability_execute_failure_bundle.v1'"
+                  :correlation-report-valid="capabilityExecutionEfficiencyCorrelationReport.version === 'efficiency_correlation_report.v1'"
+                  @export-jsonl="exportCapabilityTraceAsJsonl"
+                  @more-action="handleCapabilityMoreAction"
+                  @exit-replay="exitReplayMode"
+                />
 
                 <el-tabs v-model="capabilitySubTab" class="capability-sub-tabs">
                   <el-tab-pane label="概览" name="overview">
-
-                <section v-if="capabilityTraceRows.length" class="capability-health-strip">
-                  <CapabilityStatusBadge
-                    :status-class="capabilityTraceHealth.status"
-                    :label="capabilityTraceHealth.label"
-                  />
-                  <span>route {{ capabilityTraceHealth.route }}</span>
-                  <span>execute {{ capabilityTraceHealth.execute }}</span>
-                  <span>issues {{ capabilityTraceHealth.issues }}</span>
-                  <span v-if="capabilityTraceHealth.alignment">
-                    {{ capabilityTraceHealth.alignment }}
-                  </span>
-                </section>
-
-                <CapabilityRuntimePanel
-                  :runtime-preflight="capabilityRuntimePreflight"
-                  :runtime-preflight-class="capabilityRuntimePreflightClass"
-                  :runtime-preflight-label="capabilityRuntimePreflightLabel"
-                  :browser-runtime="browserRuntime"
-                  :browser-runtime-class="browserRuntimeStatusClass"
-                  :browser-runtime-label="browserRuntimeLabel"
-                  :backend-summary="browserRuntimeBackendSummary"
-                  :capacity="browserRuntimeCapacity"
-                  :health-label="browserRuntimeHealthLabel"
-                  :health-cache-label="browserRuntimeHealthCacheLabel"
-                />
-
-                <CapabilityTraceList
-                  v-model:filter="capabilityTraceFilter"
-                  v-model:search-query="capabilityTraceSearchQuery"
-                  :rows="capabilityFilteredTraceRows"
-                  :total-rows="capabilityTraceRows.length"
-                  :summary="capabilityTraceSummary"
-                  @open-row="(evt) => timelinePanelRef.value?.openPhaseDialog(evt)"
-                />
-
-                <CapabilityAlignmentCard
-                  :visible="Boolean(latestCapabilityExecute)"
-                  :alignment="capabilityExecutionAlignment"
-                />
-
-                <section v-if="latestCapabilityExecute" class="capability-section">
-                  <h4>执行遥测</h4>
-                  <div class="capability-exec-summary">
-                    <span
-                      class="capability-exec-status"
-                      :class="latestCapabilityExecute.completed ? 'is-complete' : 'is-fallback'"
-                    >
-                      {{ latestCapabilityExecute.execution_status || 'unknown' }}
-                    </span>
-                    <span v-if="latestCapabilityExecute.capability">
-                      capability: {{ latestCapabilityExecute.capability }}
-                    </span>
-                    <span v-if="Number.isFinite(latestCapabilityExecute.duration_ms)">
-                      {{ latestCapabilityExecute.duration_ms }}ms
-                    </span>
-                    <span v-if="latestCapabilityExecute.fallback_reason">
-                      fallback: {{ latestCapabilityExecute.fallback_reason }}
-                    </span>
-                  </div>
-                  <CapabilityEfficiencyPanel
-                    :crawl-plan="capabilityActiveCrawlEfficiencyPlan"
-                    :available-paths="capabilityExecutionCrawlEfficiencyAvailablePaths"
-                    :candidates="capabilityExecutionCrawlEfficiencyCandidates"
-                    :summary="capabilityExecutionCrawlEfficiencySummary"
-                    :candidate-class="capabilityCrawlEfficiencyCandidateClass"
-                    :candidate-evidence="capabilityCrawlEfficiencyEvidence"
-                    :correlation-report="capabilityExecutionEfficiencyCorrelationReport"
-                    :correlation-status-class="capabilityEfficiencyCorrelationStatusClass"
-                    :correlation-alignment="capabilityExecutionEfficiencyCorrelationAlignment"
-                    :root-causes="capabilityExecutionEfficiencyCorrelationRootCauses"
-                    :planner-hints="capabilityExecutionEfficiencyCorrelationPlannerHints"
-                    :actions="capabilityExecutionEfficiencyCorrelationActions"
-                  />
-                  <div v-if="capabilityExecutionRuntimeAfter.runtime_status" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionRuntimeLabel }}</span>
-                    <span>runtime: {{ capabilityExecutionRuntimeAfter.runtime_status || 'unknown' }}</span>
-                    <span>backend: {{ capabilityExecutionRuntimeAfter.active_backend || 'unknown' }}</span>
-                    <span>health: {{ capabilityExecutionRuntimeAfter.backend_health || 'unknown' }}</span>
-                    <span>
-                      contexts:
-                      {{ capabilityExecutionRuntimeAfter.available_contexts ?? '?' }}
-                      /
-                      {{ capabilityExecutionRuntimeAfter.max_contexts ?? '?' }}
-                    </span>
-                    <span v-if="capabilityExecutionRuntimeAfter.recommended_action">
-                      action: {{ capabilityExecutionRuntimeAfter.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeDrift.version" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionDriftLabel }}</span>
-                    <span>changes: {{ Array.isArray(capabilityExecutionRuntimeDrift.changes) ? capabilityExecutionRuntimeDrift.changes.length : 0 }}</span>
-                    <span>warnings: {{ Array.isArray(capabilityExecutionRuntimeDrift.warnings) ? capabilityExecutionRuntimeDrift.warnings.length : 0 }}</span>
-                    <span v-if="capabilityExecutionRuntimeDrift.deltas">
-                      contexts Δ:
-                      {{ capabilityExecutionRuntimeDrift.deltas.available_contexts ?? 0 }}
-                    </span>
-                    <span v-if="capabilityExecutionRuntimeDrift.recommended_action">
-                      action: {{ capabilityExecutionRuntimeDrift.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeIssueSummary.version" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionIssueLabel }}</span>
-                    <span>issues: {{ capabilityExecutionRuntimeIssueSummary.issue_count ?? 0 }}</span>
-                    <span v-if="capabilityExecutionRuntimeIssueSummary.sources">
-                      drift: {{ capabilityExecutionRuntimeIssueSummary.sources.drift_status || 'unknown' }}
-                    </span>
-                    <span v-if="capabilityExecutionRuntimeIssueSummary.recommended_action">
-                      action: {{ capabilityExecutionRuntimeIssueSummary.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeIssues.length" class="capability-check-list">
-                    <span
-                      v-for="(issue, idx) in capabilityExecutionRuntimeIssues"
-                      :key="`runtime-issue-${idx}-${issue.code || idx}`"
-                      class="capability-check is-error"
-                    >
-                      {{ issue.source || 'runtime' }}: {{ issue.code || 'issue' }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionRuntimeActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityExecutionRuntimeActions"
-                      :key="`runtime-action-${action}`"
-                      class="capability-check is-complete"
-                    >
-                      action: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionIssueSummary.version" class="capability-exec-summary">
-                    <span>{{ capabilityExecutionActionIssueLabel }}</span>
-                    <span v-if="capabilityExecutionActionTrace.action">
-                      browser action: {{ capabilityExecutionActionTrace.action }}
-                    </span>
-                    <span v-if="capabilityExecutionActionFailureSummary.failure_code">
-                      failure: {{ capabilityExecutionActionFailureSummary.failure_code }}
-                    </span>
-                    <span v-if="capabilityExecutionActionFailureSummary.failure_category">
-                      category: {{ capabilityExecutionActionFailureSummary.failure_category }}
-                    </span>
-                    <span>issues: {{ capabilityExecutionActionIssueSummary.issue_count ?? 0 }}</span>
-                    <span v-if="capabilityExecutionActionIssueSummary.recommended_action">
-                      action: {{ capabilityExecutionActionIssueSummary.recommended_action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionIssues.length" class="capability-check-list">
-                    <span
-                      v-for="(issue, idx) in capabilityExecutionActionIssues"
-                      :key="`browser-action-issue-${idx}-${issue.code || idx}`"
-                      class="capability-check is-error"
-                    >
-                      {{ issue.source || 'action' }}: {{ issue.code || 'issue' }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionIssueActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityExecutionActionIssueActions"
-                      :key="`browser-action-recommendation-${action}`"
-                      class="capability-check is-complete"
-                    >
-                      action: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionActionRecoveryActions.length" class="capability-check-list">
-                    <span
-                      v-for="action in capabilityExecutionActionRecoveryActions"
-                      :key="`browser-action-recovery-${action}`"
-                      class="capability-check is-warning"
-                    >
-                      recovery: {{ action }}
-                    </span>
-                  </div>
-                  <div v-if="capabilityExecutionAttempts.length" class="capability-attempt-list">
-                    <div
-                      v-for="(attempt, idx) in capabilityExecutionAttempts"
-                      :key="`attempt-${idx}-${attempt.capability || idx}`"
-                      class="capability-attempt"
-                      :class="capabilityAttemptClass(attempt)"
-                    >
-                      <strong>{{ attempt.capability || 'unknown' }}</strong>
-                      <span>{{ attempt.status || 'attempted' }}</span>
-                      <small v-if="attempt.target_count != null">
-                        target {{ attempt.target_count }}
-                      </small>
-                      <small v-if="attempt.count != null">count {{ attempt.count }}</small>
-                      <small v-if="attempt.row_count != null">rows {{ attempt.row_count }}</small>
-                      <small v-if="attempt.item_count != null">items {{ attempt.item_count }}</small>
-                      <p v-if="attempt.reason">{{ attempt.reason }}</p>
-                    </div>
-                  </div>
-                  <div v-if="capabilityExecutionChecks.length" class="capability-check-list">
-                    <span
-                      v-for="check in capabilityExecutionChecks"
-                      :key="check.name"
-                      class="capability-check"
-                      :class="check.passed ? 'is-complete' : 'is-error'"
-                    >
-                      {{ check.name }}: {{ check.passed ? 'pass' : 'fail' }}
-                    </span>
-                  </div>
-                </section>
-
+                    <CapabilityOverviewPane
+                      v-model:trace-filter="capabilityTraceFilter"
+                      v-model:trace-search-query="capabilityTraceSearchQuery"
+                      :trace-rows="capabilityTraceRows"
+                      :filtered-trace-rows="capabilityFilteredTraceRows"
+                      :trace-summary="capabilityTraceSummary"
+                      :trace-health="capabilityTraceHealth"
+                      :runtime-preflight="capabilityRuntimePreflight"
+                      :runtime-preflight-class="capabilityRuntimePreflightClass"
+                      :runtime-preflight-label="capabilityRuntimePreflightLabel"
+                      :browser-runtime="browserRuntime"
+                      :browser-runtime-class="browserRuntimeStatusClass"
+                      :browser-runtime-label="browserRuntimeLabel"
+                      :backend-summary="browserRuntimeBackendSummary"
+                      :capacity="browserRuntimeCapacity"
+                      :health-label="browserRuntimeHealthLabel"
+                      :health-cache-label="browserRuntimeHealthCacheLabel"
+                      :has-execute-event="Boolean(latestCapabilityExecute)"
+                      :execute-event="latestCapabilityExecute"
+                      :execution-alignment="capabilityExecutionAlignment"
+                      :route-crawl-efficiency-plan="capabilityRouteCrawlEfficiencyPlan"
+                      @open-row="(evt) => timelinePanelRef.value?.openPhaseDialog(evt)"
+                    />
                   </el-tab-pane>
                   <el-tab-pane label="计划 / 工作流" name="plan">
                     <CapabilityPlanPane
@@ -3751,9 +3568,20 @@ const settingsSummaryText = computed(() => {
                   </el-tab-pane>
                 </el-tabs>
               </div>
-              <p v-else class="empty-log">
-                暂无 capability_route / capability_execute 事件 — 启动任务后会显示推荐能力链、执行尝试和模型职责边界。
-              </p>
+              <div v-else class="capability-skeleton">
+                <div class="skeleton-capability-hero">
+                  <div class="skeleton-line skeleton-line--title" />
+                  <div class="skeleton-line skeleton-line--short" />
+                </div>
+                <div class="skeleton-capability-strip">
+                  <span class="skeleton-pill" /><span class="skeleton-pill" /><span class="skeleton-pill" />
+                </div>
+                <div class="skeleton-capability-cards">
+                  <div class="skeleton-card"><div class="skeleton-line" /><div class="skeleton-line skeleton-line--medium" /></div>
+                  <div class="skeleton-card"><div class="skeleton-line" /><div class="skeleton-line skeleton-line--short" /></div>
+                </div>
+                <p class="skeleton-hint">启动任务后显示能力链与执行遥测</p>
+              </div>
             </el-scrollbar>
           </el-tab-pane>
 
@@ -3847,6 +3675,17 @@ const settingsSummaryText = computed(() => {
     <!-- T: Keyboard shortcuts cheat-sheet (Ctrl+/) ───────────────────── -->
     <ShortcutHelpDialog v-model:visible="helpDialogVisible" />
 
+    <!-- HITL Form Dialog: CDP proxy input for form filling -->
+    <HitlFormDialog
+      v-model:visible="hitlFormVisible"
+      :reason="hitlFormReason"
+      :fields="hitlFormFields"
+      :screenshot-url="hitlFormScreenshot"
+      :loading="hitlFormLoading"
+      @submit="submitHitlForm"
+      @skip="skipHitlForm"
+    />
+
     
   </main>
 </template>
@@ -3863,6 +3702,7 @@ const settingsSummaryText = computed(() => {
 }
 
 .app-shell {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(360px, 35%) minmax(0, 1fr);
   gap: 18px;
@@ -3873,6 +3713,23 @@ const settingsSummaryText = computed(() => {
     linear-gradient(180deg, rgb(var(--rgb-info) / 0.08), transparent 32%),
     var(--vsp-bg);
   color: var(--vsp-text);
+}
+
+.global-progress-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 100;
+  background: linear-gradient(90deg, transparent, var(--vsp-accent), transparent);
+  background-size: 300% 100%;
+  animation: progress-sweep 1.8s ease-in-out infinite;
+}
+
+@keyframes progress-sweep {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
 }
 
 .vspider-panel {
@@ -4106,6 +3963,17 @@ const settingsSummaryText = computed(() => {
   --el-button-hover-border-color: var(--vsp-accent-bright);
   --el-button-text-color: var(--vsp-surface-mint);
   font-weight: 700;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.run-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgb(var(--rgb-accent) / 0.3);
+}
+
+.run-button:active:not(:disabled) {
+  transform: translateY(0);
+  box-shadow: none;
 }
 
 .stop-button {
@@ -4165,6 +4033,34 @@ const settingsSummaryText = computed(() => {
   background: var(--vsp-accent);
   box-shadow: 0 0 0 0 rgb(var(--rgb-accent) / 0.58);
   animation: pulse-live 1.6s infinite;
+  transition: background 0.3s ease;
+}
+
+.live-indicator.ws-connecting {
+  color: var(--vsp-warn-soft);
+}
+
+.live-indicator.ws-connecting i {
+  background: var(--vsp-warn);
+  box-shadow: 0 0 0 0 rgb(var(--rgb-warn) / 0.5);
+  animation: pulse-connecting 1s infinite;
+}
+
+.live-indicator.ws-disconnected i,
+.live-indicator.ws-error i {
+  background: var(--vsp-danger-rose);
+  box-shadow: none;
+  animation: none;
+}
+
+.live-indicator.ws-disconnected,
+.live-indicator.ws-error {
+  color: var(--vsp-danger-rose);
+}
+
+@keyframes pulse-connecting {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
 }
 
 .status-pill {
@@ -4198,6 +4094,12 @@ const settingsSummaryText = computed(() => {
   width: 100%;
   height: 100%;
   object-fit: contain;
+  animation: fade-scale-in 0.3s ease-out;
+}
+
+@keyframes fade-scale-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: scale(1); }
 }
 
 .preview-placeholder {
@@ -4209,6 +4111,140 @@ const settingsSummaryText = computed(() => {
   font-size: 14px;
 }
 
+/* ── Skeleton screen shared ────────────────────────────────────────── */
+@keyframes skeleton-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, rgb(var(--rgb-slate) / 0.12) 25%, rgb(var(--rgb-slate) / 0.24) 50%, rgb(var(--rgb-slate) / 0.12) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+}
+
+.skeleton-line--title {
+  width: 60%;
+  height: 16px;
+}
+
+.skeleton-line--short {
+  width: 35%;
+}
+
+.skeleton-line--medium {
+  width: 80%;
+}
+
+.skeleton-pill {
+  display: inline-block;
+  width: 64px;
+  height: 22px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgb(var(--rgb-slate) / 0.1) 25%, rgb(var(--rgb-slate) / 0.2) 50%, rgb(var(--rgb-slate) / 0.1) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+}
+
+.skeleton-hint {
+  margin: 12px 0 0;
+  color: var(--vsp-text-dim-alt);
+  font-size: 12.5px;
+  text-align: center;
+  opacity: 0.7;
+}
+
+/* ── Preview skeleton ──────────────────────────────────────────────── */
+.skeleton-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 70%;
+  max-width: 360px;
+}
+
+.skeleton-browser-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px 8px 0 0;
+  background: rgb(var(--rgb-slate) / 0.08);
+  border: 1px solid rgb(var(--rgb-slate) / 0.12);
+}
+
+.skeleton-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgb(var(--rgb-slate) / 0.18);
+}
+
+.skeleton-url-bar {
+  flex: 1;
+  height: 10px;
+  margin-left: 6px;
+  border-radius: 5px;
+  background: linear-gradient(90deg, rgb(var(--rgb-slate) / 0.1) 25%, rgb(var(--rgb-slate) / 0.2) 50%, rgb(var(--rgb-slate) / 0.1) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+}
+
+.skeleton-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 0 0 8px 8px;
+  background: rgb(var(--rgb-slate) / 0.04);
+  border: 1px solid rgb(var(--rgb-slate) / 0.1);
+  border-top: none;
+}
+
+/* ── Capability skeleton ───────────────────────────────────────────── */
+.capability-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 16px;
+}
+
+.skeleton-capability-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 10px;
+  background: rgb(var(--rgb-indigo) / 0.06);
+  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.12);
+}
+
+.skeleton-capability-strip {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgb(var(--rgb-ink) / 0.42);
+}
+
+.skeleton-capability-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.skeleton-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  background: rgb(var(--rgb-ink) / 0.42);
+  border: 1px solid rgb(var(--rgb-slate) / 0.1);
+}
+
 .hitl-overlay {
   position: absolute;
   inset: 0;
@@ -4218,6 +4254,12 @@ const settingsSummaryText = computed(() => {
   padding: 28px;
   background: rgb(var(--rgb-danger-deep) / 0.82);
   backdrop-filter: blur(6px);
+  animation: overlay-enter 0.35s ease-out;
+}
+
+@keyframes overlay-enter {
+  from { opacity: 0; backdrop-filter: blur(0); }
+  to { opacity: 1; backdrop-filter: blur(6px); }
 }
 
 .hitl-card {
@@ -4249,6 +4291,39 @@ const settingsSummaryText = computed(() => {
   border: 1px solid rgb(var(--rgb-danger-soft) / 0.24);
   border-radius: 8px;
   font-size: 13px;
+}
+
+.hitl-screenshot-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin: 0 auto 16px;
+  max-width: 100%;
+}
+
+.hitl-screenshot {
+  max-width: 280px;
+  max-height: 160px;
+  border-radius: 8px;
+  border: 2px solid rgb(var(--rgb-white) / 0.2);
+  object-fit: contain;
+  cursor: pointer;
+  transition: max-width 0.3s ease, max-height 0.3s ease, border-color 0.2s;
+}
+
+.hitl-screenshot:hover {
+  border-color: rgb(var(--rgb-white) / 0.45);
+}
+
+.hitl-screenshot.is-expanded {
+  max-width: 520px;
+  max-height: 380px;
+}
+
+.hitl-screenshot-hint {
+  color: rgb(var(--rgb-white) / 0.5);
+  font-size: 11px;
 }
 
 .resume-button {
@@ -4347,6 +4422,12 @@ const settingsSummaryText = computed(() => {
 
 :deep(.bottom-tabs .el-tab-pane) {
   height: 100%;
+  animation: tab-fade-in 0.22s ease-out;
+}
+
+@keyframes tab-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .artifact-toolbar {
@@ -4359,6 +4440,16 @@ const settingsSummaryText = computed(() => {
 
 .artifact-badge {
   line-height: 1;
+}
+
+:deep(.artifact-badge .el-badge__content.is-dot) {
+  animation: badge-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes badge-pop {
+  0% { transform: scale(0); opacity: 0; }
+  60% { transform: scale(1.4); }
+  100% { transform: scale(1); opacity: 1; }
 }
 
 /* K3: failed-runs panel ───────────────────────────────────────────
@@ -4583,11 +4674,12 @@ const settingsSummaryText = computed(() => {
   border-radius: 8px;
   color: var(--vsp-text-label);
   cursor: pointer;
-  transition: border-color 0.2s ease;
+  transition: border-color 0.2s ease, background 0.2s ease;
 }
 
 .settings-summary:hover {
   border-color: var(--vsp-accent);
+  background: rgb(var(--rgb-accent) / 0.04);
 }
 
 .settings-summary__title {

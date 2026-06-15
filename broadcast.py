@@ -111,6 +111,8 @@ manager = ConnectionManager()
 # ── Thread-safe scheduling ───────────────────────────────────────────
 
 _HITL_RESUME_EVENT = threading.Event()
+_HITL_FORM_RESULT: dict | None = None
+_HITL_FORM_EVENT = threading.Event()
 
 
 def _schedule(coro: Coroutine[Any, Any, Any]) -> None:
@@ -282,11 +284,11 @@ def broadcast_phase(
 
 # ── Human-in-the-loop ────────────────────────────────────────────────
 
-def broadcast_human_intervention(reason: str = "") -> bool:
+def broadcast_human_intervention(reason: str = "", screenshot: str = "") -> bool:
     if _API_LOOP is None or _API_LOOP.is_closed():
         return False
     _HITL_RESUME_EVENT.clear()
-    broadcast_status("human_intervention", reason=reason)
+    broadcast_status("human_intervention", reason=reason, screenshot=screenshot)
     broadcast_log(f"[HITL] Agent 已挂起，等待人工处理：{reason or 'manual intervention required'}", level="warn")
     return True
 
@@ -299,6 +301,44 @@ async def wait_for_human_resume() -> None:
 def resume_human() -> None:
     """Signal that human intervention is complete."""
     _HITL_RESUME_EVENT.set()
+
+
+def broadcast_hitl_form(
+    fields: list[dict],
+    reason: str = "",
+    screenshot: str = "",
+) -> bool:
+    """Send a structured form to the frontend for user input."""
+    if _API_LOOP is None or _API_LOOP.is_closed():
+        return False
+    global _HITL_FORM_RESULT
+    _HITL_FORM_RESULT = None
+    _HITL_FORM_EVENT.clear()
+    broadcast_status(
+        "hitl_form",
+        reason=reason,
+        fields=fields,
+        screenshot=screenshot,
+    )
+    broadcast_log(
+        f"[HITL] 向前端发送表单请求（{len(fields)} 个字段）",
+        level="warn",
+    )
+    return True
+
+
+async def wait_for_hitl_form_result() -> dict | None:
+    """Block until the frontend submits the HITL form."""
+    await asyncio.to_thread(_HITL_FORM_EVENT.wait)
+    _HITL_FORM_EVENT.clear()
+    return _HITL_FORM_RESULT
+
+
+def submit_hitl_form(form_data: dict) -> None:
+    """Called by the API endpoint when user submits the HITL form."""
+    global _HITL_FORM_RESULT
+    _HITL_FORM_RESULT = form_data
+    _HITL_FORM_EVENT.set()
 
 
 # ── Async wrappers ───────────────────────────────────────────────────

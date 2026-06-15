@@ -3588,3 +3588,29 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 新增 contract 字段: 无。
 - Tests: tests/test_api_routes_spider_split.py 8 例。
 - 验证: G6 10✓ + G7 8✓ + G4-G5 31✓ + G2-G3 9✓ + G1 7✓ + P1 4✓ = 69 通过 0 失败。
+
+## Slice C1 (M4 契约): manifest.json 写入闭环 (done)
+
+- 能力名: manifest_enforcement（确认所有 data_writer 均通过 finalize_file_artifact 写入 manifest）。
+- 现状验证：全部 7 个 writer（xlsx/csv/jsonl/json/markdown/html/files_folder）+ _base.py 已调用 finalize_file_artifact → append_manifest_item 链路。dispatch.py 路由全 8 种 container。
+- 新增 contract 字段: 无（produced_by 已在 ManifestItem.v1）。
+- Tests: tests/test_manifest_enforcement.py 9 例（源码锚定 + dispatch 覆盖 + 数据模型）。
+
+## Slice C2 (M4 契约): media_harvester 真下载贯通 (done)
+
+- 能力名: media_download_enforcement（确认 media_harvester 真下载文件 + 写 manifest，不走 URL-as-row）。
+- 现状验证：harvester.py 调用 download_candidate + write_manifest；agent_hook.py 识别 6 种 media output_kind；HarvestReport 含 manifest_appended 计数。
+- Tests: tests/test_manifest_enforcement.py 6 例（源码锚定 + 数据模型 + 序列化）。
+- 验证: C1 9✓ + C2 9✓ + manifest roundtrip 3✓ = 18 通过 0 失败（合并在 test_manifest_enforcement.py）。
+
+## Slice B1 (M4 收口): 体量基线 + M4 收口 (done)
+
+- 能力名: file_size_baseline（体量回归防线 + M4 完整性验证）。
+- 新增 tests/test_file_size_baseline.py 6 例：
+  - main.py < 18000 行（从 18593 降至 17595，锁定 -1000 行减量）
+  - browser_env.py < 5000 行（4769，锁定）
+  - api_server.py < 2500 行（2136，锁定）
+  - phases/ 包含全部 6 个子模块
+  - som_injector.py 存在
+  - api_routes/ 包含 spider_api.py
+- M4 里程碑收口：G0-G7 + C1-C2 + B1 共 12 个 slice 全部完成。
