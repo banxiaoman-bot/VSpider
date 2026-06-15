@@ -2759,6 +2759,243 @@ function updateUndoInfo() {
 
 
 # ---------------------------------------------------------------------------
+# N1: Countdown timer
+# ---------------------------------------------------------------------------
+
+def _countdown_page_html() -> bytes:
+    body = """
+<h1 id="cd-title">倒计时</h1>
+<p>剩余：<span id="cd-value">10</span></p>
+<p id="cd-status">idle</p>
+<button id="cd-start" onclick="startCD()">开始</button>
+<button id="cd-pause" onclick="pauseCD()">暂停</button>
+<button id="cd-reset" onclick="resetCD()">重置</button>
+<script>
+var cdTimer = null, cdVal = 10;
+function startCD() {
+  if (cdTimer) return;
+  document.getElementById('cd-status').textContent = 'running';
+  cdTimer = setInterval(function() {
+    cdVal--;
+    document.getElementById('cd-value').textContent = cdVal;
+    if (cdVal <= 0) {
+      clearInterval(cdTimer); cdTimer = null;
+      document.getElementById('cd-status').textContent = 'finished';
+    }
+  }, 100);
+}
+function pauseCD() {
+  if (cdTimer) { clearInterval(cdTimer); cdTimer = null; }
+  document.getElementById('cd-status').textContent = 'paused';
+}
+function resetCD() {
+  if (cdTimer) { clearInterval(cdTimer); cdTimer = null; }
+  cdVal = 10;
+  document.getElementById('cd-value').textContent = '10';
+  document.getElementById('cd-status').textContent = 'idle';
+}
+</script>"""
+    return _page_shell("倒计时", body)
+
+
+# ---------------------------------------------------------------------------
+# N2: Drag-reorder list (JS-simulated for testability)
+# ---------------------------------------------------------------------------
+
+def _reorder_list_page_html() -> bytes:
+    items = "\n".join(
+        f'<li class="ro-item" data-id="{i}" draggable="true">'
+        f'项目 {i}</li>'
+        for i in range(1, 6)
+    )
+    body = f"""
+<h1 id="ro-title">拖拽排序列表</h1>
+<ul id="ro-list">{items}</ul>
+<p>当前顺序：<span id="ro-order">1,2,3,4,5</span></p>
+<button id="ro-move-down" onclick="moveDown()">选中项下移</button>
+<button id="ro-move-up" onclick="moveUp()">选中项上移</button>
+<script>
+var selected = null;
+document.querySelectorAll('.ro-item').forEach(function(li) {{
+  li.onclick = function() {{
+    document.querySelectorAll('.ro-item').forEach(function(x) {{
+      x.style.background = '';
+    }});
+    li.style.background = '#d4edda';
+    selected = li;
+  }};
+}});
+function updateOrder() {{
+  var ids = Array.from(document.querySelectorAll('.ro-item'))
+    .map(function(el) {{ return el.dataset.id; }});
+  document.getElementById('ro-order').textContent = ids.join(',');
+}}
+function moveDown() {{
+  if (!selected || !selected.nextElementSibling) return;
+  selected.parentNode.insertBefore(selected.nextElementSibling, selected);
+  updateOrder();
+}}
+function moveUp() {{
+  if (!selected || !selected.previousElementSibling) return;
+  selected.parentNode.insertBefore(selected, selected.previousElementSibling);
+  updateOrder();
+}}
+</script>"""
+    return _page_shell("排序列表", body)
+
+
+# ---------------------------------------------------------------------------
+# N3: Full-text search with highlight
+# ---------------------------------------------------------------------------
+
+SEARCH_PARAGRAPHS = [
+    "智能温控器采用高精度传感器，温度控制精度达±0.1°C。",
+    "工业网关支持 Modbus、OPC UA 等多种工业协议转换。",
+    "边缘计算盒搭载 ARM Cortex-A72 处理器，8GB RAM。",
+    "振动传感器提供三轴加速度数据，支持实时监测。",
+    "光纤收发器实现电信号与光信号的高速转换。",
+]
+
+
+def _search_highlight_page_html() -> bytes:
+    paras = "\n".join(
+        f'<p class="sh-para" id="sh-p-{i}">{p}</p>'
+        for i, p in enumerate(SEARCH_PARAGRAPHS)
+    )
+    body = f"""
+<h1 id="sh-title">全文搜索高亮</h1>
+<input type="text" id="sh-input" placeholder="搜索关键词...">
+<button id="sh-search" onclick="doSearch()">搜索</button>
+<p>匹配数：<span id="sh-match-count">0</span></p>
+<div id="sh-content">{paras}</div>
+<script>
+function doSearch() {{
+  var q = document.getElementById('sh-input').value;
+  var paras = document.querySelectorAll('.sh-para');
+  var count = 0;
+  paras.forEach(function(p, i) {{
+    var original = {json.dumps(SEARCH_PARAGRAPHS, ensure_ascii=False)}[i];
+    if (!q) {{ p.innerHTML = original; return; }}
+    var re = new RegExp('(' + q.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&') + ')', 'gi');
+    if (re.test(original)) {{
+      p.innerHTML = original.replace(re, '<mark class="sh-highlight">$1</mark>');
+      count++;
+    }} else {{
+      p.innerHTML = original;
+    }}
+  }});
+  document.getElementById('sh-match-count').textContent = count;
+}}
+</script>"""
+    return _page_shell("搜索高亮", body)
+
+
+# ---------------------------------------------------------------------------
+# N4: Expandable card grid
+# ---------------------------------------------------------------------------
+
+def _card_grid_page_html() -> bytes:
+    cards = "\n".join(
+        f'<div class="cg-card" id="card-{p["id"]}" onclick="toggleCard({p["id"]})">'
+        f'<h3 class="cg-card-title">{p["name"]}</h3>'
+        f'<div class="cg-card-detail" id="detail-{p["id"]}" style="display:none;">'
+        f'SKU: {p["sku"]} | 价格: {p["price"]} | 库存: {p["stock"]}</div></div>'
+        for p in PRODUCTS[:6]
+    )
+    body = f"""
+<h1 id="cg-title">卡片网格</h1>
+<p>展开数：<span id="cg-expanded">0</span></p>
+<div id="cg-grid" style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px;">
+{cards}
+</div>
+<script>
+function toggleCard(id) {{
+  var detail = document.getElementById('detail-' + id);
+  detail.style.display = detail.style.display === 'none' ? 'block' : 'none';
+  var expanded = document.querySelectorAll('.cg-card-detail[style*="display: block"]').length +
+    document.querySelectorAll('.cg-card-detail[style="display:block;"]').length;
+  document.getElementById('cg-expanded').textContent = expanded;
+}}
+</script>"""
+    return _page_shell("卡片网格", body)
+
+
+# ---------------------------------------------------------------------------
+# N5: Sticky header table
+# ---------------------------------------------------------------------------
+
+def _sticky_table_page_html() -> bytes:
+    rows = "\n".join(
+        f'<tr><td>{p["sku"]}</td><td>{p["name"]}</td>'
+        f'<td>{p["price"]}</td></tr>'
+        for p in PRODUCTS
+    )
+    body = f"""
+<h1 id="st-title">粘性表头</h1>
+<div id="st-container" style="height:200px; overflow-y:auto;">
+  <table id="st-table">
+    <thead style="position:sticky; top:0; background:#fff; z-index:1;">
+      <tr><th id="st-th-sku">SKU</th><th>名称</th><th>价格</th></tr>
+    </thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>"""
+    return _page_shell("粘性表头", body)
+
+
+# ---------------------------------------------------------------------------
+# N6: Conditional form sections
+# ---------------------------------------------------------------------------
+
+def _conditional_form_page_html() -> bytes:
+    body = """
+<h1 id="cf-title">条件表单</h1>
+<form id="cf-form">
+  <fieldset>
+    <legend>身份类型</legend>
+    <label><input type="radio" name="identity" value="personal"
+      onclick="switchSection('personal')" checked> 个人</label>
+    <label><input type="radio" name="identity" value="company"
+      onclick="switchSection('company')"> 企业</label>
+    <label><input type="radio" name="identity" value="government"
+      onclick="switchSection('government')"> 政府</label>
+  </fieldset>
+  <div id="sec-personal" class="cf-section">
+    <label>姓名 <input type="text" id="cf-name" name="name"></label>
+    <label>身份证 <input type="text" id="cf-idcard" name="idcard"></label>
+  </div>
+  <div id="sec-company" class="cf-section" style="display:none;">
+    <label>公司名 <input type="text" id="cf-company" name="company"></label>
+    <label>税号 <input type="text" id="cf-taxid" name="taxid"></label>
+    <label>法人 <input type="text" id="cf-legal" name="legal"></label>
+  </div>
+  <div id="sec-government" class="cf-section" style="display:none;">
+    <label>单位名 <input type="text" id="cf-dept" name="dept"></label>
+    <label>统一代码 <input type="text" id="cf-usc" name="usc"></label>
+  </div>
+  <button type="button" id="cf-submit" onclick="submitCF()">提交</button>
+</form>
+<p>提交结果：<span id="cf-result">none</span></p>
+<script>
+function switchSection(type) {
+  document.querySelectorAll('.cf-section').forEach(function(s) {
+    s.style.display = 'none';
+  });
+  document.getElementById('sec-' + type).style.display = 'block';
+}
+function submitCF() {
+  var type = document.querySelector('input[name=identity]:checked').value;
+  var sec = document.getElementById('sec-' + type);
+  var inputs = sec.querySelectorAll('input');
+  var data = type + ':';
+  inputs.forEach(function(inp) { data += inp.value + ','; });
+  document.getElementById('cf-result').textContent = data;
+}
+</script>"""
+    return _page_shell("条件表单", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -3128,6 +3365,24 @@ def make_alpha_handler(store: ScenarioStore):
             # --- M6: Undo/Redo ---
             if path == "/undo-redo":
                 return self._send(_undoredo_page_html())
+            # --- N1: Countdown ---
+            if path == "/countdown":
+                return self._send(_countdown_page_html())
+            # --- N2: Reorder list ---
+            if path == "/reorder":
+                return self._send(_reorder_list_page_html())
+            # --- N3: Search highlight ---
+            if path == "/search-highlight":
+                return self._send(_search_highlight_page_html())
+            # --- N4: Card grid ---
+            if path == "/card-grid":
+                return self._send(_card_grid_page_html())
+            # --- N5: Sticky table ---
+            if path == "/sticky-table":
+                return self._send(_sticky_table_page_html())
+            # --- N6: Conditional form ---
+            if path == "/conditional-form":
+                return self._send(_conditional_form_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
