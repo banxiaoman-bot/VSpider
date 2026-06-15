@@ -1543,6 +1543,212 @@ def _file_process_result_html(action: str, filename: str, result: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# I1: Modal dialog element
+# ---------------------------------------------------------------------------
+
+def _modal_page_html() -> bytes:
+    body = """
+<h1 id="modal-title">Modal 对话框</h1>
+<button id="modal-open" onclick="document.getElementById('my-dialog').showModal()">
+  打开对话框
+</button>
+<p>最近提交：<span id="modal-result">none</span></p>
+
+<dialog id="my-dialog">
+  <h2 id="dialog-heading">订单确认</h2>
+  <form id="dialog-form" method="dialog">
+    <label>商品 <input type="text" id="dlg-product" name="product"></label>
+    <label>数量 <input type="number" id="dlg-qty" name="qty" value="1"></label>
+    <button type="submit" id="dlg-confirm" value="confirm">确认</button>
+    <button type="submit" id="dlg-cancel" value="cancel">取消</button>
+  </form>
+</dialog>
+
+<script>
+var dlg = document.getElementById('my-dialog');
+dlg.addEventListener('close', function() {
+  if (dlg.returnValue === 'confirm') {
+    var p = document.getElementById('dlg-product').value;
+    var q = document.getElementById('dlg-qty').value;
+    document.getElementById('modal-result').textContent = p + 'x' + q;
+  } else {
+    document.getElementById('modal-result').textContent = 'cancelled';
+  }
+});
+</script>"""
+    return _page_shell("Modal", body)
+
+
+# ---------------------------------------------------------------------------
+# I2: Progress bar / task queue
+# ---------------------------------------------------------------------------
+
+def _progress_page_html() -> bytes:
+    body = """
+<h1 id="prog-title">任务进度</h1>
+<progress id="prog-bar" value="0" max="100"></progress>
+<p>进度：<span id="prog-value">0</span>%</p>
+<p id="prog-status">idle</p>
+<button id="prog-start" onclick="startTask()">开始</button>
+<button id="prog-cancel" onclick="cancelTask()">取消</button>
+<button id="prog-reset" onclick="resetTask()">重置</button>
+<script>
+var timer = null;
+var progress = 0;
+function startTask() {
+  if (timer) return;
+  document.getElementById('prog-status').textContent = 'running';
+  timer = setInterval(function() {
+    progress += 10;
+    document.getElementById('prog-bar').value = progress;
+    document.getElementById('prog-value').textContent = progress;
+    if (progress >= 100) {
+      clearInterval(timer);
+      timer = null;
+      document.getElementById('prog-status').textContent = 'complete';
+    }
+  }, 100);
+}
+function cancelTask() {
+  if (timer) { clearInterval(timer); timer = null; }
+  document.getElementById('prog-status').textContent = 'cancelled';
+}
+function resetTask() {
+  if (timer) { clearInterval(timer); timer = null; }
+  progress = 0;
+  document.getElementById('prog-bar').value = 0;
+  document.getElementById('prog-value').textContent = '0';
+  document.getElementById('prog-status').textContent = 'idle';
+}
+</script>"""
+    return _page_shell("任务进度", body)
+
+
+# ---------------------------------------------------------------------------
+# I3: Responsive layout (media query viewport-dependent)
+# ---------------------------------------------------------------------------
+
+def _responsive_page_html() -> bytes:
+    body = """
+<h1 id="resp-title">响应式布局</h1>
+<div id="resp-layout" class="layout-wide">
+  <div id="resp-sidebar" style="background:#e0e0e0;padding:10px;">侧边栏</div>
+  <div id="resp-main" style="background:#f5f5f5;padding:10px;">主内容区</div>
+</div>
+<p id="resp-mode">wide</p>
+<style>
+  #resp-layout { display: flex; gap: 10px; }
+  #resp-sidebar { width: 200px; flex-shrink: 0; }
+  #resp-main { flex: 1; }
+  @media (max-width: 600px) {
+    #resp-layout { flex-direction: column; }
+    #resp-sidebar { width: 100%; }
+  }
+</style>
+<script>
+function checkMode() {
+  var w = window.innerWidth;
+  document.getElementById('resp-mode').textContent = w <= 600 ? 'narrow' : 'wide';
+}
+window.addEventListener('resize', checkMode);
+checkMode();
+</script>"""
+    return _page_shell("响应式", body)
+
+
+# ---------------------------------------------------------------------------
+# I4: HTTP caching with ETag
+# ---------------------------------------------------------------------------
+
+ETAG_CONTENT_V1 = {"version": 1, "data": "original content"}
+ETAG_CONTENT_V2 = {"version": 2, "data": "updated content"}
+
+
+# ---------------------------------------------------------------------------
+# I5: Rich text editing (contenteditable + execCommand)
+# ---------------------------------------------------------------------------
+
+def _richtext_page_html() -> bytes:
+    body = """
+<h1 id="rt-title">富文本编辑</h1>
+<div id="rt-toolbar">
+  <button id="rt-bold" onclick="document.execCommand('bold')">B</button>
+  <button id="rt-italic" onclick="document.execCommand('italic')">I</button>
+  <button id="rt-underline" onclick="document.execCommand('underline')">U</button>
+</div>
+<div id="rt-editor" contenteditable="true"
+     style="border:1px solid #ccc; min-height:100px; padding:8px;">
+  在此编辑内容
+</div>
+<p>HTML 输出：</p>
+<pre id="rt-output"></pre>
+<button id="rt-export" onclick="exportHtml()">导出 HTML</button>
+<script>
+function exportHtml() {
+  document.getElementById('rt-output').textContent =
+    document.getElementById('rt-editor').innerHTML;
+}
+</script>"""
+    return _page_shell("富文本", body)
+
+
+# ---------------------------------------------------------------------------
+# I6: Data attribute manipulation
+# ---------------------------------------------------------------------------
+
+I6_ITEMS = [
+    {"id": f"item-{i}", "name": p["name"], "category": p["category"],
+     "price": p["price"]}
+    for i, p in enumerate(PRODUCTS[:8], start=1)
+]
+
+
+def _data_attr_page_html() -> bytes:
+    items_html = "\n".join(
+        f'<div class="da-item" id="{it["id"]}" '
+        f'data-category="{it["category"]}" data-price="{it["price"]}" '
+        f'data-selected="false">'
+        f'<span class="da-name">{it["name"]}</span> '
+        f'<span class="da-price">{it["price"]}</span> '
+        f'<button class="da-toggle" onclick="toggleItem(\'{it["id"]}\')">选择</button>'
+        f'</div>'
+        for it in I6_ITEMS
+    )
+    body = f"""
+<h1 id="da-title">Data 属性操作</h1>
+<div id="da-filters">
+  <button id="da-filter-all" onclick="filterBy('')">全部</button>
+  <button id="da-filter-sensor" onclick="filterBy('传感')">传感</button>
+  <button id="da-filter-network" onclick="filterBy('网络')">网络</button>
+</div>
+<p>已选：<span id="da-selected-count">0</span></p>
+<div id="da-list">{items_html}</div>
+<script>
+function filterBy(cat) {{
+  document.querySelectorAll('.da-item').forEach(function(el) {{
+    if (!cat || el.dataset.category === cat) {{
+      el.style.display = '';
+    }} else {{
+      el.style.display = 'none';
+    }}
+  }});
+}}
+function toggleItem(id) {{
+  var el = document.getElementById(id);
+  var selected = el.dataset.selected === 'true';
+  el.dataset.selected = selected ? 'false' : 'true';
+  el.style.background = selected ? '' : '#d4edda';
+  updateCount();
+}}
+function updateCount() {{
+  var count = document.querySelectorAll('.da-item[data-selected="true"]').length;
+  document.getElementById('da-selected-count').textContent = count;
+}}
+</script>"""
+    return _page_shell("Data 属性", body)
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -1802,6 +2008,36 @@ def make_alpha_handler(store: ScenarioStore):
                 return self._send(
                     content.encode("utf-8"), mime="text/plain",
                     extra={"Content-Disposition": "attachment; filename=result.txt"})
+            # --- I1: Modal dialog ---
+            if path == "/modal":
+                return self._send(_modal_page_html())
+            # --- I2: Progress bar ---
+            if path == "/progress":
+                return self._send(_progress_page_html())
+            # --- I3: Responsive layout ---
+            if path == "/responsive":
+                return self._send(_responsive_page_html())
+            # --- I4: ETag caching API ---
+            if path == "/api/cached-data":
+                version = int((qs.get("v") or ["1"])[0])
+                data = ETAG_CONTENT_V1 if version == 1 else ETAG_CONTENT_V2
+                etag = f'"v{version}"'
+                if_none_match = self.headers.get("If-None-Match", "")
+                if if_none_match == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.end_headers()
+                    return
+                payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                return self._send(
+                    payload, mime="application/json",
+                    extra={"ETag": etag, "Cache-Control": "must-revalidate"})
+            # --- I5: Rich text editor ---
+            if path == "/richtext":
+                return self._send(_richtext_page_html())
+            # --- I6: Data attributes page ---
+            if path == "/data-attr":
+                return self._send(_data_attr_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
