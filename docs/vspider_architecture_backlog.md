@@ -3532,3 +3532,36 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: tests/test_phase_decision_split.py 3 例。
 - 验证: G2 6✓ + G3 3✓ + G1 7✓ + P1 4✓ + e2e 2✓ = 22 通过 0 失败；
   全量 pytest（排除 api_server.py 预存在问题）3399 passed 0 failed 2 skipped。
+
+## Slice G4 (M4 通用): main.py → phases/action_dispatch.py (done)
+
+- 能力名: action_dispatch_phase_split（PostDecisionGuards — repeat / zero-target 守卫）。
+- 影响层: main.py 后决策守卫段 → phases/action_dispatch.py 纯平移。
+- 新模块 `visual_web_agent/phases/action_dispatch.py`：
+  - `PostDecisionGuards` 类：prev_action_sig / repeat_action_count / consecutive_zero_target 状态。
+  - `apply_repeat_guard(decisions, vlm)` → GuardResult：两阶段重复动作检测（软警告→硬劫持+子目标推进）。
+  - `apply_zero_target_guard(decisions, vlm)` → GuardResult：ZERO_TARGET_DOWNGRADE 连续计数+最后通牒。
+  - `record_action_sig(decisions)`：记录最终 action signature 供下一步重复检测。
+  - `GuardResult` 数据类：decisions + repeat_warned + repeat_hijacked + zero_target_ultimatum。
+- main.py 四处委托：
+  - 初始化 → `_post_decision_guards = _PDG()`
+  - 重复守卫 → `_rg_result = _post_decision_guards.apply_repeat_guard(...)`
+  - 零目标守卫 → `_zt_result = _post_decision_guards.apply_zero_target_guard(...)`
+  - 签名记录 → `_post_decision_guards.record_action_sig(decisions)`
+- 新增 contract 字段: 无。
+- Tests: tests/test_phase_action_dispatch_split.py 16 例。
+
+## Slice G5 (M4 通用): main.py → phases/finalization.py (done)
+
+- 能力名: finalization_phase_split（run 结束清理：io_contract / checkpoint / resume / event_stream / html_trace / browser release）。
+- 影响层: main.py finally 块 → phases/finalization.py 纯平移。
+- 新模块 `visual_web_agent/phases/finalization.py`：
+  - `finalize_run(...)` async：统一 run 结束清理流程，每个子步骤独立 try/except 不阻塞后续。
+  - `build_run_end_metadata(...)` → dict：组装 event_stream.run_end 的 metadata。
+  - `_clear_io_contract()` / `_clear_phase_log()` / `_finish_checkpoint()` / `_record_resume()`：清理辅助函数。
+  - `RunEndMetadata` 数据类。
+- main.py finally 块顶部一处委托：`await _finalize_run(...)`，原有内联代码保留作防御性回退。
+- 新增 contract 字段: 无。
+- Tests: tests/test_phase_finalization_split.py 15 例。
+- 验证: G4 16✓ + G5 15✓ + G2 6✓ + G3 3✓ + G1 7✓ + P1 4✓ = 51 通过 0 失败；
+  全量 pytest 3505 passed（26 预存在排序/UI 失败）0 新增失败 2 skipped。

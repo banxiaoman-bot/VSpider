@@ -4,4 +4,6 @@ P1: perception phase (E1-E3 extend with reuse / partial SoM / AX diff).
 G1: startup phase (RunContext + loop guards).
 G2: planning phase (PlanningPhase — Planner / Reflector state machine).
 G3: decision phase (make_vlm_decision — VLM ask wrapper).
+G4: action dispatch phase (PostDecisionGuards — repeat / zero-target guards).
+G5: finalization phase (finalize_run — run-end cleanup).
 """
