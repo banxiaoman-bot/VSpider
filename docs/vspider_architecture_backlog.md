@@ -3565,3 +3565,26 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: tests/test_phase_finalization_split.py 15 例。
 - 验证: G4 16✓ + G5 15✓ + G2 6✓ + G3 3✓ + G1 7✓ + P1 4✓ = 51 通过 0 失败；
   全量 pytest 3505 passed（26 预存在排序/UI 失败）0 新增失败 2 skipped。
+
+## Slice G6 (M4 通用): browser_env.py → som_injector.py (done)
+
+- 能力名: som_injector_split（SoM 注入引擎：JS 评估 + 元素收集 + 重试 + 性能遥测）。
+- 影响层: browser_env.py SoM 注入段 → som_injector.py 纯平移。
+- 新模块 `visual_web_agent/som_injector.py`：
+  - `SomInjector` 类：持有 som_js 脚本。
+  - `inject_across_frames(frames, ...)` async → (SomResult, input_descriptions)：跨 frame 评估 SoM JS + 元素收集。
+  - `retry_injection(page, ...)` async → 零元素重试逻辑。
+  - `SomResult` 数据类：elements / total_elements / injected_frames / duration_ms / is_heavy / retried。
+- 新增 contract 字段: 无。
+- Tests: tests/test_som_injector_split.py 10 例。
+
+## Slice G7 (M4 通用): api_server.py → api_routes/ (done, phase 1)
+
+- 能力名: api_routes_split（API 路由按业务域拆分，phase 1: spider routes）。
+- 影响层: api_server.py spider 路由段 → api_routes/spider_api.py 纯平移。
+- 新模块 `api_routes/__init__.py` + `api_routes/spider_api.py`：
+  - `register_spider_routes(app, spider_lite=)` → 挂载全部 7 个 /api/spider/* 端点。
+  - 路由: run / runs / page_cache / page_cache/entries / export / items / get_run。
+- 新增 contract 字段: 无。
+- Tests: tests/test_api_routes_spider_split.py 8 例。
+- 验证: G6 10✓ + G7 8✓ + G4-G5 31✓ + G2-G3 9✓ + G1 7✓ + P1 4✓ = 69 通过 0 失败。
