@@ -752,6 +752,11 @@ def test_efficiency_feedback_replay_api_accepts_multiple_input_shapes_and_option
         monkeypatch.setattr(api_server, "resolve_artifact_path", lambda filename, subdir="": temp_root / subdir / filename)
         monkeypatch.setattr(api_server, "register_artifact", lambda path: None)
         monkeypatch.setattr(api_server, "artifact_url", lambda path: "/download/" + Path(path).name)
+        import capability_artifact_persistence as _cap_persist
+        monkeypatch.setattr(_cap_persist, "resolve_artifact_path", lambda filename, subdir="": temp_root / subdir / filename)
+        monkeypatch.setattr(_cap_persist, "register_artifact", lambda path: None)
+        monkeypatch.setattr(_cap_persist, "artifact_url", lambda path: "/download/" + Path(path).name)
+        monkeypatch.setattr(_cap_persist, "artifact_root", lambda: temp_root)
 
         client = TestClient(api_server.app)
         direct_resp = client.post(
@@ -1058,6 +1063,11 @@ def test_capability_failure_fixture_library_and_batch_replay_api(monkeypatch) ->
         monkeypatch.setattr(api_server, "resolve_artifact_path", lambda filename, subdir="": temp_root / subdir / filename)
         monkeypatch.setattr(api_server, "register_artifact", lambda path: None)
         monkeypatch.setattr(api_server, "artifact_url", lambda path: "/download/" + Path(path).name)
+        import capability_artifact_persistence as _cap_persist
+        monkeypatch.setattr(_cap_persist, "resolve_artifact_path", lambda filename, subdir="": temp_root / subdir / filename)
+        monkeypatch.setattr(_cap_persist, "register_artifact", lambda path: None)
+        monkeypatch.setattr(_cap_persist, "artifact_url", lambda path: "/download/" + Path(path).name)
+        monkeypatch.setattr(_cap_persist, "artifact_root", lambda: temp_root)
 
         fixture_dir = temp_root / "capability" / "failure_fixtures"
         fixture_dir.mkdir(parents=True, exist_ok=True)
@@ -2018,6 +2028,10 @@ def test_capability_execute_exception_trace_broadcasts_and_writes_artifact(monke
 def test_capability_router_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    cap_persist_src = (root / "capability_artifact_persistence.py").read_text(encoding="utf-8")
+    cap_exec_src = (root / "capability_execute_helpers.py").read_text(encoding="utf-8")
+    api_src_combined = api_src + "\n" + cap_persist_src + "\n" + cap_exec_src
+    api_src = api_src_combined
     action_ref_src = (root / "visual_web_agent" / "action_ref.py").read_text(encoding="utf-8")
     browser_backend_src = (root / "visual_web_agent" / "browser_backend.py").read_text(encoding="utf-8")
     browser_control_api_src = (root / "visual_web_agent" / "browser_control_api.py").read_text(encoding="utf-8")

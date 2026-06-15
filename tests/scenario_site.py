@@ -130,6 +130,12 @@ class ScenarioStore:
         {"id": i, "sku": p["sku"], "name": p["name"], "selected": False}
         for i, p in enumerate(PRODUCTS[:8], start=1)
     ])
+    # F2: drag order persisted server-side
+    drag_order: list[str] = field(default_factory=lambda: [
+        p["sku"] for p in PRODUCTS[:5]
+    ])
+    # F3: cookie consent tracking
+    consent_given: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +750,206 @@ var interval = setInterval(function() {
 # E6: Batch operations (select all / partial select + delete / export)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# F1: Search + filter + sort
+# ---------------------------------------------------------------------------
+
+def _search_page_html() -> bytes:
+    products_js = json.dumps(
+        [{"sku": p["sku"], "name": p["name"], "price": float(p["price"]),
+          "category": p["category"]} for p in PRODUCTS],
+        ensure_ascii=False,
+    )
+    body = f"""
+<h1 id="search-title">产品搜索</h1>
+<div id="search-controls">
+  <input type="text" id="search-input" placeholder="搜索..." oninput="applyFilters()">
+  <select id="filter-category" onchange="applyFilters()">
+    <option value="">全部类目</option>
+    <option value="传感">传感</option>
+    <option value="网络">网络</option>
+    <option value="计算">计算</option>
+    <option value="控制">控制</option>
+    <option value="外设">外设</option>
+    <option value="安防">安防</option>
+  </select>
+  <select id="sort-by" onchange="applyFilters()">
+    <option value="default">默认排序</option>
+    <option value="price_asc">价格升序</option>
+    <option value="price_desc">价格降序</option>
+    <option value="name">名称排序</option>
+  </select>
+</div>
+<p id="result-count"></p>
+<ul id="search-results"></ul>
+<script>
+var ALL_PRODUCTS = {products_js};
+function applyFilters() {{
+  var q = document.getElementById('search-input').value.toLowerCase();
+  var cat = document.getElementById('filter-category').value;
+  var sort = document.getElementById('sort-by').value;
+  var items = ALL_PRODUCTS.filter(function(p) {{
+    var matchQ = !q || p.name.toLowerCase().indexOf(q) >= 0 || p.sku.toLowerCase().indexOf(q) >= 0;
+    var matchCat = !cat || p.category === cat;
+    return matchQ && matchCat;
+  }});
+  if (sort === 'price_asc') items.sort(function(a,b){{ return a.price - b.price; }});
+  else if (sort === 'price_desc') items.sort(function(a,b){{ return b.price - a.price; }});
+  else if (sort === 'name') items.sort(function(a,b){{ return a.name.localeCompare(b.name); }});
+  document.getElementById('result-count').textContent = '找到 ' + items.length + ' 个结果';
+  var ul = document.getElementById('search-results');
+  ul.innerHTML = '';
+  items.forEach(function(p) {{
+    var li = document.createElement('li');
+    li.className = 'search-item';
+    li.setAttribute('data-sku', p.sku);
+    li.setAttribute('data-price', p.price);
+    li.textContent = p.sku + ' - ' + p.name + ' ¥' + p.price;
+    ul.appendChild(li);
+  }});
+}}
+applyFilters();
+</script>"""
+    return _page_shell("产品搜索", body)
+
+
+# ---------------------------------------------------------------------------
+# F2: Drag-and-drop reorder
+# ---------------------------------------------------------------------------
+
+def _drag_page_html(order: list[str]) -> bytes:
+    items = "\n".join(
+        f"<li class='drag-item' draggable='true' data-sku='{sku}'>{sku}</li>"
+        for sku in order
+    )
+    body = f"""
+<h1 id="drag-title">拖拽排序</h1>
+<ul id="drag-list">{items}</ul>
+<button id="save-order" onclick="saveOrder()">保存顺序</button>
+<p id="drag-status"></p>
+<script>
+var list = document.getElementById('drag-list');
+var dragged = null;
+list.addEventListener('dragstart', function(e) {{ dragged = e.target; }});
+list.addEventListener('dragover', function(e) {{ e.preventDefault(); }});
+list.addEventListener('drop', function(e) {{
+  e.preventDefault();
+  if (e.target.classList.contains('drag-item') && e.target !== dragged) {{
+    list.insertBefore(dragged, e.target);
+  }}
+}});
+function saveOrder() {{
+  var items = document.querySelectorAll('.drag-item');
+  var order = [];
+  items.forEach(function(li) {{ order.push(li.getAttribute('data-sku')); }});
+  fetch('/api/drag-order', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{order: order}})
+  }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+    document.getElementById('drag-status').textContent = d.message;
+  }});
+}}
+</script>"""
+    return _page_shell("拖拽排序", body)
+
+
+# ---------------------------------------------------------------------------
+# F3: Cookie consent banner (blocks interaction until accepted)
+# ---------------------------------------------------------------------------
+
+def _consent_page_html() -> bytes:
+    body = """
+<div id="consent-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;display:flex;align-items:center;justify-content:center">
+  <div id="consent-dialog" style="background:white;padding:20px;border-radius:8px;max-width:400px">
+    <h2>Cookie 使用同意</h2>
+    <p>本站使用 Cookie 提升体验。继续使用即表示同意。</p>
+    <button id="consent-accept" onclick="acceptConsent()">接受</button>
+    <button id="consent-reject" onclick="rejectConsent()">拒绝</button>
+  </div>
+</div>
+<div id="main-content" style="pointer-events:none;opacity:0.3">
+  <h1 id="consent-page-title">受保护的内容</h1>
+  <p id="content-text">您已通过 Cookie 同意验证。</p>
+  <button id="action-btn" onclick="document.getElementById('action-result').textContent='操作成功'">执行操作</button>
+  <p id="action-result"></p>
+</div>
+<script>
+function acceptConsent() {
+  document.cookie = 'consent=accepted; Path=/';
+  document.getElementById('consent-overlay').style.display = 'none';
+  document.getElementById('main-content').style.pointerEvents = 'auto';
+  document.getElementById('main-content').style.opacity = '1';
+  fetch('/api/consent', {method: 'POST', body: 'accepted'});
+}
+function rejectConsent() {
+  document.getElementById('consent-overlay').style.display = 'none';
+  document.getElementById('main-content').style.pointerEvents = 'auto';
+  document.getElementById('main-content').style.opacity = '1';
+  fetch('/api/consent', {method: 'POST', body: 'rejected'});
+}
+if (document.cookie.indexOf('consent=accepted') >= 0) {
+  document.getElementById('consent-overlay').style.display = 'none';
+  document.getElementById('main-content').style.pointerEvents = 'auto';
+  document.getElementById('main-content').style.opacity = '1';
+}
+</script>"""
+    return _page_shell("Cookie 同意", body)
+
+
+# ---------------------------------------------------------------------------
+# F5: Keyboard navigation page
+# ---------------------------------------------------------------------------
+
+def _keyboard_page_html() -> bytes:
+    body = """
+<h1 id="kb-title">键盘交互测试</h1>
+<form id="kb-form" method="post" action="/keyboard/submit">
+  <label>字段1 <input type="text" name="field1" id="kb-f1" tabindex="1"></label>
+  <label>字段2 <input type="text" name="field2" id="kb-f2" tabindex="2"></label>
+  <label>字段3 <input type="text" name="field3" id="kb-f3" tabindex="3"></label>
+  <button type="submit" id="kb-submit" tabindex="4">提交</button>
+</form>
+<p id="kb-result"></p>
+<div id="shortcut-area" tabindex="0">
+  <p>快捷键区域（按 Ctrl+S 保存，Escape 关闭）</p>
+  <p id="shortcut-result"></p>
+</div>
+<script>
+document.getElementById('shortcut-area').addEventListener('keydown', function(e) {
+  if (e.ctrlKey && e.key === 's') {
+    e.preventDefault();
+    document.getElementById('shortcut-result').textContent = '快捷保存触发';
+  }
+  if (e.key === 'Escape') {
+    document.getElementById('shortcut-result').textContent = '关闭触发';
+  }
+});
+</script>"""
+    return _page_shell("键盘交互", body)
+
+
+# ---------------------------------------------------------------------------
+# F6: Clipboard operations
+# ---------------------------------------------------------------------------
+
+def _clipboard_page_html() -> bytes:
+    body = """
+<h1 id="clip-title">剪贴板操作</h1>
+<p id="copy-source">SKU-CLIP-TEST-001</p>
+<button id="btn-copy" onclick="
+  navigator.clipboard.writeText(document.getElementById('copy-source').textContent)
+    .then(function() { document.getElementById('copy-status').textContent = '已复制'; });
+">复制 SKU</button>
+<p id="copy-status"></p>
+<label>粘贴区 <input type="text" id="paste-target"></label>"""
+    return _page_shell("剪贴板", body)
+
+
+# ---------------------------------------------------------------------------
+# E6: Batch operations (select all / partial select + delete / export)
+# ---------------------------------------------------------------------------
+
 def _batch_page_html(items: list[dict[str, Any]]) -> bytes:
     rows = "\n".join(
         "<tr data-id='{id}'>"
@@ -948,6 +1154,21 @@ def make_alpha_handler(store: ScenarioStore):
             # --- E6: batch operations page ---
             if path == "/batch":
                 return self._send(_batch_page_html(store.batch_items))
+            # --- F1: search page ---
+            if path == "/search":
+                return self._send(_search_page_html())
+            # --- F2: drag reorder page ---
+            if path == "/drag":
+                return self._send(_drag_page_html(store.drag_order))
+            # --- F3: cookie consent page ---
+            if path == "/consent":
+                return self._send(_consent_page_html())
+            # --- F5: keyboard page ---
+            if path == "/keyboard":
+                return self._send(_keyboard_page_html())
+            # --- F6: clipboard page ---
+            if path == "/clipboard":
+                return self._send(_clipboard_page_html())
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
@@ -1017,6 +1238,29 @@ def make_alpha_handler(store: ScenarioStore):
 <p id="vf-echo-type">类型：{data.get('client_type', '')}</p>
 <p id="vf-echo-taxid">税号：{data.get('tax_id', '')}</p>"""
                 return self._send(_page_shell("提交成功", result))
+            # --- F2: drag order API ---
+            if path == "/api/drag-order":
+                data = json.loads(body.decode("utf-8"))
+                store.drag_order = data.get("order", [])
+                payload = json.dumps(
+                    {"message": f"顺序已保存（{len(store.drag_order)} 项）"}
+                ).encode("utf-8")
+                return self._send(payload, mime="application/json")
+            # --- F3: consent API ---
+            if path == "/api/consent":
+                store.consent_given += 1
+                return self._send(
+                    b'{"ok":true}', mime="application/json")
+            # --- F5: keyboard form submit ---
+            if path == "/keyboard/submit":
+                data = self._parse_form(body)
+                result = (
+                    f'<h1 id="kb-done">提交成功</h1>'
+                    f'<p id="kb-echo">{data.get("field1","")}'
+                    f'|{data.get("field2","")}'
+                    f'|{data.get("field3","")}</p>'
+                )
+                return self._send(_page_shell("键盘提交成功", result))
             # --- E6: batch API ---
             if path == "/api/batch":
                 data = json.loads(body.decode("utf-8"))
