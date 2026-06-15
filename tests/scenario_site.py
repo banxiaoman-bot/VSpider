@@ -18,7 +18,8 @@ Two independent HTTP apps (each on its own 127.0.0.1 / localhost port):
   - Static assets: PNG images, served SVG, CSV / PDF / ZIP downloads.
 
 * **Beta 订单系统** (`BetaHandler`) - cookie-gated back office:
-  - ``GET/POST /login``: sets ``beta_session=beta-ok`` on success.
+  - ``GET/POST /login``: sets ``beta_session=v{N}`` on success (versioned;
+    legacy ``beta-ok`` value still accepted for backward compatibility).
   - ``/orders``: requires the auth cookie (302 to /login otherwise);
     lists recorded orders and offers a "new order" relay form.
   - ``POST /orders/new``: requires the cookie; appends to the store.
@@ -35,7 +36,9 @@ Everything is deterministic and offline; no external network access.
 from __future__ import annotations
 
 import base64
+import json
 import threading
+import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -114,6 +117,10 @@ class ScenarioStore:
     # When False the interstitial renders without the auto-pass script, so
     # the challenge never clears by itself (stubborn-WAF / HITL scenarios).
     waf_autopass: bool = True
+    # D3: session expiry tracking
+    beta_session_version: int = 0
+    # D5: flaky endpoint tracking — first N requests return 500
+    flaky_fail_remaining: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +370,182 @@ def _submit_result_html(fields: dict[str, Any]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# D1: AJAX-loaded page (data arrives via XHR, not in initial HTML)
+# ---------------------------------------------------------------------------
+
+AJAX_PRODUCTS = PRODUCTS[:6]
+AJAX_DELAY_MS = 400
+
+def _ajax_page_html() -> bytes:
+    body = """
+<h1 id="ajax-title">动态加载产品列表</h1>
+<p id="loading-status">加载中...</p>
+<table id="ajax-table">
+  <thead><tr><th>SKU</th><th>名称</th><th>价格</th><th>库存</th></tr></thead>
+  <tbody id="ajax-body"></tbody>
+</table>
+<script>
+setTimeout(function() {
+  fetch('/api/products').then(r => r.json()).then(function(data) {
+    var tbody = document.getElementById('ajax-body');
+    data.forEach(function(p) {
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + p.sku + '</td><td>' + p.name + '</td>' +
+                     '<td>' + p.price + '</td><td>' + p.stock + '</td>';
+      tbody.appendChild(tr);
+    });
+    document.getElementById('loading-status').textContent =
+      '已加载 ' + data.length + ' 条';
+  });
+}, """ + str(AJAX_DELAY_MS) + """);
+</script>"""
+    return _page_shell("动态加载", body)
+
+
+# ---------------------------------------------------------------------------
+# D2: Infinite scroll / load-more (IntersectionObserver)
+# ---------------------------------------------------------------------------
+
+FEED_BATCH = 3  # items per scroll batch
+FEED_TOTAL = len(PRODUCTS)
+
+def _feed_page_html() -> bytes:
+    body = """
+<h1 id="feed-title">无限滚动商品流</h1>
+<div id="feed-container" style="height:300px;overflow-y:auto">
+  <div id="feed-items"></div>
+  <div id="feed-sentinel" style="height:1px"></div>
+</div>
+<p id="feed-status">加载中...</p>
+<script>
+var offset = 0, loading = false, done = false;
+function loadMore() {
+  if (loading || done) return;
+  loading = true;
+  fetch('/api/feed?offset=' + offset + '&limit=""" + str(FEED_BATCH) + """')
+    .then(r => r.json()).then(function(data) {
+      var container = document.getElementById('feed-items');
+      data.items.forEach(function(p) {
+        var div = document.createElement('div');
+        div.className = 'feed-card';
+        div.setAttribute('data-sku', p.sku);
+        div.innerHTML = '<b>' + p.name + '</b> ¥' + p.price;
+        container.appendChild(div);
+      });
+      offset += data.items.length;
+      loading = false;
+      if (!data.has_more) {
+        done = true;
+        document.getElementById('feed-status').textContent =
+          '全部加载完毕（共 ' + offset + ' 条）';
+      } else {
+        document.getElementById('feed-status').textContent =
+          '已加载 ' + offset + ' 条';
+      }
+    });
+}
+var obs = new IntersectionObserver(function(entries) {
+  if (entries[0].isIntersecting) loadMore();
+}, {root: document.getElementById('feed-container')});
+obs.observe(document.getElementById('feed-sentinel'));
+</script>"""
+    return _page_shell("无限滚动", body)
+
+
+# ---------------------------------------------------------------------------
+# D4: Nested data — rowspan/colspan table + multi-layer accordion
+# ---------------------------------------------------------------------------
+
+def _nested_data_html() -> bytes:
+    body = """
+<h1 id="nested-title">复杂嵌套数据</h1>
+
+<h2>一、合并单元格表格</h2>
+<table id="merged-table">
+  <thead><tr><th>类目</th><th>SKU</th><th>名称</th><th>价格</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="2">传感</td><td>ALP-001</td><td>智能温控器</td><td>199.00</td></tr>
+    <tr><td>ALP-004</td><td>振动传感器</td><td>459.00</td></tr>
+    <tr><td rowspan="3">网络</td><td>ALP-002</td><td>工业网关</td><td>1299.00</td></tr>
+    <tr><td>ALP-006</td><td>光纤收发器</td><td>329.00</td></tr>
+    <tr><td>ALP-011</td><td>串口服务器</td><td>699.00</td></tr>
+    <tr><td colspan="2">合计</td><td colspan="2">5 款产品</td></tr>
+  </tbody>
+</table>
+
+<h2>二、嵌套表格</h2>
+<table id="outer-table">
+  <thead><tr><th>分区</th><th>详情</th></tr></thead>
+  <tbody>
+    <tr><td>华东区</td><td>
+      <table class="inner-table" id="inner-east">
+        <thead><tr><th>城市</th><th>仓库</th><th>库存</th></tr></thead>
+        <tbody>
+          <tr><td>杭州</td><td>HZ-W01</td><td>120</td></tr>
+          <tr><td>上海</td><td>SH-W03</td><td>85</td></tr>
+        </tbody>
+      </table>
+    </td></tr>
+    <tr><td>华北区</td><td>
+      <table class="inner-table" id="inner-north">
+        <thead><tr><th>城市</th><th>仓库</th><th>库存</th></tr></thead>
+        <tbody>
+          <tr><td>北京</td><td>BJ-W02</td><td>200</td></tr>
+        </tbody>
+      </table>
+    </td></tr>
+  </tbody>
+</table>
+
+<h2>三、多层折叠面板</h2>
+<div id="accordion">
+  <details class="level-1" open>
+    <summary>传感器类</summary>
+    <details class="level-2">
+      <summary>温度传感器</summary>
+      <ul class="acc-items"><li data-sku="ALP-001">智能温控器 ¥199</li></ul>
+    </details>
+    <details class="level-2">
+      <summary>振动传感器</summary>
+      <ul class="acc-items"><li data-sku="ALP-004">振动传感器 ¥459</li></ul>
+    </details>
+  </details>
+  <details class="level-1">
+    <summary>网络设备类</summary>
+    <details class="level-2">
+      <summary>有线设备</summary>
+      <ul class="acc-items">
+        <li data-sku="ALP-002">工业网关 ¥1299</li>
+        <li data-sku="ALP-006">光纤收发器 ¥329</li>
+      </ul>
+    </details>
+    <details class="level-2">
+      <summary>串口设备</summary>
+      <ul class="acc-items"><li data-sku="ALP-011">串口服务器 ¥699</li></ul>
+    </details>
+  </details>
+</div>"""
+    return _page_shell("复杂嵌套数据", body)
+
+
+# ---------------------------------------------------------------------------
+# D5: Error-recovery endpoints (flaky 500, redirect chain)
+# ---------------------------------------------------------------------------
+
+REDIRECT_CHAIN_DEPTH = 3
+
+def _flaky_success_html() -> bytes:
+    return _page_shell("成功", '<h1 id="flaky-ok">请求成功</h1><p>恢复正常。</p>')
+
+
+# ---------------------------------------------------------------------------
+# D6: Authenticated download (cookie-gated binary file)
+# ---------------------------------------------------------------------------
+
+PROTECTED_PDF_BYTES = b"%PDF-1.4 PROTECTED\n1 0 obj\n<</Type/Catalog>>\nendobj\n%%EOF\n"
+
+
+# ---------------------------------------------------------------------------
 # Alpha handler
 # ---------------------------------------------------------------------------
 
@@ -383,7 +566,9 @@ def make_alpha_handler(store: ScenarioStore):
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            qs = parse_qs(parsed.query)
             if path in ("/", "/page/1"):
                 return self._send(_catalog_html(1))
             if path.startswith("/page/"):
@@ -418,6 +603,77 @@ def make_alpha_handler(store: ScenarioStore):
                 return self._send(PDF_BYTES, mime="application/pdf")
             if path == "/files/bundle.zip":
                 return self._send(ZIP_BYTES, mime="application/zip")
+            # --- D1: AJAX page + API endpoint ---
+            if path == "/ajax":
+                return self._send(_ajax_page_html())
+            if path == "/api/products":
+                time.sleep(AJAX_DELAY_MS / 1000)
+                payload = json.dumps(
+                    [{"sku": p["sku"], "name": p["name"],
+                      "price": p["price"], "stock": p["stock"]}
+                     for p in AJAX_PRODUCTS],
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                return self._send(payload, mime="application/json")
+            # --- D2: infinite scroll page + feed API ---
+            if path == "/feed":
+                return self._send(_feed_page_html())
+            if path == "/api/feed":
+                offset = int((qs.get("offset") or ["0"])[0])
+                limit = int((qs.get("limit") or [str(FEED_BATCH)])[0])
+                chunk = PRODUCTS[offset:offset + limit]
+                has_more = (offset + limit) < FEED_TOTAL
+                payload = json.dumps({
+                    "items": [{"sku": p["sku"], "name": p["name"],
+                               "price": p["price"]} for p in chunk],
+                    "has_more": has_more,
+                    "total": FEED_TOTAL,
+                }, ensure_ascii=False).encode("utf-8")
+                return self._send(payload, mime="application/json")
+            # --- D4: nested data page ---
+            if path == "/nested-data":
+                return self._send(_nested_data_html())
+            # --- D5: flaky endpoint (500 then success) ---
+            if path == "/flaky":
+                if store.flaky_fail_remaining > 0:
+                    store.flaky_fail_remaining -= 1
+                    return self._send(
+                        b"Internal Server Error", status=500,
+                        mime="text/plain")
+                return self._send(_flaky_success_html())
+            # --- D5: redirect chain ---
+            if path.startswith("/redirect/"):
+                try:
+                    depth = int(path.rsplit("/", 1)[-1])
+                except ValueError:
+                    depth = 0
+                if depth > 1:
+                    return self._send(
+                        b"", status=302,
+                        extra={"Location": f"/redirect/{depth - 1}"})
+                return self._send(
+                    _page_shell("重定向终点",
+                                '<h1 id="redirect-end">到达终点</h1>'))
+            # --- D6: authenticated download ---
+            if path == "/protected/report.pdf":
+                cookie = self.headers.get("Cookie") or ""
+                if "alpha_auth=yes" not in cookie.replace(" ", ""):
+                    return self._send(
+                        b'{"error":"unauthorized"}', status=403,
+                        mime="application/json")
+                return self._send(
+                    PROTECTED_PDF_BYTES, mime="application/pdf",
+                    extra={"Content-Disposition":
+                           "attachment; filename=protected_report.pdf"})
+            if path == "/auth/login":
+                body = """
+<h1 id="alpha-login-title">Alpha 登录</h1>
+<form id="alpha-login-form" method="post" action="/auth/login">
+  <label>用户 <input type="text" name="user" id="al-user"></label>
+  <label>密码 <input type="password" name="pass" id="al-pass"></label>
+  <button type="submit" id="al-submit">登录</button>
+</form>"""
+                return self._send(_page_shell("Alpha 登录", body))
             return self._send(b"not found", status=404)
 
         def do_POST(self) -> None:  # noqa: N802
@@ -433,6 +689,25 @@ def make_alpha_handler(store: ScenarioStore):
                     _submit_result_html(fields),
                     extra={"Set-Cookie": "alpha_last_submit=ok; Path=/"},
                 )
+            if path == "/auth/login":
+                fields = {
+                    k: unquote(v[0]).replace("+", " ")
+                    for k, v in parse_qs(
+                        body.decode("utf-8", "replace"),
+                        keep_blank_values=True,
+                    ).items()
+                }
+                if fields.get("user") == "admin" and fields.get("pass") == "alpha123":
+                    return self._send(
+                        b"", status=302,
+                        extra={
+                            "Location": "/",
+                            "Set-Cookie": "alpha_auth=yes; Path=/",
+                        })
+                return self._send(
+                    _page_shell("登录失败",
+                                '<p id="alpha-login-err">用户名或密码错误</p>'),
+                    status=401)
             return self._send(b"not found", status=404)
 
     return AlphaHandler
@@ -442,6 +717,7 @@ def make_alpha_handler(store: ScenarioStore):
 # Beta handler (cookie-gated orders)
 # ---------------------------------------------------------------------------
 
+BETA_COOKIE_NAME = "beta_session"
 BETA_COOKIE = "beta_session=beta-ok"
 
 CLEARANCE_COOKIE = "cf_clearance=fixture-cleared"
@@ -523,7 +799,14 @@ def make_beta_handler(store: ScenarioStore, challenge: bool = False):
 
         def _authed(self) -> bool:
             cookie = self.headers.get("Cookie") or ""
-            return BETA_COOKIE in cookie.replace(" ", "")
+            for part in cookie.split(";"):
+                part = part.strip()
+                if part.startswith(BETA_COOKIE_NAME + "="):
+                    val = part.split("=", 1)[1]
+                    if val.startswith("v"):
+                        return val == f"v{store.beta_session_version}"
+                    return val == "beta-ok"
+            return False
 
         def _cleared(self) -> bool:
             cookie = self.headers.get("Cookie") or ""
@@ -568,6 +851,11 @@ def make_beta_handler(store: ScenarioStore, challenge: bool = False):
                         b"", status=302, extra={"Location": "/login"}
                     )
                 return self._send(_beta_orders_html(store.orders))
+            if path == "/expire-session":
+                store.beta_session_version += 100
+                return self._send(
+                    _page_shell("会话已过期",
+                                '<h1 id="expired-msg">会话已失效</h1>'))
             if path == "/":
                 return self._send(b"", status=302, extra={"Location": "/orders"})
             return self._send(b"not found", status=404)
@@ -585,11 +873,13 @@ def make_beta_handler(store: ScenarioStore, challenge: bool = False):
             if path == "/login":
                 if fields.get("user") == "ops" and fields.get("password") == "secret":
                     store.beta_logins.append(fields["user"])
+                    store.beta_session_version += 1
+                    cookie_val = f"v{store.beta_session_version}"
                     return self._send(
                         b"", status=302,
                         extra={
                             "Location": "/orders",
-                            "Set-Cookie": f"{BETA_COOKIE}; Path=/",
+                            "Set-Cookie": f"{BETA_COOKIE_NAME}={cookie_val}; Path=/",
                         },
                     )
                 return self._send(_beta_login_html("账号或密码错误"))
