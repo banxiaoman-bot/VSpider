@@ -11488,15 +11488,17 @@ async def run_agent(
         _judge_rejections = _guards.judge_rejections
         _loop_detector = _guards.loop_detector
 
-        # ── Wave 2：Planner / Reflector 状态 ──────────────────────────
-        _task_plan: "TaskPlan | None" = None
-        _steps_since_reflect = 0
-        _reflect_count = 0
-        _MAX_REFLECTS = 5          # 一次任务最多 Reflector 调用次数（防 cascade）
-        _REFLECT_INTERVAL = 5      # 兜底间隔：连续 N 步未反思时主动触发一次
-        _dedup_tripped_last_step = False  # 上一步 extract dedup 命中标志
-        _duplicate_zero_extract_streak = 0  # 连续 extract 净新增为 0 的次数
-        _abort_requested = False    # Reflector 判 abort 后允许下一步合法 done
+        # G2: Planner/Reflector state delegated to phases/planning.py
+        from visual_web_agent.phases.planning import PlanningPhase as _PlanningPhase
+        _planning = _PlanningPhase()
+        _task_plan = _planning.task_plan
+        _steps_since_reflect = _planning.steps_since_reflect
+        _reflect_count = _planning.reflect_count
+        _MAX_REFLECTS = 5
+        _REFLECT_INTERVAL = 5
+        _dedup_tripped_last_step = _planning.dedup_tripped_last_step
+        _duplicate_zero_extract_streak = _planning.duplicate_zero_extract_streak
+        _abort_requested = _planning.abort_requested
 
         # ── 跨页面记忆库 ──────────────────────────────────────────────
         # VLM 通过 save_to_memory 动作写入，通过 {{key}} 插值在 type 动作读取
@@ -11670,31 +11672,23 @@ async def run_agent(
         # Wave 2 Planner：任务起手生成子目标清单
         # 失败时静默降级为单子目标 TaskPlan，主循环行为与 Wave 1 等价。
         # ══════════════════════════════════════════════════════════════
-        try:
-            _task_plan = await vlm.make_plan(
-                goal=goal,
-                initial_url=browser.current_url or start_url,
-                workflow_memory=workflow_memory,
-            )
+        # G2: initial plan generation delegated to PlanningPhase
+        _task_plan = await _planning.make_initial_plan(
+            vlm=vlm,
+            goal=goal,
+            initial_url=browser.current_url or start_url,
+            workflow_memory=workflow_memory,
+        )
+        if _task_plan is not None:
             _original_plan_count = len(_task_plan.sub_goals)
             _task_plan = _normalize_form_task_plan(_task_plan, goal)
+            _planning.task_plan = _task_plan
             if _is_form_fill_goal and _task_plan is not None and len(_task_plan.sub_goals) != _original_plan_count:
-                logger.info(
-                    "[PLANNER] Form plan normalized: removed visibility-only subgoals"
-                )
-                _broadcast_log_safe(
-                    "[PLANNER] 表单任务已改写为逐字段填写计划，禁用完整同屏子目标",
-                    level="warn",
-                )
-            print(
-                f"\n\033[1;35m📋 [PLANNER]\033[0m 生成 "
-                f"\033[35m{len(_task_plan.sub_goals)}\033[0m 个子目标："
-            )
+                logger.info("[PLANNER] Form plan normalized: removed visibility-only subgoals")
+                _broadcast_log_safe("[PLANNER] 表单任务已改写为逐字段填写计划，禁用完整同屏子目标", level="warn")
+            print(f"\n\033[1;35m📋 [PLANNER]\033[0m 生成 \033[35m{len(_task_plan.sub_goals)}\033[0m 个子目标：")
             for _sg in _task_plan.sub_goals:
                 print(f"   {_sg.id}. {_sg.description}")
-        except Exception as _plan_err:
-            logger.warning(f"[PLANNER] 调用失败静默降级：{_plan_err}")
-            _task_plan = None
 
         if _task_plan is not None:
             try:
@@ -12438,71 +12432,23 @@ async def run_agent(
                 _tabs_state = _perception.tabs_state
                 _page_state = _perception.page_summary
 
-                # ── Wave 2 Reflector：仅失败信号或兜底触发 ────────────────
+                # G2: Reflector delegated to PlanningPhase.maybe_reflect()
                 _prev_loop_guard_size = len(_loop_guard_blocked_ids)
-                _reflect_signals: list[str] = []
-                if _consecutive_errors >= 2:
-                    _reflect_signals.append(f"连续 {_consecutive_errors} 步 action=error")
-                if _dedup_tripped_last_step:
-                    _reflect_signals.append("上一步 extract 被 dedup 拦截")
-                if _steps_since_reflect >= _REFLECT_INTERVAL and _task_plan is not None:
-                    _reflect_signals.append(f"{_REFLECT_INTERVAL} 步兜底检查")
-                # Fix 4：登录墙 URL 探测（passport/login/signin/sso/captcha）
-                _cur_url_lower = (browser.current_url or "").lower()
-                if re.search(r"/(login|signin|sign-in|passport|sso|captcha|verify)\b", _cur_url_lower):
-                    # 仅当 goal 里没显式给凭证时才当登录墙（goal 含 {{phone}} = 用户主动登录）
-                    _goal_has_cred = bool(re.search(r"\{\{\s*(phone|password|username|account|mobile|email)\s*\}\}", goal, re.IGNORECASE))
-                    if not _goal_has_cred:
-                        _reflect_signals.append(f"当前 URL 疑似登录/验证页：{browser.current_url}")
-
-                if (
-                    _reflect_signals
-                    and _task_plan is not None
-                    and _reflect_count < _MAX_REFLECTS
-                ):
-                    try:
-                        _rd = await vlm.reflect(
-                            plan=_task_plan,
-                            history_summary=vlm._build_history_summary(),
-                            signals=_reflect_signals,
-                            current_url=browser.current_url or "",
-                        )
-                        _reflect_count += 1
-                        _steps_since_reflect = 0
-                        _dedup_tripped_last_step = False
-                        if _rd.decision == "advance" and _rd.advance_to_idx is not None:
-                            _target_idx = max(0, min(_rd.advance_to_idx, len(_task_plan.sub_goals) - 1))
-                            _task_plan.sub_goals[_task_plan.current_idx].status = "done"
-                            _task_plan.current_idx = _target_idx
-                            _task_plan.sub_goals[_target_idx].status = "active"
-                            vlm.inject_error_feedback(
-                                f"🎯 [REFLECTOR] {_rd.reason}；"
-                                f"系统已推进至子目标 {_target_idx + 1}/"
-                                f"{len(_task_plan.sub_goals)}："
-                                f"{_task_plan.sub_goals[_target_idx].description}"
-                            )
-                        elif _rd.decision == "revise" and _rd.new_sub_goals:
-                            _task_plan.sub_goals = _rd.new_sub_goals
-                            _task_plan.current_idx = 0
-                            if _task_plan.sub_goals:
-                                _task_plan.sub_goals[0].status = "active"
-                            vlm.inject_error_feedback(
-                                f"🔧 [REFLECTOR] 计划已修订（{_rd.reason}）。"
-                                f"新的当前子目标："
-                                f"{_task_plan.sub_goals[0].description if _task_plan.sub_goals else '(空)'}"
-                            )
-                        elif _rd.decision == "abort":
-                            _abort_requested = True
-                            vlm.inject_error_feedback(
-                                f"🛑 [REFLECTOR] 判定不可完成（{_rd.reason}）。"
-                                f"请立即输出 action=done 结束任务。"
-                            )
-                        # continue: 不做额外干预，让 VLM 正常推进
-                    except Exception as _reflect_err:
-                        logger.warning(f"[REFLECTOR] 调用失败忽略：{_reflect_err}")
-                else:
-                    _steps_since_reflect += 1
-                _dedup_tripped_last_step = False
+                _planning.task_plan = _task_plan
+                _planning.dedup_tripped_last_step = _dedup_tripped_last_step
+                _planning.steps_since_reflect = _steps_since_reflect
+                _planning.reflect_count = _reflect_count
+                _rd = await _planning.maybe_reflect(
+                    vlm=vlm,
+                    current_url=browser.current_url or "",
+                    goal=goal,
+                    consecutive_errors=_consecutive_errors,
+                )
+                _task_plan = _planning.task_plan
+                _steps_since_reflect = _planning.steps_since_reflect
+                _reflect_count = _planning.reflect_count
+                _dedup_tripped_last_step = _planning.dedup_tripped_last_step
+                _abort_requested = _planning.abort_requested
 
                 # ── Improvement 1：消费分页器探测结果（一次性，注入完即清） ──
                 if _pagination_hint_msg:
@@ -12677,19 +12623,24 @@ async def run_agent(
                             last_sent_url=_last_prompt_image_url,
                             current_url=_cur_url,
                         )
-                        decisions = await vlm.ask(
-                            screenshot_b64,
-                            goal,
-                            step,
-                            input_descriptions,
-                            workflow_memory,
+                        # G3: VLM decision delegated to phases/decision.py
+                        from visual_web_agent.phases.decision import make_vlm_decision as _vlm_decide
+                        _vlm_result = await _vlm_decide(
+                            vlm=vlm, screenshot_b64=screenshot_b64,
+                            goal=goal, step=step,
+                            input_descriptions=input_descriptions,
+                            workflow_memory=workflow_memory,
                             task_plan=_task_plan,
                             max_steps=_effective_max_steps,
                             som_elements=getattr(browser, "_last_som_elements", None),
                             capability_route=_capability_route,
-                            extra_images=(_prompt_images if _send_prompt_imgs else None),
+                            prompt_images=_prompt_images,
+                            prompt_image_policy=_prompt_image_policy,
+                            current_url=_cur_url,
+                            last_prompt_image_url=_last_prompt_image_url,
                         )
-                        if _send_prompt_imgs:
+                        decisions = _vlm_result.decisions
+                        if _vlm_result.prompt_images_sent:
                             _last_prompt_image_url = _cur_url
                     try:
                         from api_server import broadcast_phase
