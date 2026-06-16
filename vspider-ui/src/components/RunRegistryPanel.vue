@@ -153,7 +153,9 @@ watch(() => props.refreshToken, () => fetchRuns())
       >
         刷新
       </el-button>
-      <span class="run-registry-count">共 {{ runs.length }} 条运行记录</span>
+      <span class="run-registry-count">{{ runs.length }} 条</span>
+      <span class="toolbar-spacer" />
+      <slot name="toolbar-extra" />
     </div>
 
     <el-table
@@ -384,7 +386,11 @@ watch(() => props.refreshToken, () => fetchRuns())
 .run-registry-toolbar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
+}
+
+.toolbar-spacer {
+  flex: 1;
 }
 
 .run-registry-count {

@@ -9,7 +9,7 @@ These tests fail loudly if someone:
   • Reuses Ctrl+K for a different action
   • Drops the addEventListener / removeEventListener pair on lifecycle
   • Removes the help dialog or its ``ref="promptInputRef"`` binding
-  • Renames TAB_ORDER away from the 6 tabs the UI currently has
+  • Renames TAB_ORDER away from the tabs the UI currently has
 
 Run: ``pytest tests/test_keyboard_shortcuts.py -q``
 """
@@ -104,8 +104,8 @@ class TestGlobalShortcuts:
 
 
 class TestTabOrderInvariants:
-    def test_tab_order_has_seven_tabs(self, src: str) -> None:
-        """TAB_ORDER must list the 7 tabs the UI has today, in the same
+    def test_tab_order_has_six_tabs(self, src: str) -> None:
+        """TAB_ORDER must list the 6 tabs the UI has today, in the same
         order they appear in the DOM. If a future tab is added (or one
         removed), this test forces a deliberate update."""
         m = re.search(
@@ -119,7 +119,7 @@ class TestTabOrderInvariants:
             if s.strip()
         ]
         assert items == [
-            "terminal", "timeline", "capability", "final", "artifacts", "runs", "failed",
+            "terminal", "timeline", "capability", "final", "artifacts", "runs",
         ], f"unexpected TAB_ORDER contents: {items!r}"
 
 

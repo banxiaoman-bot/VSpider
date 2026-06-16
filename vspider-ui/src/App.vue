@@ -2,7 +2,6 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   Close,
-  Monitor,
   Refresh,
   Setting,
   UploadFilled,
@@ -38,6 +37,12 @@ import AuthDialog from './components/AuthDialog.vue'
 import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import HitlFormDialog from './components/HitlFormDialog.vue'
+import CommandPalette from './components/CommandPalette.vue'
+import {
+  createSlashCommandRegistry,
+  registerBuiltinCommands,
+  useSlashCommand,
+} from './composables/useSlashCommand.js'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import {
@@ -60,6 +65,7 @@ import {
 import { API_BASE, apiFetch, wsUrl } from './api/client.js'
 
 const url = ref('')
+const urlFieldExpanded = ref(false)
 const prompt = ref('')
 const outputContractPreview = ref(null)
 const outputContractPreviewLoading = ref(false)
@@ -95,13 +101,38 @@ const authDialogOpen = ref(false)
 const authProfileOptions = ref([])
 const selectedModel = ref('backend-default')
 const selectedSemanticModel = ref('backend-default')
-const modelSettingsOpen = ref(false)
 const modelTemperature = ref(0.1)
 const modelMaxTokens = ref(4096)
 const modelBaseUrl = ref('')
 const modelApiKey = ref('')
 const semanticBaseUrl = ref('')
 const semanticApiKey = ref('')
+const vlmRemoteModels = ref([])
+const vlmRemoteLoading = ref(false)
+const semanticRemoteModels = ref([])
+const semanticRemoteLoading = ref(false)
+
+async function fetchRemoteModels (baseUrl, apiKey, targetRef, loadingRef) {
+  if (!baseUrl) { ElMessage.warning('请先填写 Base URL'); return }
+  loadingRef.value = true
+  try {
+    const headers = { 'Content-Type': 'application/json' }
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
+    const url = baseUrl.replace(/\/+$/, '') + '/models'
+    const resp = await fetch(url, { headers })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const json = await resp.json()
+    const models = (json.data || json.models || []).map(m => typeof m === 'string' ? m : m.id).filter(Boolean)
+    if (!models.length) { ElMessage.warning('未返回可用模型'); return }
+    targetRef.value = models
+    ElMessage.success(`获取到 ${models.length} 个模型`)
+  } catch (err) {
+    ElMessage.error(`连接失败: ${String(err)}`)
+  } finally {
+    loadingRef.value = false
+  }
+}
+
 const isHumanInterventionRequired = ref(false)
 const humanInterventionReason = ref('')
 const hitlFormVisible = ref(false)
@@ -112,8 +143,7 @@ const hitlFormLoading = ref(false)
 const hitlScreenshot = ref('')
 const hitlScreenshotExpanded = ref(false)
 const activeBottomTab = ref('terminal')
-// A: Capability 页签内部二级子页签（概览/计划/回放/诊断）
-const capabilitySubTab = ref('overview')
+const runsSubView = ref('all')
 // B: Timeline 筛选 chips 默认收起，点「筛选」按钮展开
 const timelineFiltersExpanded = ref(false)
 // C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
@@ -132,8 +162,6 @@ const browserRuntimeLoading = ref(false)
 // step_count/paths/paths_exist (the last is added by list_failed_runs
 // based on filesystem presence; we use it to grey out the HTML log
 // button when the underlying file was deleted/rotated).
-const hasNewFailures = ref(false)
-
 
 // ── M: Phase timeline ──
 // phaseEvents: list of {type, phase, severity, message, step, duration_ms,
@@ -254,6 +282,17 @@ let artifactsCountAtSubmit = 0
 let socket = null
 let reconnectTimer = null
 let isUnmounted = false
+
+// ── Slash command system ──
+const slashRegistry = createSlashCommandRegistry()
+const {
+  paletteVisible: cmdPaletteVisible,
+  suggestions: cmdSuggestions,
+  updateSuggestions: updateCmdSuggestions,
+  tryExecute: tryExecuteCmd,
+  dismiss: dismissCmdPalette,
+} = useSlashCommand(slashRegistry)
+const cmdPaletteRef = ref(null)
 
 const MODEL_SETTINGS_STORAGE_KEY = 'vspider:model-settings:v1'
 
@@ -572,8 +611,8 @@ const connectWebSocket = () => {
         // await it so the rest of the done-handler stays responsive.
         if (payload.success === false) {
           failedRunsPaneRef.value?.fetchFailedRuns()
-          if (activeBottomTab.value !== 'failed') {
-            hasNewFailures.value = true
+          if (activeBottomTab.value !== 'runs') {
+            hasNewRuns.value = true
           }
         }
 
@@ -2597,7 +2636,7 @@ const _writeToClipboard = async (text) => {
 
 // Tab name lookup for Ctrl+1..6 — kept here so the help dialog can use
 // it as a single source of truth.
-const TAB_ORDER = ['terminal', 'timeline', 'capability', 'final', 'artifacts', 'runs', 'failed']
+const TAB_ORDER = ['terminal', 'timeline', 'capability', 'final', 'artifacts', 'runs']
 
 // Switch active tab + apply the same badge-clearing side effects the
 // el-tabs @tab-change handler does, since direct assignment to the model
@@ -2613,7 +2652,6 @@ const setActiveBottomTab = (name) => {
     if (timelineAutoScroll.value) timelinePanelRef.value?.scrollToBottom()
   }
   if (name === 'capability') hasNewCapability.value = false
-  if (name === 'failed') hasNewFailures.value = false
 }
 
 // Focus the Prompt textarea programmatically. Element Plus el-input
@@ -2807,7 +2845,37 @@ watch(prompt, () => {
   }, 450)
 })
 
+// ── Slash command input handlers ──
+const onPromptInput = (val) => {
+  const firstLine = (typeof val === 'string' ? val : prompt.value).split('\n')[0]
+  updateCmdSuggestions(firstLine)
+}
+const onPromptKeydown = (e) => {
+  if (cmdPaletteVisible.value) {
+    cmdPaletteRef.value?.onKeydown(e)
+  }
+}
+const handleCmdSelect = (cmd) => {
+  prompt.value = '/' + cmd.name + (cmd.args ? ' ' : '')
+  dismissCmdPalette()
+  nextTick(() => {
+    promptInputRef.value?.focus()
+  })
+}
+const trySlashBeforeSubmit = () => {
+  const firstLine = prompt.value.trim().split('\n')[0]
+  if (firstLine.startsWith('/')) {
+    const executed = tryExecuteCmd(firstLine)
+    if (executed) {
+      prompt.value = ''
+      return true
+    }
+  }
+  return false
+}
+
 const submitTask = async () => {
+  if (trySlashBeforeSubmit()) return
   const validation = validateTaskInput({ prompt: prompt.value })
   if (!validation.ok) {
     ElMessage.warning(validation.message)
@@ -2934,6 +3002,26 @@ const forceStop = async () => {
 onMounted(() => {
   document.documentElement.classList.add('dark')
   loadModelSettings()
+  registerBuiltinCommands(slashRegistry, {
+    selectedModel,
+    selectedSemanticModel,
+    modelApiKey,
+    modelBaseUrl,
+    semanticBaseUrl,
+    semanticApiKey,
+    modelTemperature,
+    modelMaxTokens,
+    proxyServer,
+    resumeEnabled,
+    batchMaxRuns,
+    settingsDrawerOpen,
+    settingsActivePanels,
+    authDialogOpen,
+    helpDialogVisible,
+    targetUrl: url,
+    forceStop,
+    showMessage: (type, msg) => ElMessage[type]?.(msg),
+  })
   connectWebSocket()
   loadAuthProfiles()
   loadCaptchaSolverStatus()
@@ -2995,373 +3083,192 @@ const handleCapabilityMoreAction = (command) => {
   handlers[command]?.()
 }
 
-// C2: 抽屉关闭时在左栏回显当前配置概要
-const settingsSummaryText = computed(() => {
-  const identity = selectedAuthProfiles.value.length
-    ? selectedAuthProfiles.value.join('、')
-    : '默认身份'
-  const attach = selectedFile.value ? selectedFile.value.name : '无附件'
-  return `${selectedModel.value} · ${selectedSemanticModel.value} · ${identity} · ${attach}`
-})
 </script>
 
 <template>
   <main class="app-shell">
     <div v-if="isRunning" class="global-progress-bar" />
     <section class="control-panel vspider-panel">
-      <header class="brand-header">
-        <div class="brand-mark">
-          <Monitor class="brand-icon" />
-        </div>
-        <div>
-          <h1>VSpider Control Center</h1>
-          <p>任务编排与执行入口</p>
-        </div>
-      </header>
-
       <div class="control-scroll">
-        <div class="field-group">
-          <label>目标 URL <small class="field-hint">（可选，留空时从业务指令推断）</small></label>
+        <div class="brand-row">
+          <span class="brand-text">VSpider</span>
+          <span v-if="!urlFieldExpanded && !url" class="url-toggle" @click="urlFieldExpanded = true">+ URL</span>
+        </div>
+
+        <div v-if="urlFieldExpanded || url" class="url-field-collapsible">
           <el-input
             v-model="url"
             clearable
+            size="small"
             :disabled="isRunning"
-            placeholder="https://example.com（可留空）"
+            placeholder="目标 URL（可选）"
+            @blur="urlFieldExpanded = false"
           />
         </div>
 
-        <div class="field-group">
-          <label>业务指令</label>
+        <div class="prompt-input-wrap">
+          <CommandPalette
+            ref="cmdPaletteRef"
+            :visible="cmdPaletteVisible"
+            :suggestions="cmdSuggestions"
+            @select="handleCmdSelect"
+            @dismiss="dismissCmdPalette"
+          />
           <el-input
             ref="promptInputRef"
             v-model="prompt"
             type="textarea"
             resize="none"
-            :autosize="{ minRows: 4, maxRows: 8 }"
+            :autosize="{ minRows: 3, maxRows: 8 }"
             :disabled="isRunning"
-            placeholder="描述你希望 VSpider 执行的业务任务 (Ctrl+Enter 提交，Ctrl+K 聚焦本框，Ctrl+/ 查看快捷键)"
+            placeholder="描述任务… (Ctrl+Enter 提交，/ 命令)"
+            @input="onPromptInput"
+            @keydown="onPromptKeydown"
+            @blur="() => setTimeout(dismissCmdPalette, 150)"
           />
         </div>
 
-        <div v-if="outputContractPreviewLoading || outputContractPreview" class="field-group output-contract-preview">
-          <label>推断输出形态 <small class="field-hint">（由 goal 自动推断，非固定 Excel）</small></label>
-          <div v-if="outputContractPreviewLoading" class="output-contract-preview__loading">推断中…</div>
-          <div v-else-if="outputContractPreview" class="output-contract-preview__card">
-            <div class="output-contract-preview__row">
-              <span class="output-contract-preview__label">类型</span>
-              <strong>{{ outputContractPreview.kind_label }}</strong>
-              <span class="output-contract-preview__sep">→</span>
-              <span class="output-contract-preview__label">落盘</span>
-              <strong>{{ outputContractPreview.container_label }}</strong>
-              <el-tag size="small" type="info">{{ outputContractPreview.mode }}</el-tag>
-            </div>
-            <p v-if="outputContractPreview.reasons.length" class="output-contract-preview__reasons">
-              {{ outputContractPreview.reasons.slice(0, 2).join('；') }}
-            </p>
+        <div class="action-bar">
+          <div v-if="outputContractPreviewLoading || outputContractPreview" class="output-contract-inline">
+            <span v-if="outputContractPreviewLoading" class="output-contract-inline__loading">…</span>
+            <template v-else-if="outputContractPreview">
+              <el-tag size="small" type="info">{{ outputContractPreview.kind_label }}</el-tag>
+              <span class="output-contract-inline__arrow">→</span>
+              <el-tag size="small">{{ outputContractPreview.container_label }}</el-tag>
+            </template>
+          </div>
+          <div class="action-buttons">
+            <el-button
+              type="primary"
+              class="run-button"
+              :icon="VideoPlay"
+              :loading="isRunning"
+              @click="submitTask"
+            >
+              执行
+            </el-button>
+            <el-button
+              v-if="isRunning"
+              class="stop-button"
+              :icon="Close"
+              @click="forceStop"
+            >
+              停止
+            </el-button>
+            <button type="button" class="settings-toggle" @click="settingsDrawerOpen = true" title="配置">
+              <el-icon><Setting /></el-icon>
+            </button>
           </div>
         </div>
-
-        <button type="button" class="settings-summary" @click="settingsDrawerOpen = true">
-          <span class="settings-summary__title">
-            <el-icon><Setting /></el-icon>
-            高级配置
-            <span class="settings-summary__open">打开 ›</span>
-          </span>
-          <span class="settings-summary__echo">{{ settingsSummaryText }}</span>
-        </button>
       </div>
 
-      <footer class="action-footer">
-        <el-button
-          type="primary"
-          class="run-button"
-          :icon="VideoPlay"
-          :loading="isRunning"
-          @click="submitTask"
-        >
-          开始执行
-        </el-button>
-        <el-button
-          class="stop-button"
-          :icon="Close"
-          :disabled="!isRunning"
-          @click="forceStop"
-        >
-          强制终止
-        </el-button>
-      </footer>
-
-      <!-- C2: 高级配置抽屉 — 双脑调度/身份/运行约束/附件统一入口 -->
       <el-drawer
         v-model="settingsDrawerOpen"
-        title="高级配置"
+        title="配置"
         direction="rtl"
-        size="440px"
+        size="380px"
         class="settings-drawer"
       >
           <el-collapse v-model="settingsActivePanels" class="advanced-collapse drawer-collapse">
           <el-collapse-item name="models">
             <template #title>
-              <span>双脑调度中心</span>
+              <span>模型</span>
               <span class="collapse-title-echo">{{ selectedModel }} · {{ selectedSemanticModel }}</span>
             </template>
-        <div class="field-group model-center">
-          <div class="field-title-row">
-            <label>模型选择</label>
-            <el-popover
-              v-model:visible="modelSettingsOpen"
-              placement="right-start"
-              width="360"
-              trigger="click"
-            >
-              <template #reference>
-                <el-button text size="small" :icon="Setting">
-                  高级参数
-                </el-button>
-              </template>
-              <div class="model-popover">
-                <label>Temperature: {{ modelTemperature }}</label>
-                <el-slider
-                  v-model="modelTemperature"
-                  :min="0"
-                  :max="2"
-                  :step="0.1"
-                  :disabled="isRunning"
-                />
-                <label>Max Tokens</label>
-                <el-input-number
-                  v-model="modelMaxTokens"
-                  :min="512"
-                  :max="32768"
-                  :step="512"
-                  :disabled="isRunning"
-                  class="full-width"
-                />
-                <label>Base URL Override</label>
-                <el-input
-                  v-model="modelBaseUrl"
-                  clearable
-                  :disabled="isRunning"
-                  placeholder="http://localhost:8000/v1"
-                />
-                <label>API Key Override</label>
-                <el-input
-                  v-model="modelApiKey"
-                  clearable
-                  show-password
-                  :disabled="isRunning"
-                  placeholder="empty = backend default"
-                />
-                <label>Semantic Base URL Override</label>
-                <el-input
-                  v-model="semanticBaseUrl"
-                  clearable
-                  :disabled="isRunning"
-                  placeholder="https://api.deepseek.com"
-                />
-                <label>Semantic API Key Override</label>
-                <el-input
-                  v-model="semanticApiKey"
-                  clearable
-                  show-password
-                  :disabled="isRunning"
-                  placeholder="empty = backend/default VLM key"
-                />
+            <div class="model-section">
+              <label>VLM (视觉模型)</label>
+              <el-input v-model="modelBaseUrl" clearable :disabled="isRunning" placeholder="Base URL (如 https://dashscope.aliyuncs.com/compatible-mode/v1)" size="small" />
+              <div class="model-connect-row">
+                <el-input v-model="modelApiKey" clearable show-password :disabled="isRunning" placeholder="API Key" size="small" />
+                <el-button size="small" :loading="vlmRemoteLoading" @click="fetchRemoteModels(modelBaseUrl, modelApiKey, vlmRemoteModels, vlmRemoteLoading)">连接</el-button>
               </div>
-            </el-popover>
-          </div>
-
-          <el-select
-            v-model="selectedModel"
-            :disabled="isRunning"
-            filterable
-            allow-create
-            default-first-option
-            class="full-width"
-            placeholder="选择或输入 Model ID"
-          >
-            <el-option-group label="视觉多模态大模型 (VL)">
-              <el-option value="backend-default" label="Backend Default" />
-              <el-option value="qwen3-vl-plus" label="Qwen-VL-Plus" />
-              <el-option value="local-74b-vl" label="内网本地 74B VL 模型" />
-            </el-option-group>
-            <el-option-group label="纯文本逻辑模型 (Text)">
-              <el-option value="deepseek-chat" label="DeepSeek-V3" />
-              <el-option value="deepseek-reasoner" label="DeepSeek-R1" />
-              <el-option value="deepseek-v4-flash" label="DeepSeek-V4-Flash" />
-              <el-option value="deepseek-v4-pro" label="DeepSeek-V4-Pro" />
-            </el-option-group>
-          </el-select>
-
-          <el-select
-            v-model="selectedSemanticModel"
-            :disabled="isRunning"
-            filterable
-            allow-create
-            default-first-option
-            class="full-width"
-            placeholder="选择或输入 Model ID"
-          >
-            <el-option value="backend-default" label="Semantic Backend Default" />
-            <el-option value="deepseek-chat" label="DeepSeek-V3" />
-            <el-option value="deepseek-reasoner" label="DeepSeek-R1" />
-            <el-option value="deepseek-v4-flash" label="DeepSeek-V4-Flash" />
-            <el-option value="deepseek-v4-pro" label="DeepSeek-V4-Pro" />
-            <el-option value="qwen3-vl-plus" label="Qwen-VL-Plus" />
-            <el-option value="local-74b-vl" label="Local 74B VL" />
-          </el-select>
-
-          <p v-if="selectedModelType === 'text'" class="model-warning">
-            当前为纯文本模型，将自动剥离图像，仅依赖 AX Tree 执行任务。
-          </p>
-        </div>
+              <el-select v-model="selectedModel" :disabled="isRunning" filterable allow-create default-first-option class="full-width" placeholder="选择模型">
+                <el-option-group v-if="vlmRemoteModels.length" :label="`远程 (${vlmRemoteModels.length})`">
+                  <el-option v-for="m in vlmRemoteModels" :key="m" :value="m" :label="m" />
+                </el-option-group>
+                <el-option-group label="预设">
+                  <el-option value="backend-default" label="Backend Default" />
+                  <el-option value="qwen3-vl-plus" label="Qwen-VL-Plus" />
+                  <el-option value="local-74b-vl" label="内网 74B VL" />
+                  <el-option value="deepseek-chat" label="DeepSeek-V3" />
+                  <el-option value="deepseek-reasoner" label="DeepSeek-R1" />
+                  <el-option value="deepseek-v4-flash" label="DeepSeek-V4-Flash" />
+                  <el-option value="deepseek-v4-pro" label="DeepSeek-V4-Pro" />
+                </el-option-group>
+              </el-select>
+              <p v-if="selectedModelType === 'text'" class="model-warning">纯文本模型，将剥离图像仅用 AX Tree。</p>
+            </div>
+            <div class="model-section">
+              <label>Semantic (语义模型)</label>
+              <el-input v-model="semanticBaseUrl" clearable :disabled="isRunning" placeholder="Base URL (如 https://api.deepseek.com)" size="small" />
+              <div class="model-connect-row">
+                <el-input v-model="semanticApiKey" clearable show-password :disabled="isRunning" placeholder="API Key" size="small" />
+                <el-button size="small" :loading="semanticRemoteLoading" @click="fetchRemoteModels(semanticBaseUrl, semanticApiKey, semanticRemoteModels, semanticRemoteLoading)">连接</el-button>
+              </div>
+              <el-select v-model="selectedSemanticModel" :disabled="isRunning" filterable allow-create default-first-option class="full-width" placeholder="选择模型">
+                <el-option-group v-if="semanticRemoteModels.length" :label="`远程 (${semanticRemoteModels.length})`">
+                  <el-option v-for="m in semanticRemoteModels" :key="m" :value="m" :label="m" />
+                </el-option-group>
+                <el-option-group label="预设">
+                  <el-option value="backend-default" label="Backend Default" />
+                  <el-option value="deepseek-chat" label="DeepSeek-V3" />
+                  <el-option value="deepseek-reasoner" label="DeepSeek-R1" />
+                  <el-option value="deepseek-v4-flash" label="DeepSeek-V4-Flash" />
+                  <el-option value="deepseek-v4-pro" label="DeepSeek-V4-Pro" />
+                  <el-option value="qwen3-vl-plus" label="Qwen-VL-Plus" />
+                  <el-option value="local-74b-vl" label="Local 74B VL" />
+                </el-option-group>
+              </el-select>
+            </div>
+            <el-collapse class="model-advanced-fold">
+              <el-collapse-item title="高级参数" name="adv">
+                <label>Temperature: {{ modelTemperature }}</label>
+                <el-slider v-model="modelTemperature" :min="0" :max="2" :step="0.1" :disabled="isRunning" />
+                <label>Max Tokens</label>
+                <el-input-number v-model="modelMaxTokens" :min="512" :max="32768" :step="512" :disabled="isRunning" class="full-width" />
+              </el-collapse-item>
+            </el-collapse>
           </el-collapse-item>
           <el-collapse-item name="identity">
             <template #title>
-              <span>身份选择</span>
-              <span class="collapse-title-echo">{{ selectedAuthProfiles.length ? selectedAuthProfiles.join('、') : '未选择（可选）' }}</span>
+              <span>登录</span>
+              <span class="collapse-title-echo">{{ selectedAuthProfiles.length ? selectedAuthProfiles.join('、') : '可选' }}</span>
             </template>
-        <div class="field-group">
-          <div class="field-title-row">
-            <label>Auth Profile</label>
-            <div class="field-actions">
-              <el-button
-                text
-                size="small"
-                :icon="Refresh"
-                @click="loadAuthProfiles"
-              >
-                刷新
-              </el-button>
-              <el-button
-                text
-                size="small"
-                :icon="Setting"
-                @click="authDialogOpen = true"
-              >
-                管理
-              </el-button>
+            <div class="field-title-row">
+              <el-button text size="small" :icon="Refresh" @click="loadAuthProfiles">刷新</el-button>
+              <el-button text size="small" :icon="Setting" @click="authDialogOpen = true">管理</el-button>
             </div>
-          </div>
-
-          <el-select
-            v-model="selectedAuthProfiles"
-            multiple
-            filterable
-            allow-create
-            collapse-tags
-            collapse-tags-tooltip
-            :disabled="isRunning"
-            placeholder="选择或输入 Auth Profile"
-            class="full-width"
-          >
-            <el-option
-              v-for="item in authProfileOptions"
-              :key="item.name"
-              :label="authProfileOptionLabel(item)"
-              :value="item.name"
-            />
-          </el-select>
-        </div>
+            <el-select v-model="selectedAuthProfiles" multiple filterable allow-create collapse-tags collapse-tags-tooltip :disabled="isRunning" placeholder="Auth Profile" class="full-width">
+              <el-option v-for="item in authProfileOptions" :key="item.name" :label="authProfileOptionLabel(item)" :value="item.name" />
+            </el-select>
           </el-collapse-item>
-          <el-collapse-item title="运行约束（可选）" name="constraints">
-            <label>附加 URL 列表</label>
-            <el-input
-              v-model="extraUrls"
-              type="textarea"
-              :rows="2"
-              :disabled="isRunning"
-              placeholder="每行一个 URL，或逗号分隔；与目标 URL 组成多起点任务"
-              class="full-width"
-            />
-            <label>代理服务器</label>
-            <el-input
-              v-model="proxyServer"
-              clearable
-              :disabled="isRunning"
-              placeholder="http://127.0.0.1:7890"
-              class="full-width"
-            />
-            <label>代理用户名</label>
-            <el-input
-              v-model="proxyUsername"
-              clearable
-              :disabled="isRunning"
-              class="full-width"
-            />
-            <label>代理密码</label>
-            <el-input
-              v-model="proxyPassword"
-              clearable
-              show-password
-              :disabled="isRunning"
-              class="full-width"
-            />
-            <label>批处理最大并发（max_runs）</label>
-            <el-input-number
-              v-model="batchMaxRuns"
-              :min="0"
-              :max="16"
-              :disabled="isRunning"
-              class="full-width"
-            />
-            <label>断点续跑（resume）</label>
-            <el-switch
-              v-model="resumeEnabled"
-              :disabled="isRunning"
-              active-text="开"
-              inactive-text="关"
-            />
-            <p class="file-status">
-              开启后：跳过上次已完成的行 / 步骤 / 已下载字节（batch / run / 媒体下载统一生效）
-            </p>
-            <p class="file-status">
-              Captcha Solver：
-              <span :class="captchaSolverEnabled ? 'solver-on' : 'solver-off'">
-                {{ captchaSolverEnabled ? `已配置 (${captchaSolverProvider || 'auto'})` : '未配置（仅 HITL）' }}
-              </span>
-            </p>
+          <el-collapse-item title="运行约束" name="constraints">
+            <label>附加 URL</label>
+            <el-input v-model="extraUrls" type="textarea" :rows="2" :disabled="isRunning" placeholder="每行一个 URL" class="full-width" />
+            <label>代理</label>
+            <el-input v-model="proxyServer" clearable :disabled="isRunning" placeholder="http://127.0.0.1:7890" class="full-width" />
+            <div v-if="proxyServer" class="proxy-auth-row">
+              <el-input v-model="proxyUsername" clearable :disabled="isRunning" placeholder="用户名" />
+              <el-input v-model="proxyPassword" clearable show-password :disabled="isRunning" placeholder="密码" />
+            </div>
+            <div class="constraint-inline-row">
+              <span>并发</span>
+              <el-input-number v-model="batchMaxRuns" :min="0" :max="16" :disabled="isRunning" size="small" />
+              <span>续跑</span>
+              <el-switch v-model="resumeEnabled" :disabled="isRunning" />
+            </div>
+            <p v-if="captchaSolverEnabled" class="file-status solver-on">Captcha Solver: {{ captchaSolverProvider || 'auto' }}</p>
           </el-collapse-item>
-          <el-collapse-item title="附件（可选）" name="file">
-            <el-upload
-              drag
-              class="compact-upload"
-              :auto-upload="false"
-              :limit="1"
-              :disabled="isRunning"
-              :accept="ATTACHMENT_ACCEPT"
-              :on-change="handleUploadChange"
-              :on-remove="handleUploadRemove"
-            >
-              <el-icon class="upload-icon">
-                <UploadFilled />
-              </el-icon>
-              <div class="upload-copy">拖拽文件到此处，或点击选择</div>
+          <el-collapse-item title="附件" name="file">
+            <el-upload drag class="compact-upload" :auto-upload="false" :limit="1" :disabled="isRunning" :accept="ATTACHMENT_ACCEPT" :on-change="handleUploadChange" :on-remove="handleUploadRemove">
+              <el-icon class="upload-icon"><UploadFilled /></el-icon>
+              <div class="upload-copy">拖拽或点击选择文件</div>
             </el-upload>
-            <p class="file-status">
-              {{ ATTACHMENT_HINT }}
-            </p>
-            <p class="file-status">
-              当前文件：{{ selectedFile ? selectedFile.name : '未选择文件，当前为单任务模式' }}
-            </p>
+            <p class="file-status">{{ selectedFile ? selectedFile.name : '未选择文件' }}</p>
             <template v-if="selectedFile">
-              <el-select
-                v-model="attachmentIntent"
-                :disabled="isRunning"
-                size="small"
-                class="attachment-intent-select"
-                placeholder="附件用途"
-              >
-                <el-option
-                  v-for="option in ATTACHMENT_INTENT_OPTIONS"
-                  :key="option.value"
-                  :label="option.label"
-                  :value="option.value"
-                />
+              <el-select v-model="attachmentIntent" :disabled="isRunning" size="small" class="attachment-intent-select" placeholder="附件用途">
+                <el-option v-for="option in ATTACHMENT_INTENT_OPTIONS" :key="option.value" :label="option.label" :value="option.value" />
               </el-select>
-              <p class="file-status">
-                附件用途：自动推断不合预期时可在此显式指定（写入 input_contract）
-              </p>
             </template>
           </el-collapse-item>
           </el-collapse>
@@ -3370,14 +3277,10 @@ const settingsSummaryText = computed(() => {
 
     <section class="monitor-panel">
       <div class="preview-panel vspider-panel">
-        <div class="panel-title">
-          <div>
-            <h2>实时画面</h2>
-            <p>Agent 实时视觉画面</p>
-          </div>
+        <div class="panel-title panel-title--compact">
           <span class="live-indicator" :class="`ws-${wsStatus}`">
             <i />
-            {{ wsStatus === 'connected' ? 'LIVE' : wsStatus === 'connecting' ? 'CONNECTING' : 'OFFLINE' }}
+            {{ wsStatus === 'connected' ? 'LIVE' : wsStatus === 'connecting' ? '...' : 'OFF' }}
           </span>
         </div>
         <div class="preview-stage">
@@ -3387,55 +3290,24 @@ const settingsSummaryText = computed(() => {
             alt="实时画面"
           />
           <div v-else class="preview-placeholder">
-            <div class="skeleton-preview">
-              <div class="skeleton-browser-bar">
-                <span class="skeleton-dot" /><span class="skeleton-dot" /><span class="skeleton-dot" />
-                <div class="skeleton-url-bar" />
-              </div>
-              <div class="skeleton-content">
-                <div class="skeleton-line skeleton-line--title" />
-                <div class="skeleton-line skeleton-line--short" />
-                <div class="skeleton-line" />
-                <div class="skeleton-line skeleton-line--medium" />
-              </div>
-              <p class="skeleton-hint">等待首帧画面</p>
-            </div>
+            <p class="skeleton-hint">等待首帧画面</p>
           </div>
           <div v-if="isHumanInterventionRequired" class="hitl-overlay">
             <div class="hitl-card">
-              <div class="hitl-title">{{ isBotChallengeHitl ? '人机验证 / Cloudflare' : 'HITL REQUIRED' }}</div>
+              <div class="hitl-title">{{ isBotChallengeHitl ? '人机验证' : '需要人工介入' }}</div>
               <div class="hitl-copy">
-                <template v-if="isBotChallengeHitl">
-                  Agent 已暂停。请在浏览器窗口完成 Cloudflare / Turnstile 验证；
-                  通过后点击 Resume。首次验证成功后会自动缓存 cf_clearance 到 Auth Profile。
-                </template>
-                <template v-else>
-                  Agent is paused. Complete captcha, slider, QR scan, or 2FA in the browser window.
-                </template>
+                {{ isBotChallengeHitl ? '请在浏览器完成验证后点击恢复' : '请在浏览器完成验证码 / 扫码 / 2FA' }}
               </div>
-              <div v-if="hitlScreenshot" class="hitl-screenshot-wrap">
-                <img
-                  :src="hitlScreenshot"
-                  alt="当前页面截图"
-                  class="hitl-screenshot"
-                  :class="{ 'is-expanded': hitlScreenshotExpanded }"
-                  @click="hitlScreenshotExpanded = !hitlScreenshotExpanded"
-                />
-                <span class="hitl-screenshot-hint">
-                  {{ hitlScreenshotExpanded ? '点击缩小' : '点击放大查看当前页面' }}
-                </span>
-              </div>
-              <div v-if="humanInterventionReason" class="hitl-reason">
-                {{ humanInterventionReason }}
-              </div>
-              <el-button
-                type="success"
-                size="large"
-                class="resume-button"
-                @click="resumeAgentExecution"
-              >
-                恢复执行
-              </el-button>
+              <img
+                v-if="hitlScreenshot"
+                :src="hitlScreenshot"
+                alt="截图"
+                class="hitl-screenshot"
+                :class="{ 'is-expanded': hitlScreenshotExpanded }"
+                @click="hitlScreenshotExpanded = !hitlScreenshotExpanded"
+              />
+              <div v-if="humanInterventionReason" class="hitl-reason">{{ humanInterventionReason }}</div>
+              <el-button type="success" @click="resumeAgentExecution">恢复执行</el-button>
             </div>
           </div>
         </div>
@@ -3452,16 +3324,8 @@ const settingsSummaryText = computed(() => {
             if (name === 'capability') hasNewCapability = false
             if (name === 'timeline') {
               hasNewPhase = false
-              // P: when re-entering the Timeline tab, snap to bottom if
-              // auto-scroll is still on so the user lands on the freshest
-              // events instead of stale earlier-step rows.
               if (timelineAutoScroll) timelinePanelRef.value?.scrollToBottom()
             }
-            // K3: clear the failures badge dot when the user actually
-            // opens the panel. We don't auto-refresh here — the user can
-            // hit Refresh manually; the WS done-handler already refetches
-            // on the moment a new failure lands.
-            if (name === 'failed') hasNewFailures = false
           }"
         >
           <el-tab-pane name="terminal">
@@ -3516,33 +3380,31 @@ const settingsSummaryText = computed(() => {
                   @exit-replay="exitReplayMode"
                 />
 
-                <el-tabs v-model="capabilitySubTab" class="capability-sub-tabs">
-                  <el-tab-pane label="概览" name="overview">
-                    <CapabilityOverviewPane
-                      v-model:trace-filter="capabilityTraceFilter"
-                      v-model:trace-search-query="capabilityTraceSearchQuery"
-                      :trace-rows="capabilityTraceRows"
-                      :filtered-trace-rows="capabilityFilteredTraceRows"
-                      :trace-summary="capabilityTraceSummary"
-                      :trace-health="capabilityTraceHealth"
-                      :runtime-preflight="capabilityRuntimePreflight"
-                      :runtime-preflight-class="capabilityRuntimePreflightClass"
-                      :runtime-preflight-label="capabilityRuntimePreflightLabel"
-                      :browser-runtime="browserRuntime"
-                      :browser-runtime-class="browserRuntimeStatusClass"
-                      :browser-runtime-label="browserRuntimeLabel"
-                      :backend-summary="browserRuntimeBackendSummary"
-                      :capacity="browserRuntimeCapacity"
-                      :health-label="browserRuntimeHealthLabel"
-                      :health-cache-label="browserRuntimeHealthCacheLabel"
-                      :has-execute-event="Boolean(latestCapabilityExecute)"
-                      :execute-event="latestCapabilityExecute"
-                      :execution-alignment="capabilityExecutionAlignment"
-                      :route-crawl-efficiency-plan="capabilityRouteCrawlEfficiencyPlan"
-                      @open-row="(evt) => timelinePanelRef.value?.openPhaseDialog(evt)"
-                    />
-                  </el-tab-pane>
-                  <el-tab-pane label="计划 / 工作流" name="plan">
+                <CapabilityOverviewPane
+                  v-model:trace-filter="capabilityTraceFilter"
+                  v-model:trace-search-query="capabilityTraceSearchQuery"
+                  :trace-rows="capabilityTraceRows"
+                  :filtered-trace-rows="capabilityFilteredTraceRows"
+                  :trace-summary="capabilityTraceSummary"
+                  :trace-health="capabilityTraceHealth"
+                  :runtime-preflight="capabilityRuntimePreflight"
+                  :runtime-preflight-class="capabilityRuntimePreflightClass"
+                  :runtime-preflight-label="capabilityRuntimePreflightLabel"
+                  :browser-runtime="browserRuntime"
+                  :browser-runtime-class="browserRuntimeStatusClass"
+                  :browser-runtime-label="browserRuntimeLabel"
+                  :backend-summary="browserRuntimeBackendSummary"
+                  :capacity="browserRuntimeCapacity"
+                  :health-label="browserRuntimeHealthLabel"
+                  :health-cache-label="browserRuntimeHealthCacheLabel"
+                  :has-execute-event="Boolean(latestCapabilityExecute)"
+                  :execute-event="latestCapabilityExecute"
+                  :execution-alignment="capabilityExecutionAlignment"
+                  :route-crawl-efficiency-plan="capabilityRouteCrawlEfficiencyPlan"
+                  @open-row="(evt) => timelinePanelRef.value?.openPhaseDialog(evt)"
+                />
+                <el-collapse class="capability-fold">
+                  <el-collapse-item title="计划 / 工作流" name="plan">
                     <CapabilityPlanPane
                       :plan-steps="capabilityExecutionPlanSteps"
                       :workflow-graph="capabilityWorkflowGraph"
@@ -3550,14 +3412,14 @@ const settingsSummaryText = computed(() => {
                       :action-ref-schema="capabilityActionRefSchema"
                       :backend-plan="capabilityBackendPlan"
                     />
-                  </el-tab-pane>
-                  <el-tab-pane label="回放与 Fixture" name="replay">
+                  </el-collapse-item>
+                  <el-collapse-item title="回放与 Fixture" name="replay">
                     <CapabilityReplayPane
                       v-bind="capabilityReplayPaneProps"
                       @copy-batch-summary="copyCapabilityFailureFixtureBatchReplaySummary"
                     />
-                  </el-tab-pane>
-                  <el-tab-pane label="诊断" name="diagnostics">
+                  </el-collapse-item>
+                  <el-collapse-item title="诊断" name="diagnostics">
                     <CapabilityDiagnosticsPane
                       :manifest-summary="capabilityManifestSummary"
                       :fallback-chain="capabilityFallbackChain"
@@ -3565,22 +3427,11 @@ const settingsSummaryText = computed(() => {
                       :audit-findings="capabilityAuditFindings"
                       :raw-json="capabilityTraceJson || capabilityExecuteJson"
                     />
-                  </el-tab-pane>
-                </el-tabs>
+                  </el-collapse-item>
+                </el-collapse>
               </div>
               <div v-else class="capability-skeleton">
-                <div class="skeleton-capability-hero">
-                  <div class="skeleton-line skeleton-line--title" />
-                  <div class="skeleton-line skeleton-line--short" />
-                </div>
-                <div class="skeleton-capability-strip">
-                  <span class="skeleton-pill" /><span class="skeleton-pill" /><span class="skeleton-pill" />
-                </div>
-                <div class="skeleton-capability-cards">
-                  <div class="skeleton-card"><div class="skeleton-line" /><div class="skeleton-line skeleton-line--medium" /></div>
-                  <div class="skeleton-card"><div class="skeleton-line" /><div class="skeleton-line skeleton-line--short" /></div>
-                </div>
-                <p class="skeleton-hint">启动任务后显示能力链与执行遥测</p>
+                <p class="skeleton-hint">启动任务后显示能力追踪</p>
               </div>
             </el-scrollbar>
           </el-tab-pane>
@@ -3606,36 +3457,26 @@ const settingsSummaryText = computed(() => {
                 <span>产物</span>
               </el-badge>
             </template>
-            <div class="artifact-toolbar">
-              <el-button size="small" plain :icon="Refresh" @click="fetchArtifacts">
-                刷新
-              </el-button>
-            </div>
             <el-table
               :data="artifactList"
-              height="190"
+              height="220"
               class="artifact-table"
               header-cell-class-name="dark-table-header"
               empty-text="暂无产物"
             >
               <el-table-column prop="name" label="文件" show-overflow-tooltip />
-              <el-table-column prop="size_kb" label="大小 KB" width="84" />
-              <el-table-column prop="created_at" label="创建时间" width="168" />
-              <el-table-column label="操作" width="92">
+              <el-table-column prop="size_kb" label="KB" width="64" />
+              <el-table-column label="" width="72">
+                <template #header>
+                  <el-button text size="small" :icon="Refresh" @click="fetchArtifacts" />
+                </template>
                 <template #default="scope">
-                  <a
-                    :href="`${API_BASE}${scope.row.url}`"
-                    download
-                    class="download-link"
-                  >
-                    下载
-                  </a>
+                  <a :href="`${API_BASE}${scope.row.url}`" download class="download-link">下载</a>
                 </template>
               </el-table-column>
             </el-table>
           </el-tab-pane>
 
-          <!-- K3: Failed runs drawer — post-mortem list with HTML log jump -->
           <el-tab-pane name="runs">
             <template #label>
               <el-badge :is-dot="hasNewRuns" class="artifact-badge">
@@ -3643,21 +3484,23 @@ const settingsSummaryText = computed(() => {
               </el-badge>
             </template>
             <RunRegistryPanel
+              v-show="runsSubView === 'all'"
               :refresh-token="runHistoryRefreshToken"
               @loaded="() => { if (activeBottomTab === 'runs') hasNewRuns = false }"
               @open-detail="hasNewRuns = false"
-            />
-          </el-tab-pane>
-
-          <el-tab-pane name="failed">
-            <template #label>
-              <el-badge :is-dot="hasNewFailures" class="artifact-badge">
-                <span>失败记录</span>
-              </el-badge>
-            </template>
+            >
+              <template #toolbar-extra>
+                <el-segmented v-model="runsSubView" :options="[{label:'全部',value:'all'},{label:'失败',value:'failed'}]" size="small" />
+              </template>
+            </RunRegistryPanel>
             <FailedRunsPane
+              v-show="runsSubView === 'failed'"
               ref="failedRunsPaneRef"
-            />
+            >
+              <template #toolbar-extra>
+                <el-segmented v-model="runsSubView" :options="[{label:'全部',value:'all'},{label:'失败',value:'failed'}]" size="small" />
+              </template>
+            </FailedRunsPane>
           </el-tab-pane>
         </el-tabs>
       </div>
@@ -3752,31 +3595,20 @@ const settingsSummaryText = computed(() => {
   flex-direction: column;
 }
 
-.brand-header {
+.brand-row {
   display: flex;
-  gap: 14px;
   align-items: center;
-  padding: 22px 22px 16px;
-  border-bottom: 1px solid var(--vsp-border);
+  gap: 10px;
+  margin-bottom: 8px;
 }
 
-.brand-mark {
-  display: grid;
-  width: 42px;
-  height: 42px;
-  place-items: center;
-  border-radius: 8px;
-  color: var(--vsp-accent);
-  background: var(--vsp-bg);
-  border: 1px solid rgb(var(--rgb-accent) / 0.28);
+.brand-text {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--vsp-text-1);
 }
 
-.brand-icon {
-  width: 22px;
-  height: 22px;
-}
-
-.brand-header h1,
 .panel-title h2 {
   margin: 0;
   font-size: 18px;
@@ -3784,7 +3616,6 @@ const settingsSummaryText = computed(() => {
   letter-spacing: 0;
 }
 
-.brand-header p,
 .panel-title p {
   margin: 4px 0 0;
   color: var(--vsp-text-faint);
@@ -3795,7 +3626,7 @@ const settingsSummaryText = computed(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 18px 22px 20px;
+  padding: 14px 18px 16px;
 }
 
 .field-group {
@@ -3803,6 +3634,89 @@ const settingsSummaryText = computed(() => {
   flex-direction: column;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.prompt-input-wrap {
+  position: relative;
+}
+
+/* (brand-header removed — now uses .brand-row + .brand-text) */
+
+.url-field-collapsible {
+  margin-bottom: 8px;
+}
+
+/* (prompt-label-row removed — url-toggle moved to brand-row) */
+
+.url-toggle {
+  font-size: 12px;
+  color: var(--vsp-accent);
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px dashed rgb(var(--rgb-accent) / 0.3);
+  transition: background 0.15s;
+}
+
+.url-toggle:hover {
+  background: rgb(var(--rgb-accent) / 0.08);
+}
+
+.output-contract-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0 8px;
+  font-size: 12px;
+}
+
+.output-contract-inline__loading {
+  color: var(--vsp-text-faint);
+  font-size: 12px;
+}
+
+.output-contract-inline__arrow {
+  color: var(--vsp-text-faint);
+}
+
+.action-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px 0 4px;
+}
+
+.action-bar .output-contract-inline {
+  padding: 0;
+}
+
+.action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.action-buttons .run-button {
+  flex: 1;
+}
+
+.settings-toggle {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 1px solid var(--vsp-border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--vsp-text-faint);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  font-size: 18px;
+}
+
+.settings-toggle:hover {
+  color: var(--vsp-accent);
+  border-color: rgb(var(--rgb-accent) / 0.4);
 }
 
 .field-group label,
@@ -3836,16 +3750,51 @@ const settingsSummaryText = computed(() => {
   background: rgb(var(--rgb-accent) / 0.035);
 }
 
-.model-popover {
+.proxy-auth-row {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  margin-top: 4px;
 }
 
-.model-popover label {
+.constraint-inline-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 13px;
   color: var(--vsp-text-label);
+}
+
+:deep(.model-advanced-fold .el-collapse-item__header) {
+  font-size: 12px;
+  height: 28px;
+  color: var(--vsp-text-2);
+}
+
+:deep(.model-advanced-fold .el-collapse-item__content) {
+  padding-bottom: 4px;
+}
+
+.model-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.model-section > label {
   font-size: 12px;
   font-weight: 600;
+  color: var(--vsp-text-label);
+}
+
+.model-connect-row {
+  display: flex;
+  gap: 6px;
+}
+
+.model-connect-row .el-input {
+  flex: 1;
 }
 
 .model-warning {
@@ -4016,6 +3965,11 @@ const settingsSummaryText = computed(() => {
   padding-bottom: 10px;
 }
 
+.panel-title--compact {
+  padding: 6px 18px 4px;
+  justify-content: flex-end;
+}
+
 .live-indicator,
 .status-pill {
   display: inline-flex;
@@ -4111,138 +4065,20 @@ const settingsSummaryText = computed(() => {
   font-size: 14px;
 }
 
-/* ── Skeleton screen shared ────────────────────────────────────────── */
-@keyframes skeleton-shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
-}
-
-.skeleton-line {
-  height: 12px;
-  border-radius: 6px;
-  background: linear-gradient(90deg, rgb(var(--rgb-slate) / 0.12) 25%, rgb(var(--rgb-slate) / 0.24) 50%, rgb(var(--rgb-slate) / 0.12) 75%);
-  background-size: 200% 100%;
-  animation: skeleton-shimmer 1.8s ease-in-out infinite;
-}
-
-.skeleton-line--title {
-  width: 60%;
-  height: 16px;
-}
-
-.skeleton-line--short {
-  width: 35%;
-}
-
-.skeleton-line--medium {
-  width: 80%;
-}
-
-.skeleton-pill {
-  display: inline-block;
-  width: 64px;
-  height: 22px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, rgb(var(--rgb-slate) / 0.1) 25%, rgb(var(--rgb-slate) / 0.2) 50%, rgb(var(--rgb-slate) / 0.1) 75%);
-  background-size: 200% 100%;
-  animation: skeleton-shimmer 1.8s ease-in-out infinite;
-}
-
+/* ── Skeleton placeholders ─────────────────────────────────────────── */
 .skeleton-hint {
-  margin: 12px 0 0;
+  margin: 0;
   color: var(--vsp-text-dim-alt);
   font-size: 12.5px;
   text-align: center;
-  opacity: 0.7;
+  opacity: 0.6;
 }
 
-/* ── Preview skeleton ──────────────────────────────────────────────── */
-.skeleton-preview {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  width: 70%;
-  max-width: 360px;
-}
-
-.skeleton-browser-bar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 10px;
-  border-radius: 8px 8px 0 0;
-  background: rgb(var(--rgb-slate) / 0.08);
-  border: 1px solid rgb(var(--rgb-slate) / 0.12);
-}
-
-.skeleton-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: rgb(var(--rgb-slate) / 0.18);
-}
-
-.skeleton-url-bar {
-  flex: 1;
-  height: 10px;
-  margin-left: 6px;
-  border-radius: 5px;
-  background: linear-gradient(90deg, rgb(var(--rgb-slate) / 0.1) 25%, rgb(var(--rgb-slate) / 0.2) 50%, rgb(var(--rgb-slate) / 0.1) 75%);
-  background-size: 200% 100%;
-  animation: skeleton-shimmer 1.8s ease-in-out infinite;
-}
-
-.skeleton-content {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px 14px;
-  border-radius: 0 0 8px 8px;
-  background: rgb(var(--rgb-slate) / 0.04);
-  border: 1px solid rgb(var(--rgb-slate) / 0.1);
-  border-top: none;
-}
-
-/* ── Capability skeleton ───────────────────────────────────────────── */
 .capability-skeleton {
   display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 18px 16px;
-}
-
-.skeleton-capability-hero {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 14px;
-  border-radius: 10px;
-  background: rgb(var(--rgb-indigo) / 0.06);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.12);
-}
-
-.skeleton-capability-strip {
-  display: flex;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: rgb(var(--rgb-ink) / 0.42);
-}
-
-.skeleton-capability-cards {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-
-.skeleton-card {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px;
-  border-radius: 8px;
-  background: rgb(var(--rgb-ink) / 0.42);
-  border: 1px solid rgb(var(--rgb-slate) / 0.1);
+  align-items: center;
+  justify-content: center;
+  padding: 32px 16px;
 }
 
 .hitl-overlay {
@@ -4277,57 +4113,34 @@ const settingsSummaryText = computed(() => {
 }
 
 .hitl-copy {
-  margin-bottom: 18px;
+  margin-bottom: 14px;
   color: var(--vsp-danger-pale);
-  font-size: 15px;
-  line-height: 1.7;
+  font-size: 14px;
 }
 
 .hitl-reason {
-  margin: 0 auto 22px;
-  padding: 10px 12px;
+  margin: 0 auto 14px;
+  padding: 8px 10px;
   color: var(--vsp-danger-soft);
   background: rgb(var(--rgb-black) / 0.24);
-  border: 1px solid rgb(var(--rgb-danger-soft) / 0.24);
-  border-radius: 8px;
-  font-size: 13px;
-}
-
-.hitl-screenshot-wrap {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  margin: 0 auto 16px;
-  max-width: 100%;
+  border-radius: 6px;
+  font-size: 12px;
 }
 
 .hitl-screenshot {
-  max-width: 280px;
-  max-height: 160px;
-  border-radius: 8px;
-  border: 2px solid rgb(var(--rgb-white) / 0.2);
+  max-width: 240px;
+  max-height: 140px;
+  margin: 0 auto 12px;
+  border-radius: 6px;
+  border: 1px solid rgb(var(--rgb-white) / 0.2);
   object-fit: contain;
   cursor: pointer;
-  transition: max-width 0.3s ease, max-height 0.3s ease, border-color 0.2s;
-}
-
-.hitl-screenshot:hover {
-  border-color: rgb(var(--rgb-white) / 0.45);
+  transition: max-width 0.3s, max-height 0.3s;
 }
 
 .hitl-screenshot.is-expanded {
-  max-width: 520px;
-  max-height: 380px;
-}
-
-.hitl-screenshot-hint {
-  color: rgb(var(--rgb-white) / 0.5);
-  font-size: 11px;
-}
-
-.resume-button {
-  box-shadow: 0 0 24px rgb(var(--rgb-success) / 0.38);
+  max-width: 480px;
+  max-height: 360px;
 }
 
 
@@ -4428,14 +4241,6 @@ const settingsSummaryText = computed(() => {
 @keyframes tab-fade-in {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
-}
-
-.artifact-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-bottom: 8px;
 }
 
 .artifact-badge {
@@ -4636,18 +4441,16 @@ const settingsSummaryText = computed(() => {
     min-height: 720px;
   }
 }
-/* A: Capability 二级子页签 */
-:deep(.capability-sub-tabs .el-tabs__header) {
-  margin: 0 0 10px;
-}
-
-:deep(.capability-sub-tabs .el-tabs__nav-wrap::after) {
-  height: 1px;
-  background: var(--vsp-border);
-}
-
-:deep(.capability-sub-tabs .el-tabs__item) {
+/* A: Capability fold */
+:deep(.capability-fold .el-collapse-item__header) {
   font-size: 13px;
+  padding: 0 4px;
+  height: 32px;
+  color: var(--vsp-text-2);
+}
+
+:deep(.capability-fold .el-collapse-item__content) {
+  padding-bottom: 8px;
 }
 
 /* C: 折叠标题回显当前选择 */

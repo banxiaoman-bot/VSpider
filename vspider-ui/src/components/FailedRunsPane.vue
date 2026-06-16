@@ -141,9 +141,11 @@ defineExpose({ fetchFailedRuns, failedRunsList, goToPrevFailedRun, goToNextFaile
 
 <template>
   <div>
-    <div class="artifact-toolbar">
+    <div class="artifact-toolbar" style="display:flex;align-items:center;gap:8px">
       <el-button size="small" plain :icon="Refresh" :loading="failedRunsLoading" @click="fetchFailedRuns">刷新</el-button>
-      <span class="failed-runs-count">{{ failedRunsList.length }} 条记录</span>
+      <span class="failed-runs-count">{{ failedRunsList.length }} 条</span>
+      <span style="flex:1" />
+      <slot name="toolbar-extra" />
     </div>
     <el-table :data="failedRunsList" height="190" class="artifact-table failed-runs-table failed-runs-clickable" header-cell-class-name="dark-table-header" empty-text="目前还没有失败记录 🎉" @row-click="openFailedRunDetail">
       <el-table-column label="时间" width="138">
