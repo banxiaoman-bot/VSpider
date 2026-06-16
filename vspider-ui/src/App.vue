@@ -142,6 +142,7 @@ const hitlFormScreenshot = ref('')
 const hitlFormLoading = ref(false)
 const hitlScreenshot = ref('')
 const hitlScreenshotExpanded = ref(false)
+const pipExpanded = ref(false)
 const activeBottomTab = ref('terminal')
 const runsSubView = ref('all')
 // B: Timeline 筛选 chips 默认收起，点「筛选」按钮展开
@@ -3000,7 +3001,6 @@ const forceStop = async () => {
 }
 
 onMounted(() => {
-  document.documentElement.classList.add('dark')
   loadModelSettings()
   registerBuiltinCommands(slashRegistry, {
     selectedModel,
@@ -3276,22 +3276,21 @@ const handleCapabilityMoreAction = (command) => {
     </section>
 
     <section class="monitor-panel">
-      <div class="preview-panel vspider-panel">
-        <div class="panel-title panel-title--compact">
-          <span class="live-indicator" :class="`ws-${wsStatus}`">
+      <div class="pip-preview" :class="{ 'pip-preview--expanded': pipExpanded, 'pip-preview--has-image': !!currentImageBase64, 'pip-preview--hitl': isHumanInterventionRequired }">
+        <div class="pip-header" @click="pipExpanded = !pipExpanded">
+          <span class="live-indicator live-indicator--pip" :class="`ws-${wsStatus}`">
             <i />
             {{ wsStatus === 'connected' ? 'LIVE' : wsStatus === 'connecting' ? '...' : 'OFF' }}
           </span>
+          <span class="pip-toggle">{{ pipExpanded ? '收起' : '展开' }}</span>
         </div>
-        <div class="preview-stage">
+        <div v-show="pipExpanded" class="pip-stage">
           <img
             v-if="currentImageBase64"
             :src="currentImageBase64"
             alt="实时画面"
           />
-          <div v-else class="preview-placeholder">
-            <p class="skeleton-hint">等待首帧画面</p>
-          </div>
+          <div v-else class="pip-placeholder">等待首帧</div>
           <div v-if="isHumanInterventionRequired" class="hitl-overlay">
             <div class="hitl-card">
               <div class="hitl-title">{{ isBotChallengeHitl ? '人机验证' : '需要人工介入' }}</div>
@@ -3313,7 +3312,7 @@ const handleCapabilityMoreAction = (command) => {
         </div>
       </div>
 
-      <div class="terminal-panel vspider-panel">
+      <div class="terminal-panel vspider-panel terminal-panel--full">
         <el-tabs
           v-model="activeBottomTab"
           class="bottom-tabs"
@@ -3547,14 +3546,12 @@ const handleCapabilityMoreAction = (command) => {
 .app-shell {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(360px, 35%) minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns: minmax(300px, 30%) minmax(0, 1fr);
+  gap: 12px;
   height: 100vh;
   overflow: hidden;
-  padding: 22px;
-  background:
-    linear-gradient(180deg, rgb(var(--rgb-info) / 0.08), transparent 32%),
-    var(--vsp-bg);
+  padding: 12px;
+  background: var(--vsp-bg);
   color: var(--vsp-text);
 }
 
@@ -3563,7 +3560,7 @@ const handleCapabilityMoreAction = (command) => {
   top: 0;
   left: 0;
   right: 0;
-  height: 3px;
+  height: 2px;
   z-index: 100;
   background: linear-gradient(90deg, transparent, var(--vsp-accent), transparent);
   background-size: 300% 100%;
@@ -3578,14 +3575,12 @@ const handleCapabilityMoreAction = (command) => {
 .vspider-panel {
   background: var(--vsp-surface);
   border: 1px solid var(--vsp-border);
-  border-radius: 8px;
-  box-shadow: 0 8px 22px rgb(var(--rgb-black) / 0.18);
+  border-radius: 10px;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.06), 0 1px 2px rgb(0 0 0 / 0.04);
 }
 
 /* D: 主次层级 — 主画面保留重投影，其余面板轻量化 */
-.preview-panel.vspider-panel {
-  box-shadow: 0 18px 42px rgb(var(--rgb-black) / 0.32);
-}
+/* (preview-panel removed — now uses .pip-preview) */
 
 .control-panel {
   display: flex;
@@ -3939,18 +3934,81 @@ const handleCapabilityMoreAction = (command) => {
 }
 
 .monitor-panel {
-  display: grid;
+  position: relative;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
-  grid-template-rows: minmax(0, 2fr) minmax(180px, 1fr);
-  gap: 18px;
 }
 
-.preview-panel,
 .terminal-panel {
   display: flex;
   min-height: 0;
+  flex: 1;
   flex-direction: column;
   overflow: hidden;
+}
+
+.terminal-panel--full {
+  height: 100%;
+}
+
+/* PIP floating preview */
+.pip-preview {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 50;
+  width: 200px;
+  border-radius: 8px;
+  background: var(--vsp-surface-2);
+  border: 1px solid var(--vsp-border);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.3);
+  overflow: hidden;
+  transition: width 0.25s ease;
+}
+
+.pip-preview--expanded {
+  width: 360px;
+}
+
+.pip-preview--hitl {
+  width: 360px;
+}
+
+.pip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  cursor: pointer;
+  background: rgb(0 0 0 / 0.2);
+  font-size: 11px;
+}
+
+.pip-toggle {
+  color: var(--vsp-text-2);
+  font-size: 11px;
+}
+
+.pip-stage {
+  position: relative;
+}
+
+.pip-stage img {
+  width: 100%;
+  display: block;
+}
+
+.pip-placeholder {
+  padding: 12px;
+  text-align: center;
+  color: var(--vsp-text-dim-alt);
+  font-size: 11px;
+}
+
+.live-indicator--pip {
+  font-size: 10px;
+  gap: 4px;
 }
 
 .panel-title {
@@ -3963,11 +4021,6 @@ const handleCapabilityMoreAction = (command) => {
 
 .panel-title.compact {
   padding-bottom: 10px;
-}
-
-.panel-title--compact {
-  padding: 6px 18px 4px;
-  justify-content: flex-end;
 }
 
 .live-indicator,
@@ -4031,39 +4084,7 @@ const handleCapabilityMoreAction = (command) => {
   border-color: rgb(var(--rgb-rose) / 0.24);
 }
 
-.preview-stage {
-  display: grid;
-  min-height: 0;
-  flex: 1;
-  margin: 0 18px 18px;
-  overflow: hidden;
-  place-items: center;
-  border-radius: 8px;
-  background: var(--vsp-surface-2);
-  border: 1px solid var(--vsp-border);
-  position: relative;
-}
-
-.preview-stage img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  animation: fade-scale-in 0.3s ease-out;
-}
-
-@keyframes fade-scale-in {
-  from { opacity: 0; transform: scale(0.97); }
-  to { opacity: 1; transform: scale(1); }
-}
-
-.preview-placeholder {
-  display: grid;
-  width: 100%;
-  height: 100%;
-  place-items: center;
-  color: var(--vsp-text-dim-alt);
-  font-size: 14px;
-}
+/* (preview-stage / preview-placeholder removed — now uses .pip-*) */
 
 /* ── Skeleton placeholders ─────────────────────────────────────────── */
 .skeleton-hint {
@@ -4295,8 +4316,8 @@ const handleCapabilityMoreAction = (command) => {
 }
 
 :deep(.artifact-table .dark-table-header) {
-  background: var(--vsp-slate-800) !important;
-  color: var(--vsp-text-strong);
+  background: var(--vsp-bg) !important;
+  color: var(--vsp-text-label);
 }
 
 .download-link {

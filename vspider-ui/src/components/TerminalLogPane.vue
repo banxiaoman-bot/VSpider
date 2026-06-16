@@ -9,6 +9,9 @@ const props = defineProps({
 })
 
 const terminalRef = ref(null)
+const logFilter = ref('all')
+const autoScroll = ref(true)
+const userScrolled = ref(false)
 const terminalSearchVisible = ref(false)
 const terminalSearchQuery = ref('')
 const terminalSearchCurrent = ref(0)
@@ -29,6 +32,31 @@ function logLineClass(line) {
   if (head.startsWith('[SYSTEM')) return 'log-line--system'
   if (head.startsWith('[AUTH')) return 'log-line--system'
   return ''
+}
+
+const filteredLogs = computed(() => {
+  if (logFilter.value === 'all') return props.logs
+  return props.logs.filter(line => {
+    const cls = logLineClass(line)
+    if (logFilter.value === 'error') return cls === 'log-line--error'
+    if (logFilter.value === 'warn') return cls === 'log-line--warn' || cls === 'log-line--error'
+    return true
+  })
+})
+
+const errorCount = computed(() => props.logs.filter(l => logLineClass(l) === 'log-line--error').length)
+const warnCount = computed(() => props.logs.filter(l => logLineClass(l) === 'log-line--warn').length)
+
+function copyLine (line) {
+  navigator.clipboard?.writeText(String(line || ''))
+}
+
+function handleScroll () {
+  const el = terminalRef.value?.wrapRef || terminalRef.value
+  if (!el) return
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30
+  autoScroll.value = atBottom
+  userScrolled.value = !atBottom
 }
 
 const _escapeRegex = (s) =>
@@ -141,7 +169,8 @@ watch(() => props.logs, () => {
   }
 })
 
-const scrollToBottom = async () => {
+const scrollToBottom = async (force = false) => {
+  if (!force && !autoScroll.value) return
   await nextTick()
   const el = terminalRef.value
   if (!el) return
@@ -151,6 +180,12 @@ const scrollToBottom = async () => {
   }
   const wrap = el.wrapRef || el
   if (wrap) wrap.scrollTop = wrap.scrollHeight
+}
+
+const jumpToBottom = () => {
+  autoScroll.value = true
+  userScrolled.value = false
+  scrollToBottom(true)
 }
 
 defineExpose({
@@ -167,8 +202,17 @@ defineExpose({
   <div class="terminal-log-pane">
     <div class="terminal-heading">
       <span class="status-pill" :class="wsStatus">
-        {{ isRunning ? 'RUNNING' : 'IDLE' }} · {{ wsStatus }}
+        {{ isRunning ? 'RUNNING' : 'IDLE' }}
       </span>
+      <div class="log-filter-chips">
+        <button :class="{ active: logFilter === 'all' }" @click="logFilter = 'all'">全部</button>
+        <button :class="{ active: logFilter === 'error', 'has-count': errorCount > 0 }" @click="logFilter = 'error'">
+          ERROR<span v-if="errorCount" class="chip-count">{{ errorCount }}</span>
+        </button>
+        <button :class="{ active: logFilter === 'warn', 'has-count': warnCount > 0 }" @click="logFilter = 'warn'">
+          WARN<span v-if="warnCount" class="chip-count">{{ warnCount }}</span>
+        </button>
+      </div>
       <div class="terminal-heading-spacer" />
       <div v-if="terminalSearchVisible" class="terminal-search-bar">
         <el-input
@@ -218,18 +262,19 @@ defineExpose({
         @click="openTerminalSearch"
       >搜索</el-button>
     </div>
-    <el-scrollbar ref="terminalRef" class="terminal-scroll">
+    <el-scrollbar ref="terminalRef" class="terminal-scroll" @scroll="handleScroll">
       <p v-if="logsTrimmedCount > 0" class="log-line log-line--system">
-        [SYSTEM] 已裁剪最早 {{ logsTrimmedCount }} 行（完整日志见后端 event_stream.jsonl）
+        [SYSTEM] 已裁剪最早 {{ logsTrimmedCount }} 行
       </p>
-      <template v-if="logs.length">
+      <template v-if="filteredLogs.length">
         <p
-          v-for="(line, idx) in logs"
+          v-for="(line, idx) in filteredLogs"
           :key="idx"
           class="log-line"
           :class="logLineClass(line)"
+          @dblclick="copyLine(line)"
         >
-          <template v-if="terminalSearchSegments.get(idx)">
+          <template v-if="logFilter === 'all' && terminalSearchSegments.get(idx)">
             <span
               v-for="(seg, sidx) in terminalSearchSegments.get(idx)"
               :key="`${idx}-${sidx}`"
@@ -242,8 +287,13 @@ defineExpose({
           <template v-else>{{ line }}</template>
         </p>
       </template>
-      <p v-else class="empty-log">等待日志流...</p>
+      <p v-else class="empty-log">{{ logFilter !== 'all' ? '无匹配日志' : '等待日志流...' }}</p>
     </el-scrollbar>
+    <transition name="scroll-fade">
+      <button v-if="userScrolled" class="scroll-to-bottom" @click="jumpToBottom">
+        ↓ 新日志
+      </button>
+    </transition>
   </div>
 </template>
 
