@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 
 from visual_web_agent.main import run_agent
+from visual_web_agent.extraction_engine.runtime import ExtractRuntime
 from visual_web_agent.virtual_scroll import (
     VIRTUAL_LIST_ROWS_JS,
     VIRTUAL_LIST_SIGNATURE_JS,
@@ -458,7 +459,8 @@ class TestFieldMapping:
 
 class TestMainWiring:
     def test_dedup_nudge_falls_back_to_virtual_scroll(self) -> None:
-        src = inspect.getsource(run_agent)
+        # S1d: _nudge_scroll_after_duplicate_extract moved to ExtractRuntime.
+        src = inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
         assert "nudge_virtual_scroll(_scroll_page" in src, (
             "the dedup nudge no longer falls back to the virtual-scroll path"
         )

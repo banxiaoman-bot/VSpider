@@ -107,6 +107,12 @@ def _mk_runtime(
     requested_output_fields=None,
     data_controller=None,
     state=None,
+    event_stream=None,
+    run_ts="",
+    snapshot_goal="",
+    goal_output_contract=None,
+    vlm_output="",
+    enable_xhr=False,
 ):
     deps = ExtractDeps(
         browser=browser if browser is not None else _StubBrowser(_StubFrame()),
@@ -116,6 +122,12 @@ def _mk_runtime(
         goal_output_mode=goal_output_mode,
         requested_output_fields=[] if requested_output_fields is None else requested_output_fields,
         data_controller=data_controller,
+        event_stream=event_stream,
+        run_ts=run_ts,
+        snapshot_goal=snapshot_goal,
+        goal_output_contract=goal_output_contract,
+        vlm_output=vlm_output,
+        enable_xhr=enable_xhr,
     )
     return ExtractRuntime(deps, state if state is not None else ExtractState())
 
@@ -364,3 +376,91 @@ def test_sanitize_extraction_candidate_returns_scored_candidate():
     assert isinstance(candidate["score"], float)
     assert candidate["data_signature"] == "sig"
     assert "rows" in candidate
+
+
+# ── S1d: ExtractRuntime fast-path / finalizer-adjacent methods ─────────
+
+
+def test_compact_link_match_text_strips_nonalnum():
+    rt = _mk_runtime()
+    assert rt.compact_link_match_text("Hello, World!") == "helloworld"
+
+
+def test_row_primary_link_text_prefers_title_field():
+    rt = _mk_runtime()
+    row = {"title": "Breaking News Headline", "score": "123"}
+    assert rt.row_primary_link_text(row) == "Breaking News Headline"
+
+
+def test_capture_body_text_excerpt_truncates():
+    rt = _mk_runtime(browser=_StubBrowser(_StubFrame(eval_result="HELLO WORLD")))
+    assert asyncio.run(rt.capture_body_text_excerpt(limit=5)) == "HELLO"
+
+
+def test_inspect_click_nav_guard_non_click_returns_empty():
+    rt = _mk_runtime()
+    out = asyncio.run(rt.inspect_click_target_for_extract_nav_guard({"action": "type"}))
+    assert out == {}
+
+
+def test_inspect_click_nav_guard_no_target_id_returns_text():
+    rt = _mk_runtime()
+    out = asyncio.run(
+        rt.inspect_click_target_for_extract_nav_guard(
+            {"action": "click", "target_id": 0, "type_value": "Submit"}
+        )
+    )
+    assert out == {"text": "Submit", "action": "click"}
+
+
+def test_extract_body_text_for_semantic_cards_no_fields_returns_empty():
+    rt = _mk_runtime(requested_output_fields=[])
+    assert asyncio.run(rt.extract_body_text_for_semantic_cards("t")) == ""
+
+
+def test_extract_body_text_for_semantic_cards_with_fields():
+    rt = _mk_runtime(
+        requested_output_fields=["title"],
+        browser=_StubBrowser(_StubFrame(eval_result="card body text")),
+    )
+    assert asyncio.run(rt.extract_body_text_for_semantic_cards("t")) == "card body text"
+
+
+def test_xhr_target_reached_disabled_returns_false():
+    class _Br:
+        intercepted_count = 5
+
+        async def _ensure_active_page(self, reason=""):
+            return _StubFrame()
+
+    rt = _mk_runtime(browser=_Br(), enable_xhr=False)
+    reached, count, _target = rt.xhr_target_reached()
+    assert reached is False
+    assert count == 5
+
+
+def test_xhr_saved_row_count_no_filename_returns_none():
+    class _Br:
+        _intercept_filename = ""
+
+    count, path = _mk_runtime(browser=_Br()).xhr_saved_row_count()
+    assert count is None
+    assert path == ""
+
+
+def test_enrich_rows_no_anchors_returns_normalized():
+    rt = _mk_runtime(
+        browser=_StubBrowser(_StubFrame(eval_result=[])),
+        requested_output_fields=[],
+    )
+    rows = asyncio.run(rt.enrich_rows_with_dom_links([{"title": "X", "url": "/a"}]))
+    assert rows == [{"title": "X", "url": "/a"}]
+
+
+def test_extract_compact_list_text_via_dom_returns_on_rich_list():
+    payload = {"count": 6, "text": "x" * 500}
+    rt = _mk_runtime(browser=_StubBrowser(_StubFrame(eval_result=payload)))
+    source, text, count = asyncio.run(rt.extract_compact_list_text_via_dom("t"))
+    assert source == "LIST_ITEMS_TEXT"
+    assert count == 6
+    assert len(text) == 500

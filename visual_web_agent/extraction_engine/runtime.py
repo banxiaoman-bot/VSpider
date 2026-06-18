@@ -21,6 +21,11 @@ try:  # pragma: no cover - import shim mirrors main.py
         _normalize_output_field_key,
         _parse_goal_target_count,
     )
+    from ..phases.decision_helpers import _goal_is_bulk_extraction
+    from .snapshots import maybe_save_snapshot
+    from ..data_writers import save_run_dataset
+    from ..artifact_manager import resolve_artifact_path
+    from ..virtual_scroll import nudge_virtual_scroll
 except ImportError:  # pragma: no cover
     from data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows
     from phases.goal_parser import (
@@ -28,6 +33,11 @@ except ImportError:  # pragma: no cover
         _normalize_output_field_key,
         _parse_goal_target_count,
     )
+    from phases.decision_helpers import _goal_is_bulk_extraction
+    from extraction_engine.snapshots import maybe_save_snapshot
+    from data_writers import save_run_dataset
+    from artifact_manager import resolve_artifact_path
+    from virtual_scroll import nudge_virtual_scroll
 import re
 
 
@@ -80,6 +90,12 @@ class ExtractDeps:
     goal_output_mode: str
     requested_output_fields: Any
     data_controller: Any
+    event_stream: Any = None
+    run_ts: str = ""
+    snapshot_goal: str = ""
+    goal_output_contract: Any = None
+    vlm_output: str = ""
+    enable_xhr: bool = False
 
 
 class ExtractRuntime:
@@ -1256,3 +1272,631 @@ class ExtractRuntime:
     def is_probable_url(self, value: object) -> bool:
         text = str(value or "").strip()
         return bool(re.match(r"^https?://", text, flags=re.IGNORECASE))
+
+    async def capture_body_text_excerpt(self, limit: int = 3000) -> str:
+        try:
+            page = await self.deps.browser._ensure_active_page(reason="extraction snapshot body text")
+            if not page:
+                return ""
+            text = await page.evaluate(
+                """() => String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim()"""
+            )
+            return str(text or "")[:limit]
+        except Exception as exc:
+            self.deps.logger.debug("[EXTRACTION SNAPSHOT] body text capture skipped: %s", exc)
+            return ""
+
+    async def save_extraction_snapshot(self, 
+        *,
+        step: int = 0,
+        source: str,
+        rows: list,
+        output_file: str,
+        accepted_rows: int,
+        duplicate_rows: int = 0,
+        rejected_rows: int = 0,
+        candidates: list[dict] | None = None,
+        data_shape: dict | None = None,
+        source_text: str = "",
+        metadata: dict | None = None,
+    ) -> str:
+        try:
+            snapshot_path = maybe_save_snapshot(
+                url=getattr(self.deps.browser, "current_url", "") or "",
+                goal=self.deps.snapshot_goal,
+                source=source,
+                rows=rows,
+                requested_fields=self.deps.requested_output_fields,
+                output_file=output_file,
+                run_id=self.deps.run_ts,
+                step=step,
+                total_rows=self.state.total_extracted_rows,
+                accepted_rows=accepted_rows,
+                duplicate_rows=duplicate_rows,
+                rejected_rows=rejected_rows,
+                candidates=candidates or [],
+                data_shape=data_shape or {},
+                source_text=source_text,
+                body_text=await self.capture_body_text_excerpt(),
+                metadata=metadata or {},
+            )
+            if not snapshot_path:
+                return ""
+            self.deps.logger.info("[EXTRACTION SNAPSHOT] saved: %s", snapshot_path)
+            self.deps.event_stream.extract(
+                step=step,
+                source=source,
+                rows=accepted_rows,
+                output_file=output_file,
+                metadata={
+                    **dict(metadata or {}),
+                    "snapshot_path": str(snapshot_path),
+                },
+            )
+            return str(snapshot_path)
+        except Exception as exc:
+            self.deps.logger.debug("[EXTRACTION SNAPSHOT] save skipped: %s", exc)
+            return ""
+
+    async def try_dom_api_fast_path(self, 
+        dom_rows: list,
+        *,
+        step: int = 0,
+        source: str,
+        dom_text: str = "",
+    ) -> dict:
+        try:
+            from visual_web_agent.content_completeness_guard import (
+                evaluate_dom_api_completeness,
+                execute_api_fast_path,
+            )
+
+            page_text = dom_text or await self.capture_body_text_excerpt(6000)
+            verdict = evaluate_dom_api_completeness(
+                dom_rows=dom_rows,
+                dom_text=page_text,
+                run_id=self.deps.run_ts,
+                goal=self.deps.goal,
+            )
+            if not verdict.get("should_fast_path"):
+                return {"applied": False, "verdict": verdict}
+
+            cookies: list = []
+            if getattr(self.deps.browser, "_context", None) is not None:
+                cookies = await self.deps.browser._context.cookies()
+            fast = execute_api_fast_path(
+                run_id=self.deps.run_ts,
+                verdict=verdict,
+                cookies=cookies,
+            )
+            if not fast.get("applied"):
+                return fast
+
+            api_rows = fast.get("rows") or []
+            if not api_rows:
+                return {"applied": False, "reason": "empty_api_rows", "verdict": verdict}
+
+            saved_path = ""
+            if self.deps.goal_output_mode != "answer":
+                saved_path = save_run_dataset(
+                    api_rows,
+                    run_id=self.deps.run_ts,
+                    output_contract=self.deps.goal_output_contract,
+                    produced_by="api_fast_path",
+                    filename_hint=self.deps.vlm_output,
+                )
+            self.record_extract_progress(api_rows, len(api_rows))
+            self.deps.logger.info(
+                "[API FAST PATH] upgraded %s via %s rows=%s saved=%s",
+                source,
+                fast.get("endpoint"),
+                len(api_rows),
+                saved_path,
+            )
+            self.deps.event_stream.guard(
+                step=step,
+                name="DOM_API_FAST_PATH",
+                message="DOM truncated or sparse; replayed richer API payload.",
+                metadata={"verdict": verdict, "fast_path": fast, "source": source},
+            )
+            try:
+                from api_server import broadcast_phase as _bp_api_fp
+
+                _bp_api_fp(
+                    "completion_guard",
+                    severity="info",
+                    message=f"api_fast_path: {fast.get('endpoint', '')[:80]}",
+                    step=step,
+                    notice_severity=getattr(self.deps.browser, "_last_notice_severity", None),
+                    extra={
+                        "guard": "dom_api_fast_path",
+                        "evaluation": {
+                            "status": "complete",
+                            "evidence": verdict.get("reasons") or [],
+                            "reasons": ["api_fast_path"],
+                        },
+                        "endpoint": fast.get("endpoint"),
+                        "row_count": len(api_rows),
+                    },
+                )
+            except Exception:
+                pass
+            return {"applied": True, "verdict": verdict, "fast_path": fast, "saved_path": saved_path}
+        except Exception as _api_fp_err:
+            self.deps.logger.debug("[API FAST PATH] skipped: %s", _api_fp_err)
+            return {"applied": False, "error": str(_api_fp_err)}
+
+    def xhr_saved_row_count(self, ) -> tuple[int | None, str]:
+        filename = str(getattr(self.deps.browser, "_intercept_filename", "") or "")
+        if not filename:
+            return None, ""
+        # The intercept saver rewrites the suffix per the run's
+        # output_contract container (jsonl/csv/xlsx), so probe all
+        # dataset suffixes instead of assuming xlsx.
+        base = resolve_artifact_path(filename)
+        candidates = [base]
+        for _suffix in (".jsonl", ".csv", ".xlsx"):
+            alt = base.with_suffix(_suffix)
+            if alt not in candidates:
+                candidates.append(alt)
+        path = next((p for p in candidates if p.exists()), base)
+        if not path.exists():
+            return None, str(path)
+        try:
+            import pandas as _pd
+
+            suffix = path.suffix.lower()
+            if suffix == ".jsonl":
+                df = _pd.read_json(path, orient="records", lines=True)
+            elif suffix == ".csv":
+                df = _pd.read_csv(path)
+            else:
+                df = _pd.read_excel(path)
+            return int(len(df.index)), str(path)
+        except Exception as exc:
+            self.deps.logger.debug("[XHR HARD KILL] saved-row count skipped: %s", exc)
+            return None, str(path)
+
+    def xhr_target_reached(self, ) -> tuple[bool, int, int | None]:
+        target = _parse_goal_target_count(self.deps.goal)
+        if not self.deps.enable_xhr or target is None or self.deps.browser.intercepted_count <= 0:
+            return False, self.deps.browser.intercepted_count, target
+        if _goal_is_tooltip_extract(self.deps.goal):
+            return False, self.deps.browser.intercepted_count, target
+        if not _goal_is_bulk_extraction(self.deps.goal):
+            return False, self.deps.browser.intercepted_count, target
+        saved_count, saved_path = self.xhr_saved_row_count()
+        effective_count = (
+            saved_count
+            if saved_count is not None
+            else int(self.deps.browser.intercepted_count or 0)
+        )
+        if saved_count is not None and saved_count != self.deps.browser.intercepted_count:
+            self.deps.logger.info(
+                "[XHR HARD KILL] using saved clean rows=%s instead of raw intercepted=%s (%s)",
+                saved_count,
+                self.deps.browser.intercepted_count,
+                saved_path,
+            )
+        return effective_count >= target, effective_count, target
+
+    def compact_link_match_text(self, value: object) -> str:
+        return re.sub(r"\W+", "", str(value or "").lower(), flags=re.UNICODE)
+
+    def row_primary_link_text(self, row: dict) -> str:
+        preferred_markers = (
+            "title", "name", "product", "item", "subject", "label",
+            "heading", "caption", "标题", "名称", "商品", "项目",
+        )
+        preferred: list[str] = []
+        fallback: list[str] = []
+        for key, value in row.items():
+            if value is None:
+                continue
+            key_norm = str(key or "").strip().lower()
+            text = re.sub(r"\s+", " ", str(value).strip())
+            if len(self.compact_link_match_text(text)) < 8:
+                continue
+            if any(marker in key_norm for marker in preferred_markers):
+                preferred.append(text)
+            elif not re.fullmatch(r"[\d\s,.:/%+\-]+", text):
+                fallback.append(text)
+        candidates = preferred or fallback
+        return max(candidates, key=lambda s: len(self.compact_link_match_text(s))) if candidates else ""
+
+    async def enrich_rows_with_dom_links(self, rows: list) -> list:
+        """Fill row URLs by matching title/name text to page anchors.
+
+        This is schema-agnostic: it enriches rows only when a stable text
+        field has an unambiguous anchor match in the current DOM.
+        """
+        rows = self.normalize_extracted_row_fields(rows, project=False)
+        if not rows or not any(isinstance(row, dict) for row in rows):
+            return rows
+        page = await self.deps.browser._ensure_active_page(reason="enrich extracted rows with links")
+        if not page:
+            return rows
+        try:
+            anchors = await page.evaluate(
+                """() => {
+                    const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const nearestText = (a) => {
+                        const direct = clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title'));
+                        const row = a.closest('article, [role="article"], [role="listitem"], li, tr, .Story, .story, .ais-Hits-item, .hit');
+                        const rowText = clean(row ? row.innerText : '');
+                        return clean([direct, rowText].filter(Boolean).join(' '));
+                    };
+                    return Array.from(document.querySelectorAll('a[href]')).map(a => ({
+                        text: nearestText(a),
+                        own_text: clean(a.innerText || a.textContent || a.getAttribute('aria-label') || a.getAttribute('title')),
+                        href: a.href || ''
+                    })).filter(x => x.text && x.href && !x.href.startsWith('javascript:'));
+                }"""
+            )
+        except Exception as exc:
+            self.deps.logger.debug("[LINK ENRICH] anchor scan skipped: %s", exc)
+            return rows
+
+        anchor_rows: list[dict] = []
+        for anchor in anchors or []:
+            text = str(anchor.get("text") or "").strip()
+            own_text = str(anchor.get("own_text") or "").strip()
+            href = str(anchor.get("href") or "").strip()
+            compact = self.compact_link_match_text(text)
+            if len(compact) >= 8 and href:
+                anchor_rows.append(
+                    {
+                        "href": href,
+                        "compact": compact,
+                        "own_compact": self.compact_link_match_text(own_text),
+                    }
+                )
+        if not anchor_rows:
+            return rows
+
+        enriched_source = 0
+        enriched_detail = 0
+        out: list = []
+        for row in rows:
+            if not isinstance(row, dict):
+                out.append(row)
+                continue
+            primary_compact = self.compact_link_match_text(self.row_primary_link_text(row))
+            if len(primary_compact) < 8:
+                out.append(row)
+                continue
+            matches = []
+            for anchor in anchor_rows:
+                a_compact = anchor["compact"]
+                if primary_compact in a_compact or a_compact in primary_compact:
+                    matches.append((min(len(primary_compact), len(a_compact)), anchor))
+            matches.sort(key=lambda item: item[0], reverse=True)
+            best_match = matches[0][1] if matches and (len(matches) == 1 or matches[0][0] > matches[1][0]) else None
+            if best_match:
+                row = dict(row)
+                href = best_match["href"]
+                role = self.classify_url_role(href)
+                if role == "detail":
+                    if not row.get("detail_url"):
+                        row["detail_url"] = href
+                        enriched_detail += 1
+                elif not row.get("source_url"):
+                    row["source_url"] = href
+                    enriched_source += 1
+                if not row.get("primary_url"):
+                    row["primary_url"] = row.get("source_url") or row.get("detail_url") or href
+                row["url"] = row.get("primary_url")
+
+            if isinstance(row, dict) and not row.get("detail_url"):
+                detail_matches = []
+                for anchor in anchor_rows:
+                    href = anchor["href"]
+                    if self.classify_url_role(href) != "detail":
+                        continue
+                    a_compact = anchor["compact"]
+                    if primary_compact in a_compact or a_compact in primary_compact:
+                        detail_matches.append((min(len(primary_compact), len(a_compact)), anchor))
+                detail_matches.sort(key=lambda item: item[0], reverse=True)
+                if detail_matches:
+                    row = dict(row)
+                    row["detail_url"] = detail_matches[0][1]["href"]
+                    enriched_detail += 1
+            out.append(row)
+        if enriched_source or enriched_detail:
+            self.deps.logger.info(
+                "[LINK ENRICH] Filled source_url=%s detail_url=%s",
+                enriched_source,
+                enriched_detail,
+            )
+        return self.normalize_extracted_row_fields(out)
+
+    async def extract_compact_list_text_via_dom(self, reason: str) -> tuple[str, str, int]:
+        """Return compact repeated-list item text when the DOM exposes clear rows."""
+        try:
+            _page_for_items = await self.deps.browser._ensure_active_page(reason=reason)
+            result = await _page_for_items.evaluate(
+                """() => {
+                    const clean = (value) => String(value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    const compact = (value) => clean(value).toLowerCase()
+                        .replace(/[^a-z0-9\\u4e00-\\u9fff]+/g, '');
+                    const isVisible = (el) => {
+                        if (!el || !(el instanceof Element)) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none'
+                            && style.visibility !== 'hidden'
+                            && rect.width > 0
+                            && rect.height > 0;
+                    };
+                    // EXTRACT-SHADOW-2: list/card components can render
+                    // inside open shadow roots (same walker as the table
+                    // harvest / form fallback).
+                    const deepQueryAll = (selector, root = document) => {
+                        const out = Array.from(root.querySelectorAll(selector));
+                        for (const host of root.querySelectorAll('*')) {
+                            if (host.shadowRoot) out.push(...deepQueryAll(selector, host.shadowRoot));
+                        }
+                        return out;
+                    };
+                    const candidates = [];
+                    const addCandidate = (el, source) => {
+                        if (!isVisible(el)) return;
+                        const text = clean(el.innerText || el.textContent);
+                        if (text.length < 20 || text.length > 1800) return;
+                        const childBlocks = Array.from(el.querySelectorAll(
+                            'article, [role="article"], [role="listitem"], li, tbody tr'
+                        )).filter(node => node !== el && isVisible(node));
+                        if (childBlocks.length >= 3 && text.length > 800) return;
+                        const links = Array.from(el.querySelectorAll('a[href]'))
+                            .filter(isVisible)
+                            .map(a => ({
+                                text: clean(a.innerText || a.textContent || a.getAttribute('aria-label')),
+                                href: a.href || ''
+                            }))
+                            .filter(a => a.href)
+                            .slice(0, 6);
+                        const key = links[0]?.href || compact(text).slice(0, 180);
+                        if (!key) return;
+                        candidates.push({source, key, text, links});
+                    };
+
+                    const directSelectors = [
+                        'article', '[role="article"]', '[role="listitem"]',
+                        '.Story', '.story', '.ais-Hits-item', '.hit',
+                        '.search-result', '.result', '.item'
+                    ];
+                    for (const el of deepQueryAll(directSelectors.join(','))) {
+                        addCandidate(el, 'selector');
+                    }
+
+                    const containerSelectors = [
+                        'main', '[role="main"]', '#content', '.content',
+                        '.list', '.item-list', '.results', '.search-results',
+                        'ol', 'ul', 'section'
+                    ];
+                    for (const root of deepQueryAll(containerSelectors.join(','))) {
+                        if (!isVisible(root)) continue;
+                        const children = Array.from(root.children || []).filter(isVisible);
+                        if (children.length < 4) continue;
+                        const buckets = new Map();
+                        for (const child of children) {
+                            const cls = clean(child.className || child.tagName).slice(0, 80);
+                            buckets.set(cls, (buckets.get(cls) || 0) + 1);
+                        }
+                        const repeat = Math.max(...Array.from(buckets.values()), 0);
+                        if (repeat < 4) continue;
+                        for (const child of children) addCandidate(child, 'container');
+                    }
+
+                    const seen = new Set();
+                    const rows = [];
+                    for (const candidate of candidates) {
+                        if (seen.has(candidate.key)) continue;
+                        seen.add(candidate.key);
+                        rows.push(candidate);
+                    }
+                    rows.sort((a, b) => {
+                        const aTop = document.body.innerText.indexOf(a.text.slice(0, 40));
+                        const bTop = document.body.innerText.indexOf(b.text.slice(0, 40));
+                        return (aTop < 0 ? 1e9 : aTop) - (bTop < 0 ? 1e9 : bTop);
+                    });
+                    const selected = rows.slice(0, 120);
+                    const lines = selected.map((row, index) => {
+                        const linkText = row.links
+                            .map(link => {
+                                const label = link.text ? `${link.text} -> ` : '';
+                                return `${label}${link.href}`;
+                            })
+                            .join(' ; ');
+                        return [
+                            `Item ${index + 1}: ${row.text}`,
+                            linkText ? `Links: ${linkText}` : ''
+                        ].filter(Boolean).join('\\n');
+                    });
+                    return {
+                        count: selected.length,
+                        text: lines.join('\\n\\n')
+                    };
+                }"""
+            )
+            if not isinstance(result, dict):
+                return "", "", 0
+            text = str(result.get("text") or "").strip()
+            count = int(result.get("count") or 0)
+            if count >= 5 and len(text) >= 400:
+                self.deps.logger.info(
+                    "[EXTRACT FULL] DOM compact list candidate: %s items, %s chars",
+                    count,
+                    len(text),
+                )
+                return "LIST_ITEMS_TEXT", text, count
+        except Exception as list_err:
+            self.deps.logger.debug("[EXTRACT FULL] compact list DOM probe skipped: %s", list_err)
+        return "", "", 0
+
+    async def extract_full_page_text_for_data(self, reason: str) -> tuple[str, str]:
+        """Return the best full-page text source for semantic extraction."""
+        list_source, list_text, list_count = await self.extract_compact_list_text_via_dom(reason)
+        if list_text and list_count >= 10:
+            self.deps.logger.info(
+                "[EXTRACT FULL] using compact DOM list text before AX/innerText "
+                "(items=%s, chars=%s)",
+                list_count,
+                len(list_text),
+            )
+            return list_source, list_text
+
+        source = "AX_TREE"
+        ax_text = await self.deps.browser.extract_page_text_via_ax_tree()
+        body_text = ""
+        try:
+            _page_for_text = await self.deps.browser._ensure_active_page(reason=reason)
+            body_text = await _page_for_text.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            body_text = str(body_text or "").strip()
+        except Exception as text_err:
+            self.deps.logger.debug("[EXTRACT FULL] innerText fallback skipped: %s", text_err)
+
+        ax_text = str(ax_text or "").strip()
+        if list_text and len(list_text) > max(len(ax_text) * 0.5, 1200):
+            self.deps.logger.info(
+                "[EXTRACT FULL] compact DOM list richer than AX slice "
+                "(items=%s, list=%s chars, ax=%s chars), using list text",
+                list_count,
+                len(list_text),
+                len(ax_text),
+            )
+            return list_source, list_text
+        if body_text and len(body_text) > max(len(ax_text) * 1.2, 800):
+            if ax_text:
+                self.deps.logger.info(
+                    "[EXTRACT FULL] innerText richer than AX (%s vs %s chars), using combined text",
+                    len(body_text),
+                    len(ax_text),
+                )
+                return (
+                    "AX_TREE+INNER_TEXT",
+                    f"【AX Tree 语义文本】\n{ax_text}\n\n【DOM innerText 全页文本】\n{body_text}",
+                )
+            self.deps.logger.info("[EXTRACT FULL] AX Tree empty/short, using innerText")
+            return "INNER_TEXT_FALLBACK", body_text
+        if ax_text:
+            return source, ax_text
+        return ("INNER_TEXT_FALLBACK", body_text) if body_text else ("", "")
+
+    async def extract_body_text_for_semantic_cards(self, reason: str) -> str:
+        """Lightweight body text fallback for schema-driven card extraction."""
+        if not self.deps.requested_output_fields:
+            return ""
+        try:
+            _body_page = await self.deps.browser._ensure_active_page(reason=reason)
+            text = await _body_page.evaluate(
+                """() => document.body ? String(document.body.innerText || '') : ''"""
+            )
+            return str(text or "").strip()[:20000]
+        except Exception as body_err:
+            self.deps.logger.debug("[EXTRACT DOM] semantic card body text skipped: %s", body_err)
+            return ""
+
+    async def inspect_click_target_for_extract_nav_guard(self, decision: dict) -> dict:
+        action_name = str(decision.get("action") or "").strip().lower()
+        if action_name not in {"click", "click_text", "click_point"}:
+            return {}
+        target_id = int(decision.get("target_id") or 0)
+        if target_id <= 0:
+            return {
+                "text": str(decision.get("type_value") or ""),
+                "action": action_name,
+            }
+        try:
+            page = await self.deps.browser._ensure_active_page(
+                reason="inspect extraction same-page nav target"
+            )
+            if not page:
+                return {}
+            return await page.evaluate(
+                """(targetId) => {
+                    const el = document.querySelector(`[data-som-id="${targetId}"]`);
+                    if (!el) return {exists: false, target_id: targetId};
+                    const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+                    const anchor = el.closest('a[href]');
+                    const role = clean(el.getAttribute('role') || '');
+                    const tag = clean(el.tagName || '').toLowerCase();
+                    const href = anchor ? anchor.href : (
+                        el.href || el.getAttribute('href') || ''
+                    );
+                    const text = clean(
+                        el.innerText || el.textContent ||
+                        el.getAttribute('aria-label') ||
+                        el.getAttribute('title') || ''
+                    );
+                    const cls = clean(el.className || '');
+                    const parent = el.closest(
+                        'nav,header,[role="navigation"],[role="tablist"],.tab,.tabs,.nav,.navbar,.forecast'
+                    );
+                    return {
+                        exists: true,
+                        target_id: targetId,
+                        tag,
+                        role,
+                        href,
+                        text,
+                        class_name: cls,
+                        nav_like: Boolean(parent),
+                        tab_like: role === 'tab' ||
+                            el.getAttribute('aria-controls') ||
+                            el.getAttribute('data-toggle') === 'tab' ||
+                            /\\b(tab|tabs|nav-link|active)\\b/i.test(cls),
+                    };
+                }""",
+                target_id,
+            ) or {}
+        except Exception as inspect_err:
+            self.deps.logger.debug("[EXTRACT NAV GUARD] target inspection skipped: %s", inspect_err)
+            return {}
+
+    async def nudge_scroll_after_duplicate_extract(self, reason: str, scroll_amount: int = 2000) -> bool:
+        try:
+            _scroll_page = await self.deps.browser._ensure_active_page(reason=reason)
+            before_size = await _scroll_page.evaluate("() => document.body.innerText.length")
+            await _scroll_page.evaluate(
+                """(amt) => {
+                    window.scrollBy({top: Math.max(amt, window.innerHeight * 1.5), behavior: 'smooth'});
+                }""",
+                scroll_amount,
+            )
+            await _scroll_page.wait_for_timeout(1500)
+            try:
+                await _scroll_page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+            after_size = await _scroll_page.evaluate("() => document.body.innerText.length")
+            delta = after_size - before_size
+            pct = (delta / before_size * 100) if before_size > 0 else 0.0
+            self.deps.logger.info(
+                "[EXTRACT DEDUP] nudged page downward (%s): %d→%d bytes (+%d, %.1f%%)",
+                reason, before_size, after_size, delta, pct,
+            )
+            if delta > 100:
+                return True
+            # EXTRACT-VSCROLL-1: virtualised lists render a constant row
+            # window inside an inner scroller, so window.scrollBy does
+            # nothing and body length stays flat. Scroll the dominant
+            # container itself and compare row signatures instead.
+            vs = await nudge_virtual_scroll(_scroll_page, amount=scroll_amount)
+            if vs.get("rows_changed") or (
+                vs.get("mode") == "container" and vs.get("moved")
+            ):
+                self.deps.logger.info(
+                    "[EXTRACT DEDUP] virtual-scroll nudge advanced (%s): %s",
+                    reason,
+                    vs,
+                )
+                return True
+            return False
+        except Exception as scroll_err:
+            self.deps.logger.debug("[EXTRACT DEDUP] duplicate-row scroll nudge failed: %s", scroll_err)
+            return False
