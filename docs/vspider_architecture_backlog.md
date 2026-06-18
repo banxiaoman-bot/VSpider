@@ -3880,3 +3880,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useTimelineReplay.test.js 9 例（解析器空行/坏行/非 dict/detail 解包/单 trace 文档 + 状态机导入/容错/切 tab/退出）；vitest 87 passed（9 文件）；npm run build 绿（1691 模块）。
 - App.vue 行数: 2146 → **2033 行**（-113）。本会话累计 ~4150 → 2033（约 -51%）。
 - 风险: 低（纯解析器 + 状态机平移，依赖经注入，单测覆盖解析与状态迁移）。
+
+## Slice D-UI-10 (M4 简便): capability fixture/efficiency 重放子系统抽离 useCapabilityFixtureReplay (done, P2)
+
+- 能力名: capability_fixture_replay_extraction（failure fixture / efficiency feedback 的生成·重放·拉取·批量重放 + 派生 computed + capabilityReplayPaneProps 打包，整体抽成 composable）。
+- 影响层: 新增 composables/useCapabilityFixtureReplay.js（50 个符号：17 state + 25 派生 computed + buildSummaryText + capabilityReplayPaneProps + copySummary + 7 异步动作）。App.vue 仅 destructure 9 个（capabilityReplayPaneProps + 8 动作），并删除现已不用的 buildFailureFixtureBatchReplaySummaryText import。
+- 依赖注入: url / prompt（ref 直传）、fetchArtifacts / writeToClipboard（wrapper arrow，后者 _writeToClipboard 定义晚于接线点）、latestCapabilityExecute / capabilityExecutionFailureBundle / capabilityExecutionEfficiencyCorrelationReport（来自 useCapabilityTrace 的 computed，接线点在其 destructure 之后）。
+- 抽离方法: 脚本逐字提取 3 个连续块（state 154-170 / computed 633-718 / 函数 940-1230），`_writeToClipboard(` → `writeToClipboard(` 重命名；apiFetch / ElMessage / buildFailureFixtureBatchReplaySummaryText 改由 composable 直接 import。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useCapabilityFixtureReplay.test.js 5 例（smoke：capabilityReplayPaneProps 打包遍历所有派生 computed 不抛错；generate/replay/replayEfficiency 非法输入 guard 不发网络；generate happy path：POST→refetch artifacts+library→success toast，apiFetch/ElMessage mock）；vitest 92 passed（10 文件）；npm run build 绿（1692 模块）。
+- App.vue 行数: 2033 → **1644 行**（-389）。本会话累计 ~4150 → 1644（约 -60%）。
+- 风险: 中（副作用最重的一块：网络/toast/跨组件依赖；但依赖经注入 + smoke 穷举求值 + guard/happy 双测覆盖，build+vitest 三绿）。
