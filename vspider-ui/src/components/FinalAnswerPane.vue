@@ -24,10 +24,10 @@ const lineCount = computed(() => {
 const isLong = computed(() => charCount.value > COLLAPSE_THRESHOLD)
 
 const DOMAIN_META = {
-  weather: { icon: '\u{1F324}\uFE0F', label: '\u5929\u6C14', accent: '#7ec8ff' },
+  weather: { icon: '\u{1F324}\uFE0F', label: '\u5929\u6C14', accent: '#5cc4d4' },
   stock:   { icon: '\u{1F4C8}', label: '\u80A1\u7968', accent: '#7ce0a2' },
   recipe:  { icon: '\u{1F373}', label: '\u83DC\u8C31', accent: '#ffb877' },
-  flight:  { icon: '\u2708\uFE0F', label: '\u822A\u73ED', accent: '#c89bff' },
+  flight:  { icon: '\u2708\uFE0F', label: '\u822A\u73ED', accent: '#a594e8' },
 }
 const domainMeta = computed(() => DOMAIN_META[props.domain] || null)
 
