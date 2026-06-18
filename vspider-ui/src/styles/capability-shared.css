@@ -3,8 +3,8 @@
    选择器均以 .capability- 前缀命名空间隔离。 */
 
 .capability-export-btn {
-  border-color: rgb(var(--rgb-indigo-bright) / 0.45);
-  color: var(--vsp-indigo-200);
+  border-color: rgb(var(--rgb-cyan) / 0.45);
+  color: var(--vsp-cyan-200);
 }
 
 .capability-section h4 {
@@ -52,7 +52,7 @@
 .capability-card-head strong,
 .capability-role-card strong,
 .capability-audit-item strong {
-  color: var(--vsp-info-200);
+  color: var(--vsp-cyan-300);
   font-size: 13px;
 }
 
@@ -64,7 +64,7 @@
   height: 20px;
   border-radius: 50%;
   color: var(--vsp-slate-900);
-  background: var(--vsp-info-200);
+  background: var(--vsp-cyan-300);
   font-size: 11px;
   font-weight: 800;
 }
@@ -137,7 +137,7 @@
   border-radius: 10px;
   color: var(--vsp-text-2);
   background: rgb(var(--rgb-ink) / 0.74);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.24);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.24);
 }
 
 .capability-fixture-replay-grid {
@@ -152,7 +152,7 @@
 }
 
 .capability-fixture-replay-grid strong {
-  color: var(--vsp-sky-100);
+  color: var(--vsp-cyan-200);
 }
 
 .capability-fixture-replay-artifact,
@@ -166,7 +166,7 @@
 }
 
 .capability-fixture-replay-artifact a {
-  color: var(--vsp-info-200);
+  color: var(--vsp-cyan-300);
   text-decoration: none;
 }
 
@@ -216,7 +216,7 @@
   border-radius: 10px;
   color: var(--vsp-text-2);
   background: rgb(var(--rgb-ink) / 0.58);
-  border: 1px solid rgb(var(--rgb-sky-bright) / 0.18);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.18);
 }
 
 .capability-fixture-library-actions {
@@ -251,7 +251,7 @@
 
 .capability-fixture-history-trend.is-stable,
 .capability-fixture-history-trend.is-baseline {
-  border-color: rgb(var(--rgb-sky-bright) / 0.26);
+  border-color: rgb(var(--rgb-cyan) / 0.26);
 }
 
 .capability-fixture-library-list,
@@ -282,7 +282,7 @@
 .capability-efficiency-feedback-library-item strong,
 .capability-fixture-history-item strong,
 .capability-fixture-batch-item strong {
-  color: var(--vsp-sky-100);
+  color: var(--vsp-cyan-200);
 }
 
 .capability-fixture-library-item span,
@@ -297,12 +297,12 @@
 
 .capability-fixture-library-item a,
 .capability-efficiency-feedback-library-item a {
-  color: var(--vsp-info-200);
+  color: var(--vsp-cyan-300);
   text-decoration: none;
 }
 
 .capability-fixture-history-item a {
-  color: var(--vsp-info-200);
+  color: var(--vsp-cyan-300);
   text-decoration: none;
 }
 
@@ -315,11 +315,11 @@
   padding: 8px;
   border-radius: 8px;
   background: rgb(var(--rgb-ink-deep) / 0.28);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.18);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.18);
 }
 
 .capability-fixture-triage-focus {
-  color: var(--vsp-indigo-200);
+  color: var(--vsp-cyan-200);
   font-size: 12px;
   margin-bottom: 6px;
 }
@@ -343,7 +343,7 @@
 }
 
 .capability-fixture-triage-grid strong {
-  color: var(--vsp-sky-100);
+  color: var(--vsp-cyan-200);
   font-size: 12px;
 }
 
@@ -409,7 +409,7 @@
 }
 
 .capability-attempt strong {
-  color: var(--vsp-sky-100);
+  color: var(--vsp-cyan-200);
 }
 
 .capability-attempt p {
@@ -448,9 +448,9 @@
   display: inline-flex;
   padding: 3px 8px;
   border-radius: 999px;
-  color: var(--vsp-indigo-200);
-  background: rgb(var(--rgb-indigo) / 0.16);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.32);
+  color: var(--vsp-cyan-200);
+  background: rgb(var(--rgb-cyan) / 0.16);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.32);
   font-size: 11.5px;
 }
 
