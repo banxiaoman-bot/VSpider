@@ -43,10 +43,6 @@ dist/
 .coverage.*
 htmlcov/
 
-# Loose design exports at repo root (mascot source, not wired into the build)
-/ty2fu.png
-/ty_spider.svg
-
 # Temporary generated artifacts
 auto_extract_fallback_*
 
