@@ -17,10 +17,11 @@ import inspect
 import re
 
 from visual_web_agent.main import run_agent
+from visual_web_agent.extraction_engine.runtime import ExtractRuntime
 
 
 def _run_agent_src() -> str:
-    return inspect.getsource(run_agent)
+    return inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
 
 
 class TestShadowTableWiring:

@@ -19,8 +19,9 @@ import re
 import pytest
 
 from visual_web_agent.main import run_agent
+from visual_web_agent.extraction_engine.runtime import ExtractRuntime
 
-SRC = inspect.getsource(run_agent)
+SRC = inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
 
 
 class TestSignatureScope:
@@ -51,7 +52,7 @@ class TestAutopagerSweep:
     def test_empty_signature_advances_to_next_scope(self) -> None:
         """No table in a scope = keep probing; nothing was clicked yet."""
         assert re.search(
-            r'before_sig = await _visible_table_signature\(\s*\r?\n\s*'
+            r'before_sig = await self\.visible_table_signature\(\s*\r?\n\s*'
             r'"table autopager before", scope=scope\s*\r?\n\s*\)\s*\r?\n'
             r"\s*if not before_sig:\s*\r?\n\s*continue",
             SRC,

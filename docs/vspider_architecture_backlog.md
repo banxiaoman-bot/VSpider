@@ -3686,6 +3686,20 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: `tests/test_extract_runtime.py` 4✓（标量默认值 / set 默认空 / 别名共享可变可见 / 每实例独立 set）；`main.py` `py_compile` 通过；全量 pytest 3879 passed / 2 skipped / 0 failed。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1a→S1e / S2 / S3 / B）。
 
+## Slice S1b (M5 拆分): DOM 抽取读闭包 → ExtractRuntime 方法 (done, P1)
+
+- 能力名: extract_runtime_dom_readers（6 个只读 DOM 抽取闭包从 `run_agent` 平移进 `extraction_engine/runtime.py::ExtractRuntime`，构造注入 `ExtractDeps`，主循环调用点经薄包装保持稳定）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。
+- 前置: S1a 已完成（`ExtractState` 共享计数器就位）。
+- 改动:
+  - 新建 `ExtractDeps`（`browser` / `logger` / `evaluate_rows_with_frame_fallback` / `normalize_extracted_row_fields`）+ `ExtractRuntime`（持 `ExtractDeps` + 共享 `ExtractState`）。
+  - 6 个闭包平移为方法：`extract_list_rows_via_dom` / `extract_visible_table_rows_via_dom` / `visible_table_signature` / `auto_advance_table_page_via_dom` / `probe_scroll_drain_state` / `detect_canvas_grid`（内联 JS 整段照搬，`browser`→`self.deps.browser`，跨方法调用→`self.<method>`；6 者均只读探针，不写 state）。
+  - `main.py:3520-3528` 构造 `_extract_deps` + `_extract_rt`；原 6 个闭包改为薄委托包装（签名不变，所有调用点零改动）；闭包体移出后 main.py 净减约 695 行。
+  - 纯平移零行为改动。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 追加 10 例（stub-frame：list/table 读取 / signature 显式 scope / autopager 翻页 / scroll-drain / canvas found+not-found），合计 14✓；6 个源码扫描测试（`test_autopager_shadow` / `test_extract_canvas_fallback` / `test_extract_shadow_list` / `test_extract_shadow_table` / `test_extract_table_iframe` / `test_table_autopager_frames`）改为同时 `inspect.getsource(run_agent)+ExtractRuntime`（JS 标记随闭包迁移）；`py_compile` 通过；`validate_y S1b` 全绿（target 14 / build / core 112 / 全量 pytest 3889 passed / 2 skipped / 0 failed）。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1b）。
+
 ## Slice C4 (M5 契约): input_contract 落地 (done, P1)
 
 - 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。

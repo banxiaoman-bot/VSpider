@@ -16,10 +16,11 @@ from __future__ import annotations
 import inspect
 
 from visual_web_agent.main import run_agent
+from visual_web_agent.extraction_engine.runtime import ExtractRuntime
 
 
 def _src() -> str:
-    return inspect.getsource(run_agent)
+    return inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
 
 
 class TestShadowListWiring:

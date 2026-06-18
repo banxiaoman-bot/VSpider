@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from visual_web_agent.main import _evaluate_rows_with_frame_fallback, run_agent
+from visual_web_agent.extraction_engine.runtime import ExtractRuntime
 
 ROWS = [{"name": "Ada", "city": "London"}, {"name": "Lin", "city": "Xi'an"}]
 JS = "() => []"
@@ -173,14 +174,14 @@ class TestDictPayloads:
 
 class TestWiring:
     def test_table_harvest_routes_through_frame_fallback(self) -> None:
-        src = inspect.getsource(run_agent)
-        assert "_evaluate_rows_with_frame_fallback(" in src, (
+        src = inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
+        assert "evaluate_rows_with_frame_fallback(" in src, (
             "bulk table extraction no longer routes through the iframe sweep"
         )
         assert 'log_tag="EXTRACT DOM"' in src
 
     def test_list_harvest_routes_through_frame_fallback(self) -> None:
-        src = inspect.getsource(run_agent)
+        src = inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
         assert 'log_tag="EXTRACT DOM LIST"' in src, (
             "list/card extraction no longer routes through the iframe sweep"
         )

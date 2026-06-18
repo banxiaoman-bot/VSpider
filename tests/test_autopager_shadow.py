@@ -19,17 +19,18 @@ import inspect
 import re
 
 from visual_web_agent.main import run_agent
+from visual_web_agent.extraction_engine.runtime import ExtractRuntime
 
 
 def _pager_js_block() -> str:
-    src = inspect.getsource(run_agent)
+    src = inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
     m = re.search(r'_pager_js = """\(\) => \{.*?\}"""', src, re.S)
     assert m, "_pager_js not found in run_agent source"
     return m.group(0)
 
 
 def _pager_wait_js_block() -> str:
-    src = inspect.getsource(run_agent)
+    src = inspect.getsource(run_agent) + "\n" + inspect.getsource(ExtractRuntime)
     m = re.search(r'_pager_wait_js = """\(before\) => \{.*?\}"""', src, re.S)
     assert m, "_pager_wait_js not found in run_agent source"
     return m.group(0)
