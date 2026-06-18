@@ -305,6 +305,29 @@ Acceptance:
 - 新增 contract 字段: capability_failure_recovery_decision_replay.v1（report['recovery_decision'] 子结构）。
 - Tests: test_capability_failure_recovery_replay.py 6✓（含 batch 聚合 recovery_decision_count=2）；test_fixture_coverage_audit.py(FIXTURE-AUDIT-1) 回归仍绿。
 
+## Slice RB3 (M5 鲁棒): extraction recovery 接入 live 主链路 (done, P2)
+
+- 能力名: maybe_publish_extraction_recovery_hint（RB1 的 `recover_extraction_selectors` 此前只在测试里调、live 抽取塌陷不触发；本片把它接进 run_agent 抽取主链路，产生生产价值）。
+- 影响层: extraction_engine/recovery.py（新增 live-wiring 助手）+ execution_kernel（main.py `_try_pre_extract_fast_path` 塌陷点）。
+- 前置: RB1 已完成。
+- 改动:
+  - recovery.py 新增 `maybe_publish_extraction_recovery_hint(workflow_memory, candidates, ...)`：跑门控恢复，命中 recovered=True 时把 hint 写入 `workflow_memory[RECOVERY_HINT_MEMORY_KEY]`（键 `extraction_recovery_hint`，常量导出，向下兼容）；非 dict / None 内存容错。advisory only，绝不伪造行。
+  - main.py 抽取塌陷点 `if not candidates:` 接入该助手（镜像既有 `canvas_grid_notice` 写 workflow_memory 范式），命中写 logger.info 留痕，异常 logger.debug 吞掉。两处 import 块（相对 + 绝对回退）同步加 `maybe_publish_extraction_recovery_hint`。
+  - main.py 净增 ~21 行（含 import）；行数 9669 → 9690，仍 < 9700 基线守卫。
+- 新增 contract 字段: RECOVERY_HINT_MEMORY_KEY = "extraction_recovery_hint"（workflow_memory 键，沿用 extraction_selector_recovery.v1 结构）。
+- Tests: test_extraction_selector_recovery.py +3✓（写 workflow_memory / not-recovered 不写 / None 容错），共 8✓；test_extract_canvas_fallback.py(塌陷点源断言) 回归仍绿。
+- 验证: TDD 红→绿；定向 50✓；全量 pytest 36 失败全为既有并发 UI/api 重构（stash 我方改动后同 36 失败，证明零新增）。
+
+## Slice RB4 (M5 鲁棒): type 动作 selector cache 读路径 (done, P2)
+
+- 能力名: type_selector_cache_read（`TypeHandler` 此前只有 E4 写回 `store("type")`、无读路径 → type 缓存是死的，selector 漂移时享受不到 click 已有的跨 run 加速/抹险）。
+- 影响层: operations_plane（visual_web_agent/actions/click_and_type.py::TypeHandler）。
+- 前置: E4 selector_cache click/type 集成已完成（写回侧）。
+- 改动: TypeHandler 镜像 ClickHandler 的 E4 读路径——`lookup("type")` → `validate_cached_target`（可见 + 文本指纹）→ 命中用缓存 locator（`SimpleNamespace(handle=...)` 包壳，下游 `target.handle.*` 零改）跳过 `_resolve_action_target` 并 `record_hit`；stale 则 `invalidate` 降级回 SoM 漏斗；既有写回逻辑不动（命中后自然刷新条目）。新增 `from types import SimpleNamespace`。`VSPIDER_SELECTOR_CACHE=0` 时整条读路径跳过。
+- 新增 contract 字段: 无（沿用 action_selector_cache.v1）。
+- Tests: test_selector_cache.py 新增 TestTypeWiring 3✓（命中跳 resolve+record_hit / stale invalidate 后漏斗重存 / env 关闭走 resolve）；既有 click_text/validate/som_key 用例仍绿（共 50✓）。
+- 验证: TDD 红（命中仍 resolve=1）→绿（resolve=0）；lint 零错。
+
 ## Slice 7: State Debug CLI
 
 Reference: browser-use CLI `state`, `click`, `type`, `screenshot`.
@@ -3975,3 +3998,16 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 无新增（纯删除、零行为改动）；既有 vitest 113 passed（13 文件）不变；删后脚本 0 死候选；ReadLints clean；npm run build 绿（index js 191.96→**191.14kB**，-0.8kB 死 computed 摇树）。
 - App.vue 行数: 1394 → **1373 行**（-21）。顶层声明 189 → 168。本会话累计 ~4150 → 1373（约 -67%）。
 - 风险: 低（仅删 count==1 的 destructure 名，script/template/composable 零触碰；脚本迭代确认 + build+vitest+lint 三绿）。
+
+## Slice R2-1 (M5 拆分): extract data_shape 探针去重 → ExtractRuntime (done, P1)
+
+- 能力名: extract_data_shape_dedup（auto/explicit 两处 extract 路径重复的「data_shape 探针 + 稠密页 scroll-drain override」收敛为 `ExtractRuntime.compute_data_shape_with_drain(reason)`）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。R2「安全增量」首刀：只搬真·无控制流子段；控制流尾段（8 break + 4 `_task_completed` + `event_stream.done`）按设计留主循环。
+- 前置: S1 已完成（`ExtractRuntime`/`ExtractState` 就位）。
+- 改动:
+  - 新增方法 `ExtractRuntime.compute_data_shape_with_drain(reason) -> dict`：`browser.probe_data_shape()` → 稠密（`expected_rows_from_data_shape>=10`）时附 `physically_drained`/`drain_state`，probe 异常吞掉返回 `{}`。逐字平移零行为改动。
+  - `main.py` 两处 19 行内联块（auto extract / explicit extract，仅 drain reason 串与缩进不同）改为单行委托；净减约 32 行；`_drain_state` 局部移除经全量引用核验安全（下游 5418/6816 均先重赋后读）。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 追加 3 例（sparse 不附 override / dense 附 drain_state / probe 异常返回 {}），先验红（AttributeError）后转绿，合计 41✓；`py_compile` 通过，CLEAN_CRLF 无混行；main.py 9669→9658 行（<9700 基线仍绿）。
+- 验证: 全量 pytest **36 failed / 3893 passed / 2 skipped**——36 失败全是并发 UI agent 的 App.vue source-wiring/keyboard/timeline/timer 断言（已 `git stash` 证实 HEAD 无本切片改动时同样失败），与本切片零关联；**本切片 0 新增失败**。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（R2 安全增量首刀；下刀候选：candidate 采集段 6344-6517 → `gather_candidates`）。

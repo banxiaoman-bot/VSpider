@@ -280,3 +280,46 @@ def recover_extraction_selectors(
         "baseline_source": str(baseline.get("source") or ""),
         "baseline_path": str(baseline.get("_snapshot_path") or ""),
     }
+
+
+# Stable key under which the live run records a fired recovery hint so the
+# planner/prompt layer (which already reads workflow_memory notices, cf.
+# canvas_grid_notice) can re-attempt extraction biased to the known-good
+# surface. Additive contract — never renamed.
+RECOVERY_HINT_MEMORY_KEY = "extraction_recovery_hint"
+
+
+def maybe_publish_extraction_recovery_hint(
+    workflow_memory: Any,
+    candidates: list[dict[str, Any]] | None,
+    *,
+    url: str,
+    requested_fields: list[str] | None = None,
+    goal: str = "",
+    directory: str | Path = DEFAULT_SNAPSHOT_DIR,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Run the gated selector recovery and, when it fires, publish the hint.
+
+    This is the live-path wiring for :func:`recover_extraction_selectors`:
+    callers invoke it at an extraction-collapse decision point. On recovery the
+    structured hint is written to ``workflow_memory[RECOVERY_HINT_MEMORY_KEY]``
+    (a dict-like store; non-dict / ``None`` memories are tolerated). The hint is
+    advisory only — it never fabricates rows. Always returns the recovery
+    result so the caller can also log it.
+    """
+
+    result = recover_extraction_selectors(
+        candidates,
+        url=url,
+        requested_fields=requested_fields,
+        goal=goal,
+        directory=directory,
+        **kwargs,
+    )
+    if result.get("recovered"):
+        try:
+            workflow_memory[RECOVERY_HINT_MEMORY_KEY] = result
+        except (TypeError, AttributeError):
+            pass
+    return result

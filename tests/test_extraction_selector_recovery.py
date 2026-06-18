@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from visual_web_agent.extraction_engine.recovery import recover_extraction_selectors
+from visual_web_agent.extraction_engine.recovery import (
+    RECOVERY_HINT_MEMORY_KEY,
+    maybe_publish_extraction_recovery_hint,
+    recover_extraction_selectors,
+)
 from visual_web_agent.extraction_engine.snapshots import build_snapshot, save_snapshot
 
 
@@ -126,3 +130,49 @@ def test_weak_baseline_does_not_trigger_recovery(tmp_path: Path) -> None:
     )
     assert result["recovered"] is False
     assert result["reason"] == "no_strong_baseline"
+
+
+# ── C1 live wiring: publish hint into workflow_memory on collapse ──
+
+
+def test_publish_hint_writes_to_memory_on_recovery(tmp_path: Path) -> None:
+    _save_strong_baseline(tmp_path)
+    memory: dict = {}
+    result = maybe_publish_extraction_recovery_hint(
+        memory,
+        [],  # extraction collapsed
+        url=_URL,
+        requested_fields=_FIELDS,
+        directory=tmp_path,
+    )
+    assert result["recovered"] is True
+    hint = memory[RECOVERY_HINT_MEMORY_KEY]
+    assert hint["recovered"] is True
+    assert hint["source_family"] == "DOM_TABLE"
+    assert set(hint["expected_fields"]) == set(_FIELDS)
+
+
+def test_publish_hint_noop_when_not_recovered(tmp_path: Path) -> None:
+    memory: dict = {}
+    result = maybe_publish_extraction_recovery_hint(
+        memory,
+        [],
+        url="https://example.com/no-baseline-here",
+        requested_fields=_FIELDS,
+        directory=tmp_path,
+    )
+    assert result["recovered"] is False
+    assert RECOVERY_HINT_MEMORY_KEY not in memory
+
+
+def test_publish_hint_tolerates_non_dict_memory(tmp_path: Path) -> None:
+    _save_strong_baseline(tmp_path)
+    # A None memory (e.g. early run state) must not raise.
+    result = maybe_publish_extraction_recovery_hint(
+        None,
+        [],
+        url=_URL,
+        requested_fields=_FIELDS,
+        directory=tmp_path,
+    )
+    assert result["recovered"] is True

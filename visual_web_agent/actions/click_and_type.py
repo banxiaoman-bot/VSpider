@@ -9,6 +9,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from ._base import (
@@ -1220,8 +1221,39 @@ class TypeHandler(ActionHandler):
         selector = f'[data-som-id="{target_id}"]'
         logger.info(f"Executing type: element #{target_id} <- {display_value!r}")
         try:
-            await browser._clear_som_overlays()
-            target = await browser._resolve_action_target(target_id, "type")
+            # ── C3: selector cache read — try cached CSS selector before SoM ──
+            # Mirrors ClickHandler's E4 read path so type drift enjoys the same
+            # cross-run acceleration / de-risking the click path already has.
+            _sc_handle = None
+            try:
+                from visual_web_agent.selector_cache import (
+                    SelectorCache as _SelC, cache_host as _sch,
+                    selector_cache_enabled as _sce, som_cache_key as _sck,
+                    validate_cached_target as _scv,
+                )
+                if _sce():
+                    _sc_url = getattr(page, "url", "") or ""
+                    _sc_host = _sch(_sc_url)
+                    _sc_ckey = _sck(getattr(browser, "_last_som_elements", []), target_id) if _sc_host else ""
+                    if _sc_ckey:
+                        _sc_c = _SelC(_sc_host)
+                        _sc_e = _sc_c.lookup("type", _sc_ckey)
+                        if _sc_e:
+                            _sc_name = _sc_ckey.split("::", 1)[-1] if "::" in _sc_ckey else ""
+                            _sc_handle = await _scv(page, _sc_e, _sc_name)
+                            if _sc_handle:
+                                _sc_c.record_hit("type", _sc_ckey)
+                                logger.info(f"[E4] type #{target_id} resolved via selector cache")
+                            else:
+                                _sc_c.invalidate("type", _sc_ckey)
+            except Exception:
+                _sc_handle = None
+
+            if _sc_handle is not None:
+                target = SimpleNamespace(handle=_sc_handle)
+            else:
+                await browser._clear_som_overlays()
+                target = await browser._resolve_action_target(target_id, "type")
 
             if not target:
                 raise RuntimeError(

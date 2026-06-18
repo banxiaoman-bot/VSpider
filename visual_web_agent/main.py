@@ -85,7 +85,10 @@ try:
     from .skills.registry import build_default_skill_registry
     from .skills.replay import save_skill_replay_snapshot
     from .extraction_engine.snapshots import maybe_save_snapshot
-    from .extraction_engine.recovery import rank_extraction_candidates_with_history
+    from .extraction_engine.recovery import (
+        rank_extraction_candidates_with_history,
+        maybe_publish_extraction_recovery_hint,
+    )
     from .extraction_engine.cards import extract_semantic_card_rows
     from .extraction_engine.strategies import (
         choose_pre_extract_reached_candidate as _choose_pre_extract_reached_candidate,
@@ -156,7 +159,10 @@ except ImportError:
     from skills.registry import build_default_skill_registry
     from skills.replay import save_skill_replay_snapshot
     from extraction_engine.snapshots import maybe_save_snapshot
-    from extraction_engine.recovery import rank_extraction_candidates_with_history
+    from extraction_engine.recovery import (
+        rank_extraction_candidates_with_history,
+        maybe_publish_extraction_recovery_hint,
+    )
     from extraction_engine.cards import extract_semantic_card_rows
     from extraction_engine.strategies import (
         choose_pre_extract_reached_candidate as _choose_pre_extract_reached_candidate,
@@ -2459,6 +2465,21 @@ async def run_agent(
                         canvas_notice.get("coverage"),
                         canvas_notice.get("grid_like"),
                     )
+                # C1: on collapse, publish a gated selector-recovery hint so the
+                # planner can re-attempt biased to a known-good baseline surface.
+                try:
+                    _rec_hint = maybe_publish_extraction_recovery_hint(
+                        workflow_memory, candidates,
+                        url=getattr(browser, "current_url", "") or start_url,
+                        requested_fields=_requested_output_fields, goal=_snapshot_goal,
+                    )
+                    if _rec_hint.get("recovered"):
+                        logger.info(
+                            "[PRE-EXTRACT] selector recovery hint published: source_family=%s coverage=%s",
+                            _rec_hint.get("source_family"), _rec_hint.get("baseline_coverage"),
+                        )
+                except Exception as _rec_hint_err:
+                    logger.debug("[PRE-EXTRACT] recovery hint skipped: %s", _rec_hint_err)
                 logger.info("[PRE-EXTRACT] no deterministic candidates")
                 return False
 
@@ -5047,25 +5068,9 @@ async def run_agent(
                         f"(第 {_xs.extract_null_streak} 次)，启动 AX Tree 自动提取"
                     )
                     try:
-                        _data_shape = {}
-                        try:
-                            _data_shape = await browser.probe_data_shape()
-                            logger.info("[DATA SHAPE] %s", _data_shape)
-                            if _expected_rows_from_data_shape(_data_shape) >= 10:
-                                _drain_state = await _probe_scroll_drain_state(
-                                    "auto extract dense-shape drain override"
-                                )
-                                _data_shape = dict(_data_shape)
-                                _data_shape["physically_drained"] = bool(
-                                    _drain_state.get("at_bottom")
-                                )
-                                _data_shape["drain_state"] = _drain_state
-                                logger.info(
-                                    "[DATA SHAPE] dense drain_state=%s",
-                                    _drain_state,
-                                )
-                        except Exception as _shape_err:
-                            logger.debug("[DATA SHAPE] skipped: %s", _shape_err)
+                        _data_shape = await _extract_rt.compute_data_shape_with_drain(
+                            "auto extract dense-shape drain override"
+                        )
 
                         _auto_extract_text_source, _ax_text = (
                             await _extract_full_page_text_for_data(
@@ -6313,25 +6318,9 @@ async def run_agent(
                         if extracted:
                             _log_extract_text_source = "VLM_EXTRACT_OUTPUT"
                             _source_text_for_validation = ""
-                            _data_shape = {}
-                            try:
-                                _data_shape = await browser.probe_data_shape()
-                                logger.info("[DATA SHAPE] %s", _data_shape)
-                                if _expected_rows_from_data_shape(_data_shape) >= 10:
-                                    _drain_state = await _probe_scroll_drain_state(
-                                        "explicit extract dense-shape drain override"
-                                    )
-                                    _data_shape = dict(_data_shape)
-                                    _data_shape["physically_drained"] = bool(
-                                        _drain_state.get("at_bottom")
-                                    )
-                                    _data_shape["drain_state"] = _drain_state
-                                    logger.info(
-                                        "[DATA SHAPE] dense drain_state=%s",
-                                        _drain_state,
-                                    )
-                            except Exception as _shape_err:
-                                logger.debug("[DATA SHAPE] skipped: %s", _shape_err)
+                            _data_shape = await _extract_rt.compute_data_shape_with_drain(
+                                "explicit extract dense-shape drain override"
+                            )
 
                             _candidates: list[dict] = []
                             _full_extract_text_source = ""

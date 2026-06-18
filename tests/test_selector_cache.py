@@ -376,3 +376,204 @@ class TestValidateCachedTarget:
         page._cached_sel = "#btn"
         result = asyncio.run(validate_cached_target(page, {"selector": "#btn"}, "submit"))
         assert result is None
+
+
+# ════════════════════════════════════════════════════════════════════
+#                       C3: TYPE CACHE READ PATH (stub e2e)
+# ════════════════════════════════════════════════════════════════════
+
+
+class _TypeStubHandle:
+    """A unified stub usable both as a validate locator and a type handle."""
+
+    def __init__(self, *, count: int = 1, visible: bool = True, text: str = "Search",
+                 derived: str = "#derived"):
+        self._count = count
+        self._visible = visible
+        self._text = text
+        self._derived = derived
+        self.click_calls = 0
+
+    # ── locator surface (validate_cached_target) ──
+    @property
+    def first(self):
+        return self
+
+    async def count(self):
+        return self._count
+
+    async def is_visible(self):
+        return self._visible
+
+    async def inner_text(self):
+        return self._text
+
+    async def get_attribute(self, _name: str):
+        return ""
+
+    # ── handle surface (TypeHandler flow) ──
+    async def scroll_into_view_if_needed(self, **_):
+        return None
+
+    async def click(self, **_):
+        self.click_calls += 1
+
+    async def evaluate(self, script: str, *args, **kwargs):
+        if script == DERIVE_SELECTOR_JS:
+            return self._derived
+        if "getBoundingClientRect" in script:
+            return {"fully_visible": True, "height": 20, "partial_clip": 0}
+        if "el.value != null" in script:
+            return ""  # empty current value → no no-op short circuit
+        if "isContentEditable" in script:
+            return False
+        return False
+
+
+class _TypeStubKeyboard:
+    def __init__(self):
+        self.typed: list[str] = []
+
+    async def press(self, _combo: str):
+        return None
+
+    async def type(self, value: str, delay: int = 0):
+        self.typed.append(value)
+
+
+class _TypeStubPage:
+    def __init__(self, *, cached: _TypeStubHandle | None, cached_sel: str = "#cached",
+                 url: str = "https://demo.example.com/search"):
+        self.url = url
+        self._cached = cached
+        self._cached_sel = cached_sel
+        self.keyboard = _TypeStubKeyboard()
+
+    def locator(self, sel: str):
+        if self._cached is not None and sel == self._cached_sel:
+            return self._cached
+        return _TypeStubHandle(count=0)
+
+
+def _make_type_browser(resolve_handle: _TypeStubHandle, resolve_counter: dict) -> Any:
+    async def _no_op(*_, **__):
+        return None
+
+    async def _clear(*_, **__):
+        return None
+
+    async def _resolve(target_id, action):
+        resolve_counter["calls"] = resolve_counter.get("calls", 0) + 1
+        return SimpleNamespace(handle=resolve_handle)
+
+    async def _get_xpath(_h):
+        return "/html/body/input"
+
+    async def _get_ax(_p, _h):
+        return ("textbox", "Search")
+
+    async def _count_interactive():
+        return 5
+
+    async def _calendar():
+        return False
+
+    async def _submenu(_c, max_wait=2.5):
+        return False
+
+    return SimpleNamespace(
+        _clear_som_overlays=_clear,
+        _resolve_action_target=_resolve,
+        _LOCATOR_TIMEOUT=1000,
+        _last_som_elements=[{"id": 0, "role": "textbox", "name": "Search"}],
+        _get_xpath=_get_xpath,
+        _get_accessibility_signature=_get_ax,
+        _count_interactive_elements=_count_interactive,
+        _is_calendar_popup_visible=_calendar,
+        _wait_for_submenu=_submenu,
+        _wait_after_action=_no_op,
+        set_tab_notice=lambda *a, **k: None,
+        rpa_trail=[],
+        _last_action_error=None,
+    )
+
+
+def _make_type_ctx(browser: Any, page: Any, value: str = "hello world") -> SimpleNamespace:
+    action = SimpleNamespace(target_id=0, type_value=value, memory_key="")
+    return SimpleNamespace(
+        action=action,
+        browser=browser,
+        page=page,
+        workflow_memory={},
+        with_rpa_meta=lambda d: d,
+    )
+
+
+class TestTypeWiring:
+    def _run(self, ctx) -> None:
+        from visual_web_agent.actions import TypeHandler
+
+        asyncio.run(TypeHandler().execute(ctx))
+
+    def test_cache_hit_skips_resolve_and_records_hit(self, local_tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("VSPIDER_SELECTOR_CACHE_DIR", str(local_tmp_path))
+        SelectorCache("demo.example.com", base_dir=local_tmp_path).store(
+            "type", "textbox::search", "#cached"
+        )
+        cached = _TypeStubHandle(text="Search")
+        page = _TypeStubPage(cached=cached, cached_sel="#cached")
+        resolve_counter: dict = {}
+        resolve_handle = _TypeStubHandle(text="Search")
+        browser = _make_type_browser(resolve_handle, resolve_counter)
+        ctx = _make_type_ctx(browser, page)
+
+        self._run(ctx)
+
+        # cache hit → resolve funnel never used, hit count incremented
+        assert resolve_counter.get("calls", 0) == 0
+        assert cached.click_calls == 1
+        assert resolve_handle.click_calls == 0
+        assert SelectorCache("demo.example.com", base_dir=local_tmp_path).lookup(
+            "type", "textbox::search"
+        )["hits"] == 1
+
+    def test_stale_cache_invalidated_then_resolve_used(self, local_tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("VSPIDER_SELECTOR_CACHE_DIR", str(local_tmp_path))
+        SelectorCache("demo.example.com", base_dir=local_tmp_path).store(
+            "type", "textbox::search", "#cached"
+        )
+        stale = _TypeStubHandle(text="完全无关")  # text mismatch → validate fails
+        page = _TypeStubPage(cached=stale, cached_sel="#cached")
+        resolve_counter: dict = {}
+        resolve_handle = _TypeStubHandle(text="Search")
+        browser = _make_type_browser(resolve_handle, resolve_counter)
+        ctx = _make_type_ctx(browser, page)
+
+        self._run(ctx)
+
+        assert stale.click_calls == 0
+        assert resolve_counter.get("calls", 0) == 1
+        # stale entry invalidated, then funnel re-stored a fresh selector
+        entry = SelectorCache("demo.example.com", base_dir=local_tmp_path).lookup(
+            "type", "textbox::search"
+        )
+        assert entry is not None
+        assert entry["selector"] == "#derived"
+
+    def test_cache_disabled_via_env_uses_resolve(self, local_tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("VSPIDER_SELECTOR_CACHE_DIR", str(local_tmp_path))
+        monkeypatch.setenv("VSPIDER_SELECTOR_CACHE", "0")
+        SelectorCache("demo.example.com", base_dir=local_tmp_path).store(
+            "type", "textbox::search", "#cached"
+        )
+        cached = _TypeStubHandle(text="Search")
+        page = _TypeStubPage(cached=cached, cached_sel="#cached")
+        resolve_counter: dict = {}
+        resolve_handle = _TypeStubHandle(text="Search")
+        browser = _make_type_browser(resolve_handle, resolve_counter)
+        ctx = _make_type_ctx(browser, page)
+
+        self._run(ctx)
+
+        assert cached.click_calls == 0
+        assert resolve_counter.get("calls", 0) == 1
