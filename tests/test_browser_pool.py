@@ -374,8 +374,9 @@ def test_browser_pool_source_wiring() -> None:
     assert "await release_browser(" in main_src
     assert "from visual_web_agent.browser_pool import get_browser_pool_status as _get_browser_pool_status" in api_src
     assert "from visual_web_agent.browser_pool import get_browser_runtime_status as _get_browser_runtime_status" in api_src
-    assert '@app.get("/api/browser_pool"' in api_src
-    assert '"runtime": _get_browser_runtime_status(pool_status=pool, backend_status=backend)' in api_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/browser_pool"' in tq_src
+    assert "get_browser_runtime_status(" in tq_src
     assert "class BrowserPool" in pool_src
     assert "max_contexts: int = 1" in pool_src
     assert "def resolve_browser_pool_config(*, workload_contexts: int = 1)" in pool_src

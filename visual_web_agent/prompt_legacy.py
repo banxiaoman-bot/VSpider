@@ -5,9 +5,9 @@ Extracted from prompts.py to reduce file size.
 """
 
 try:
-    from .prompts import FULL_SYSTEM_PROMPT, _prompt_section, _has_any
+    from .prompt_templates import FULL_SYSTEM_PROMPT, _prompt_section, _has_any
 except ImportError:
-    from prompts import FULL_SYSTEM_PROMPT, _prompt_section, _has_any
+    from prompt_templates import FULL_SYSTEM_PROMPT, _prompt_section, _has_any
 
 
 _PROMPT_INTRO = FULL_SYSTEM_PROMPT.split("## 输入上下文", 1)[0].strip()
