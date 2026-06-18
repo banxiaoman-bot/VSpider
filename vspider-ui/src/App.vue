@@ -38,6 +38,8 @@ import RunRegistryPanel from './components/RunRegistryPanel.vue'
 import ShortcutHelpDialog from './components/dialogs/ShortcutHelpDialog.vue'
 import HitlFormDialog from './components/HitlFormDialog.vue'
 import CommandPalette from './components/CommandPalette.vue'
+import SpiderAssistant from './components/SpiderAssistant.vue'
+import RunScreenshotHistory from './components/RunScreenshotHistory.vue'
 import {
   createSlashCommandRegistry,
   registerBuiltinCommands,
@@ -94,6 +96,8 @@ const {
   clear: clearTerminalLogs,
 } = createTerminalLogBuffer({ onFlush: () => { scrollToBottom() } })
 const currentImageBase64 = ref('')
+const screenshotHistory = ref([])
+const SCREENSHOT_HISTORY_MAX = 60
 const terminalLogPaneRef = ref(null)
 const wsStatus = ref('connecting')
 
@@ -141,8 +145,6 @@ const hitlFormReason = ref('')
 const hitlFormScreenshot = ref('')
 const hitlFormLoading = ref(false)
 const hitlScreenshot = ref('')
-const hitlScreenshotExpanded = ref(false)
-const pipExpanded = ref(false)
 const activeBottomTab = ref('terminal')
 const runsSubView = ref('all')
 // B: Timeline 筛选 chips 默认收起，点「筛选」按钮展开
@@ -526,10 +528,10 @@ const copyFinalAnswerToClipboard = async () => {
 
 // F3: 域 → 卡片元数据（图标 + 标签 + 着色）
 const FINAL_ANSWER_DOMAIN_META = {
-  weather: { icon: '🌤️', label: '天气', accent: '#7ec8ff' },
+  weather: { icon: '🌤️', label: '天气', accent: '#5cc4d4' },
   stock:   { icon: '📈', label: '股票', accent: '#7ce0a2' },
   recipe:  { icon: '🍳', label: '菜谱', accent: '#ffb877' },
-  flight:  { icon: '✈️', label: '航班', accent: '#c89bff' },
+  flight:  { icon: '✈️', label: '航班', accent: '#a594e8' },
 }
 const finalAnswerDomainMeta = computed(
   () => FINAL_ANSWER_DOMAIN_META[finalAnswerDomain.value] || null,
@@ -592,6 +594,12 @@ const connectWebSocket = () => {
 
       if (payload.type === 'image' || payload.type === 'screenshot') {
         currentImageBase64.value = payload.data || ''
+        if (payload.data) {
+          screenshotHistory.value.push({ src: payload.data, ts: Date.now() })
+          if (screenshotHistory.value.length > SCREENSHOT_HISTORY_MAX) {
+            screenshotHistory.value.shift()
+          }
+        }
         return
       }
 
@@ -715,7 +723,6 @@ const connectWebSocket = () => {
           isHumanInterventionRequired.value = true
           humanInterventionReason.value = payload.reason || 'Agent 遇到需要人工处理的障碍'
           hitlScreenshot.value = payload.screenshot || currentImageBase64.value || ''
-          hitlScreenshotExpanded.value = false
           await appendLog(`[HITL] ${humanInterventionReason.value}`)
         }
         if (payload.status === 'hitl_form') {
@@ -1811,7 +1818,7 @@ function phaseChipStyle(evt) {
   const sev = _effectiveSeverity(evt)
   if (sev === 'error') return { background: '#fee2e2', color: '#991b1b', border: '#fca5a5' }
   if (sev === 'warn')  return { background: '#fef3c7', color: '#92400e', border: '#fcd34d' }
-  return { background: '#dbeafe', color: '#1e40af', border: '#93c5fd' }
+  return { background: '#dcf6f2', color: '#0b7d74', border: '#9ee5dc' }
 }
 
 // Short, single-line label for a chip ("vlm_call · 2.3s")
@@ -2886,6 +2893,7 @@ const submitTask = async () => {
   isRunning.value = true
   clearTerminalLogs()
   currentImageBase64.value = ''
+  screenshotHistory.value = []
   // M: clear timeline buffer at the start of every new run so phases
   // from old runs don't bleed into the new timeline view.
   phaseEvents.value = []
@@ -3276,42 +3284,6 @@ const handleCapabilityMoreAction = (command) => {
     </section>
 
     <section class="monitor-panel">
-      <div class="pip-preview" :class="{ 'pip-preview--expanded': pipExpanded, 'pip-preview--has-image': !!currentImageBase64, 'pip-preview--hitl': isHumanInterventionRequired }">
-        <div class="pip-header" @click="pipExpanded = !pipExpanded">
-          <span class="live-indicator live-indicator--pip" :class="`ws-${wsStatus}`">
-            <i />
-            {{ wsStatus === 'connected' ? 'LIVE' : wsStatus === 'connecting' ? '...' : 'OFF' }}
-          </span>
-          <span class="pip-toggle">{{ pipExpanded ? '收起' : '展开' }}</span>
-        </div>
-        <div v-show="pipExpanded" class="pip-stage">
-          <img
-            v-if="currentImageBase64"
-            :src="currentImageBase64"
-            alt="实时画面"
-          />
-          <div v-else class="pip-placeholder">等待首帧</div>
-          <div v-if="isHumanInterventionRequired" class="hitl-overlay">
-            <div class="hitl-card">
-              <div class="hitl-title">{{ isBotChallengeHitl ? '人机验证' : '需要人工介入' }}</div>
-              <div class="hitl-copy">
-                {{ isBotChallengeHitl ? '请在浏览器完成验证后点击恢复' : '请在浏览器完成验证码 / 扫码 / 2FA' }}
-              </div>
-              <img
-                v-if="hitlScreenshot"
-                :src="hitlScreenshot"
-                alt="截图"
-                class="hitl-screenshot"
-                :class="{ 'is-expanded': hitlScreenshotExpanded }"
-                @click="hitlScreenshotExpanded = !hitlScreenshotExpanded"
-              />
-              <div v-if="humanInterventionReason" class="hitl-reason">{{ humanInterventionReason }}</div>
-              <el-button type="success" @click="resumeAgentExecution">恢复执行</el-button>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <div class="terminal-panel vspider-panel terminal-panel--full">
         <el-tabs
           v-model="activeBottomTab"
@@ -3528,7 +3500,13 @@ const handleCapabilityMoreAction = (command) => {
       @skip="skipHitlForm"
     />
 
-    
+    <SpiderAssistant :running="isRunning">
+      <div v-if="isHumanInterventionRequired" class="sp-hitl-notice">
+        <p>{{ isBotChallengeHitl ? '人机验证 — 请在浏览器完成验证' : '需要人工介入' }}</p>
+        <el-button type="success" size="small" @click="resumeAgentExecution">恢复执行</el-button>
+      </div>
+      <RunScreenshotHistory :frames="screenshotHistory" :running="isRunning" />
+    </SpiderAssistant>
   </main>
 </template>
 
@@ -3712,6 +3690,7 @@ const handleCapabilityMoreAction = (command) => {
 .settings-toggle:hover {
   color: var(--vsp-accent);
   border-color: rgb(var(--rgb-accent) / 0.4);
+  background: rgb(var(--rgb-accent) / 0.08);
 }
 
 .field-group label,
@@ -3884,8 +3863,9 @@ const handleCapabilityMoreAction = (command) => {
 .advanced-collapse label {
   display: block;
   margin: 10px 0 6px;
-  color: var(--vsp-text-2-alt2);
+  color: var(--vsp-text-2);
   font-size: 13px;
+  font-weight: 500;
 }
 
 .action-footer {
@@ -3952,64 +3932,7 @@ const handleCapabilityMoreAction = (command) => {
   height: 100%;
 }
 
-/* PIP floating preview */
-.pip-preview {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 50;
-  width: 200px;
-  border-radius: 8px;
-  background: var(--vsp-surface-2);
-  border: 1px solid var(--vsp-border);
-  box-shadow: 0 4px 16px rgb(0 0 0 / 0.3);
-  overflow: hidden;
-  transition: width 0.25s ease;
-}
-
-.pip-preview--expanded {
-  width: 360px;
-}
-
-.pip-preview--hitl {
-  width: 360px;
-}
-
-.pip-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 4px 8px;
-  cursor: pointer;
-  background: rgb(0 0 0 / 0.2);
-  font-size: 11px;
-}
-
-.pip-toggle {
-  color: var(--vsp-text-2);
-  font-size: 11px;
-}
-
-.pip-stage {
-  position: relative;
-}
-
-.pip-stage img {
-  width: 100%;
-  display: block;
-}
-
-.pip-placeholder {
-  padding: 12px;
-  text-align: center;
-  color: var(--vsp-text-dim-alt);
-  font-size: 11px;
-}
-
-.live-indicator--pip {
-  font-size: 10px;
-  gap: 4px;
-}
+/* (PIP removed — screenshot moved to SpiderAssistant drawer) */
 
 .panel-title {
   display: flex;
@@ -4102,67 +4025,7 @@ const handleCapabilityMoreAction = (command) => {
   padding: 32px 16px;
 }
 
-.hitl-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 28px;
-  background: rgb(var(--rgb-danger-deep) / 0.82);
-  backdrop-filter: blur(6px);
-  animation: overlay-enter 0.35s ease-out;
-}
-
-@keyframes overlay-enter {
-  from { opacity: 0; backdrop-filter: blur(0); }
-  to { opacity: 1; backdrop-filter: blur(6px); }
-}
-
-.hitl-card {
-  max-width: 560px;
-  text-align: center;
-  color: var(--vsp-white);
-}
-
-.hitl-title {
-  margin-bottom: 14px;
-  color: var(--vsp-white);
-  font-size: 26px;
-  font-weight: 800;
-  animation: pulse-live 1.2s infinite;
-}
-
-.hitl-copy {
-  margin-bottom: 14px;
-  color: var(--vsp-danger-pale);
-  font-size: 14px;
-}
-
-.hitl-reason {
-  margin: 0 auto 14px;
-  padding: 8px 10px;
-  color: var(--vsp-danger-soft);
-  background: rgb(var(--rgb-black) / 0.24);
-  border-radius: 6px;
-  font-size: 12px;
-}
-
-.hitl-screenshot {
-  max-width: 240px;
-  max-height: 140px;
-  margin: 0 auto 12px;
-  border-radius: 6px;
-  border: 1px solid rgb(var(--rgb-white) / 0.2);
-  object-fit: contain;
-  cursor: pointer;
-  transition: max-width 0.3s, max-height 0.3s;
-}
-
-.hitl-screenshot.is-expanded {
-  max-width: 480px;
-  max-height: 360px;
-}
+/* (HITL overlay removed — moved to SpiderAssistant drawer) */
 
 
 /* ── M: Phase timeline panel ───────────────────────────────────────── */
@@ -4177,7 +4040,7 @@ const handleCapabilityMoreAction = (command) => {
   height: 245px;
   border-radius: 8px;
   background: var(--vsp-bg-deep);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.22);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.22);
 }
 
 .capability-panel {
@@ -4194,13 +4057,13 @@ const handleCapabilityMoreAction = (command) => {
   padding: 12px 14px;
   border-radius: 10px;
   background:
-    linear-gradient(135deg, rgb(var(--rgb-indigo) / 0.2), rgb(var(--rgb-sky) / 0.06)),
+    linear-gradient(135deg, rgb(var(--rgb-cyan) / 0.2), rgb(var(--rgb-accent) / 0.06)),
     var(--vsp-slate-900);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.35);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.35);
 }
 
 .capability-kicker {
-  color: var(--vsp-indigo-300);
+  color: var(--vsp-cyan-300);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -4223,9 +4086,9 @@ const handleCapabilityMoreAction = (command) => {
   align-self: flex-start;
   padding: 4px 10px;
   border-radius: 999px;
-  color: var(--vsp-indigo-200);
-  background: rgb(var(--rgb-indigo) / 0.18);
-  border: 1px solid rgb(var(--rgb-indigo-bright) / 0.45);
+  color: var(--vsp-cyan-200);
+  background: rgb(var(--rgb-cyan) / 0.18);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.45);
   font-family: Consolas, 'JetBrains Mono', monospace;
   font-size: 12px;
 }
@@ -4321,13 +4184,13 @@ const handleCapabilityMoreAction = (command) => {
 }
 
 .download-link {
-  color: var(--vsp-info);
+  color: var(--vsp-accent);
   font-weight: 700;
   text-decoration: none;
 }
 
 .download-link:hover {
-  color: var(--vsp-info-soft);
+  color: var(--vsp-accent-bright);
 }
 
 :deep(.el-input__wrapper),
@@ -4392,7 +4255,7 @@ const handleCapabilityMoreAction = (command) => {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: var(--vsp-info);
+  background: var(--vsp-accent);
   opacity: 0.35;
   animation: typing-bounce 1.2s infinite ease-in-out;
 }
@@ -4423,16 +4286,16 @@ const handleCapabilityMoreAction = (command) => {
 
 .tab-jump {
   margin: 0 4px;
-  color: var(--vsp-info);
+  color: var(--vsp-accent);
   font-weight: 600;
   text-decoration: none;
-  border-bottom: 1px dashed rgb(var(--rgb-info) / 0.5);
+  border-bottom: 1px dashed rgb(var(--rgb-accent) / 0.5);
   cursor: pointer;
 }
 
 .tab-jump:hover {
-  color: var(--vsp-info-soft);
-  border-bottom-color: var(--vsp-info-soft);
+  color: var(--vsp-accent-bright);
+  border-bottom-color: var(--vsp-accent-bright);
 }
 
 
@@ -4480,7 +4343,8 @@ const handleCapabilityMoreAction = (command) => {
   max-width: 55%;
   overflow: hidden;
   font-size: 12px;
-  color: var(--vsp-text-2);
+  font-weight: 500;
+  color: var(--vsp-text-faint);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -4530,19 +4394,29 @@ const handleCapabilityMoreAction = (command) => {
 }
 /* C2: 抽屉视觉打磨 — 卡片化分组、与主面板同一套 token */
 :global(.settings-drawer.el-drawer) {
-  background: var(--vsp-surface);
+  background: linear-gradient(180deg, #f7faf9 0%, var(--vsp-bg) 42%, var(--vsp-bg-deep) 100%);
   border-left: 1px solid var(--vsp-border);
-  box-shadow: -18px 0 42px rgb(var(--rgb-black) / 0.45);
+  box-shadow: -16px 0 44px rgb(var(--rgb-teal-deep) / 0.16);
 }
 
 :global(.settings-drawer .el-drawer__header) {
   margin-bottom: 0;
   padding: 16px 20px;
   font-size: 15px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.06em;
-  color: var(--vsp-text);
+  color: var(--vsp-teal-deep);
   border-bottom: 1px solid var(--vsp-border);
+  /* faint brand tint + a 56x2 emerald→cyan hairline pinned bottom-left, drawn
+     as background layers. (A scoped :global(...)::after mis-compiles and leaks
+     its declarations onto the header element, collapsing it to a tiny box.) */
+  background:
+    linear-gradient(90deg, var(--vsp-accent), var(--vsp-cyan-bright)) 0 100% / 56px 2px no-repeat,
+    linear-gradient(90deg, rgb(var(--rgb-accent) / 0.06), transparent 55%);
+}
+
+:global(.settings-drawer .el-drawer__title) {
+  white-space: nowrap;
 }
 
 :global(.settings-drawer .el-drawer__body) {
@@ -4558,21 +4432,35 @@ const handleCapabilityMoreAction = (command) => {
 .drawer-collapse :deep(.el-collapse-item) {
   margin-bottom: 12px;
   overflow: hidden;
-  background: rgb(var(--rgb-surface-2) / 0.6);
+  background: var(--vsp-surface);
   border: 1px solid var(--vsp-border);
   border-radius: 10px;
+  box-shadow: 0 1px 3px rgb(var(--rgb-teal-deep) / 0.05), 0 1px 2px rgb(var(--rgb-teal-deep) / 0.04);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.drawer-collapse :deep(.el-collapse-item:hover) {
+  border-color: rgb(var(--rgb-accent) / 0.28);
+  box-shadow: 0 2px 8px rgb(var(--rgb-teal-deep) / 0.07);
 }
 
 .drawer-collapse :deep(.el-collapse-item__header) {
   height: 44px;
   padding: 0 14px;
   font-weight: 600;
+  color: var(--vsp-text-strong);
   background: transparent;
   border-bottom: none;
 }
 
+.drawer-collapse :deep(.el-collapse-item.is-active) {
+  border-color: rgb(var(--rgb-accent) / 0.4);
+  box-shadow: 0 4px 14px rgb(var(--rgb-accent) / 0.14);
+}
 .drawer-collapse :deep(.el-collapse-item.is-active .el-collapse-item__header) {
-  border-bottom: 1px solid var(--vsp-border);
+  color: var(--vsp-accent);
+  background: linear-gradient(90deg, rgb(var(--rgb-accent) / 0.1), rgb(var(--rgb-cyan) / 0.05));
+  border-bottom: 1px solid rgb(var(--rgb-accent) / 0.2);
 }
 
 .drawer-collapse :deep(.el-collapse-item__content) {
@@ -4587,4 +4475,20 @@ const handleCapabilityMoreAction = (command) => {
 .drawer-collapse .field-group {
   margin-bottom: 0;
 }
+
+.sp-hitl-notice {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: #991b1b;
+}
+
+.sp-hitl-notice p { margin: 0; }
 </style>
