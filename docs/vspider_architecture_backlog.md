@@ -3953,3 +3953,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useCapabilityTraceExport.test.js 8 例（空 trace 双 guard / buildSummaryText header+health+intent+alignment / 可选 crawl+runtime 段 / off-plan "not in plan" / copy happy 写剪贴板+toast / copy 失败不 toast / export DOM-stub 验证 _ts 剥离+文件名 capability_trace_<stamp>.jsonl+导出计数 toast）；vitest 106 passed（12 文件）；npm run build 绿（1694 模块）。
 - App.vue 行数: 1602 → **1440 行**（-162）。本会话累计 ~4150 → 1440（约 -65%）。
 - 风险: 低-中（buildSummaryText ~120 行多分支逐字平移，靠整袋注入零转写；guard/happy/可选段 + DOM-stub export 覆盖，build+vitest+lint 三绿）。
+
+## Slice D-UI-13 (M4 简便): HITL 人工介入/表单子系统抽离 useHitlForm (done, P2)
+
+- 能力名: hitl_form_extraction（human-in-the-loop 介入/前端补填表单：8 state + isBotChallengeHitl computed + 3 动作整体抽成 composable）。
+- 影响层: 新增 composables/useHitlForm.js（`useHitlForm({ appendLog })` 返回 8 state：isHumanInterventionRequired/humanInterventionReason/hitlScreenshot + hitlForm{Visible/Fields/Reason/Screenshot/Loading} + isBotChallengeHitl computed + resumeAgentExecution/submitHitlForm/skipHitlForm）。
+- 依赖注入: appendLog（注入）；apiFetch / ElMessage / isBotChallengeReason（后者来自 ./useTaskSubmit）由 composable 直接 import。
+- 抽离方法: 8 state + 1 computed + 3 函数逐字平移；App.vue destructure 全部 12 个返回值。**关键**：WS 消息处理器 handleSocketMessage（295/410-427）直接写这些 ref（`isHumanInterventionRequired.value = true` 等），destructure 后同名变量，**零改动**；模板 7 处绑定（HitlFormDialog v-model/reason/fields/screenshot/loading/@submit/@skip + sp-hitl-notice 的 isBotChallengeHitl/resumeAgentExecution）零改动。顺带删除 App.vue 现已无用的 isBotChallengeReason import（其唯一引用随 computed 迁出）。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useHitlForm.test.js 7 例（默认惰性态 / isBotChallengeHitl 跟随 reason（mock useTaskSubmit）/ resume happy 清介入+toast / resume error 保留 flag / submit happy 隐表单+字段计数 / submit error 复位 loading / skip 隐表单+日志且不发网络）；vitest 113 passed（13 文件）；npm run build 绿（index js 191.96kB）。
+- App.vue 行数: 1440 → **1394 行**（-46）。本会话累计 ~4150 → 1394（约 -66%）。
+- 风险: 低（state/computed/3 action 逐字平移，WS 写入点经同名 ref 零改；resume/submit/skip 的 happy+error+guard 全覆盖，build+vitest+lint 三绿）。

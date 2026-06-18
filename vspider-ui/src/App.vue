@@ -43,6 +43,7 @@ import { useTimelineReplay } from './composables/useTimelineReplay.js'
 import { useCapabilityFixtureReplay } from './composables/useCapabilityFixtureReplay.js'
 import { useBrowserRuntimeStatus } from './composables/useBrowserRuntimeStatus.js'
 import { useCapabilityTraceExport } from './composables/useCapabilityTraceExport.js'
+import { useHitlForm } from './composables/useHitlForm.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -55,7 +56,6 @@ import {
   authProfileOptionLabel,
   buildAuthoritativeUrlsPayload,
   buildTaskConstraints,
-  isBotChallengeReason,
   validateTaskInput,
   fetchOutputContractPreview,
   formatOutputContractPreview,
@@ -117,14 +117,20 @@ const {
   selectedModelType,
 } = useModelSettings()
 
-const isHumanInterventionRequired = ref(false)
-const humanInterventionReason = ref('')
-const hitlFormVisible = ref(false)
-const hitlFormFields = ref([])
-const hitlFormReason = ref('')
-const hitlFormScreenshot = ref('')
-const hitlFormLoading = ref(false)
-const hitlScreenshot = ref('')
+const {
+  isHumanInterventionRequired,
+  humanInterventionReason,
+  hitlFormVisible,
+  hitlFormFields,
+  hitlFormReason,
+  hitlFormScreenshot,
+  hitlFormLoading,
+  hitlScreenshot,
+  isBotChallengeHitl,
+  resumeAgentExecution,
+  submitHitlForm,
+  skipHitlForm,
+} = useHitlForm({ appendLog })
 const activeBottomTab = ref('terminal')
 const runsSubView = ref('all')
 // C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
@@ -245,10 +251,6 @@ watch(taskResult, (val, oldVal) => {
     activeBottomTab.value = 'artifacts'
   }
 })
-
-const isBotChallengeHitl = computed(() =>
-  isBotChallengeReason(humanInterventionReason.value),
-)
 
 const finalAnswerHtml = computed(() => renderMarkdown(finalAnswerText.value))
 
@@ -510,54 +512,6 @@ const useAuthProfile = (name) => {
   if (!selectedAuthProfiles.value.includes(name)) {
     selectedAuthProfiles.value = [...selectedAuthProfiles.value, name]
   }
-}
-
-const resumeAgentExecution = async () => {
-  try {
-    const response = await apiFetch('/api/human/resume', {
-      method: 'POST',
-    })
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '恢复执行失败')
-    }
-    isHumanInterventionRequired.value = false
-    humanInterventionReason.value = ''
-    ElMessage.success('已发送恢复执行信号')
-    await appendLog('[HITL] Resume signal sent')
-  } catch (err) {
-    ElMessage.error(`恢复执行失败: ${String(err)}`)
-    await appendLog(`[ERROR] 恢复执行失败: ${String(err)}`)
-  }
-}
-
-const submitHitlForm = async (formData) => {
-  hitlFormLoading.value = true
-  try {
-    const response = await apiFetch('/api/human/form_submit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fields: formData }),
-    })
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '表单提交失败')
-    }
-    hitlFormVisible.value = false
-    hitlFormLoading.value = false
-    ElMessage.success('已提交表单数据，Agent 继续执行')
-    await appendLog(`[HITL] 表单数据已提交，${Object.keys(formData).length} 个字段`)
-  } catch (err) {
-    hitlFormLoading.value = false
-    ElMessage.error(`表单提交失败: ${String(err)}`)
-    await appendLog(`[ERROR] HITL 表单提交失败: ${String(err)}`)
-  }
-}
-
-const skipHitlForm = async () => {
-  hitlFormVisible.value = false
-  hitlFormLoading.value = false
-  await appendLog('[HITL] 用户选择跳过前端表单，请去浏览器窗口操作')
 }
 
 const capabilityTrace = useCapabilityTrace(phaseEvents)
