@@ -22,14 +22,14 @@ def _line_count(rel_path: str) -> int:
 
 
 class TestFileSizeBaseline:
-    def test_main_py_below_10200(self):
-        # S1a-S1d carved the extraction subsystem out of run_agent into
-        # extraction_engine/runtime.py (~1600 lines removed); lock in the gain.
-        # The 3 nonlocal run-lifecycle finalizers stay in main.py by design,
-        # so the limit is set just above the current count; S2/S3 will tighten it.
+    def test_main_py_below_9700(self):
+        # S1a-S1d carved the extraction subsystem into extraction_engine/runtime.py;
+        # S3 carved the 9 startup/handoff closures into phases/setup.py
+        # (~280 lines further removed). main.py is now ~9669 Python lines, so the
+        # baseline is tightened from 10200 to 9700 to lock in the S3 gain.
         count = _line_count("visual_web_agent/main.py")
-        assert count < 10200, (
-            f"main.py has {count} lines (limit 10200). "
+        assert count < 9700, (
+            f"main.py has {count} lines (limit 9700). "
             "New features must go into phases/ or extraction_engine/ modules, not main.py."
         )
 
@@ -74,3 +74,11 @@ class TestFileSizeBaseline:
         src = runtime.read_text(encoding="utf-8")
         for cls in ("class ExtractState", "class ExtractDeps", "class ExtractRuntime"):
             assert cls in src, f"{cls} missing from extraction_engine/runtime.py"
+
+    def test_phase_setup_carved_out(self):
+        # S3 closeout: the 9 startup/handoff closures now live in phases/setup.py.
+        setup = _PROJECT / "visual_web_agent" / "phases" / "setup.py"
+        assert setup.exists()
+        src = setup.read_text(encoding="utf-8")
+        for cls in ("class SetupDeps", "class SetupTools"):
+            assert cls in src, f"{cls} missing from phases/setup.py"

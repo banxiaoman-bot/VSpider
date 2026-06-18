@@ -3744,6 +3744,46 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - S1 阶段小结: extraction 闭包族（DOM 读 / 仲裁归一 / 快路径文本）已全量迁入 `ExtractRuntime`（33 方法）；main.py `run_agent` 由 ~11600 降至 10019（Python 行）；S1a-S1d 四刀均纯平移零行为改动，每刀经 ExtractRuntime 单测 + 抽取回归 + 全量 pytest 零新增 Python 失败验证。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1e）。
 
+## Slice S2 (M5 拆分): 动作分发迁注册表 (done, P1 — 早由 actions/ 达成)
+
+- 能力名: action_dispatch_to_registry（计划拟新建 `actions/dispatch_table.py` 把 `run_agent` 内 `if action == ...` 分发链迁出）。
+- 影响层: operations_plane（`action_registry.py` + `actions/`）。
+- 前置: S1 已完成。
+- 结论: **跳过新建 `dispatch_table.py`，目标早已由既有 `actions/` 模块化达成**。复核 `main.py` 残留的 `action ==` 全是**循环控制守卫**（强制 next_page / 首翻 / click_text handoff / done 后处理等 run_agent step 逻辑），属生命周期控制流，**不是动作分发**；动作分发本就走 `action_registry` + `actions/<cap>.py` handler。再建 `dispatch_table.py` 为冗余层，按「能用既有就不新增」铁律不做。
+- 与计划偏差: 计划的 S2a 建 `dispatch_table.py` 判定为冗余，已征用户同意「跳过 S2 转 S3」。
+- 新增 contract 字段: 无。
+- Tests: 无（无代码改动，仅复核 + 决策）。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S2，重定义为「已达成」）。
+
+## Slice S3 (M5 拆分): 起手/handoff 闭包迁 phases/setup.py (done, P1)
+
+- 能力名: setup_phase_extraction（`run_agent` 起手段 9 个闭包平移进 `phases/setup.py::SetupTools`）。
+- 影响层: execution_kernel（`visual_web_agent/main.py` → `visual_web_agent/phases/setup.py`）。
+- 前置: S1 已完成、S2 已跳过。
+- 改动:
+  - 平移 9 闭包 → `SetupTools(SetupDeps)`：`browser_action_tool` / `targeted_probe_tool` / `try_targeted_click_text_handoff` / `resolve_type_value_for_handoff` / `try_targeted_type_handoff` / `check_stop` / `abort_if_stale_auth` / `with_tool_metadata` / `recover_active_page`。
+  - 无 nonlocal（不同于 S1d finalizer）：`_check_stop` / `_recover_active_page` 靠 raise 异常控制流，方法内 raise 行为不变。
+  - `SetupDeps` 注入 browser / goal / vlm / logger / event_stream / stop_event / start_url / action_registry / selected_tools + 2 个传递回调 `_broadcast_log_safe` / `_broadcast_done_safe`；模块助手在 setup.py import。
+  - 接线点：`_browser_action_tool` 原 `action_registry.bind("next_page", ...)` 改绑 `_setup.browser_action_tool`；`_setup` 在 action_registry 之后、bind 之前构造（deps 就绪）。main.py 闭包改薄包装保签名（含 3 个 registry bind 零改），净减约 280 行。字节级 patch（CRLF，即用即删）；纯平移零行为改动。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_phase_setup_split.py` 10✓；run_agent import + 抽取 sanity 92✓；全量 pytest S3 零新增 Python 失败（35 失败全是并发 UI/api 重构，与本切片无关）。
+- 提交: `4b759b0`（新建 `phases/setup.py` + main.py + test_phase_setup_split.py，4 文件 +610/−383）。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S3）。
+
+## Slice B (M5 拆分收口): main.py 体量基线刷新 + S2/S3 收口 (done, P1)
+
+- 能力名: main_py_baseline_refresh（S3 后 `main.py` 体量回归守卫收紧 + S2/S3 阶段收口留痕）。
+- 影响层: 测试基线（`tests/test_file_size_baseline.py`）+ 文档（本 backlog）。
+- 前置: S3 已完成。
+- 改动:
+  - `test_file_size_baseline.py`：`main.py` 行数守卫由 10200 收紧为 **9700**（实测 9669，锁定 S3 减约 280 行的成果），`test_main_py_below_10200` → `test_main_py_below_9700`；新增 `test_phase_setup_carved_out` 断言 `phases/setup.py` 存在且含 `SetupDeps` / `SetupTools`（对齐 S1 的 `test_extraction_runtime_carved_out`）。
+  - 本 backlog 补录 S2（跳过/已达成）、S3（`4b759b0`）、B（本条）三条。
+- 与计划偏差: 计划终态 `main.py < 5500` **不可达**——因 S2 的 ~6380 行 dispatch 早不在 `main.py`（前序 `actions/` 重构已迁），计划行数前提过时。9669 为 S1+S3 后的真实终态。
+- main.py 解构整体收官: S1（extraction→ExtractRuntime，5 commit）+ S2（dispatch 早由 actions/ 达成，跳过）+ S3（setup→phases/setup.py，`4b759b0`）；`main.py` ~11600 → **9669**（Python，累计 −~1930）。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_file_size_baseline.py` 8✓（含新增 `test_phase_setup_carved_out`）。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（收口 B）。
+
 ## Slice C4 (M5 契约): input_contract 落地 (done, P1)
 
 - 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。
