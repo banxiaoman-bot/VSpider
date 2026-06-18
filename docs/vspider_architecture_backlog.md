@@ -297,6 +297,14 @@ Acceptance:
 - 新增 contract 字段: extraction_selector_recovery.v1（新增 advisory 结构，不改既有契约）。
 - Tests: test_extraction_selector_recovery.py 5✓（塌陷恢复 / 弱部分恢复 / 健康不恢复 / 无 baseline / 弱 baseline 拒绝）；test_extraction_recovery.py 旧用例仍绿。
 
+## Slice RB2 (M5 鲁棒): failure-replay recovery-decision 闭环 (done, P2)
+
+- 能力名: replay_recovery_decision（把已捕获失败的 action_trace 喂回 self_healing_policy，离线断言「会真的产出恢复决策」）。
+- 影响层: capability_failure_replay.py（接入 replay_capability_failure_fixture 报告 + 批处理聚合 recovery_decision_count）。
+- 改动: 纯增量，不改 FIXTURE-AUDIT-1 锁定的 report['passed'] planner-feedback 门；rich bundle(带 action_trace) → has_recovery_decision=True 且 selector_missing 引向 use_similar_selector；minimal bundle(无 trace) → has_recovery_decision=False。
+- 新增 contract 字段: capability_failure_recovery_decision_replay.v1（report['recovery_decision'] 子结构）。
+- Tests: test_capability_failure_recovery_replay.py 6✓（含 batch 聚合 recovery_decision_count=2）；test_fixture_coverage_audit.py(FIXTURE-AUDIT-1) 回归仍绿。
+
 ## Slice 7: State Debug CLI
 
 Reference: browser-use CLI `state`, `click`, `type`, `screenshot`.
