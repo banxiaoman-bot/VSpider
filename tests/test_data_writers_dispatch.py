@@ -503,28 +503,58 @@ class TestSaveRunDataset:
         assert path.endswith(".csv")
         assert Path(path).exists()
 
-    def test_save_run_dataset_unique_key_uses_legacy_xlsx(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_save_run_dataset_unique_key_xlsx_via_save_artifact(
+        self, tmp_path: Path
     ) -> None:
+        """unique_key + xlsx now goes through save_artifact (not legacy save_to_excel),
+        ensuring manifest is always written via finalize_file_artifact."""
         pytest.importorskip("pandas")
-        from visual_web_agent import data_manager as dm
         from visual_web_agent.data_writers.dispatch import save_run_dataset
 
-        monkeypatch.setattr(
-            dm,
-            "resolve_artifact_path",
-            lambda filename, subdir="": tmp_path / Path(filename).name,
-            raising=True,
-        )
         path = save_run_dataset(
             [{"tooltip": "one"}],
             run_id="run_tooltip",
             output_contract={"container": "xlsx"},
             filename_hint="tips.xlsx",
             unique_key="tooltip",
+            base_dir=tmp_path,
         )
         assert path.endswith("tips.xlsx")
         assert Path(path).exists()
+
+        manifest_path = tmp_path / "run_tooltip" / "manifest.json"
+        assert manifest_path.exists(), "manifest.json must be written"
+
+    def test_save_run_dataset_unique_key_dedupes_on_second_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Two saves with the same unique_key should dedupe rows."""
+        pytest.importorskip("pandas")
+        import pandas as pd
+        from visual_web_agent.data_writers.dispatch import save_run_dataset
+
+        contract = {"container": "xlsx"}
+        save_run_dataset(
+            [{"id": "a", "val": 1}, {"id": "b", "val": 2}],
+            run_id="run_dedup",
+            output_contract=contract,
+            filename_hint="dedup.xlsx",
+            unique_key="id",
+            base_dir=tmp_path,
+        )
+        path = save_run_dataset(
+            [{"id": "a", "val": 99}, {"id": "c", "val": 3}],
+            run_id="run_dedup",
+            output_contract=contract,
+            filename_hint="dedup.xlsx",
+            unique_key="id",
+            base_dir=tmp_path,
+        )
+        df = pd.read_excel(path, engine="openpyxl")
+        ids = sorted(df["id"].tolist())
+        assert ids == ["a", "b", "c"], f"expected deduped ids, got {ids}"
+        row_a = df[df["id"] == "a"].iloc[0]
+        assert row_a["val"] == 99, "last write wins for duplicated key"
 
 
 # ---------------------------------------------------------------------------

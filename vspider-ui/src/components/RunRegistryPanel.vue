@@ -133,6 +133,26 @@ const artifactHref = (item) => {
   return `${API_BASE}/download/runs/${encodeURIComponent(runId)}/artifacts/${encodeURI(rel)}`
 }
 
+const FILE_BUNDLE_THRESHOLD = 5
+const downloadableKinds = new Set([
+  'media_image', 'media_video', 'media_audio', 'media_pdf',
+  'media_archive', 'file_generic', 'screenshot',
+])
+const downloadableFileCount = computed(() =>
+  manifestItems.value.filter(
+    (item) =>
+      downloadableKinds.has(String(item?.kind || '')) &&
+      String(item?.path || '') &&
+      !item?.inline &&
+      !(item?.extra && item.extra.bundle),
+  ).length,
+)
+const bundleHref = computed(() => {
+  const runId = String(manifest.value.run_id || runRecord.value.run_id || '')
+  if (!runId) return ''
+  return `${API_BASE}/download/runs/${encodeURIComponent(runId)}/bundle.zip`
+})
+
 const closeDialog = () => {
   dialogVisible.value = false
 }
@@ -304,6 +324,15 @@ watch(() => props.refreshToken, () => fetchRuns())
           <header>
             <Document class="run-section-icon" />
             <h4>产物清单 Manifest</h4>
+            <a
+              v-if="downloadableFileCount > FILE_BUNDLE_THRESHOLD && bundleHref"
+              :href="bundleHref"
+              class="download-link bundle-download-link"
+              target="_blank"
+              rel="noreferrer"
+            >
+              打包下载（{{ downloadableFileCount }} 个文件）
+            </a>
           </header>
           <el-table
             :data="visibleManifestItems"
