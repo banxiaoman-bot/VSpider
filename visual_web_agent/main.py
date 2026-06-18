@@ -2281,27 +2281,34 @@ async def run_agent(
             "upload", "press_key", "find_text", "next_page", "save_to_memory",
             "download_image",
         )
-        _extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
-        _pagination_probed = False  # 首次 extract 后探测分页器一次（Improvement 1）
-        _pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
-        _pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
-        _first_flip_pending = False  # 首次 extract 后强制下一步走 next_page（引擎层硬约束）
-        _page_is_infinite_scroll = False  # 标记当前页面是无限滚动（无分页器）
-        _force_next_page_pending = False  # 物理触底且未达标：下一轮强制 next_page
-        _force_extract_after_navigation_pending = False  # 翻页落地后：下一轮必须先提取新页，禁止连续翻页跳页
-        _block_next_page_until_drained = False  # 当前页只提到少量数据且还能滚动：禁止过早翻页
-        _block_next_page_reason = ""
-        _first_extract_ever_done = False  # 任务级永久锁：首次 extract 完成过（不会被翻页重置）
+        # S1a: group extraction counters into a shared ExtractState so the
+        # main loop and the extraction closures mutate one instance.
+        try:
+            from .extraction_engine.runtime import ExtractState as _ExtractState
+        except ImportError:  # pragma: no cover
+            from extraction_engine.runtime import ExtractState as _ExtractState  # type: ignore[no-redef]
+        _xs = _ExtractState()
+        _xs.extract_count = 0  # 连续 extract 次数（中间无翻页 click），>=2 强制 done
+        _xs.pagination_probed = False  # 首次 extract 后探测分页器一次（Improvement 1）
+        _xs.pagination_kind = ""        # "numeric" / "next_only" / "infinite" / ""
+        _xs.pagination_hint_msg = ""    # 待注入到 VLM 的探测结果反馈（下一轮 ask 时消费）
+        _xs.first_flip_pending = False  # 首次 extract 后强制下一步走 next_page（引擎层硬约束）
+        _xs.page_is_infinite_scroll = False  # 标记当前页面是无限滚动（无分页器）
+        _xs.force_next_page_pending = False  # 物理触底且未达标：下一轮强制 next_page
+        _xs.force_extract_after_navigation_pending = False  # 翻页落地后：下一轮必须先提取新页，禁止连续翻页跳页
+        _xs.block_next_page_until_drained = False  # 当前页只提到少量数据且还能滚动：禁止过早翻页
+        _xs.block_next_page_reason = ""
+        _xs.first_extract_ever_done = False  # 任务级永久锁：首次 extract 完成过（不会被翻页重置）
         _prev_action_sig: tuple[str, int, str] = ("", 0, "")  # G4: also tracked by _post_decision_guards; kept for other consumers (action, target_id, type_value)，用于"思想-动作分离"检测
         _repeat_action_count: int = 0  # 同一 action sig 连续重复次数，用于精确触发 AUTO-ADVANCE
-        _total_extracted_rows = 0  # 跨页累加的总行数
-        _extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
-        _extract_null_total_resets = 0  # 防止无限重试：streak 被重置的总次数
-        _extracted_page_urls: set = set()  # 已成功提取数据的不同页面 URL 集合
-        _extracted_page_keys: set[str] = set()  # URL + table signature; SPA/table pagination stays on one URL
-        _seen_extract_row_keys: set[str] = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
-        _tooltip_trigger_keys: set[str] = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
-        _pagination_exhausted = False  # 分页已耗尽（滚到底+翻页失败），用于容差退出
+        _xs.total_extracted_rows = 0  # 跨页累加的总行数
+        _xs.extract_null_streak = 0  # 连续 extract+null 降级次数，用于三级升级策略
+        _xs.extract_null_total_resets = 0  # 防止无限重试：streak 被重置的总次数
+        _xs.extracted_page_urls = set()  # 已成功提取数据的不同页面 URL 集合
+        _xs.extracted_page_keys = set()  # URL + table signature; SPA/table pagination stays on one URL
+        _xs.seen_extract_row_keys = set()  # 行级去重，支持同 URL 无限滚动/局部刷新
+        _xs.tooltip_trigger_keys = set()  # tooltip 任务按 trigger 统计进度，而不是按候选行累加
+        _xs.pagination_exhausted = False  # 分页已耗尽（滚到底+翻页失败），用于容差退出
         # RUN-RESUME1 step3a-wire-2b: opt-in resume seed (inert unless constraints.resume).
         # Rebuild the dedup seen-set from the prior run's dataset so a resumed
         # run skips rows already on disk and only appends genuinely new ones.
@@ -2313,8 +2320,8 @@ async def run_agent(
                     from resume_seed import seed_seen_from_last_run  # type: ignore[no-redef]
                 _resume_seed = seed_seen_from_last_run(goal, start_url, _run_ts)
                 if _resume_seed.seen:
-                    _seen_extract_row_keys |= _resume_seed.seen
-                    _total_extracted_rows = max(_total_extracted_rows, _resume_seed.count)
+                    _xs.seen_extract_row_keys |= _resume_seed.seen
+                    _xs.total_extracted_rows = max(_xs.total_extracted_rows, _resume_seed.count)
                     logger.info(
                         "[RUN-RESUME] seeded %s fingerprints / %s rows from prior run %s",
                         len(_resume_seed.seen),
@@ -2343,7 +2350,7 @@ async def run_agent(
             target_count = _parse_goal_target_count(goal)
             target_remaining = (
                 None if target_count is None
-                else max(0, target_count - _total_extracted_rows)
+                else max(0, target_count - _xs.total_extracted_rows)
             )
             raw_data = data
             if _requested_output_fields and isinstance(data, list):
@@ -2363,7 +2370,7 @@ async def run_agent(
                         schema_stats.get("total_fields"),
                     )
                 raw_data = filtered_rows
-            trial_seen = set(_seen_extract_row_keys)
+            trial_seen = set(_xs.seen_extract_row_keys)
             result = sanitize_extracted_rows(
                 raw_data=raw_data,
                 source_text=source_text,
@@ -2454,7 +2461,7 @@ async def run_agent(
             target_count = _parse_goal_target_count(goal)
             target_remaining = (
                 None if target_count is None
-                else max(0, target_count - _total_extracted_rows)
+                else max(0, target_count - _xs.total_extracted_rows)
             )
             expected_rows = _expected_rows_from_data_shape(
                 candidate.get("data_shape") or {}
@@ -2560,7 +2567,7 @@ async def run_agent(
             return chosen
 
         def _commit_extraction_candidate(candidate: dict) -> tuple[list, int, int, int, str]:
-            _seen_extract_row_keys.update(candidate.get("fingerprints") or set())
+            _xs.seen_extract_row_keys.update(candidate.get("fingerprints") or set())
             return (
                 candidate.get("rows") or [],
                 int(candidate.get("accepted") or 0),
@@ -2570,10 +2577,9 @@ async def run_agent(
             )
 
         def _record_extract_progress(rows, accepted_count: int) -> tuple[int, int]:
-            nonlocal _total_extracted_rows
             if not _goal_is_tooltip_extract(goal):
-                _total_extracted_rows += accepted_count
-                return accepted_count, _total_extracted_rows
+                _xs.total_extracted_rows += accepted_count
+                return accepted_count, _xs.total_extracted_rows
 
             new_triggers = 0
             for row in rows or []:
@@ -2581,11 +2587,11 @@ async def run_agent(
                     trigger_key = extract_tooltip_primary_key(row)
                 else:
                     trigger_key = str(row).strip()
-                if trigger_key and trigger_key not in _tooltip_trigger_keys:
-                    _tooltip_trigger_keys.add(trigger_key)
+                if trigger_key and trigger_key not in _xs.tooltip_trigger_keys:
+                    _xs.tooltip_trigger_keys.add(trigger_key)
                     new_triggers += 1
-            _total_extracted_rows = len(_tooltip_trigger_keys)
-            return new_triggers, _total_extracted_rows
+            _xs.total_extracted_rows = len(_xs.tooltip_trigger_keys)
+            return new_triggers, _xs.total_extracted_rows
 
         async def _capture_body_text_excerpt(limit: int = 3000) -> str:
             try:
@@ -2623,7 +2629,7 @@ async def run_agent(
                     output_file=output_file,
                     run_id=_run_ts,
                     step=step,
-                    total_rows=_total_extracted_rows,
+                    total_rows=_xs.total_extracted_rows,
                     accepted_rows=accepted_rows,
                     duplicate_rows=duplicate_rows,
                     rejected_rows=rejected_rows,
@@ -2793,11 +2799,11 @@ async def run_agent(
             return effective_count >= target, effective_count, target
 
         async def _finish_if_xhr_target_reached(reason: str) -> bool:
-            nonlocal _total_extracted_rows, _task_completed, _run_succeeded, _log_screenshot_path, _log_decision
+            nonlocal _task_completed, _run_succeeded, _log_screenshot_path, _log_decision
             reached, count, target = _xhr_target_reached()
             if not reached:
                 return False
-            _total_extracted_rows = max(_total_extracted_rows, count)
+            _xs.total_extracted_rows = max(_xs.total_extracted_rows, count)
             output_file = str(getattr(browser, "_intercept_filename", "") or "")
             logger.info(
                 "[XHR HARD KILL] intercepted target reached: %s/%s (%s)",
@@ -5562,23 +5568,23 @@ async def run_agent(
                 _abort_requested = _planning.abort_requested
 
                 # ── Improvement 1：消费分页器探测结果（一次性，注入完即清） ──
-                if _pagination_hint_msg:
+                if _xs.pagination_hint_msg:
                     input_descriptions = (
-                        _pagination_hint_msg + "\n" + (input_descriptions or "")
+                        _xs.pagination_hint_msg + "\n" + (input_descriptions or "")
                     )
-                    _pagination_hint_msg = ""
+                    _xs.pagination_hint_msg = ""
 
                 # ── Path D + Improvement 3：进度透传，标为系统权威记账 ──
                 # VLM 没有长程数学记忆，必须在 prompt 里持续回灌权威进度。
                 # **强调"系统记账（唯一权威）"** 让 VLM 不再自己心算条数（避免 37/50 vs 30/50 偏差）。
                 _prog_target = _parse_goal_target_count(goal)
-                if _prog_target is not None and _total_extracted_rows > 0:
-                    _prog_pages = len(_extracted_page_urls)
-                    _prog_remaining = max(0, _prog_target - _total_extracted_rows)
-                    _prog_pct = int(min(100, _total_extracted_rows * 100 / _prog_target))
+                if _prog_target is not None and _xs.total_extracted_rows > 0:
+                    _prog_pages = len(_xs.extracted_page_urls)
+                    _prog_remaining = max(0, _prog_target - _xs.total_extracted_rows)
+                    _prog_pct = int(min(100, _xs.total_extracted_rows * 100 / _prog_target))
                     input_descriptions = (
                         f"\n📊【全局抓取进度（系统记账，唯一权威）】"
-                        f"{_total_extracted_rows}/{_prog_target} 条 "
+                        f"{_xs.total_extracted_rows}/{_prog_target} 条 "
                         f"({_prog_pct}%，跨 {_prog_pages} 个页面)，"
                         f"还需 {_prog_remaining} 条；达量后引擎会自动终止任务。\n"
                         f"**禁止**在 thought 里自己心算/估算条数 —— 一切以此数字为准。\n"
@@ -5587,17 +5593,17 @@ async def run_agent(
 
                 _forced_target = _parse_goal_target_count(goal)
                 _can_force_extract_after_navigation_now = (
-                    _force_extract_after_navigation_pending
+                    _xs.force_extract_after_navigation_pending
                     and (
                         _forced_target is None
-                        or _total_extracted_rows < _forced_target
+                        or _xs.total_extracted_rows < _forced_target
                     )
                 )
                 _can_force_next_page_now = (
-                    _force_next_page_pending
+                    _xs.force_next_page_pending
                     and (
                         _forced_target is None
-                        or _total_extracted_rows < _forced_target
+                        or _xs.total_extracted_rows < _forced_target
                     )
                 )
                 if _can_force_extract_after_navigation_now:
@@ -5669,7 +5675,7 @@ async def run_agent(
                             "current_state": "",
                             "subgoal_status": "in_progress",
                         }]
-                    _force_extract_after_navigation_pending = False
+                    _xs.force_extract_after_navigation_pending = False
                 elif _can_force_next_page_now:
                     logger.info(
                         "[FORCE NEXT_PAGE] skipping VLM ask; executing engine-scheduled next_page"
@@ -5693,14 +5699,14 @@ async def run_agent(
                         "current_state": "",
                         "subgoal_status": "in_progress",
                     }]
-                    _force_next_page_pending = False
+                    _xs.force_next_page_pending = False
                 else:
-                    if _force_extract_after_navigation_pending:
+                    if _xs.force_extract_after_navigation_pending:
                         logger.info("[FORCE EXTRACT AFTER NAV] cleared because target is already met")
-                        _force_extract_after_navigation_pending = False
-                    if _force_next_page_pending:
+                        _xs.force_extract_after_navigation_pending = False
+                    if _xs.force_next_page_pending:
                         logger.info("[FORCE NEXT_PAGE] cleared because target is already met")
-                        _force_next_page_pending = False
+                        _xs.force_next_page_pending = False
                     # G2: emit vlm_call phase event with duration for the
                     # frontend timeline. Best-effort, swallows api_server errors.
                     _vlm_t0 = time.time()
@@ -5826,11 +5832,11 @@ async def run_agent(
                             goal=goal,
                             output_contract=_goal_output_contract,
                             output_mode=_goal_output_mode,
-                            total_extracted_rows=_total_extracted_rows,
-                            total_pages=len(_extracted_page_keys),
+                            total_extracted_rows=_xs.total_extracted_rows,
+                            total_pages=len(_xs.extracted_page_keys),
                             goal_target_count=_parse_goal_target_count(goal),
                             goal_target_pages=_parse_goal_target_pages(goal),
-                            pagination_exhausted=_pagination_exhausted,
+                            pagination_exhausted=_xs.pagination_exhausted,
                             manifest_items=load_manifest_items_for_run(_run_ts),
                             workflow_memory=workflow_memory,
                             no_progress_streak=_no_progress_tracker.streak,
@@ -6023,12 +6029,12 @@ async def run_agent(
                 # 仅触发一次：执行后立即清 flag；若 next_page L4 真的报错滚不动，
                 # VLM 下一轮会收到错误反馈正常走 done/click 路径。
                 if (
-                    _force_next_page_pending
+                    _xs.force_next_page_pending
                     and decisions
                     and decisions[0].get("action") not in ("done", "ask_human", "error")
                     and (
                         (_parse_goal_target_count(goal) is None)
-                        or (_total_extracted_rows < (_parse_goal_target_count(goal) or 0))
+                        or (_xs.total_extracted_rows < (_parse_goal_target_count(goal) or 0))
                     )
                 ):
                     _orig_action = decisions[0].get("action")
@@ -6051,15 +6057,15 @@ async def run_agent(
                         + (decisions[0].get("thought") or "")
                     )
                     decisions = [decisions[0]]
-                    _force_next_page_pending = False
+                    _xs.force_next_page_pending = False
                 elif (
-                    _first_flip_pending
+                    _xs.first_flip_pending
                     and _goal_needs_pagination_probe(goal)
                     and decisions
                     and decisions[0].get("action") in ("smooth_scroll", "scroll", "extract")
                 ):
                     _orig_action = decisions[0].get("action")
-                    if not _page_is_infinite_scroll:
+                    if not _xs.page_is_infinite_scroll:
                         # Normal paginated page: rewrite to next_page
                         logger.info(
                             f"[FIRST FLIP] 引擎硬约束：首次 extract 后下一步必须 next_page，"
@@ -6090,27 +6096,27 @@ async def run_agent(
                                 f"[FIRST FLIP] 无限滚动页面，保留原动作 {_orig_action}"
                             )
                         # keep smooth_scroll/scroll as-is
-                    _first_flip_pending = False  # 一次性消费，不再触发
+                    _xs.first_flip_pending = False  # 一次性消费，不再触发
                 # 即使 VLM 已经选了 next_page，flag 也清掉避免重复触发
-                elif _first_flip_pending and not _goal_needs_pagination_probe(goal):
+                elif _xs.first_flip_pending and not _goal_needs_pagination_probe(goal):
                     logger.info("[FIRST FLIP] skipped for non-pagination extraction goal")
-                    _first_flip_pending = False
-                elif _first_flip_pending and decisions and decisions[0].get("action") == "next_page":
-                    _first_flip_pending = False
+                    _xs.first_flip_pending = False
+                elif _xs.first_flip_pending and decisions and decisions[0].get("action") == "next_page":
+                    _xs.first_flip_pending = False
 
                 # ── 过早翻页护栏 ────────────────────────────────────────
                 # 当上一轮只提到少量行，且物理探针确认当前页/容器还能继续向下滚时，
                 # 不允许 VLM 直接 next_page。这样避免豆瓣/长列表只抓视口前几条就
                 # 翻页，跳过当前页下半部分数据。若当前页已触底，则放行 next_page。
                 if (
-                    _block_next_page_until_drained
+                    _xs.block_next_page_until_drained
                     and decisions
                     and decisions[0].get("action") == "next_page"
                 ):
                     _drain_guard_target = _parse_goal_target_count(goal)
                     _target_unmet = (
                         _drain_guard_target is None
-                        or _total_extracted_rows < _drain_guard_target
+                        or _xs.total_extracted_rows < _drain_guard_target
                     )
                     if _target_unmet:
                         _drain_state = await _probe_scroll_drain_state(
@@ -6120,7 +6126,7 @@ async def run_agent(
                             _orig_thought = decisions[0].get("thought") or ""
                             logger.info(
                                 "[PREMATURE PAGE GUARD] rewrite next_page -> smooth_scroll: %s; state=%s",
-                                _block_next_page_reason,
+                                _xs.block_next_page_reason,
                                 _drain_state,
                             )
                             _broadcast_log_safe(
@@ -6141,11 +6147,11 @@ async def run_agent(
                             logger.info(
                                 "[PREMATURE PAGE GUARD] current page drained; next_page allowed"
                             )
-                            _block_next_page_until_drained = False
-                            _block_next_page_reason = ""
+                            _xs.block_next_page_until_drained = False
+                            _xs.block_next_page_reason = ""
                     else:
-                        _block_next_page_until_drained = False
-                        _block_next_page_reason = ""
+                        _xs.block_next_page_until_drained = False
+                        _xs.block_next_page_reason = ""
 
                 # ── Fix 4：连续 ZERO_TARGET_DOWNGRADE RAW LOOP GUARD ───────
                 # 检测 VLM 反复输出 click+target_id=0+type_value="X" 的 schema
@@ -6869,16 +6875,16 @@ async def run_agent(
                     _extraction_complete = (
                         _goal_target is not None
                         and (
-                            _total_extracted_rows >= _goal_target
+                            _xs.total_extracted_rows >= _goal_target
                             or (
-                                _pagination_exhausted
-                                and _total_extracted_rows >= _goal_target - _tolerance
+                                _xs.pagination_exhausted
+                                and _xs.total_extracted_rows >= _goal_target - _tolerance
                             )
                         )
                     )
-                    if _extraction_complete and _total_extracted_rows < _goal_target:
+                    if _extraction_complete and _xs.total_extracted_rows < _goal_target:
                         logger.info(
-                            f"[CLOSE ENOUGH] 容差退出: {_total_extracted_rows}/{_goal_target} "
+                            f"[CLOSE ENOUGH] 容差退出: {_xs.total_extracted_rows}/{_goal_target} "
                             f"(容差 {_tolerance}，分页已耗尽)"
                         )
                     _allow_done_via_completion_kernel = False
@@ -6902,11 +6908,11 @@ async def run_agent(
                             goal=goal,
                             output_contract=_goal_output_contract,
                             output_mode=_goal_output_mode,
-                            total_extracted_rows=_total_extracted_rows,
-                            total_pages=len(_extracted_page_keys),
+                            total_extracted_rows=_xs.total_extracted_rows,
+                            total_pages=len(_xs.extracted_page_keys),
                             goal_target_count=_goal_target,
                             goal_target_pages=_parse_goal_target_pages(goal),
-                            pagination_exhausted=_pagination_exhausted,
+                            pagination_exhausted=_xs.pagination_exhausted,
                             manifest_items=load_manifest_items_for_run(_run_ts),
                             workflow_memory=workflow_memory,
                             capability_route=_capability_route,
@@ -6927,7 +6933,7 @@ async def run_agent(
                     if _extraction_complete:
                         logger.info(
                             f"[PLAN GATE] 放行 done：提取已达量 "
-                            f"{_total_extracted_rows}/{_goal_target} 条，跳过门闸"
+                            f"{_xs.total_extracted_rows}/{_goal_target} 条，跳过门闸"
                         )
                     elif _allow_done_via_final_subgoal:
                         logger.info(
@@ -7042,18 +7048,18 @@ async def run_agent(
                     for d in decisions
                 )
                 if _has_extract_downgrade:
-                    _extract_null_streak += 1
+                    _xs.extract_null_streak += 1
                     # 同 URL 不再直接跳过：无限滚动/局部刷新常常保持 URL 不变。
                     # 这里仅记录信号，真正是否重复由行级 fingerprint 决定。
                     _current_auto_url = browser.current_url
-                    if _current_auto_url in _extracted_page_urls:
+                    if _current_auto_url in _xs.extracted_page_urls:
                         logger.info(
                             "[EXTRACT AUTO] URL already seen; continuing with row-level dedup: %s",
                             _current_auto_url,
                         )
                     logger.warning(
                         f"[EXTRACT AUTO] VLM 输出 extract+null "
-                        f"(第 {_extract_null_streak} 次)，启动 AX Tree 自动提取"
+                        f"(第 {_xs.extract_null_streak} 次)，启动 AX Tree 自动提取"
                     )
                     try:
                         _data_shape = {}
@@ -7248,8 +7254,8 @@ async def run_agent(
                             )
                             _expected_auto_rows = _expected_rows_from_data_shape(_data_shape)
                             if _expected_auto_rows >= 10:
-                                _block_next_page_until_drained = True
-                                _block_next_page_reason = (
+                                _xs.block_next_page_until_drained = True
+                                _xs.block_next_page_reason = (
                                     f"dense page exposes about {_expected_auto_rows} rows, "
                                     "but extraction returned too few"
                                 )
@@ -7307,7 +7313,7 @@ async def run_agent(
                         )
                         if _api_fast.get("applied"):
                             _auto_extracted = _api_fast.get("fast_path", {}).get("rows") or _auto_extracted
-                            _progress_total_rows = _total_extracted_rows
+                            _progress_total_rows = _xs.total_extracted_rows
                         _auto_snapshot_path = await _save_extraction_snapshot(
                             source=_auto_extract_text_source,
                             rows=_auto_extracted,
@@ -7331,8 +7337,8 @@ async def run_agent(
                                 _progress_new_rows,
                                 _progress_total_rows,
                             )
-                        _extract_count += 1
-                        _extracted_page_urls.add(browser.current_url)
+                        _xs.extract_count += 1
+                        _xs.extracted_page_urls.add(browser.current_url)
                         # 与显式 extract 路径保持一致：含数据提取的轨迹不适合极速回放。
                         # Date-picker tasks are later semanticized to a date_pick macro,
                         # so incidental docs-table extraction must not poison that cache.
@@ -7347,25 +7353,25 @@ async def run_agent(
                             "snapshot_path": _auto_snapshot_path,
                         }]
                         # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
-                        # Bug 修复：用任务级永久锁 _first_extract_ever_done，避免 _extract_count
+                        # Bug 修复：用任务级永久锁 _xs.first_extract_ever_done，避免 _xs.extract_count
                         # 在翻页/导航后被重置回 0 → 下一次 extract 又把 flag 设回 True →
                         # FIRST FLIP 在每次翻页后反复触发的问题。
                         if (
-                            not _first_extract_ever_done
+                            not _xs.first_extract_ever_done
                             and _should_force_first_flip_after_successful_extract(goal)
                         ):
-                            _first_extract_ever_done = True
-                            _first_flip_pending = True
+                            _xs.first_extract_ever_done = True
+                            _xs.first_flip_pending = True
                         # ── Improvement 1：首次 extract 后探测分页器（auto-extract 路径） ──
                         if (
                             _goal_needs_pagination_probe(goal)
-                            and not _pagination_probed
-                            and _extract_count == 1
+                            and not _xs.pagination_probed
+                            and _xs.extract_count == 1
                         ):
-                            _pagination_probed = True
+                            _xs.pagination_probed = True
                             try:
                                 _probe = await browser.probe_pagination()
-                                _pagination_kind = _probe.get("kind", "")
+                                _xs.pagination_kind = _probe.get("kind", "")
                                 _cands = _probe.get("candidates", [])
                                 if _probe.get("has_paginator"):
                                     _names = ", ".join(
@@ -7375,18 +7381,18 @@ async def run_agent(
                                         _should_schedule_next_page_after_extract(
                                             goal,
                                             new_rows=_new_rows,
-                                            total_rows=_total_extracted_rows,
+                                            total_rows=_xs.total_extracted_rows,
                                             extract_source=_auto_extract_text_source,
-                                            pagination_kind=_pagination_kind,
+                                            pagination_kind=_xs.pagination_kind,
                                             expected_rows=_expected_rows_from_data_shape(_data_shape),
                                             physically_drained=bool(_data_shape.get("physically_drained")),
                                         )
                                     )
                                     if _should_force_probe_next:
-                                        _force_next_page_pending = True
-                                        _first_flip_pending = False
-                                        _block_next_page_until_drained = False
-                                        _block_next_page_reason = ""
+                                        _xs.force_next_page_pending = True
+                                        _xs.first_flip_pending = False
+                                        _xs.block_next_page_until_drained = False
+                                        _xs.block_next_page_reason = ""
                                         logger.info(
                                             "[PROBE PAGE] armed next_page after extract: %s",
                                             _force_probe_reason,
@@ -7395,8 +7401,8 @@ async def run_agent(
                                             f"[PROBE PAGE] 已发现分页器，下一轮直接 next_page：{_force_probe_reason}",
                                             level="info",
                                         )
-                                        _pagination_hint_msg = (
-                                            f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                        _xs.pagination_hint_msg = (
+                                            f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
                                             f"已确认页面底部存在翻页控件：{_names}。\n"
                                             f"当前页已提取到足够完整的一批数据（{_force_probe_reason}）。"
                                             f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
@@ -7407,36 +7413,36 @@ async def run_agent(
                                             "pagination probe low-yield auto extract"
                                         )
                                         if not bool(_drain_state.get("at_bottom")):
-                                            _block_next_page_until_drained = True
-                                            _block_next_page_reason = _force_probe_reason
+                                            _xs.block_next_page_until_drained = True
+                                            _xs.block_next_page_reason = _force_probe_reason
                                         else:
-                                            _force_next_page_pending = True
-                                            _first_flip_pending = False
-                                            _block_next_page_until_drained = False
-                                            _block_next_page_reason = ""
+                                            _xs.force_next_page_pending = True
+                                            _xs.first_flip_pending = False
+                                            _xs.block_next_page_until_drained = False
+                                            _xs.block_next_page_reason = ""
                                             _force_probe_reason = (
                                                 f"{_force_probe_reason}; physical bottom reached"
                                             )
-                                        if _force_next_page_pending:
-                                            _pagination_hint_msg = (
-                                                f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                        if _xs.force_next_page_pending:
+                                            _xs.pagination_hint_msg = (
+                                                f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
                                                 f"已确认页面存在翻页控件：{_names}。\n"
                                                 f"本次新增 {_new_rows} 条虽低于探头预期，"
                                                 "但页面已物理触底，继续滚动不会暴露更多当前页数据。"
                                                 "下一步必须使用 next_page 翻页。"
                                             )
                                         else:
-                                            if _force_next_page_pending:
-                                                _pagination_hint_msg = (
-                                                    f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                            if _xs.force_next_page_pending:
+                                                _xs.pagination_hint_msg = (
+                                                    f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
                                                     f"已确认页面存在翻页控件：{_names}。\n"
                                                     f"本次新增 {_new_rows} 条虽低于探头预期，"
                                                     "但页面已物理触底，继续滚动不会暴露更多当前页数据。"
                                                     "下一步必须使用 next_page 翻页。"
                                                 )
                                             else:
-                                                _pagination_hint_msg = (
-                                                    f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                                _xs.pagination_hint_msg = (
+                                                    f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
                                                     f"已确认页面存在翻页控件：{_names}。\n"
                                                     f"但本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
                                                     "不足以证明当前页已提取完。\n"
@@ -7445,23 +7451,23 @@ async def run_agent(
                                                 )
                                 else:
                                     # No paginator detected — mark as infinite scroll
-                                    _page_is_infinite_scroll = True
+                                    _xs.page_is_infinite_scroll = True
                                     _should_force_probe_next, _force_probe_reason = (
                                         _should_schedule_next_page_after_extract(
                                             goal,
                                             new_rows=_new_rows,
-                                            total_rows=_total_extracted_rows,
+                                            total_rows=_xs.total_extracted_rows,
                                             extract_source=_auto_extract_text_source,
-                                            pagination_kind=_pagination_kind,
+                                            pagination_kind=_xs.pagination_kind,
                                             expected_rows=_expected_rows_from_data_shape(_data_shape),
                                             physically_drained=bool(_data_shape.get("physically_drained")),
                                         )
                                     )
                                     if _should_force_probe_next:
-                                        _force_next_page_pending = True
-                                        _first_flip_pending = False
-                                        _block_next_page_until_drained = False
-                                        _block_next_page_reason = ""
+                                        _xs.force_next_page_pending = True
+                                        _xs.first_flip_pending = False
+                                        _xs.block_next_page_until_drained = False
+                                        _xs.block_next_page_reason = ""
                                         logger.info(
                                             "[PROBE PAGE] armed universal next_page after extract: %s",
                                             _force_probe_reason,
@@ -7470,55 +7476,55 @@ async def run_agent(
                                             f"[PROBE PAGE] 大批量提取未达量，下一轮交给 next_page 宏动作：{_force_probe_reason}",
                                             level="info",
                                         )
-                                        _pagination_hint_msg = (
+                                        _xs.pagination_hint_msg = (
                                             "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
                                             "当前提取批次已足够大但目标未达成。"
                                             "**输出 next_page**，引擎层会自动走 L4 瀑布流兜底（smooth_scroll）"
                                             "加载新数据。next_page 是万能翻页动作，不需要你判断模式。"
                                         )
                                     else:
-                                        _pagination_hint_msg = (
+                                        _xs.pagination_hint_msg = (
                                             "📍【系统探测：本页**无分页器**】\n"
                                             f"本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
                                             "请继续 smooth_scroll / extract 当前列表；"
                                             "如果滚动触底且仍未达量，引擎会再调度 next_page 宏动作。"
                                         )
-                                logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
+                                logger.info(f"[PROBE PAGE] kind={_xs.pagination_kind} cands={len(_cands)}")
                             except Exception as _probe_err:
                                 logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
                         # ── Re-arm：已知分页器 + 目标未达 → 每次 extract 后强制 next_page ──
-                        # 首次探测一次性完成（_pagination_probed=True），但后续 extract
+                        # 首次探测一次性完成（_xs.pagination_probed=True），但后续 extract
                         # 仍需引擎兜底翻页，避免 VLM 自行翻页出错浪费步数。
                         if (
-                            _pagination_probed
-                            and _pagination_kind not in ("", "infinite")
-                            and not _page_is_infinite_scroll
-                            and not _force_next_page_pending
+                            _xs.pagination_probed
+                            and _xs.pagination_kind not in ("", "infinite")
+                            and not _xs.page_is_infinite_scroll
+                            and not _xs.force_next_page_pending
                         ):
                             _rearm_target = _parse_goal_target_count(goal)
-                            if _rearm_target is not None and _total_extracted_rows < _rearm_target:
-                                _force_next_page_pending = True
+                            if _rearm_target is not None and _xs.total_extracted_rows < _rearm_target:
+                                _xs.force_next_page_pending = True
                                 logger.info(
                                     "[REARM NEXT_PAGE] paginator known (%s), target not met "
                                     "(%s/%s); re-armed for next step",
-                                    _pagination_kind,
-                                    _total_extracted_rows,
+                                    _xs.pagination_kind,
+                                    _xs.total_extracted_rows,
                                     _rearm_target,
                                 )
                         # ── Path C：Hard Kill — 引擎层强杀，达量直接终止主循环 ──
                         # 不再注入提示让 VLM 决策，避免它走神或重提取浪费步数。
                         _hk_target = _parse_goal_target_count(goal)
-                        if _hk_target is not None and _total_extracted_rows >= _hk_target:
+                        if _hk_target is not None and _xs.total_extracted_rows >= _hk_target:
                             logger.info(
                                 f"[HARD KILL] 引擎达量终止：累计 "
-                                f"{_total_extracted_rows} >= 目标 {_hk_target} 条"
+                                f"{_xs.total_extracted_rows} >= 目标 {_hk_target} 条"
                             )
                             print(
                                 f"\033[1;32m🎯 [HARD KILL]\033[0m 已达量 "
-                                f"{_total_extracted_rows}/{_hk_target}，引擎层终止任务"
+                                f"{_xs.total_extracted_rows}/{_hk_target}，引擎层终止任务"
                             )
                             _broadcast_log_safe(
-                                f"[HARD KILL] 累计 {_total_extracted_rows}/{_hk_target} 条达量，引擎终止"
+                                f"[HARD KILL] 累计 {_xs.total_extracted_rows}/{_hk_target} 条达量，引擎终止"
                             )
                             _task_completed = True
                             _run_succeeded = True
@@ -7527,7 +7533,7 @@ async def run_agent(
                             logger.info(
                                 "[EXTRACT AUTO] Answer-mode rows kept in run result "
                                 "(累计 %s 条)",
-                                _total_extracted_rows,
+                                _xs.total_extracted_rows,
                             )
                             print(
                                 f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
@@ -7593,13 +7599,13 @@ async def run_agent(
                         else:
                             logger.info(
                                 f"[EXTRACT AUTO] Saved to: {saved_path} "
-                                f"(累计 {_total_extracted_rows} 条)"
+                                f"(累计 {_xs.total_extracted_rows} 条)"
                             )
                             print(
                                 f"\033[1;33m⚡ [EXTRACT AUTO]\033[0m "
                                 f"VLM 未填充数据，系统已从 {_auto_extract_text_source} 全页提取 "
                                 f"\033[36m{_new_rows}\033[0m 条数据。"
-                                f"当前总计: \033[36m{_total_extracted_rows}\033[0m 条"
+                                f"当前总计: \033[36m{_xs.total_extracted_rows}\033[0m 条"
                             )
                         # 将降级的 wait 动作替换为已完成的 extract
                         # 不需要执行内层动作循环，直接跳到翻页引导
@@ -7609,20 +7615,20 @@ async def run_agent(
                             f"[EXTRACT AUTO] 自动提取失败: {_auto_err}"
                         )
                     # 无论是否成功，注入智能翻页/结束引导
-                    _auto_pages = len(_extracted_page_urls)
+                    _auto_pages = len(_xs.extracted_page_urls)
                     _target_count = _parse_goal_target_count(goal)
                     _reached_target = (
                         _target_count is not None
-                        and _total_extracted_rows >= _target_count
+                        and _xs.total_extracted_rows >= _target_count
                     )
                     if _reached_target:
                         # 已达到用户指定的目标数量，强烈建议 done
                         vlm.inject_error_feedback(
                             f"✅ 系统已自动提取当前页数据。"
                             f"你已经成功提取了 {_auto_pages} 个不同页面的数据"
-                            f"（累计 {_total_extracted_rows} 条）。\n"
+                            f"（累计 {_xs.total_extracted_rows} 条）。\n"
                             f"用户要求获取 {_target_count} 条数据，"
-                            f"当前已累计 {_total_extracted_rows} 条，"
+                            f"当前已累计 {_xs.total_extracted_rows} 条，"
                             f"**已达到目标**！请立即输出 done 结束任务。"
                         )
                     elif _auto_pages >= 2 and _target_count is not None:
@@ -7636,9 +7642,9 @@ async def run_agent(
                             vlm.inject_error_feedback(
                                 f"✅ 系统已自动提取当前页数据。"
                                 f"已提取 {_auto_pages} 个页面"
-                                f"（累计 {_total_extracted_rows} 条），"
+                                f"（累计 {_xs.total_extracted_rows} 条），"
                                 f"但用户要求 {_target_count} 条，"
-                                f"还差 {_target_count - _total_extracted_rows} 条。\n"
+                                f"还差 {_target_count - _xs.total_extracted_rows} 条。\n"
                                 f"系统发现了翻页链接：\n{_pag_hint}\n"
                                 f"【立即操作】请继续点击翻页链接加载下一页，例如："
                                 f"click(target_id={_pag_links[0]['id']})\n"
@@ -7648,9 +7654,9 @@ async def run_agent(
                             vlm.inject_error_feedback(
                                 f"✅ 系统已自动提取当前页数据。"
                                 f"已提取 {_auto_pages} 个页面"
-                                f"（累计 {_total_extracted_rows} 条），"
+                                f"（累计 {_xs.total_extracted_rows} 条），"
                                 f"但用户要求 {_target_count} 条，"
-                                f"还差 {_target_count - _total_extracted_rows} 条。\n"
+                                f"还差 {_target_count - _xs.total_extracted_rows} 条。\n"
                                 "请向下滚动查找翻页按钮后继续翻页提取。"
                             )
                     elif _auto_pages >= 2:
@@ -7658,7 +7664,7 @@ async def run_agent(
                         vlm.inject_error_feedback(
                             f"✅ 系统已自动提取当前页数据。"
                             f"你已经成功提取了 {_auto_pages} 个不同页面的数据"
-                            f"（累计 {_total_extracted_rows} 条）。\n"
+                            f"（累计 {_xs.total_extracted_rows} 条）。\n"
                             "请仔细回顾用户的原始任务要求，"
                             "判断是否需要继续翻页提取更多数据。\n"
                             "如果已满足用户需求，请输出 done 结束任务。"
@@ -7673,7 +7679,7 @@ async def run_agent(
                             vlm.inject_error_feedback(
                                 f"✅ 系统已自动提取当前页数据"
                                 f"（已提取 {_auto_pages} 个页面，"
-                                f"累计 {_total_extracted_rows} 条）。\n"
+                                f"累计 {_xs.total_extracted_rows} 条）。\n"
                                 f"系统在当前页面发现了以下翻页链接：\n{_pag_hint}\n"
                                 f"【立即操作】请点击翻页链接加载下一页，例如："
                                 f"click(target_id={_pag_links[0]['id']})\n"
@@ -7683,39 +7689,39 @@ async def run_agent(
                             vlm.inject_error_feedback(
                                 f"✅ 系统已自动提取当前页数据"
                                 f"（已提取 {_auto_pages} 个页面，"
-                                f"累计 {_total_extracted_rows} 条）。\n"
+                                f"累计 {_xs.total_extracted_rows} 条）。\n"
                                 "当前页面未发现翻页链接，可能已是最后一页。\n"
                                 "如果任务还需要更多数据，请尝试向下滚动查找翻页按钮。\n"
                                 "如果已完成所有页的提取，请直接输出 done 结束任务。"
                             )
                     # 跳过内层动作循环（因为 extract 已自动完成）
                     # 但如果连续太多次自动提取同一页面，强制结束
-                    if _extract_null_streak >= 2:  # lowered from 3
+                    if _xs.extract_null_streak >= 2:  # lowered from 3
                         # Check if we should retry instead of terminating
                         _should_terminate = True
                         if (
                             _goal_target is not None
-                            and _total_extracted_rows < _goal_target
-                            and _extract_null_total_resets < 5  # raised from 3
+                            and _xs.total_extracted_rows < _goal_target
+                            and _xs.extract_null_total_resets < 5  # raised from 3
                         ):
                             _should_terminate = False
-                            _extract_null_total_resets += 1
+                            _xs.extract_null_total_resets += 1
                             _scroll_escalation = {1: 1500, 2: 3000, 3: 4000, 4: 5000, 5: 5000}
-                            _scroll_amount = _scroll_escalation.get(_extract_null_total_resets, 5000)
+                            _scroll_amount = _scroll_escalation.get(_xs.extract_null_total_resets, 5000)
                             logger.warning(
-                                f"[EXTRACT AUTO] streak={_extract_null_streak} 但进度 "
-                                f"{_total_extracted_rows}/{_goal_target}，"
-                                f"递增滚动 {_scroll_amount}px (reset #{_extract_null_total_resets}/5)"
+                                f"[EXTRACT AUTO] streak={_xs.extract_null_streak} 但进度 "
+                                f"{_xs.total_extracted_rows}/{_goal_target}，"
+                                f"递增滚动 {_scroll_amount}px (reset #{_xs.extract_null_total_resets}/5)"
                             )
                             _content_changed = await _nudge_scroll_after_duplicate_extract(
-                                f"extract_null_streak={_extract_null_streak}, reset #{_extract_null_total_resets}",
+                                f"extract_null_streak={_xs.extract_null_streak}, reset #{_xs.extract_null_total_resets}",
                                 scroll_amount=_scroll_amount
                             )
                             if not _content_changed:
                                 logger.warning(
                                     f"[EXTRACT AUTO] 滚动后内容未变化，下次重试将使用更大滚动量"
                                 )
-                            _extract_null_streak = 0
+                            _xs.extract_null_streak = 0
                             continue
                         if _should_terminate:
                             logger.warning(
@@ -7726,12 +7732,12 @@ async def run_agent(
                             break
                     continue  # 跳到下一步重新截图
                 else:
-                    if _extract_null_streak > 0:
+                    if _xs.extract_null_streak > 0:
                         logger.info(
                             f"[EXTRACT AUTO] extract+null 连击已中断 "
-                            f"(was {_extract_null_streak})"
+                            f"(was {_xs.extract_null_streak})"
                         )
-                    _extract_null_streak = 0
+                    _xs.extract_null_streak = 0
 
                 # ── 多标签 Session 守卫：锚定标签 + thought 与 URL 一致性 ──
                 if decisions:
@@ -7885,8 +7891,8 @@ async def run_agent(
                         if _goal_is_bulk_extraction(goal):
                             _completion_state = _extraction_targets_reached(
                                 goal,
-                                total_rows=_total_extracted_rows,
-                                total_pages=len(_extracted_page_keys),
+                                total_rows=_xs.total_extracted_rows,
+                                total_pages=len(_xs.extracted_page_keys),
                             )
                             if _completion_state.get("reached"):
                                 logger.info(
@@ -8159,7 +8165,7 @@ async def run_agent(
                         _is_bulk_extract_goal
                         and action in ("click", "click_text", "click_point")
                         and _extract_goal_target is not None
-                        and _total_extracted_rows < _extract_goal_target
+                        and _xs.total_extracted_rows < _extract_goal_target
                     ):
                         _extract_nav_is_pagination = False
                         try:
@@ -8224,7 +8230,7 @@ async def run_agent(
                                             "inspection": _nav_inspection,
                                             "shape": _shape_for_same_page_nav,
                                             "progress": {
-                                                "rows": _total_extracted_rows,
+                                                "rows": _xs.total_extracted_rows,
                                                 "target": _extract_goal_target,
                                             },
                                             "decision": {
@@ -8251,11 +8257,11 @@ async def run_agent(
                     if action == "done" and _is_bulk_extract_goal:
                         _need_more_rows = (
                             _extract_goal_target is not None
-                            and _total_extracted_rows < _extract_goal_target
+                            and _xs.total_extracted_rows < _extract_goal_target
                         )
                         _need_more_pages = (
                             _extract_goal_pages is not None
-                            and len(_extracted_page_keys) < _extract_goal_pages
+                            and len(_xs.extracted_page_keys) < _extract_goal_pages
                         )
                         if _need_more_rows or _need_more_pages:
                             if decision.get("extracted_data"):
@@ -8263,9 +8269,9 @@ async def run_agent(
                                     "[DONE GUARD] Premature done with extracted_data before extraction "
                                     "target met; downgrading to extract "
                                     "(rows=%s/%s, pages=%s/%s)",
-                                    _total_extracted_rows,
+                                    _xs.total_extracted_rows,
                                     _extract_goal_target,
-                                    len(_extracted_page_keys),
+                                    len(_xs.extracted_page_keys),
                                     _extract_goal_pages,
                                 )
                                 decision["action"] = "extract"
@@ -8281,11 +8287,11 @@ async def run_agent(
                                 _remaining_parts: list[str] = []
                                 if _need_more_rows and _extract_goal_target is not None:
                                     _remaining_parts.append(
-                                        f"系统记账仅 {_total_extracted_rows}/{_extract_goal_target} 条"
+                                        f"系统记账仅 {_xs.total_extracted_rows}/{_extract_goal_target} 条"
                                     )
                                 if _need_more_pages and _extract_goal_pages is not None:
                                     _remaining_parts.append(
-                                        f"仅完成 {len(_extracted_page_keys)}/{_extract_goal_pages} 页"
+                                        f"仅完成 {len(_xs.extracted_page_keys)}/{_extract_goal_pages} 页"
                                     )
                                 logger.warning(
                                     "[DONE GUARD] Blocked premature done on extraction goal: %s",
@@ -8313,7 +8319,7 @@ async def run_agent(
 
                         # 同 URL 可能是无限滚动/局部刷新列表，不再直接跳过。
                         # 真实重复由后面的行级 fingerprint 过滤。
-                        if _current_url in _extracted_page_urls:
+                        if _current_url in _xs.extracted_page_urls:
                             logger.info(
                                 "[EXTRACT] URL already seen; row-level dedup will decide: %s",
                                 _current_url,
@@ -8553,16 +8559,16 @@ async def run_agent(
                                 _target_count_pre = _parse_goal_target_count(goal)
                                 _pre_reached = (
                                     _target_count_pre is not None
-                                    and _total_extracted_rows >= _target_count_pre
+                                    and _xs.total_extracted_rows >= _target_count_pre
                                 )
                                 if _pre_reached:
                                     vlm.inject_error_feedback(
-                                        f"✅ 你已累计提取 {_total_extracted_rows} 条数据，"
+                                        f"✅ 你已累计提取 {_xs.total_extracted_rows} 条数据，"
                                         f"已达成用户要求的 {_target_count_pre} 条。"
                                         "请立即输出 action=done 结束任务，不要再 extract。"
                                     )
                                 else:
-                                    _has_prior_extract_page = bool(_extracted_page_urls or _extracted_page_keys)
+                                    _has_prior_extract_page = bool(_xs.extracted_page_urls or _xs.extracted_page_keys)
                                     if _target_count_pre is not None and _has_prior_extract_page:
                                         _duplicate_zero_extract_streak += 1
                                         _scroll_drain = await _probe_scroll_drain_state(
@@ -8571,7 +8577,7 @@ async def run_agent(
                                         _physically_drained = bool(_scroll_drain.get("at_bottom"))
                                         _probe_failed = bool(_scroll_drain.get("probe_failed"))
                                         if _physically_drained or (_probe_failed and _duplicate_zero_extract_streak >= 3):
-                                            _first_flip_pending = True
+                                            _xs.first_flip_pending = True
                                             _drain_reason = (
                                                 "物理触底"
                                                 if _physically_drained
@@ -8579,7 +8585,7 @@ async def run_agent(
                                             )
                                             vlm.inject_error_feedback(
                                                 f"⚠️ 系统 extract 净新增为 0，且已确认{_drain_reason}。\n"
-                                                f"当前累计 {_total_extracted_rows}/{_target_count_pre} 条，"
+                                                f"当前累计 {_xs.total_extracted_rows}/{_target_count_pre} 条，"
                                                 "说明当前页/当前滚动区域已基本榨干但目标尚未达成。\n"
                                                 "下一步必须执行 next_page（target_id=0, type_value=\"\"），"
                                                 "让底层优先尝试 URL 变异/分页器/页码；不要继续 smooth_scroll "
@@ -8592,7 +8598,7 @@ async def run_agent(
                                             )
                                             vlm.inject_error_feedback(
                                                 "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
-                                                f"当前累计 {_total_extracted_rows}/{_target_count_pre} 条，"
+                                                f"当前累计 {_xs.total_extracted_rows}/{_target_count_pre} 条，"
                                                 "这只能证明当前视口没有新行，尚不能证明整页已榨干。\n"
                                                 f"物理滚动探测显示仍有下滑空间（{_remaining_hint}）。"
                                                 "下一步先 smooth_scroll down 暴露同页下方隐藏数据；"
@@ -8607,8 +8613,8 @@ async def run_agent(
                                             _data_shape
                                         )
                                         if _expected_dense_rows >= 10:
-                                            _block_next_page_until_drained = True
-                                            _block_next_page_reason = (
+                                            _xs.block_next_page_until_drained = True
+                                            _xs.block_next_page_reason = (
                                                 f"dense page exposes about {_expected_dense_rows} rows, "
                                                 "but viewport/full extraction under-yielded"
                                             )
@@ -8674,7 +8680,7 @@ async def run_agent(
                             if _api_fast.get("applied"):
                                 extracted = _api_fast.get("fast_path", {}).get("rows") or extracted
                                 decision["extracted_data"] = extracted
-                                _progress_total_rows = _total_extracted_rows
+                                _progress_total_rows = _xs.total_extracted_rows
                             _extract_snapshot_path = await _save_extraction_snapshot(
                                 source=_log_extract_text_source or "VLM_EXTRACT_OUTPUT",
                                 rows=extracted,
@@ -8707,9 +8713,9 @@ async def run_agent(
                                     f"成功追加 \033[36m{_new_rows}\033[0m 条数据。"
                                     f"当前总计: \033[36m{_progress_total_rows}\033[0m 条"
                                 )
-                            _extract_count += 1
-                            _extracted_page_urls.add(_current_url)
-                            _extracted_page_keys.add(_current_extract_page_key)
+                            _xs.extract_count += 1
+                            _xs.extracted_page_urls.add(_current_url)
+                            _xs.extracted_page_keys.add(_current_extract_page_key)
                             if _goal_output_mode == "answer":
                                 logger.info(
                                     "[ANSWER OUTPUT] completed after targeted extract; "
@@ -8747,23 +8753,23 @@ async def run_agent(
                                 _run_succeeded = True
                                 break
                             # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
-                            # Bug 修复：用任务级永久锁，避免翻页后 _extract_count 重置反复触发
+                            # Bug 修复：用任务级永久锁，避免翻页后 _xs.extract_count 重置反复触发
                             if (
-                                not _first_extract_ever_done
+                                not _xs.first_extract_ever_done
                                 and _should_force_first_flip_after_successful_extract(goal)
                             ):
-                                _first_extract_ever_done = True
-                                _first_flip_pending = True
+                                _xs.first_extract_ever_done = True
+                                _xs.first_flip_pending = True
                             # ── Improvement 1：首次 extract 后探测分页器（显式 extract 路径） ──
                             if (
                                 _goal_needs_pagination_probe(goal)
-                                and not _pagination_probed
-                                and _extract_count == 1
+                                and not _xs.pagination_probed
+                                and _xs.extract_count == 1
                             ):
-                                _pagination_probed = True
+                                _xs.pagination_probed = True
                                 try:
                                     _probe = await browser.probe_pagination()
-                                    _pagination_kind = _probe.get("kind", "")
+                                    _xs.pagination_kind = _probe.get("kind", "")
                                     _cands = _probe.get("candidates", [])
                                     if _probe.get("has_paginator"):
                                         _names = ", ".join(
@@ -8773,18 +8779,18 @@ async def run_agent(
                                             _should_schedule_next_page_after_extract(
                                                 goal,
                                                 new_rows=_new_rows,
-                                                total_rows=_total_extracted_rows,
+                                                total_rows=_xs.total_extracted_rows,
                                                 extract_source=_log_extract_text_source,
-                                                pagination_kind=_pagination_kind,
+                                                pagination_kind=_xs.pagination_kind,
                                                 expected_rows=_expected_rows_from_data_shape(_data_shape),
                                                 physically_drained=bool(_data_shape.get("physically_drained")),
                                             )
                                         )
                                         if _should_force_probe_next:
-                                            _force_next_page_pending = True
-                                            _first_flip_pending = False
-                                            _block_next_page_until_drained = False
-                                            _block_next_page_reason = ""
+                                            _xs.force_next_page_pending = True
+                                            _xs.first_flip_pending = False
+                                            _xs.block_next_page_until_drained = False
+                                            _xs.block_next_page_reason = ""
                                             logger.info(
                                                 "[PROBE PAGE] armed next_page after extract: %s",
                                                 _force_probe_reason,
@@ -8793,8 +8799,8 @@ async def run_agent(
                                                 f"[PROBE PAGE] 已发现分页器，下一轮直接 next_page：{_force_probe_reason}",
                                                 level="info",
                                             )
-                                            _pagination_hint_msg = (
-                                                f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                            _xs.pagination_hint_msg = (
+                                                f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
                                                 f"已确认页面底部存在翻页控件：{_names}。\n"
                                                 f"当前页已提取到足够完整的一批数据（{_force_probe_reason}）。"
                                                 f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
@@ -8805,18 +8811,18 @@ async def run_agent(
                                                 "pagination probe low-yield explicit extract"
                                             )
                                             if not bool(_drain_state.get("at_bottom")):
-                                                _block_next_page_until_drained = True
-                                                _block_next_page_reason = _force_probe_reason
+                                                _xs.block_next_page_until_drained = True
+                                                _xs.block_next_page_reason = _force_probe_reason
                                             else:
-                                                _force_next_page_pending = True
-                                                _first_flip_pending = False
-                                                _block_next_page_until_drained = False
-                                                _block_next_page_reason = ""
+                                                _xs.force_next_page_pending = True
+                                                _xs.first_flip_pending = False
+                                                _xs.block_next_page_until_drained = False
+                                                _xs.block_next_page_reason = ""
                                                 _force_probe_reason = (
                                                     f"{_force_probe_reason}; physical bottom reached"
                                                 )
-                                            _pagination_hint_msg = (
-                                                f"📍【系统探测：本页**带分页器**（{_pagination_kind}）】\n"
+                                            _xs.pagination_hint_msg = (
+                                                f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
                                                 f"已确认页面存在翻页控件：{_names}。\n"
                                                 f"但本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
                                                 "不足以证明当前页已提取完。\n"
@@ -8825,23 +8831,23 @@ async def run_agent(
                                             )
                                     else:
                                         # No paginator detected — mark as infinite scroll
-                                        _page_is_infinite_scroll = True
+                                        _xs.page_is_infinite_scroll = True
                                         _should_force_probe_next, _force_probe_reason = (
                                             _should_schedule_next_page_after_extract(
                                                 goal,
                                                 new_rows=_new_rows,
-                                                total_rows=_total_extracted_rows,
+                                                total_rows=_xs.total_extracted_rows,
                                                 extract_source=_log_extract_text_source,
-                                                pagination_kind=_pagination_kind,
+                                                pagination_kind=_xs.pagination_kind,
                                                 expected_rows=_expected_rows_from_data_shape(_data_shape),
                                                 physically_drained=bool(_data_shape.get("physically_drained")),
                                             )
                                         )
                                         if _should_force_probe_next:
-                                            _force_next_page_pending = True
-                                            _first_flip_pending = False
-                                            _block_next_page_until_drained = False
-                                            _block_next_page_reason = ""
+                                            _xs.force_next_page_pending = True
+                                            _xs.first_flip_pending = False
+                                            _xs.block_next_page_until_drained = False
+                                            _xs.block_next_page_reason = ""
                                             logger.info(
                                                 "[PROBE PAGE] armed universal next_page after extract: %s",
                                                 _force_probe_reason,
@@ -8850,67 +8856,67 @@ async def run_agent(
                                                 f"[PROBE PAGE] 大批量提取未达量，下一轮交给 next_page 宏动作：{_force_probe_reason}",
                                                 level="info",
                                             )
-                                            _pagination_hint_msg = (
+                                            _xs.pagination_hint_msg = (
                                                 "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
                                                 "当前提取批次已足够大但目标未达成。"
                                                 "下一步使用 next_page 宏动作；如果确实没有分页器，"
                                                 "底层会自动走 L4 滚动兜底加载新数据。"
                                             )
                                         else:
-                                            _pagination_hint_msg = (
+                                            _xs.pagination_hint_msg = (
                                                 "📍【系统探测：本页**无分页器**】\n"
                                                 f"本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
                                                 "请继续 smooth_scroll / extract 当前列表；"
                                                 "如果滚动触底且仍未达量，引擎会再调度 next_page 宏动作。"
                                             )
-                                    logger.info(f"[PROBE PAGE] kind={_pagination_kind} cands={len(_cands)}")
+                                    logger.info(f"[PROBE PAGE] kind={_xs.pagination_kind} cands={len(_cands)}")
                                 except Exception as _probe_err:
                                     logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
                             # ── Re-arm：已知分页器 + 目标未达 → 每次 extract 后强制 next_page ──
                             if (
-                                _pagination_probed
-                                and _pagination_kind not in ("", "infinite")
-                                and not _page_is_infinite_scroll
-                                and not _force_next_page_pending
+                                _xs.pagination_probed
+                                and _xs.pagination_kind not in ("", "infinite")
+                                and not _xs.page_is_infinite_scroll
+                                and not _xs.force_next_page_pending
                             ):
                                 _rearm_target = _parse_goal_target_count(goal)
-                                if _rearm_target is not None and _total_extracted_rows < _rearm_target:
-                                    _force_next_page_pending = True
+                                if _rearm_target is not None and _xs.total_extracted_rows < _rearm_target:
+                                    _xs.force_next_page_pending = True
                                     logger.info(
                                         "[REARM NEXT_PAGE] paginator known (%s), target not met "
                                         "(%s/%s); re-armed for next step",
-                                        _pagination_kind,
-                                        _total_extracted_rows,
+                                        _xs.pagination_kind,
+                                        _xs.total_extracted_rows,
                                         _rearm_target,
                                     )
                             # ── Path C：Hard Kill 引擎层强杀（同上）──
                             _hk_target = _parse_goal_target_count(goal)
-                            if _hk_target is not None and _total_extracted_rows >= _hk_target:
+                            if _hk_target is not None and _xs.total_extracted_rows >= _hk_target:
                                 logger.info(
                                     f"[HARD KILL] 引擎达量终止：累计 "
-                                    f"{_total_extracted_rows} >= 目标 {_hk_target} 条"
+                                    f"{_xs.total_extracted_rows} >= 目标 {_hk_target} 条"
                                 )
                                 print(
                                     f"\033[1;32m🎯 [HARD KILL]\033[0m 已达量 "
-                                    f"{_total_extracted_rows}/{_hk_target}，引擎层终止任务"
+                                    f"{_xs.total_extracted_rows}/{_hk_target}，引擎层终止任务"
                                 )
                                 _broadcast_log_safe(
-                                    f"[HARD KILL] 累计 {_total_extracted_rows}/{_hk_target} 条达量，引擎终止"
+                                    f"[HARD KILL] 累计 {_xs.total_extracted_rows}/{_hk_target} 条达量，引擎终止"
                                 )
                                 _task_completed = True
                                 _run_succeeded = True
                                 break
                             _hk_pages = _parse_goal_target_pages(goal)
-                            if _hk_pages is not None and len(_extracted_page_keys) >= _hk_pages:
+                            if _hk_pages is not None and len(_xs.extracted_page_keys) >= _hk_pages:
                                 logger.info(
                                     "[HARD KILL] 表格页数达标：%s/%s pages, rows=%s",
-                                    len(_extracted_page_keys),
+                                    len(_xs.extracted_page_keys),
                                     _hk_pages,
-                                    _total_extracted_rows,
+                                    _xs.total_extracted_rows,
                                 )
                                 _broadcast_log_safe(
-                                    f"[HARD KILL] 已提取 {len(_extracted_page_keys)}/{_hk_pages} 页，"
-                                    f"累计 {_total_extracted_rows} 条，任务完成"
+                                    f"[HARD KILL] 已提取 {len(_xs.extracted_page_keys)}/{_hk_pages} 页，"
+                                    f"累计 {_xs.total_extracted_rows} 条，任务完成"
                                 )
                                 _task_completed = True
                                 _run_succeeded = True
@@ -8919,8 +8925,8 @@ async def run_agent(
                             _need_more_table_pages = (
                                 _log_extract_text_source == "DOM_TABLE"
                                 and (
-                                    (_hk_target is not None and _total_extracted_rows < _hk_target)
-                                    or (_hk_pages is not None and len(_extracted_page_keys) < _hk_pages)
+                                    (_hk_target is not None and _xs.total_extracted_rows < _hk_target)
+                                    or (_hk_pages is not None and len(_xs.extracted_page_keys) < _hk_pages)
                                 )
                             )
                             if _need_more_table_pages:
@@ -8928,10 +8934,10 @@ async def run_agent(
                                     "advance after successful table extract"
                                 )
                                 if _advanced:
-                                    _extract_count = 0
+                                    _xs.extract_count = 0
                                     vlm.inject_error_feedback(
                                         f"✅ 系统已保存当前表格页 {_new_rows} 条，"
-                                        f"累计 {_total_extracted_rows} 条。"
+                                        f"累计 {_xs.total_extracted_rows} 条。"
                                         "底层已自动点击下一页，下一步请直接执行 extract，"
                                         "不要回到上一页，也不要重复提取刚才的数据。"
                                     )
@@ -8940,16 +8946,16 @@ async def run_agent(
                             logger.warning("[EXTRACT] No extracted_data in VLM response")
 
                         # ── 智能翻页/结束引导（根据已提取页数 + 目标数量决定建议） ──
-                        _n_pages = max(len(_extracted_page_urls), len(_extracted_page_keys))
+                        _n_pages = max(len(_xs.extracted_page_urls), len(_xs.extracted_page_keys))
                         _target_count_b = _parse_goal_target_count(goal)
                         _reached_target_b = (
                             _target_count_b is not None
-                            and _total_extracted_rows >= _target_count_b
+                            and _xs.total_extracted_rows >= _target_count_b
                         )
                         if _reached_target_b:
                             vlm.inject_error_feedback(
                                 f"✅ 你已成功提取 {_n_pages} 个不同页面的数据"
-                                f"（累计 {_total_extracted_rows} 条）。\n"
+                                f"（累计 {_xs.total_extracted_rows} 条）。\n"
                                 f"用户要求获取 {_target_count_b} 条数据，"
                                 f"当前已达到目标！请立即输出 done 结束任务。"
                             )
@@ -8962,9 +8968,9 @@ async def run_agent(
                                 )
                                 vlm.inject_error_feedback(
                                     f"✅ 你已成功提取 {_n_pages} 个页面"
-                                    f"（累计 {_total_extracted_rows} 条），"
+                                    f"（累计 {_xs.total_extracted_rows} 条），"
                                     f"但用户要求 {_target_count_b} 条，"
-                                    f"还差 {_target_count_b - _total_extracted_rows} 条。\n"
+                                    f"还差 {_target_count_b - _xs.total_extracted_rows} 条。\n"
                                     f"系统发现了翻页链接：\n{_pag_hint_c}\n"
                                     f"【立即操作】请继续翻页，例如："
                                     f"click(target_id={_pag_links_c[0]['id']})"
@@ -8972,20 +8978,20 @@ async def run_agent(
                             else:
                                 vlm.inject_error_feedback(
                                     f"✅ 你已成功提取 {_n_pages} 个页面"
-                                    f"（累计 {_total_extracted_rows} 条），"
+                                    f"（累计 {_xs.total_extracted_rows} 条），"
                                     f"但用户要求 {_target_count_b} 条，"
-                                    f"还差 {_target_count_b - _total_extracted_rows} 条。\n"
+                                    f"还差 {_target_count_b - _xs.total_extracted_rows} 条。\n"
                                     "请向下滚动查找翻页按钮后继续翻页提取。"
                                 )
                         elif _n_pages >= 2:
                             vlm.inject_error_feedback(
                                 f"✅ 你已成功提取 {_n_pages} 个不同页面的数据"
-                                f"（累计 {_total_extracted_rows} 条）。\n"
+                                f"（累计 {_xs.total_extracted_rows} 条）。\n"
                                 "请仔细回顾用户的原始任务要求，"
                                 "判断是否需要继续翻页提取更多数据。\n"
                                 "如果已满足用户需求，请输出 done 结束任务。"
                             )
-                        elif _extract_count > 0:
+                        elif _xs.extract_count > 0:
                             _pag_links_b = browser.find_pagination_links()
                             if _pag_links_b:
                                 _pag_hint_b = "\n".join(
@@ -8994,7 +9000,7 @@ async def run_agent(
                                 )
                                 vlm.inject_error_feedback(
                                     f"✅ 你已成功提取当前页数据"
-                                    f"（第 {_n_pages} 个页面，累计 {_total_extracted_rows} 条）。\n"
+                                    f"（第 {_n_pages} 个页面，累计 {_xs.total_extracted_rows} 条）。\n"
                                     f"系统在当前页面发现了以下翻页链接：\n{_pag_hint_b}\n"
                                     f"【立即操作】请点击翻页链接加载下一页，例如："
                                     f"click(target_id={_pag_links_b[0]['id']})\n"
@@ -9003,47 +9009,47 @@ async def run_agent(
                             else:
                                 vlm.inject_error_feedback(
                                     f"✅ 你已成功提取当前页数据"
-                                    f"（第 {_n_pages} 个页面，累计 {_total_extracted_rows} 条）。\n"
+                                    f"（第 {_n_pages} 个页面，累计 {_xs.total_extracted_rows} 条）。\n"
                                     "当前页面未发现翻页链接，可能已是最后一页。\n"
                                     "如果任务还需要更多数据，请尝试向下滚动查找翻页按钮。\n"
                                     "如果已完成所有页的提取，请直接输出 done 结束任务。"
                                 )
 
                         # 连续 extract 守卫（防止 VLM 不翻页也不 done 陷入死循环）
-                        if _extract_count >= 3:
+                        if _xs.extract_count >= 3:
                             _guard_target = _parse_goal_target_count(goal)
-                            if _guard_target is not None and _total_extracted_rows < _guard_target:
+                            if _guard_target is not None and _xs.total_extracted_rows < _guard_target:
                                 logger.warning(
                                     "[EXTRACT GUARD] consecutive extract threshold reached, "
                                     "but target is not met (%s/%s); force navigation instead of ending.",
-                                    _total_extracted_rows,
+                                    _xs.total_extracted_rows,
                                     _guard_target,
                                 )
                                 vlm.inject_error_feedback(
                                     f"⚠️ 系统检测到连续 extract 次数过多，但当前只提取 "
-                                    f"{_total_extracted_rows}/{_guard_target} 条，尚未达标。\n"
+                                    f"{_xs.total_extracted_rows}/{_guard_target} 条，尚未达标。\n"
                                     "下一步禁止继续 extract；必须先执行 next_page、click_text 页码/Next，"
                                     "或 smooth_scroll down 加载更多真实数据。"
                                 )
-                                _extract_count = 0
+                                _xs.extract_count = 0
                                 break
                             logger.warning(
                                 "[EXTRACT GUARD] 连续 extract 无翻页动作，"
-                                f"已累积 {_total_extracted_rows} 条数据，强制结束任务。"
+                                f"已累积 {_xs.total_extracted_rows} 条数据，强制结束任务。"
                             )
                             _run_succeeded = True
                             _task_completed = True
                             # ── PROGRESS SAFEGUARD ──
                             _pg_target = _parse_goal_target_count(goal)
-                            if _pg_target is not None and _total_extracted_rows < _pg_target:
+                            if _pg_target is not None and _xs.total_extracted_rows < _pg_target:
                                 logger.warning(
-                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_xs.total_extracted_rows}/{_pg_target}，标记为失败"
                                 )
                                 _run_succeeded = False
                             _extract_guard_done_state = _extraction_targets_reached(
                                 goal,
-                                total_rows=_total_extracted_rows,
-                                total_pages=len(_extracted_page_keys),
+                                total_rows=_xs.total_extracted_rows,
+                                total_pages=len(_xs.extracted_page_keys),
                             )
                             event_stream.done(
                                 step=step,
@@ -9056,9 +9062,9 @@ async def run_agent(
                                 message="Consecutive extract guard ended the task.",
                                 metadata={
                                     "action": action,
-                                    "extract_count": _extract_count,
-                                    "total_rows": _total_extracted_rows,
-                                    "total_pages": len(_extracted_page_keys),
+                                    "extract_count": _xs.extract_count,
+                                    "total_rows": _xs.total_extracted_rows,
+                                    "total_pages": len(_xs.extracted_page_keys),
                                     "row_target": _extract_guard_done_state.get("row_target"),
                                     "page_target": _extract_guard_done_state.get("page_target"),
                                     "target_reached": _extract_guard_done_state.get("reached"),
@@ -9075,7 +9081,7 @@ async def run_agent(
                             "next_page", "scroll", "smooth_scroll", "find_text", "form_set", "goto",
                             "press_key", "switch_tab", "close_tab",
                         ):
-                            _extract_count = 0
+                            _xs.extract_count = 0
 
                     # 5. 记忆库日志（save_to_memory 动作由 execute_action 内部写入 workflow_memory）
                     if action == "save_to_memory":
@@ -9245,7 +9251,7 @@ async def run_agent(
                                 if extract_tooltip_primary_key(
                                     {"direction": _title_tooltip_target(label)}
                                 )
-                                not in _tooltip_trigger_keys
+                                not in _xs.tooltip_trigger_keys
                             ]
                             if _missing_tooltips:
                                 logger.warning(
@@ -9437,15 +9443,15 @@ async def run_agent(
                         _run_succeeded = True
                         # ── PROGRESS SAFEGUARD ──
                         _pg_target = _parse_goal_target_count(goal)
-                        if _pg_target is not None and _total_extracted_rows < _pg_target:
+                        if _pg_target is not None and _xs.total_extracted_rows < _pg_target:
                             logger.warning(
-                                f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                f"[PROGRESS SAFEGUARD] 终止时进度不足: {_xs.total_extracted_rows}/{_pg_target}，标记为失败"
                             )
                             _run_succeeded = False
                         _done_target_state = _extraction_targets_reached(
                             goal,
-                            total_rows=_total_extracted_rows,
-                            total_pages=len(_extracted_page_keys),
+                            total_rows=_xs.total_extracted_rows,
+                            total_pages=len(_xs.extracted_page_keys),
                         )
                         # 复用 Patch 4 已清洗的文本，保持 event_stream 与 WS done 一致
                         _done_message = _vlm_done_thought
@@ -9461,8 +9467,8 @@ async def run_agent(
                             metadata={
                                 "url": current_url,
                                 "page_summary": str(page_summary or "")[:1000],
-                                "total_rows": _total_extracted_rows,
-                                "total_pages": len(_extracted_page_keys),
+                                "total_rows": _xs.total_extracted_rows,
+                                "total_pages": len(_xs.extracted_page_keys),
                                 "row_target": _done_target_state.get("row_target"),
                                 "page_target": _done_target_state.get("page_target"),
                                 "target_reached": _done_target_state.get("reached"),
@@ -9876,7 +9882,7 @@ async def run_agent(
                         _hover_key_probe = extract_tooltip_primary_key(
                             {"direction": _hover_label_probe}
                         )
-                        if _hover_key_probe and _hover_key_probe in _tooltip_trigger_keys:
+                        if _hover_key_probe and _hover_key_probe in _xs.tooltip_trigger_keys:
                             _expected_tooltips = _parse_goal_tooltip_targets(goal)
                             _remaining_tooltips = [
                                 _title_tooltip_target(label)
@@ -9884,7 +9890,7 @@ async def run_agent(
                                 if extract_tooltip_primary_key(
                                     {"direction": _title_tooltip_target(label)}
                                 )
-                                not in _tooltip_trigger_keys
+                                not in _xs.tooltip_trigger_keys
                             ]
                             logger.warning(
                                 "[TOOLTIP GUARD] Blocked duplicate hover for captured trigger %s; remaining=%s",
@@ -10006,7 +10012,7 @@ async def run_agent(
                         _is_bulk_extract_goal
                         and action in ("click", "click_text", "click_point")
                         and _extract_goal_target is not None
-                        and _total_extracted_rows < _extract_goal_target
+                        and _xs.total_extracted_rows < _extract_goal_target
                         and not _pre_click_is_pagination_candidate
                         and not _decision_click_targets_extraction_control(
                             decision,
@@ -10039,7 +10045,7 @@ async def run_agent(
                             )
                             _guard_msg = (
                                 "Blocked a likely content/ad/list-item click during a bulk extraction task. "
-                                f"Progress is {_total_extracted_rows}/{_extract_goal_target}; "
+                                f"Progress is {_xs.total_extracted_rows}/{_extract_goal_target}; "
                                 "use extract/scroll instead of opening individual entries unless the user "
                                 "explicitly asks for detail pages."
                             )
@@ -10063,7 +10069,7 @@ async def run_agent(
                                     },
                                     "shape": _shape_for_click_guard,
                                     "progress": {
-                                        "rows": _total_extracted_rows,
+                                        "rows": _xs.total_extracted_rows,
                                         "target": _extract_goal_target,
                                     },
                                 },
@@ -10532,9 +10538,9 @@ async def run_agent(
                                     str(_np_landed)[:160],
                                 )
                                 _nav_target = _parse_goal_target_count(goal)
-                                if _nav_target is None or _total_extracted_rows < _nav_target:
-                                    _force_extract_after_navigation_pending = True
-                                    _force_next_page_pending = False
+                                if _nav_target is None or _xs.total_extracted_rows < _nav_target:
+                                    _xs.force_extract_after_navigation_pending = True
+                                    _xs.force_next_page_pending = False
                                     _nav_feedback = (
                                         "已成功翻页到新页面，下一步必须先执行 extract 提取当前页；"
                                         "在当前页完成提取前禁止继续 next_page，避免跳过目标数据。"
@@ -10545,7 +10551,7 @@ async def run_agent(
                                         pass
                                     logger.info(
                                         "[FORCE EXTRACT AFTER NAV] armed after next_page; progress=%s/%s",
-                                        _total_extracted_rows,
+                                        _xs.total_extracted_rows,
                                         _nav_target if _nav_target is not None else "?",
                                     )
 
@@ -10556,14 +10562,14 @@ async def run_agent(
                             _nav_target = _parse_goal_target_count(goal)
                             _nav_pages = _parse_goal_target_pages(goal)
                             if (
-                                (_nav_target is None or _total_extracted_rows < _nav_target)
+                                (_nav_target is None or _xs.total_extracted_rows < _nav_target)
                                 or (
                                     _nav_pages is not None
-                                    and len(_extracted_page_keys) < _nav_pages
+                                    and len(_xs.extracted_page_keys) < _nav_pages
                                 )
                             ):
-                                _force_extract_after_navigation_pending = True
-                                _force_next_page_pending = False
+                                _xs.force_extract_after_navigation_pending = True
+                                _xs.force_next_page_pending = False
                                 _nav_feedback = (
                                     "已通过分页控件进入下一页，下一步必须先执行 extract 提取当前页；"
                                     "在当前页完成提取前不要继续点击分页器，也不要直接 done。"
@@ -10575,7 +10581,7 @@ async def run_agent(
                                 logger.info(
                                     "[FORCE EXTRACT AFTER NAV] armed after pagination click; "
                                     "progress=%s/%s",
-                                    _total_extracted_rows,
+                                    _xs.total_extracted_rows,
                                     _nav_target if _nav_target is not None else "?",
                                 )
 
@@ -10630,11 +10636,11 @@ async def run_agent(
                             try:
                                 _np_state = _no_progress_tracker.observe(
                                     action=action,
-                                    row_count=_total_extracted_rows,
+                                    row_count=_xs.total_extracted_rows,
                                     url=_landing_key_url,
                                 )
                                 if _np_state.get("pagination_exhausted"):
-                                    _pagination_exhausted = True
+                                    _xs.pagination_exhausted = True
                                     logger.info(
                                         "[NO PROGRESS] streak=%s action=%s → pagination exhausted",
                                         _np_state.get("streak"),
@@ -10764,7 +10770,7 @@ async def run_agent(
                             _tooltip_key = extract_tooltip_primary_key(_tooltip_row)
                             _tooltip_rows = [_tooltip_row] if _tooltip_key else []
                             _new_rows = (
-                                1 if _tooltip_key and _tooltip_key not in _tooltip_trigger_keys
+                                1 if _tooltip_key and _tooltip_key not in _xs.tooltip_trigger_keys
                                 else 0
                             )
                             _dup_rows = 1 if _tooltip_key and not _new_rows else 0
@@ -10778,7 +10784,7 @@ async def run_agent(
                             _remaining_tooltips = [
                                 label for label in _expected_tooltips
                                 if extract_tooltip_primary_key({"direction": _title_tooltip_target(label)})
-                                not in _tooltip_trigger_keys
+                                not in _xs.tooltip_trigger_keys
                             ]
 
                             if _tooltip_rows:
@@ -10934,9 +10940,9 @@ async def run_agent(
                             _task_completed = True
                             # ── PROGRESS SAFEGUARD ──
                             _pg_target = _parse_goal_target_count(goal)
-                            if _pg_target is not None and _total_extracted_rows < _pg_target:
+                            if _pg_target is not None and _xs.total_extracted_rows < _pg_target:
                                 logger.warning(
-                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_xs.total_extracted_rows}/{_pg_target}，标记为失败"
                                 )
                                 _run_succeeded = False
                             break
@@ -10961,15 +10967,15 @@ async def run_agent(
                             _task_completed = True
                             # ── PROGRESS SAFEGUARD ──
                             _pg_target = _parse_goal_target_count(goal)
-                            if _pg_target is not None and _total_extracted_rows < _pg_target:
+                            if _pg_target is not None and _xs.total_extracted_rows < _pg_target:
                                 logger.warning(
-                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_total_extracted_rows}/{_pg_target}，标记为失败"
+                                    f"[PROGRESS SAFEGUARD] 终止时进度不足: {_xs.total_extracted_rows}/{_pg_target}，标记为失败"
                                 )
                                 _run_succeeded = False
                             _hover_done_state = _extraction_targets_reached(
                                 goal,
-                                total_rows=_total_extracted_rows,
-                                total_pages=len(_extracted_page_keys),
+                                total_rows=_xs.total_extracted_rows,
+                                total_pages=len(_xs.extracted_page_keys),
                             )
                             event_stream.done(
                                 step=step,
@@ -10988,8 +10994,8 @@ async def run_agent(
                                     "target_id": decision.get("target_id", 0),
                                     "menu_text": _menu_text,
                                     "repeat_count": _click_repeat_count,
-                                    "total_rows": _total_extracted_rows,
-                                    "total_pages": len(_extracted_page_keys),
+                                    "total_rows": _xs.total_extracted_rows,
+                                    "total_pages": len(_xs.extracted_page_keys),
                                     "row_target": _hover_done_state.get("row_target"),
                                     "page_target": _hover_done_state.get("page_target"),
                                     "target_reached": _hover_done_state.get("reached"),
@@ -11206,33 +11212,33 @@ async def run_agent(
                         _target_after_scroll_fail = _parse_goal_target_count(goal)
                         _scroll_bottom_target_unmet = (
                             _target_after_scroll_fail is not None
-                            and _total_extracted_rows < _target_after_scroll_fail
+                            and _xs.total_extracted_rows < _target_after_scroll_fail
                         )
                         if _scroll_down_failed_at_bottom and _scroll_bottom_target_unmet:
-                            _pagination_exhausted = True
-                            _force_next_page_pending = True
-                            _first_flip_pending = False
+                            _xs.pagination_exhausted = True
+                            _xs.force_next_page_pending = True
+                            _xs.first_flip_pending = False
                             vlm.inject_error_feedback(
                                 "⚠️ 底层已确认页面/主滚动区域向下滚动到达底部，"
-                                f"但当前仅累计 {_total_extracted_rows}/{_target_after_scroll_fail} 条。\n"
+                                f"但当前仅累计 {_xs.total_extracted_rows}/{_target_after_scroll_fail} 条。\n"
                                 "下一轮系统将强制执行 next_page（target_id=0, type_value=\"\"），"
                                 "优先尝试 URL 变异、分页器和页码探测；不要继续 smooth_scroll。"
                             )
                             logger.info(
                                 "[FORCE NEXT_PAGE] armed after bottom scroll failure: "
                                 "%s/%s rows",
-                                _total_extracted_rows,
+                                _xs.total_extracted_rows,
                                 _target_after_scroll_fail,
                             )
                             # Check close-enough with tolerance
                             _tolerance = min(5, max(1, int(_target_after_scroll_fail * 0.05)))
-                            if _total_extracted_rows >= _target_after_scroll_fail - _tolerance:
+                            if _xs.total_extracted_rows >= _target_after_scroll_fail - _tolerance:
                                 logger.info(
-                                    f"[CLOSE ENOUGH] scroll 到底且进度 {_total_extracted_rows}/{_target_after_scroll_fail} "
+                                    f"[CLOSE ENOUGH] scroll 到底且进度 {_xs.total_extracted_rows}/{_target_after_scroll_fail} "
                                     f"在容差 {_tolerance} 内，标记完成"
                                 )
                                 _extraction_complete = True
-                                _pagination_exhausted = True
+                                _xs.pagination_exhausted = True
 
                         if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
                             # 连续失败达到上限，交人工处理
@@ -11258,7 +11264,7 @@ async def run_agent(
                                 ) from exec_err
                         else:
                             # 将错误注入下一轮 VLM 提示，引导换策略
-                            if not _force_next_page_pending:
+                            if not _xs.force_next_page_pending:
                                 vlm.inject_error_feedback(err_msg)
                         break  # 中止本批次，进入下一步（重新截图）
 
@@ -11309,7 +11315,7 @@ async def run_agent(
                             _run_completed_steps = None
                     _run_ckpt.record(
                         step,
-                        item_count=_total_extracted_rows,
+                        item_count=_xs.total_extracted_rows,
                         completed_steps=_run_completed_steps,
                     )
 
@@ -11382,7 +11388,7 @@ async def run_agent(
                 goal=goal,
                 start_url=start_url,
                 run_ts=_run_ts,
-                total_extracted_rows=locals().get('_total_extracted_rows', 0),
+                total_extracted_rows=locals().get('_xs.total_extracted_rows', 0),
                 run_constraints=locals().get('run_constraints'),
                 event_stream=event_stream,
                 html_logger=html_logger,
@@ -11436,7 +11442,7 @@ async def run_agent(
                     goal,
                     start_url,
                     _run_ts,
-                    item_count=_total_extracted_rows,
+                    item_count=_xs.total_extracted_rows,
                     status="completed" if _run_succeeded else "failed",
                 )
             except Exception:

@@ -3658,6 +3658,18 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 风险: 高（闭包大量局部变量，核心数据路径）。
 - 前置: C3 + R1 已完成。
 
+## Slice S1a (M5 拆分): ExtractState 归集抽取计数器 (done, P1)
+
+- 能力名: extract_state_grouping（run_agent 内 ~19 个 run 级抽取计数器收进共享 `ExtractState` 实例，破解 extraction 闭包 / 主 step 循环双向耦合，为 S1b-S1d 平移 extraction 闭包铺路）。
+- 影响层: data_plane（新建 `extraction_engine/runtime.py` + `main.py::run_agent`）。
+- 改动:
+  - 新建 `extraction_engine/runtime.py::ExtractState`（dataclass，19 字段；set 字段用 `field(default_factory=set)` 防可变默认 bug）。
+  - `main.py:2284-2311` 用 `_xs = ExtractState()` 替换 19 处局部初始化；run_agent 全函数体（闭包段 + 主循环段）对这 19 个 `_xxx` 标识符的读写字节级 patch 改写为 `_xs.xxx`（共 317 处引用，0 处遗留裸引用，`nonlocal` 声明同步清理）。
+  - 纯平移零行为改动：`ExtractState` 字段名 = 原局部名去前导下划线。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 4✓（标量默认值 / set 默认空 / 别名共享可变可见 / 每实例独立 set）；`main.py` `py_compile` 通过；全量 pytest 3879 passed / 2 skipped / 0 failed。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1a→S1e / S2 / S3 / B）。
+
 ## Slice C4 (M5 契约): input_contract 落地 (pending, P1)
 
 - 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。
