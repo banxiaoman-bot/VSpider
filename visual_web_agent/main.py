@@ -920,333 +920,37 @@ async def run_agent(
     event_stream = EventStream(run_id=_run_ts)
     _snapshot_goal = goal
     action_registry = build_default_action_registry()
+    try:
+        from .phases.setup import SetupDeps as _SetupDeps, SetupTools as _SetupTools
+    except ImportError:
+        from phases.setup import SetupDeps as _SetupDeps, SetupTools as _SetupTools
+    _setup = _SetupTools(_SetupDeps(
+        browser=browser,
+        goal=goal,
+        vlm=vlm,
+        logger=logger,
+        event_stream=event_stream,
+        stop_event=stop_event,
+        start_url=start_url,
+        action_registry=action_registry,
+        broadcast_log_safe=_broadcast_log_safe,
+        broadcast_done_safe=_broadcast_done_safe,
+    ))
     skill_registry = build_default_skill_registry(load_history=True)
     async def _browser_action_tool(action_payload, workflow_memory=None):
-        return await browser.execute_action(action_payload, workflow_memory)
+        return await _setup.browser_action_tool(action_payload, workflow_memory)
 
     async def _targeted_probe_tool(action_payload, workflow_memory=None):
-        page = await browser._ensure_active_page(reason="targeted probe action")
-        before_url = browser.current_url
-        before_pages = len(browser._context.pages) if browser._context else 0
-        raw_value = str((action_payload or {}).get("type_value") or "").strip()
-        probe_goal = goal
-        kinds: list[str] = []
-        if raw_value:
-            if "|" in raw_value:
-                kind_part, probe_part = raw_value.split("|", 1)
-                kinds = [
-                    item.strip()
-                    for item in re.split(r"[,，\s]+", kind_part)
-                    if item.strip() in {"input", "button", "link", "table", "dialog"}
-                ]
-                probe_goal = probe_part.strip() or goal
-            elif raw_value in {"input", "button", "link", "table", "dialog"}:
-                kinds = [raw_value]
-            else:
-                probe_goal = raw_value
-        if not page:
-            browser._last_action_result = ActionResult.from_action(
-                action_payload,
-                success=False,
-                error="No active page for targeted probe.",
-                before_url=before_url,
-                after_url=before_url,
-                before_pages=before_pages,
-                after_pages=before_pages,
-            )
-            return None
-        probe_result = await probe_page(
-            page,
-            goal=probe_goal,
-            kinds=tuple(kinds) or None,
-            limit=12,
-        )
-        summary = format_probe_text(probe_result, limit=8)
-        metadata = {
-            "probe": probe_result.as_dict(),
-            "probe_goal": probe_goal,
-            "candidate_count": len(probe_result.candidates),
-        }
-        browser._last_action_result = ActionResult.from_action(
-            action_payload,
-            success=probe_result.ok,
-            message=summary,
-            error="" if probe_result.ok else "No targeted candidates found.",
-            before_url=before_url,
-            after_url=browser.current_url,
-            before_pages=before_pages,
-            after_pages=len(browser._context.pages) if browser._context else before_pages,
-            metadata=metadata,
-        )
-        try:
-            if probe_result.ok:
-                vlm.inject_error_feedback(
-                    "局部感知探针已返回候选元素。优先根据下列 selector/bbox/evidence 选择下一步；"
-                    "如果候选足够明确，可改用 click_text/type/press_key 等确定性动作；"
-                    "如果候选不匹配，再回退到全页截图/SoM 判断。\n"
-                    + summary
-                )
-            else:
-                vlm.inject_error_feedback(
-                    "局部感知探针未找到匹配候选。请回退到全页截图/SoM 观察，或先滚动/展开弹窗后重试。"
-                )
-        except Exception:
-            pass
-        return page
+        return await _setup.targeted_probe_tool(action_payload, workflow_memory)
 
-    async def _try_targeted_click_text_handoff(action_payload: dict) -> bool:
-        click_text = str((action_payload or {}).get("type_value") or "").strip()
-        if not click_text or len(click_text) > 80:
-            return False
-        page = await browser._ensure_active_page(reason="targeted click_text handoff")
-        if not page:
-            return False
-        before_url = browser.current_url
-        before_pages = len(browser._context.pages) if browser._context else 0
-        try:
-            probe_result = await probe_page(
-                page,
-                goal=f"click {click_text}",
-                kinds=("button", "link"),
-                limit=8,
-            )
-            candidate = choose_click_handoff_candidate(
-                probe_result,
-                target_text=click_text,
-                min_confidence=0.55,
-            )
-            if not candidate:
-                return False
-            frame = page.main_frame
-            for item in page.frames:
-                try:
-                    if candidate.frame_name and item.name == candidate.frame_name:
-                        frame = item
-                        break
-                    if candidate.frame_url and item.url == candidate.frame_url:
-                        frame = item
-                        break
-                except Exception:
-                    continue
-            locator = frame.locator(candidate.selector).first
-            await locator.scroll_into_view_if_needed(timeout=2500)
-            await locator.click(timeout=4000)
-            await browser._wait_after_action()
-            active_page = await browser._ensure_active_page(reason="targeted click_text handoff after click")
-            browser._last_action_result = ActionResult.from_action(
-                action_payload,
-                success=True,
-                message=(
-                    "targeted_probe high-confidence handoff clicked "
-                    f"{candidate.kind} {candidate.text!r}"
-                ),
-                before_url=before_url,
-                after_url=browser.current_url,
-                before_pages=before_pages,
-                after_pages=len(browser._context.pages) if browser._context else before_pages,
-                metadata={
-                    "clicked_text": candidate.text,
-                    "targeted_handoff": {
-                        "mode": "click_text_to_selector",
-                        "selector": candidate.selector,
-                        "confidence": candidate.confidence,
-                        "kind": candidate.kind,
-                        "text": candidate.text,
-                        "frame_url": candidate.frame_url,
-                        "evidence": list(candidate.evidence),
-                    },
-                    "probe": probe_result.as_dict(),
-                },
-            )
-            logger.info(
-                "[TARGETED HANDOFF] click_text %r -> selector=%s conf=%s text=%r",
-                click_text,
-                candidate.selector,
-                candidate.confidence,
-                candidate.text,
-            )
-            return active_page is not None
-        except Exception as exc:
-            logger.debug("[TARGETED HANDOFF] click_text probe/click skipped: %s", exc)
-            return False
+    async def _try_targeted_click_text_handoff(action_payload):
+        return await _setup.try_targeted_click_text_handoff(action_payload)
 
-    def _resolve_type_value_for_handoff(raw_value: str, workflow_memory=None) -> tuple[str, str]:
-        value = str(raw_value or "")
-        display_value = value
-        if workflow_memory and "{{" in value:
-            def _interpolate(match: re.Match) -> str:
-                key = match.group(1).strip()
-                resolved = (workflow_memory or {}).get(key)
-                return match.group(0) if resolved is None else str(resolved)
-            value = re.sub(r"\{\{([^}]+)\}\}", _interpolate, value)
-            display_value = value
-        env_template = display_value if "{{env:" in display_value else ""
-        value, used_auth_vault, _env_names = resolve_env_placeholders(value)
-        if used_auth_vault:
-            display_value = env_template
-        return value, display_value
+    def _resolve_type_value_for_handoff(raw_value, workflow_memory=None):
+        return _setup.resolve_type_value_for_handoff(raw_value, workflow_memory)
 
-    async def _try_targeted_type_handoff(
-        action_payload: dict,
-        workflow_memory=None,
-    ) -> bool:
-        raw_value = str((action_payload or {}).get("type_value") or "")
-        if not raw_value.strip():
-            return False
-        try:
-            target_id = int((action_payload or {}).get("target_id") or 0)
-        except Exception:
-            target_id = 0
-        if target_id > 0:
-            return False
-        page = await browser._ensure_active_page(reason="targeted type handoff")
-        if not page:
-            return False
-        before_url = browser.current_url
-        before_pages = len(browser._context.pages) if browser._context else 0
-        try:
-            probe_goal = goal
-            probe_result = await probe_page(
-                page,
-                goal=probe_goal,
-                kinds=("input",),
-                limit=8,
-            )
-            candidate = choose_type_handoff_candidate(
-                probe_result,
-                min_confidence=0.5,
-            )
-            if not candidate:
-                try:
-                    try:
-                        from .targeted_type_fallback import fill_best_text_input
-                    except ImportError:
-                        from targeted_type_fallback import fill_best_text_input
-                    value, display_value = _resolve_type_value_for_handoff(
-                        raw_value,
-                        workflow_memory=workflow_memory,
-                    )
-                    fallback_result = await fill_best_text_input(page, value)
-                    if not fallback_result.get("ok"):
-                        return False
-                    await browser._wait_after_action(light_action=True)
-                    browser.rpa_trail.append({
-                        "action": "type",
-                        "method": "dom_input_fallback",
-                        "type_value": display_value,
-                    })
-                    browser._last_action_result = ActionResult.from_action(
-                        action_payload,
-                        success=True,
-                        message=(
-                            "DOM fallback filled visible text/search input "
-                            f"{fallback_result.get('tag', '')} "
-                            f"{fallback_result.get('ariaLabel') or fallback_result.get('placeholder') or fallback_result.get('name') or ''!r}"
-                        ),
-                        before_url=before_url,
-                        after_url=browser.current_url,
-                        before_pages=before_pages,
-                        after_pages=len(browser._context.pages) if browser._context else before_pages,
-                        metadata={
-                            "value_readbacks": [
-                                {
-                                    "value": display_value,
-                                    "method": "dom_input_fallback",
-                                    "observed": fallback_result.get("value", ""),
-                                }
-                            ],
-                            "targeted_handoff": {
-                                "mode": "dom_input_fallback",
-                                **fallback_result,
-                            },
-                            "probe": probe_result.as_dict(),
-                        },
-                    )
-                    logger.info(
-                        "[TARGETED HANDOFF] type DOM fallback -> %s",
-                        fallback_result,
-                    )
-                    return True
-                except Exception as fallback_exc:
-                    logger.debug(
-                        "[TARGETED HANDOFF] DOM input fallback skipped: %s",
-                        fallback_exc,
-                    )
-                    return False
-            frame = page.main_frame
-            for item in page.frames:
-                try:
-                    if candidate.frame_name and item.name == candidate.frame_name:
-                        frame = item
-                        break
-                    if candidate.frame_url and item.url == candidate.frame_url:
-                        frame = item
-                        break
-                except Exception:
-                    continue
-            value, display_value = _resolve_type_value_for_handoff(
-                raw_value,
-                workflow_memory=workflow_memory,
-            )
-            locator = frame.locator(candidate.selector).first
-            await locator.scroll_into_view_if_needed(timeout=2500)
-            await locator.click(timeout=3000)
-            await locator.fill(value, timeout=4000)
-            await locator.evaluate(
-                """el => {
-                    el.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
-                    el.dispatchEvent(new Event('blur', {bubbles: true, composed: true}));
-                }"""
-            )
-            await browser._wait_after_action(light_action=True)
-            browser.rpa_trail.append({
-                "action": "type",
-                "selector": candidate.selector,
-                "method": "targeted_probe_handoff",
-                "type_value": display_value,
-            })
-            browser._last_action_result = ActionResult.from_action(
-                action_payload,
-                success=True,
-                message=(
-                    "targeted_probe high-confidence handoff filled "
-                    f"{candidate.tag} {candidate.text!r}"
-                ),
-                before_url=before_url,
-                after_url=browser.current_url,
-                before_pages=before_pages,
-                after_pages=len(browser._context.pages) if browser._context else before_pages,
-                metadata={
-                    "value_readbacks": [
-                        {
-                            "selector": candidate.selector,
-                            "value": display_value,
-                            "method": "targeted_probe_handoff",
-                        }
-                    ],
-                    "targeted_handoff": {
-                        "mode": "type_to_input_selector",
-                        "selector": candidate.selector,
-                        "confidence": candidate.confidence,
-                        "kind": candidate.kind,
-                        "text": candidate.text,
-                        "frame_url": candidate.frame_url,
-                        "evidence": list(candidate.evidence),
-                    },
-                    "probe": probe_result.as_dict(),
-                },
-            )
-            logger.info(
-                "[TARGETED HANDOFF] type -> selector=%s conf=%s text=%r",
-                candidate.selector,
-                candidate.confidence,
-                candidate.text,
-            )
-            return True
-        except Exception as exc:
-            logger.debug("[TARGETED HANDOFF] type probe/fill skipped: %s", exc)
-            return False
+    async def _try_targeted_type_handoff(action_payload, workflow_memory=None):
+        return await _setup.try_targeted_type_handoff(action_payload, workflow_memory)
 
     action_registry.bind("auto_form_fill", _try_auto_form_fill)
     action_registry.bind("round_form_challenge", _run_round_form_if_present)
@@ -1275,71 +979,17 @@ async def run_agent(
     _home_browser = None
     _home_system_id = ""
 
-    def _check_stop(context: str) -> None:
-        if stop_event and stop_event.is_set():
-            raise RuntimeError(f"STOP_REQUESTED::{context}")
+    def _check_stop(context):
+        return _setup.check_stop(context)
 
-    def _abort_if_stale_auth() -> bool:
-        if not getattr(browser, "auth_stale_detected", False):
-            return False
-        stale_msg = getattr(browser, "auth_stale_reason", "") or (
-            "Auth profile appears stale; please refresh it with tools/manual_auth.py."
-        )
-        logger.error("[AUTH STALE] %s", stale_msg)
-        _broadcast_log_safe(f"[AUTH STALE] {stale_msg}", level="error")
-        _broadcast_done_safe(False, stale_msg)
-        return True
+    def _abort_if_stale_auth():
+        return _setup.abort_if_stale_auth()
 
     def _with_tool_metadata(result):
-        if result is None:
-            return result
-        try:
-            action_name = (
-                result.action
-                if isinstance(result, ActionResult)
-                else str(result.get("action") or "")
-            )
-        except Exception:
-            action_name = ""
-        tool_meta = _resolve_action_tool_metadata(
-            action_registry,
-            action_name,
-            goal=goal,
-            selected_tools=_selected_tools,
-        )
-        if not tool_meta:
-            return result
-        if isinstance(result, ActionResult):
-            result.metadata.setdefault("tool", tool_meta)
-            return result
-        if isinstance(result, dict):
-            data = dict(result)
-            metadata = dict(data.get("metadata") or {})
-            metadata.setdefault("tool", tool_meta)
-            data["metadata"] = metadata
-            return data
-        return result
+        return _setup.with_tool_metadata(result, _selected_tools)
 
-    async def _recover_active_page(reason: str):
-        page = await browser._ensure_active_page(reason=reason)
-        if page is not None and not page.is_closed():
-            return page
-        logger.warning(
-            "[BROWSER RECOVERY] No active page during %s; restarting browser at %s",
-            reason,
-            start_url,
-        )
-        event_stream.guard(
-            step=0,
-            name="BROWSER_CONTEXT_RECOVERY",
-            message=f"No active page during {reason}; restarted browser context",
-            metadata={"start_url": start_url},
-        )
-        await browser.restart(start_url, reason=reason)
-        page = await browser._ensure_active_page(reason=f"after restart: {reason}")
-        if page is None or page.is_closed():
-            raise RuntimeError(f"No active page after browser restart ({reason})")
-        return page
+    async def _recover_active_page(reason):
+        return await _setup.recover_active_page(reason)
 
     try:
         _broadcast_log_safe("VSpider Agent started", level="info")
