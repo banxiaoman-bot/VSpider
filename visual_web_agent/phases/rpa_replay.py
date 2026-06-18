@@ -396,9 +396,12 @@ async def _replay_rpa(
     """
     from playwright.async_api import Error as PlaywrightError
     try:
-        from . import semantic_macros as _semantic_macros
+        from .. import semantic_macros as _semantic_macros
     except ImportError:
-        import semantic_macros as _semantic_macros  # type: ignore[no-redef]
+        try:
+            from . import semantic_macros as _semantic_macros  # type: ignore[no-redef]
+        except ImportError:
+            import semantic_macros as _semantic_macros  # type: ignore[no-redef]
 
     # RPA-XSYS: auto-thread the run's SessionRouter off the browser when not
     # passed explicitly. main.py attaches browser._session_router ONLY when

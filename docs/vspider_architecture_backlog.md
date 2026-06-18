@@ -3686,17 +3686,31 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: `tests/test_extract_runtime.py` 4✓（标量默认值 / set 默认空 / 别名共享可变可见 / 每实例独立 set）；`main.py` `py_compile` 通过；全量 pytest 3879 passed / 2 skipped / 0 failed。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1a→S1e / S2 / S3 / B）。
 
-## Slice C4 (M5 契约): input_contract 落地 (pending, P1)
+## Slice C4 (M5 契约): input_contract 落地 (done, P1)
 
 - 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。
 - 影响层: main.py run 初始化 → io_contract/persistence.py。
 - 前置: C3 已完成。
+- 改动: 三大入口均已落 input_contract.json——
+  - CLI / 即席 / replay: main.py:870 `ensure_input_contract_skeleton`（仅缺失时写，smart_batch 的富契约仍优先）。
+  - 批处理 / API: smart_batch_runner._persist_io_contracts_safe → write_input_contract（api_server._run_batch_task → run_smart_batch_sync）。
+  - 能力 API: capability_api.py:133 write_input_contract（带 run_id 时）。
+  - 落盘前 secret_redaction 脱敏；atomic temp + os.replace 写。
+- 新增 contract 字段: 无（沿用 input_contract.v1 既有结构）。
+- Tests: test_io_contract_persistence.py + test_io_contract.py + test_workflow_graph_input_contract.py 全绿。
 
-## Slice X1 (M5 调度): 跨系统 context 切换 (pending, P2)
+## Slice X1 (M5 调度): 跨系统 context 切换 (done, P2)
 
 - 能力名: cross_system_dispatch（按 system_id 切 BrowserSession context / storage_state）。
-- 影响层: workflow_graph cross_system risk_flag → execution_kernel。
+- 影响层: workflow_graph cross_system risk_flag → execution_kernel（main.py 热循环 + phases/rpa_replay.py）。
 - 前置: C4 已完成。
+- 改动: cross_system_enabled() 默认 True——
+  - main.py:4912-5129 E1b 运行时系统观测 → E1c-3b acquire_for_switch + storage_state 暂存 → 物理 rebind active browser → E1c-A1 goto 拦截切换。
+  - session_router / browser_session_pool / run_system_tracker 支撑按 (run, system, auth) 三元组切 BrowserSession。
+  - RPA 回放 phases/rpa_replay.py 同步按 system_id 切 browser（_replay_switch_system）。
+  - Bugfix: rpa_replay.py 的 `semantic_macros` import 误指 `phases/` 包，改为对齐同目录 auto_form.py 的三级 import（首选父包 `visual_web_agent.semantic_macros`）；否则跨系统 RPA 回放在运行时 ModuleNotFoundError（X1 默认开 → 真实命中）。
+- 新增 contract 字段: 无。
+- Tests: 修前 test_rpa_cross_system_replay 3 failed（ModuleNotFoundError）；修后跨系统全量 307 passed（session_router / browser_session_pool / route_executor_cross_system / xsys_dual_login_e2e / xsys_contract_to_relay_e2e / goto_cross_system / run_system_tracker / rpa_xsys_event_stream）。
 
 ## Slice G8 (M5 拆分): form_engine 抽离 main.py (pending, P3)
 
