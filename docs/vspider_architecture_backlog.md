@@ -3869,3 +3869,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useCapabilityTrace.test.js 9 例（选取/intent/rows/summary/filter/反应性 + 全 46 返回值「求值不抛错」冒烟，含空事件）；vitest 78 passed（8 文件）；npm run build 绿（1690 模块）。
 - App.vue 行数: 2593 → **2146 行**（-447）。本会话累计 ~4150 → 2146（约 -48%）。
 - 风险: 低-中（44 computed 逐字平移 + 依赖分析 + 冒烟测试穷举求值确认无悬空引用；跨组件 bug 一并闭合）。
+
+## Slice D-UI-9 (M4 简便): 时间线离线回放抽离 useTimelineReplay (done, P3)
+
+- 能力名: timeline_replay_extraction（phase_<id>.jsonl 解析 + 进入/退出回放状态机抽成 composable）。
+- 影响层: 新增 composables/useTimelineReplay.js —— 模块级纯函数 `parsePhaseReplayJsonl(text)`（容忍空行/坏 JSON/非 dict，支持 detail.phase_event 解包与单 capability_execute_trace 文档）+ `useTimelineReplay({ phaseEvents, hasNewCapability, setActiveBottomTab })`（持 replayMode/replaySourceName/replayInputRef/replayImportTarget + triggerReplayImport/exitReplayMode/handleTimelineImportReplay）。App.vue destructure 接线，`setActiveBottomTab` 以 wrapper arrow 延迟引用（其定义晚于接线点）。
+- 改动: 逐字平移，行为不变（WS replayMode 门控、resetForNewTask 复位、capability/timeline 双入口均经返回 ref/函数保持）。
+- 备注: 既有现象——App.vue 的 replayInputRef 从未在模板绑定，triggerReplayImport 实为 no-op（capability 回放导入入口未接），本 slice 原样保留（不在本次修），仅记录。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useTimelineReplay.test.js 9 例（解析器空行/坏行/非 dict/detail 解包/单 trace 文档 + 状态机导入/容错/切 tab/退出）；vitest 87 passed（9 文件）；npm run build 绿（1691 模块）。
+- App.vue 行数: 2146 → **2033 行**（-113）。本会话累计 ~4150 → 2033（约 -51%）。
+- 风险: 低（纯解析器 + 状态机平移，依赖经注入，单测覆盖解析与状态迁移）。

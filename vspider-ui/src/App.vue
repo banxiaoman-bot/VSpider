@@ -40,6 +40,7 @@ import { useModelSettings } from './composables/useModelSettings.js'
 import { useWebSocket } from './composables/useWebSocket.js'
 import { useKeyboardCommand } from './composables/useKeyboardCommand.js'
 import { useCapabilityTrace } from './composables/useCapabilityTrace.js'
+import { useTimelineReplay } from './composables/useTimelineReplay.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -180,23 +181,19 @@ const PHASE_LIMIT = 500
 const helpDialogVisible = ref(false)
 const promptInputRef = ref(null)
 
-// W: Offline replay mode ───────────────────────────────────────────
-//   replayMode:        when true, ``phaseEvents`` is replaced by an
-//                      imported ``phase_<id>.jsonl`` file and incoming
-//                      WS phase events are DROPPED so they don't
-//                      pollute the replay buffer. The Live Terminal
-//                      keeps streaming — only Timeline is gated.
-//   replaySourceName:  name of the imported file (shown in the banner)
-//                      so the user can tell which run they're viewing.
-//   replayInputRef:    bound to the hidden <input type="file"> so the
-//                      "导入回放" button can trigger it programmatically.
-const replayMode = ref(false)
-const replaySourceName = ref('')
-const replayInputRef = ref(null)
+const {
+  replayMode,
+  replaySourceName,
+  triggerReplayImport,
+  exitReplayMode,
+  handleTimelineImportReplay,
+} = useTimelineReplay({
+  phaseEvents,
+  hasNewCapability,
+  setActiveBottomTab: (name) => setActiveBottomTab(name),
+})
 const timelinePanelRef = ref(null)
 const failedRunsPaneRef = ref(null)
-const replayImportTarget = ref('timeline')
-
 // X: Live Terminal in-content search ──────────────────────────────────
 //   terminalSearchVisible: shows the search bar when true.
 //   terminalSearchQuery:   user input (case-insensitive substring).
@@ -1258,116 +1255,6 @@ const batchReplayCapabilityFailureFixtures = async () => {
 // We DON'T cap by PHASE_LIMIT here — a user importing a giant file
 // presumably wants to see all of it. The Timeline render already
 // virtualizes per-step so it handles ~10k events fine.
-
-const triggerReplayImport = (target = 'timeline') => {
-  // Programmatically click the hidden <input type="file"> so the user
-  // gets the native picker. We reset the value first so re-importing
-  // the same file fires onchange again (browsers debounce identical
-  // selections otherwise).
-  replayImportTarget.value = target === 'capability' ? 'capability' : 'timeline'
-  const inp = replayInputRef.value
-  if (!inp) return
-  try {
-    inp.value = ''
-    inp.click()
-  } catch (err) {
-    // Quiet — file picker errors are essentially "user clicked cancel"
-    // and the rest of the app is unaffected.
-  }
-}
-
-const _parseJsonlText = (text) => {
-  const out = []
-  let bad = 0
-  let total = 0
-  const _capabilityExecuteArtifactPhaseEvent = (doc) => {
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return null
-    if (String(doc.type || '') !== 'capability_execute_trace') return null
-    const result = doc.result && typeof doc.result === 'object' && !Array.isArray(doc.result) ? doc.result : {}
-    return {
-      type: 'phase',
-      phase: 'capability_execute',
-      severity: result.completed ? 'info' : 'warn',
-      message: String(result.capability || result.fallback_reason || result.status || 'capability_execute'),
-      ts: Number.isFinite(doc.created_at) ? doc.created_at : Date.now() / 1000,
-      execution_status: result.status,
-      completed: Boolean(result.completed),
-      capability: result.capability,
-      attempts: Array.isArray(result.attempts) ? result.attempts : [],
-      verification: result.verification,
-      fallback_reason: result.fallback_reason,
-      artifact: result.artifact,
-      trace_artifact: result.trace_artifact,
-      runtime_summary: result.runtime_summary,
-      runtime_drift: result.runtime_drift,
-      runtime_issue_summary: result.runtime_issue_summary,
-      action_trace: result.action_trace,
-      action_issue_summary: result.action_issue_summary,
-      failure_bundle: result.failure_bundle,
-      route_intent: result.route?.intent,
-    }
-  }
-  try {
-    const doc = JSON.parse(String(text || '').trim())
-    const artifactEvent = _capabilityExecuteArtifactPhaseEvent(doc)
-    if (artifactEvent) return { events: [artifactEvent], total: 1, bad: 0 }
-  } catch (err) {
-    // fall through to JSONL parsing
-  }
-  // Normalize line endings: a phase log captured on Windows may carry
-  // CRLF and we don't want a stray '\r' breaking the JSON parser.
-  const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n')
-  for (const raw of lines) {
-    const line = raw.trim()
-    if (!line) continue
-    total += 1
-    try {
-      const obj = JSON.parse(line)
-      if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-        const artifactEvent = _capabilityExecuteArtifactPhaseEvent(obj)
-        if (artifactEvent) {
-          out.push(artifactEvent)
-          continue
-        }
-        const phaseEvent = obj?.detail?.phase_event
-        out.push(phaseEvent && typeof phaseEvent === 'object' && !Array.isArray(phaseEvent) ? phaseEvent : obj)
-        continue
-      }
-    } catch (err) {
-      // fall through to bad counter
-    }
-    bad += 1
-  }
-  return { events: out, total, bad }
-}
-
-const exitReplayMode = () => {
-  replayMode.value = false
-  replaySourceName.value = ''
-  phaseEvents.value = []
-  hasNewCapability.value = false
-  ElMessage.info('已退出回放模式')
-}
-
-const handleTimelineImportReplay = (rawText, filename) => {
-  const { events, total, bad } = _parseJsonlText(rawText)
-  if (events.length === 0) {
-    ElMessage.warning('文件中没有可识别的 phase 事件')
-    return
-  }
-  for (const e of events) {
-    if (typeof e._ts !== 'number') e._ts = Number.isFinite(e.ts) ? e.ts : Date.now() / 1000
-  }
-  phaseEvents.value = events
-  replayMode.value = true
-  replaySourceName.value = filename
-  setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')
-  if (bad > 0) {
-    ElMessage.warning(`已导入 ${events.length} / ${total} 条事件（跳过 ${bad} 行损坏数据）`)
-  } else {
-    ElMessage.success(`已导入 ${events.length} 条事件，进入回放模式`)
-  }
-}
 
 // Same clipboard fallback chain as copyPhaseJson + finalAnswerText copy.
 const _writeToClipboard = async (text) => {
