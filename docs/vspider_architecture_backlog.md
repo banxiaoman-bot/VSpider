@@ -3931,3 +3931,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useCapabilityFixtureReplay.test.js 5 例（smoke：capabilityReplayPaneProps 打包遍历所有派生 computed 不抛错；generate/replay/replayEfficiency 非法输入 guard 不发网络；generate happy path：POST→refetch artifacts+library→success toast，apiFetch/ElMessage mock）；vitest 92 passed（10 文件）；npm run build 绿（1692 模块）。
 - App.vue 行数: 2033 → **1644 行**（-389）。本会话累计 ~4150 → 1644（约 -60%）。
 - 风险: 中（副作用最重的一块：网络/toast/跨组件依赖；但依赖经注入 + smoke 穷举求值 + guard/happy 双测覆盖，build+vitest 三绿）。
+
+## Slice D-UI-11 (M4 简便): 浏览器运行时状态子系统抽离 useBrowserRuntimeStatus (done, P3)
+
+- 能力名: browser_runtime_status_extraction（browser pool 运行时状态：2 state + 拉取动作 + 7 派生展示 computed 整体抽成 composable）。
+- 影响层: 新增 composables/useBrowserRuntimeStatus.js（`useBrowserRuntimeStatus({ appendLog })` 返回 browserRuntimeStatus/browserRuntimeLoading + fetchBrowserRuntimeStatus + 7 computed：browserRuntime/Capacity/BackendSummary/StatusClass/Label/HealthLabel/HealthCacheLabel）。App.vue destructure 全部 10 个返回值。
+- 依赖注入: appendLog（来自 createTerminalLogBuffer，第 91 行就绪，接线点在其后）；apiFetch 由 composable 直接 import。
+- 抽离方法: 逐字平移 3 处（state 135-136 / 动作 fetchBrowserRuntimeStatus / 7 computed），零转写；调用点（handleSocketMessage / submitTask / onMounted 共 3 处 fetchBrowserRuntimeStatus()）与模板 5 绑定（CapabilityRuntimePanel 的 browser-runtime / -class / -label / backend-summary / capacity / health-label / health-cache-label）零改动。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useBrowserRuntimeStatus.test.js 6 例（默认空对象+route-only/unknown；status→class+中文标签 6 例；health/cache 标签变体；fetch happy 存 runtime+toggle loading；re-entrancy guard 不发网络；error 经 appendLog 告警且 status 不变）；vitest 98 passed（11 文件）；npm run build 绿（1693 模块，index js 190.32kB）。
+- App.vue 行数: 1644 → **1602 行**（-42）。本会话累计 ~4150 → 1602。
+- 风险: 低（纯 computed + 单 fetch action 平移，依赖经注入，guard/happy/error 三路 + 标签映射穷举覆盖；build+vitest+lint 三绿）。

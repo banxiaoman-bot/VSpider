@@ -41,6 +41,7 @@ import { useKeyboardCommand } from './composables/useKeyboardCommand.js'
 import { useCapabilityTrace } from './composables/useCapabilityTrace.js'
 import { useTimelineReplay } from './composables/useTimelineReplay.js'
 import { useCapabilityFixtureReplay } from './composables/useCapabilityFixtureReplay.js'
+import { useBrowserRuntimeStatus } from './composables/useBrowserRuntimeStatus.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -132,8 +133,18 @@ const artifactList = ref([])
 const hasNewArtifacts = ref(false)
 const runHistoryRefreshToken = ref(0)
 const hasNewRuns = ref(false)
-const browserRuntimeStatus = ref(null)
-const browserRuntimeLoading = ref(false)
+const {
+  browserRuntimeStatus,
+  browserRuntimeLoading,
+  fetchBrowserRuntimeStatus,
+  browserRuntime,
+  browserRuntimeCapacity,
+  browserRuntimeBackendSummary,
+  browserRuntimeStatusClass,
+  browserRuntimeLabel,
+  browserRuntimeHealthLabel,
+  browserRuntimeHealthCacheLabel,
+} = useBrowserRuntimeStatus({ appendLog })
 
 // ── K3: Failed runs drawer ──
 // failedRunsList: array of records returned by GET /api/failed_runs.
@@ -493,23 +504,6 @@ const fetchArtifacts = async () => {
   }
 }
 
-const fetchBrowserRuntimeStatus = async () => {
-  if (browserRuntimeLoading.value) return
-  browserRuntimeLoading.value = true
-  try {
-    const response = await apiFetch('/api/browser_pool')
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '加载浏览器运行时状态失败')
-    }
-    browserRuntimeStatus.value = result.runtime || null
-  } catch (err) {
-    await appendLog(`[WARN] 加载浏览器运行时状态失败: ${String(err)}`)
-  } finally {
-    browserRuntimeLoading.value = false
-  }
-}
-
 const useAuthProfile = (name) => {
   if (!name) return
   if (!selectedAuthProfiles.value.includes(name)) {
@@ -631,42 +625,6 @@ const {
   latestCapabilityExecute,
   capabilityExecutionFailureBundle,
   capabilityExecutionEfficiencyCorrelationReport,
-})
-const browserRuntime = computed(() => browserRuntimeStatus.value || {})
-const browserRuntimeCapacity = computed(() => browserRuntime.value.capacity || {})
-const browserRuntimeBackendSummary = computed(() => browserRuntime.value.backend_summary || {})
-const browserRuntimeStatusClass = computed(() => {
-  const status = String(browserRuntime.value.status || 'unknown')
-  if (status === 'available') return 'healthy'
-  if (status === 'pool_exhausted' || status === 'backend_unavailable' || status === 'backend_unhealthy') return 'issue'
-  if (status === 'limited') return 'fallback'
-  return 'route-only'
-})
-const browserRuntimeLabel = computed(() => {
-  const status = String(browserRuntime.value.status || 'unknown')
-  if (status === 'available') return '可用'
-  if (status === 'pool_exhausted') return 'Pool 已满'
-  if (status === 'backend_unavailable') return 'Backend 不可用'
-  if (status === 'backend_unhealthy') return 'Backend 异常'
-  if (status === 'limited') return '受限'
-  return '未知'
-})
-const browserRuntimeHealthLabel = computed(() => {
-  const status = String(browserRuntimeBackendSummary.value.health_status || 'unknown')
-  if (status === 'healthy') return 'healthy'
-  if (status === 'not_configured') return 'not configured'
-  if (status === 'unhealthy') return 'unhealthy'
-  return status
-})
-const browserRuntimeHealthCacheLabel = computed(() => {
-  const summary = browserRuntimeBackendSummary.value
-  if (summary.health_cache_stale) return 'stale cache'
-  if (summary.health_cache_hit) {
-    const age = summary.health_cache_age_s == null ? '?' : summary.health_cache_age_s
-    const ttl = summary.health_cache_ttl_s == null ? '?' : summary.health_cache_ttl_s
-    return `cached ${age}s/${ttl}s`
-  }
-  return 'fresh'
 })
 const clearPhaseEvents = () => {
   phaseEvents.value = []
