@@ -144,3 +144,139 @@ def rank_extraction_candidates_with_history(
             candidate["recovery"] = dict(best, boost=boost)
             candidate["score"] = float(candidate.get("score") or 0) + boost
     return ranked
+
+
+_EXTRACTION_SELECTOR_RECOVERY_VERSION = "extraction_selector_recovery.v1"
+
+
+def _required_field_coverage(rows: Any, requested_fields: list[str] | None) -> float:
+    """Fraction of requested fields that have at least one non-empty value."""
+
+    row_dicts = [row for row in (rows or []) if isinstance(row, dict)]
+    if not row_dicts:
+        return 0.0
+    fields = [str(field).strip() for field in (requested_fields or []) if str(field).strip()]
+    if not fields:
+        return 1.0
+    covered = 0
+    for field in fields:
+        field_lower = field.lower()
+        present = False
+        for row in row_dicts:
+            value = row.get(field)
+            if value is None:
+                lower_map = {str(key).strip().lower(): val for key, val in row.items()}
+                value = lower_map.get(field_lower)
+            if value is not None and str(value).strip():
+                present = True
+                break
+        if present:
+            covered += 1
+    return round(covered / len(fields), 4)
+
+
+def _best_candidate_coverage(
+    candidates: list[dict[str, Any]] | None,
+    requested_fields: list[str] | None,
+) -> float:
+    best = 0.0
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        if int(candidate.get("accepted") or 0) <= 0:
+            continue
+        coverage = _required_field_coverage(candidate.get("rows"), requested_fields)
+        if coverage > best:
+            best = coverage
+    return best
+
+
+def recover_extraction_selectors(
+    candidates: list[dict[str, Any]] | None,
+    *,
+    url: str,
+    requested_fields: list[str] | None = None,
+    goal: str = "",
+    directory: str | Path = DEFAULT_SNAPSHOT_DIR,
+    max_baselines: int = 5,
+    min_baseline_coverage: float = 0.8,
+    max_current_coverage: float = 0.5,
+) -> dict[str, Any]:
+    """Return a strictly-gated selector-recovery hint when extraction collapsed.
+
+    Recovery only fires when the *current* extraction is weak (no accepted rows
+    or required-field coverage at/below ``max_current_coverage``) AND a *strong*
+    historical baseline (coverage >= ``min_baseline_coverage``) exists for the
+    same URL/field group. The hint surfaces the baseline's source-family,
+    selector-like signal, and expected fields so the caller can re-attempt
+    extraction biased to the known-good surface. It never fabricates rows.
+    """
+
+    current_coverage = _best_candidate_coverage(candidates, requested_fields)
+    if current_coverage > float(max_current_coverage):
+        return {
+            "version": _EXTRACTION_SELECTOR_RECOVERY_VERSION,
+            "recovered": False,
+            "reason": "current_extraction_healthy",
+            "current_coverage": current_coverage,
+        }
+
+    baselines = load_recovery_baselines(
+        url=url,
+        requested_fields=requested_fields,
+        goal=goal,
+        directory=directory,
+        limit=max_baselines,
+    )
+    if not baselines:
+        return {
+            "version": _EXTRACTION_SELECTOR_RECOVERY_VERSION,
+            "recovered": False,
+            "reason": "no_baseline",
+            "current_coverage": current_coverage,
+        }
+
+    best: tuple[float, int, dict[str, Any]] | None = None
+    for baseline in baselines:
+        rows = baseline.get("rows") if isinstance(baseline.get("rows"), list) else []
+        baseline_fields = (
+            baseline.get("requested_fields")
+            if isinstance(baseline.get("requested_fields"), list)
+            else (requested_fields or [])
+        )
+        coverage = _required_field_coverage(rows, requested_fields or baseline_fields)
+        row_count = len([row for row in rows if isinstance(row, dict)])
+        if coverage < float(min_baseline_coverage) or row_count <= 0:
+            continue
+        if best is None or (coverage, row_count) > (best[0], best[1]):
+            best = (coverage, row_count, baseline)
+
+    if best is None:
+        return {
+            "version": _EXTRACTION_SELECTOR_RECOVERY_VERSION,
+            "recovered": False,
+            "reason": "no_strong_baseline",
+            "current_coverage": current_coverage,
+        }
+
+    baseline_coverage, baseline_row_count, baseline = best
+    fingerprint = _snapshot_fingerprint(baseline)
+    expected_fields = [
+        str(field)
+        for field in (baseline.get("requested_fields") or requested_fields or [])
+        if str(field).strip()
+    ]
+    return {
+        "version": _EXTRACTION_SELECTOR_RECOVERY_VERSION,
+        "recovered": True,
+        "reason": "current_extraction_weak_baseline_available",
+        "current_coverage": current_coverage,
+        "baseline_coverage": baseline_coverage,
+        "baseline_row_count": baseline_row_count,
+        "source_family": str(fingerprint.get("source_family") or baseline.get("source") or ""),
+        "selector_like": list(fingerprint.get("selector_like") or []),
+        "expected_fields": expected_fields,
+        "baseline_signature": str(fingerprint.get("signature") or ""),
+        "baseline_source": str(baseline.get("source") or ""),
+        "baseline_path": str(baseline.get("_snapshot_path") or ""),
+    }

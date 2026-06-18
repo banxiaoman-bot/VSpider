@@ -289,6 +289,14 @@ Acceptance:
   too low.
 - Regression cases still pass with selector recovery enabled.
 
+## Slice RB1 (M5 鲁棒): extraction selector recovery 严门控重选 (done, P2)
+
+- 能力名: recover_extraction_selectors（抽取塌陷时按强历史 baseline 给出门控恢复提示）。
+- 影响层: extraction_engine/recovery.py（与既有 advisory boost 同模块，新增独立函数，未改既有签名/行为）。
+- 改动: 仅当「当前抽取弱」(无 accepted 行 / 必填字段覆盖 ≤ max_current_coverage) 且「同 URL/字段组存在强 baseline」(覆盖 ≥ min_baseline_coverage 且有行) 才回 recovered=True，附 source_family / selector_like / expected_fields；否则按 current_extraction_healthy / no_baseline / no_strong_baseline 直接拒。绝不伪造行。兑现本节「Future selector recovery must be rejected when coverage too low」验收项。
+- 新增 contract 字段: extraction_selector_recovery.v1（新增 advisory 结构，不改既有契约）。
+- Tests: test_extraction_selector_recovery.py 5✓（塌陷恢复 / 弱部分恢复 / 健康不恢复 / 无 baseline / 弱 baseline 拒绝）；test_extraction_recovery.py 旧用例仍绿。
+
 ## Slice 7: State Debug CLI
 
 Reference: browser-use CLI `state`, `click`, `type`, `screenshot`.
