@@ -3964,3 +3964,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useHitlForm.test.js 7 例（默认惰性态 / isBotChallengeHitl 跟随 reason（mock useTaskSubmit）/ resume happy 清介入+toast / resume error 保留 flag / submit happy 隐表单+字段计数 / submit error 复位 loading / skip 隐表单+日志且不发网络）；vitest 113 passed（13 文件）；npm run build 绿（index js 191.96kB）。
 - App.vue 行数: 1440 → **1394 行**（-46）。本会话累计 ~4150 → 1394（约 -66%）。
 - 风险: 低（state/computed/3 action 逐字平移，WS 写入点经同名 ref 零改；resume/submit/skip 的 happy+error+guard 全覆盖，build+vitest+lint 三绿）。
+
+## Slice D-UI-14 (M1 准确 + M4 简便): D-UI-11~13 抽离后遗留死 destructure 清除 (done, P3)
+
+- 能力名: appvue_dead_destructure_sweep（D-UI-11/12/13 抽离子系统后，App.vue 残留的「destructure 出来但已无任何活引用」的符号全量删除）。
+- 影响层: 仅 App.vue `<script setup>` 的三处 destructure（template / style / 子组件 / 各 composable 均未动）。
+- 审计方法: 临时脚本（即用即删）解析 `<script setup>` 顶层声明 + 多行 destructure 名（含 alias），对「去注释的 script+template 合并全文」做 `\b<name>\b` 计数，count==1（仅定义处）判死；删后再跑一次脚本确认 0 死候选（迭代收敛）。
+- 结论与删除: 删 **21 个死 destructure**——① useCapabilityTrace 袋里 18 个（capabilityModelRoles + 10 个 runtime/action issue 系列 + 4 个 crawl-efficiency 系列 + 3 个 efficiency-correlation alignment/rootcauses/actions），均为 D-UI-12 把 buildCapabilityTraceSummaryText 迁出后失去活引用者；② useBrowserRuntimeStatus 袋里 browserRuntimeStatus/browserRuntimeLoading（D-UI-11 过度 destructure，实际只在 composable 内部用）；③ useModelSettings 袋里 saveModelSettings（早已无引用）。保留 capabilityTraceJson / capabilityExecutionFailureBundle / capabilityExecutionEfficiencyCorrelationReport / capabilityAuditFindings 等仍被模板或下游 composable 接线参数引用者。
+- 新增 contract 字段: 无。
+- Tests: 无新增（纯删除、零行为改动）；既有 vitest 113 passed（13 文件）不变；删后脚本 0 死候选；ReadLints clean；npm run build 绿（index js 191.96→**191.14kB**，-0.8kB 死 computed 摇树）。
+- App.vue 行数: 1394 → **1373 行**（-21）。顶层声明 189 → 168。本会话累计 ~4150 → 1373（约 -67%）。
+- 风险: 低（仅删 count==1 的 destructure 名，script/template/composable 零触碰；脚本迭代确认 + build+vitest+lint 三绿）。
