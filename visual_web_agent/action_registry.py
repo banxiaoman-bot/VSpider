@@ -776,4 +776,192 @@ def build_default_action_registry() -> ActionRegistry:
         enabled=False,
         risk="medium",
     ))
+
+    # ── VLM primitive actions ──
+    # Metadata-only entries so capability_router can recognise them.
+    # Execution goes through browser.execute_action (actions/ handlers).
+
+    register(ActionTool(
+        name="click_text",
+        capability="interaction",
+        description="Click an element identified by visible text content.",
+        actions=("click_text",),
+        aliases=("点击文字",),
+        tags=("click",),
+        evidence=("selector", "text"),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="type_text",
+        capability="interaction",
+        description="Type text into the focused or specified input element.",
+        actions=("type",),
+        aliases=("输入", "填写文本"),
+        tags=("input", "keyboard"),
+        evidence=("value_readback",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="scroll_page",
+        capability="navigation",
+        description="Scroll the page or a specific element.",
+        actions=("scroll", "smooth_scroll"),
+        aliases=("滚动", "翻页"),
+        tags=("scroll",),
+        evidence=("scroll_position",),
+        deterministic=False,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="click_point",
+        capability="interaction",
+        description="Click at precise viewport coordinates.",
+        actions=("click_point",),
+        aliases=("坐标点击",),
+        tags=("click", "coordinate"),
+        evidence=("point",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="click_new_tab",
+        capability="navigation",
+        description="Click a link that opens in a new tab and switch to it.",
+        actions=("click_new_tab",),
+        aliases=("新标签页打开",),
+        tags=("click", "tab"),
+        evidence=("url", "tab_id"),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="press_key",
+        capability="interaction",
+        description="Press a keyboard key or shortcut.",
+        actions=("press_key",),
+        aliases=("按键", "快捷键"),
+        tags=("keyboard",),
+        evidence=("key",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="find_text",
+        capability="perception",
+        description="Search for text on the current page.",
+        actions=("find_text",),
+        aliases=("查找", "搜索文本"),
+        tags=("search",),
+        evidence=("matches",),
+        deterministic=False,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="wait_action",
+        capability="control",
+        description="Wait for a specified duration or condition.",
+        actions=("wait",),
+        aliases=("等待",),
+        tags=("timing",),
+        evidence=("duration",),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="goto_url",
+        capability="navigation",
+        description="Navigate to a specified URL.",
+        actions=("goto",),
+        aliases=("跳转", "打开网址"),
+        tags=("navigation", "url"),
+        evidence=("url",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="switch_tab",
+        capability="navigation",
+        description="Switch to a different browser tab.",
+        actions=("switch_tab",),
+        aliases=("切换标签页",),
+        tags=("tab",),
+        evidence=("tab_id",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="close_tab",
+        capability="navigation",
+        description="Close the current or specified browser tab.",
+        actions=("close_tab",),
+        aliases=("关闭标签页",),
+        tags=("tab",),
+        evidence=("tab_id",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="select_option",
+        capability="interaction",
+        description="Select an option from a dropdown or listbox.",
+        actions=("select",),
+        aliases=("选择", "下拉选择"),
+        tags=("select", "dropdown"),
+        evidence=("value_readback",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="done_signal",
+        capability="control",
+        description="Signal task completion to the agent loop.",
+        actions=("done",),
+        aliases=("完成",),
+        tags=("terminal",),
+        evidence=("summary",),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="ask_human",
+        capability="control",
+        description="Request human intervention for captchas, logins, or ambiguous decisions.",
+        actions=("ask_human",),
+        aliases=("人工介入", "验证码"),
+        tags=("hitl",),
+        evidence=("reason",),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="drag_and_drop",
+        capability="interaction",
+        description="Drag an element and drop it onto a target.",
+        actions=("drag_and_drop",),
+        aliases=("拖拽",),
+        tags=("drag",),
+        evidence=("source", "target"),
+        deterministic=False,
+        risk="medium",
+    ))
+    register(ActionTool(
+        name="save_to_memory",
+        capability="control",
+        description="Store extracted information in workflow memory for later use.",
+        actions=("save_to_memory",),
+        aliases=("记住", "保存到记忆"),
+        tags=("memory",),
+        evidence=("key", "value"),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+
     return registry

@@ -56,6 +56,23 @@ def _finish_checkpoint(run_ckpt: Any | None, succeeded: bool) -> None:
         pass
 
 
+def _package_artifacts(run_ts: str) -> None:
+    """Auto-bundle run artifacts when the file count exceeds the threshold.
+
+    Honors the delivery policy (files > 5 -> one bundle.zip; <= 5 stay
+    individually downloadable). Swallows all errors so packaging never
+    blocks run finalization.
+    """
+    try:
+        try:
+            from ..data_writers.packaging import package_run_artifacts
+        except ImportError:
+            from data_writers.packaging import package_run_artifacts  # type: ignore[no-redef]
+        package_run_artifacts(run_ts)
+    except Exception:
+        pass
+
+
 def _record_resume(
     *,
     goal: str,
@@ -161,6 +178,8 @@ async def finalize_run(
         succeeded=succeeded,
         run_constraints=run_constraints,
     )
+
+    _package_artifacts(run_ts)
 
     metadata = build_run_end_metadata(
         html_logger=html_logger,

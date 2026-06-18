@@ -279,9 +279,9 @@ class TestRowActionHandlerRegistration:
         """The Pydantic schema must accept row_action so VLM emissions parse."""
         import inspect
 
-        from visual_web_agent import vlm_client
+        from visual_web_agent import vlm_models
 
-        src = inspect.getsource(vlm_client)
+        src = inspect.getsource(vlm_models)
         assert '"row_action"' in src
 
     def test_json_schema_advertises_row_action(self) -> None:

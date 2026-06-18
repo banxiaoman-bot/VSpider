@@ -2032,6 +2032,7 @@ def test_capability_router_source_wiring() -> None:
     cap_exec_src = (root / "capability_execute_helpers.py").read_text(encoding="utf-8")
     api_src_combined = api_src + "\n" + cap_persist_src + "\n" + cap_exec_src
     api_src = api_src_combined
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
     action_ref_src = (root / "visual_web_agent" / "action_ref.py").read_text(encoding="utf-8")
     browser_backend_src = (root / "visual_web_agent" / "browser_backend.py").read_text(encoding="utf-8")
     browser_control_api_src = (root / "visual_web_agent" / "browser_control_api.py").read_text(encoding="utf-8")
@@ -2148,7 +2149,7 @@ def test_capability_router_source_wiring() -> None:
     assert '@app.post("/api/capabilities/route"' not in api_src
     assert '@router.post("/api/capabilities/route"' in capability_api_src
     assert '@router.get("/api/browser_control/backend"' in browser_control_api_src
-    assert '"runtime": _get_browser_runtime_status(pool_status=pool, backend_status=backend)' in api_src
+    assert "get_browser_runtime_status(" in tq_src
     assert '@router.get("/api/capabilities/manifest"' in capability_api_src
     assert '@router.get("/api/capabilities/model_roles"' in capability_api_src
     assert "app.include_router(create_capability_failure_fixture_router(CapabilityFailureFixtureApiDeps(" in api_src
@@ -2384,7 +2385,8 @@ def test_capability_router_source_wiring() -> None:
     assert '"systems_involved"' in executor_src
     assert '"system_attempts"' in executor_src
     assert 'from visual_web_agent.browser_session_pool import get_browser_session_pool_status as _get_browser_session_pool_status' in api_src
-    assert '@app.get("/api/browser_sessions"' in api_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/browser_sessions"' in tq_src
     # E1b: runtime cross-system tracker module + main.py wiring.
     assert "class RunSystemTracker" in run_system_tracker_src
     assert "def build_run_system_tracker(" in run_system_tracker_src

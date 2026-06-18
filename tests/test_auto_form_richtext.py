@@ -24,6 +24,7 @@ import re
 import pytest
 
 from visual_web_agent import main as main_mod
+from visual_web_agent.phases import auto_form as auto_form_mod
 from visual_web_agent.main import (
     _try_auto_form_fill,
     _try_auto_form_fill_bound_controls,
@@ -298,7 +299,7 @@ class TestFrameLevelRescue:
             rerun_calls.append(list(preset_labels or []))
             return {"ok": True, "submitted": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,
@@ -326,7 +327,7 @@ class TestFrameLevelRescue:
         async def fake_macro(p, **kwargs):
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,
@@ -348,7 +349,7 @@ class TestFrameLevelRescue:
             rerun_calls.append(kwargs)
             return {"ok": True}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         original = _unreachable_result()
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
@@ -371,7 +372,7 @@ class TestFrameLevelRescue:
             rerun_calls.append(kwargs)
             return {"ok": True}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         original = _unreachable_result()
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
@@ -440,7 +441,7 @@ class TestNestedFrameRescue:
             rerun_scopes.append(scope)
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,
@@ -463,7 +464,7 @@ class TestNestedFrameRescue:
             rerun_scopes.append(scope)
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,
@@ -483,7 +484,7 @@ class TestNestedFrameRescue:
         async def fake_macro(scope, **kwargs):
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         original = _unreachable_result()
         original["frame_url"] = host.url
         out = _run(
@@ -523,7 +524,7 @@ class TestNestedFrameRescue:
                 return {"ok": True, "results": [], "verifications": []}
             return _unreachable_result()
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_fill_bound_controls_with_frames(
                 page,
@@ -556,7 +557,7 @@ class TestNestedFrameRescue:
                 }
             return ok_hit
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_fill_bound_controls_with_frames(
                 page,
@@ -642,7 +643,7 @@ class TestSrcdocFrameRescue:
         async def fake_macro(p, *, preset_labels=None, **kwargs):
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,
@@ -670,7 +671,7 @@ class TestSrcdocFrameRescue:
         async def fake_macro(p, *, preset_labels=None, **kwargs):
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,
@@ -692,7 +693,7 @@ class TestSrcdocFrameRescue:
         async def fake_macro(p, *, preset_labels=None, **kwargs):
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         result = _unreachable_result()
         result["results"][1]["frameToken"] = "vsp-stale-token"
         out = _run(
@@ -715,7 +716,7 @@ class TestSrcdocFrameRescue:
         async def fake_macro(p, *, preset_labels=None, **kwargs):
             return {"ok": True, "results": [], "verifications": []}
 
-        monkeypatch.setattr(main_mod, "_try_auto_form_fill_bound_controls", fake_macro)
+        monkeypatch.setattr(auto_form_mod, "_try_auto_form_fill_bound_controls", fake_macro)
         out = _run(
             main_mod._auto_form_rescue_unreachable_iframes(
                 page,

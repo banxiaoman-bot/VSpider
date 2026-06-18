@@ -14,9 +14,9 @@ logger = logging.getLogger("vspider.main")
 
 def _runtime_config_module():
     try:
-        from . import config as runtime_config
+        from .. import config as runtime_config
     except ImportError:
-        import config as runtime_config
+        import config as runtime_config  # type: ignore[no-redef]
     return runtime_config
 
 

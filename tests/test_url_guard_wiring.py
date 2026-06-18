@@ -109,10 +109,10 @@ class TestMainFetchWiring:
             main_mod._load_rpa_challenge_rows("file:///etc/passwd", 1)
 
     def test_main_fetch_sites_use_guarded_opener(self):
-        # Pin the wiring: a refactor must not silently revert to raw urlopen
-        # (which would also drop the redirect-hop guard).
         src = Path("visual_web_agent/main.py").read_text(encoding="utf-8")
-        assert src.count("build_guarded_opener().open(") >= 2
+        rpa_src = Path("visual_web_agent/phases/rpa_macros.py").read_text(encoding="utf-8")
+        combined = src + rpa_src
+        assert combined.count("build_guarded_opener().open(") >= 2
         assert "with urlopen(" not in src
 
 
