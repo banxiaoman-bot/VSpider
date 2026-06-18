@@ -464,3 +464,52 @@ def test_extract_compact_list_text_via_dom_returns_on_rich_list():
     assert source == "LIST_ITEMS_TEXT"
     assert count == 6
     assert len(text) == 500
+
+
+# ── R2-1: compute_data_shape_with_drain (dedup of auto/explicit extract) ─────
+
+
+def test_compute_data_shape_with_drain_sparse_skips_override():
+    # < 10 expected rows: probe shape returned as-is, drain probe never runs.
+    class _Br:
+        async def probe_data_shape(self):
+            return {"table_rows": 2}
+
+        async def _ensure_active_page(self, reason=""):
+            raise AssertionError("drain probe must not run for sparse shape")
+
+    rt = _mk_runtime(browser=_Br())
+    shape = asyncio.run(rt.compute_data_shape_with_drain("r"))
+    assert shape == {"table_rows": 2}
+    assert "drain_state" not in shape
+
+
+def test_compute_data_shape_with_drain_dense_attaches_override():
+    # >= 10 expected rows (table_rows>=3 and table_cells>=2): attach drain state.
+    class _Frame:
+        async def evaluate(self, *_a, **_k):
+            return {"at_bottom": True, "window_remaining": 0}
+
+    class _Br:
+        async def probe_data_shape(self):
+            return {"table_rows": 50, "table_cells": 3}
+
+        async def _ensure_active_page(self, reason=""):
+            return _Frame()
+
+    rt = _mk_runtime(browser=_Br())
+    shape = asyncio.run(rt.compute_data_shape_with_drain("r"))
+    assert shape["table_rows"] == 50
+    assert shape["physically_drained"] is True
+    assert shape["drain_state"]["at_bottom"] is True
+
+
+def test_compute_data_shape_with_drain_probe_failure_returns_empty():
+    # probe_data_shape raising is swallowed; empty shape returned.
+    class _Br:
+        async def probe_data_shape(self):
+            raise RuntimeError("probe boom")
+
+    rt = _mk_runtime(browser=_Br())
+    shape = asyncio.run(rt.compute_data_shape_with_drain("r"))
+    assert shape == {}

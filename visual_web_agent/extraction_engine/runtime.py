@@ -765,6 +765,26 @@ class ExtractRuntime:
             self.deps.logger.debug("[EXTRACT DEDUP] scroll drain probe failed: %s", probe_err)
             return {"at_bottom": False, "probe_failed": True}
 
+    async def compute_data_shape_with_drain(self, reason: str) -> dict:
+        """Probe the page data shape, attaching a physical scroll-drain
+        override for dense pages (>=10 expected rows). Verbatim relocation of
+        the block duplicated across run_agent's auto- and explicit-extract
+        paths; the only per-call difference was the drain probe ``reason``.
+        """
+        data_shape: dict = {}
+        try:
+            data_shape = await self.deps.browser.probe_data_shape()
+            self.deps.logger.info("[DATA SHAPE] %s", data_shape)
+            if self.expected_rows_from_data_shape(data_shape) >= 10:
+                drain_state = await self.probe_scroll_drain_state(reason)
+                data_shape = dict(data_shape)
+                data_shape["physically_drained"] = bool(drain_state.get("at_bottom"))
+                data_shape["drain_state"] = drain_state
+                self.deps.logger.info("[DATA SHAPE] dense drain_state=%s", drain_state)
+        except Exception as shape_err:
+            self.deps.logger.debug("[DATA SHAPE] skipped: %s", shape_err)
+        return data_shape
+
     async def detect_canvas_grid(self, reason: str) -> dict:
         """Detect a dominant canvas/svg-rendered grid (EXTRACT-CANVAS-1).
 
