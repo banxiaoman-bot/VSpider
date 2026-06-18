@@ -22,11 +22,15 @@ def _line_count(rel_path: str) -> int:
 
 
 class TestFileSizeBaseline:
-    def test_main_py_below_18000(self):
+    def test_main_py_below_10200(self):
+        # S1a-S1d carved the extraction subsystem out of run_agent into
+        # extraction_engine/runtime.py (~1600 lines removed); lock in the gain.
+        # The 3 nonlocal run-lifecycle finalizers stay in main.py by design,
+        # so the limit is set just above the current count; S2/S3 will tighten it.
         count = _line_count("visual_web_agent/main.py")
-        assert count < 18000, (
-            f"main.py has {count} lines (limit 18000). "
-            "New features must go into phases/ modules, not main.py."
+        assert count < 10200, (
+            f"main.py has {count} lines (limit 10200). "
+            "New features must go into phases/ or extraction_engine/ modules, not main.py."
         )
 
     def test_browser_env_below_5000(self):
@@ -62,3 +66,11 @@ class TestFileSizeBaseline:
         api_routes = _PROJECT / "api_routes"
         assert api_routes.is_dir()
         assert (api_routes / "spider_api.py").exists()
+
+    def test_extraction_runtime_carved_out(self):
+        # S1 closeout: the extraction subsystem now lives in its own module.
+        runtime = _PROJECT / "visual_web_agent" / "extraction_engine" / "runtime.py"
+        assert runtime.exists()
+        src = runtime.read_text(encoding="utf-8")
+        for cls in ("class ExtractState", "class ExtractDeps", "class ExtractRuntime"):
+            assert cls in src, f"{cls} missing from extraction_engine/runtime.py"

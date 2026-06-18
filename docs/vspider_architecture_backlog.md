@@ -3731,6 +3731,19 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 提交: `6c5cfbb`（仅 Python；本条目延后补录）。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1d）。
 
+## Slice S1e (M5 拆分收口): 抽取子系统体量基线 + S1 收口 (done, P1)
+
+- 能力名: extraction_subsystem_baseline（S1a-S1d 把 extraction 子系统从 `run_agent` 切到 `extraction_engine/runtime.py` 后的体量回归守卫 + S1 阶段收口）。
+- 影响层: data_plane / 测试基线（`tests/test_file_size_baseline.py`）。
+- 前置: S1a-S1d 已完成（`ExtractRuntime` 现 33 方法：6 DOM 读 + 14 仲裁/归一 + 13 快路径/文本）。
+- 改动:
+  - `test_file_size_baseline.py`：main.py 行数守卫 18000 收紧为 10200（实测 10019，锁定 S1 减约 1600 行的成果；S2/S3 再逐步收紧）；新增 `test_extraction_runtime_carved_out` 断言 `runtime.py` 存在且含 `ExtractState`/`ExtractDeps`/`ExtractRuntime`。
+  - 与计划偏差: 计划估算 main.py `<9500`，实际 10019——因 3 个 nonlocal 收尾闭包（`_finish_if_xhr_target_reached` / `_finish_if_file_download_completed` / `_try_pre_extract_fast_path`）按设计留在 main.py（属 run 生命周期，待日后 RunState/phases 切片再迁），且原行数估算用 `Measure-Object`（CRLF 下偏低 ~350 行）。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_file_size_baseline.py` 7✓。
+- S1 阶段小结: extraction 闭包族（DOM 读 / 仲裁归一 / 快路径文本）已全量迁入 `ExtractRuntime`（33 方法）；main.py `run_agent` 由 ~11600 降至 10019（Python 行）；S1a-S1d 四刀均纯平移零行为改动，每刀经 ExtractRuntime 单测 + 抽取回归 + 全量 pytest 零新增 Python 失败验证。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1e）。
+
 ## Slice C4 (M5 契约): input_contract 落地 (done, P1)
 
 - 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。
