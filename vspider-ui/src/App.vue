@@ -47,6 +47,10 @@ import {
 } from './composables/useSlashCommand.js'
 import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
+import { renderMarkdown } from './composables/markdownRender.js'
+import { useModelSettings } from './composables/useModelSettings.js'
+import { useWebSocket } from './composables/useWebSocket.js'
+import { useKeyboardCommand } from './composables/useKeyboardCommand.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -64,7 +68,7 @@ import {
   fetchOutputContractPreview,
   formatOutputContractPreview,
 } from './composables/useTaskSubmit'
-import { API_BASE, apiFetch, wsUrl } from './api/client.js'
+import { API_BASE, apiFetch } from './api/client.js'
 
 const url = ref('')
 const urlFieldExpanded = ref(false)
@@ -99,43 +103,27 @@ const currentImageBase64 = ref('')
 const screenshotHistory = ref([])
 const SCREENSHOT_HISTORY_MAX = 60
 const terminalLogPaneRef = ref(null)
-const wsStatus = ref('connecting')
 
 const authDialogOpen = ref(false)
 const authProfileOptions = ref([])
-const selectedModel = ref('backend-default')
-const selectedSemanticModel = ref('backend-default')
-const modelTemperature = ref(0.1)
-const modelMaxTokens = ref(4096)
-const modelBaseUrl = ref('')
-const modelApiKey = ref('')
-const semanticBaseUrl = ref('')
-const semanticApiKey = ref('')
-const vlmRemoteModels = ref([])
-const vlmRemoteLoading = ref(false)
-const semanticRemoteModels = ref([])
-const semanticRemoteLoading = ref(false)
-
-async function fetchRemoteModels (baseUrl, apiKey, targetRef, loadingRef) {
-  if (!baseUrl) { ElMessage.warning('请先填写 Base URL'); return }
-  loadingRef.value = true
-  try {
-    const headers = { 'Content-Type': 'application/json' }
-    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`
-    const url = baseUrl.replace(/\/+$/, '') + '/models'
-    const resp = await fetch(url, { headers })
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-    const json = await resp.json()
-    const models = (json.data || json.models || []).map(m => typeof m === 'string' ? m : m.id).filter(Boolean)
-    if (!models.length) { ElMessage.warning('未返回可用模型'); return }
-    targetRef.value = models
-    ElMessage.success(`获取到 ${models.length} 个模型`)
-  } catch (err) {
-    ElMessage.error(`连接失败: ${String(err)}`)
-  } finally {
-    loadingRef.value = false
-  }
-}
+const {
+  selectedModel,
+  selectedSemanticModel,
+  modelTemperature,
+  modelMaxTokens,
+  modelBaseUrl,
+  modelApiKey,
+  semanticBaseUrl,
+  semanticApiKey,
+  vlmRemoteModels,
+  vlmRemoteLoading,
+  semanticRemoteModels,
+  semanticRemoteLoading,
+  fetchRemoteModels,
+  loadModelSettings,
+  saveModelSettings,
+  selectedModelType,
+} = useModelSettings()
 
 const isHumanInterventionRequired = ref(false)
 const humanInterventionReason = ref('')
@@ -147,8 +135,6 @@ const hitlFormLoading = ref(false)
 const hitlScreenshot = ref('')
 const activeBottomTab = ref('terminal')
 const runsSubView = ref('all')
-// B: Timeline 筛选 chips 默认收起，点「筛选」按钮展开
-const timelineFiltersExpanded = ref(false)
 // C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
 const settingsDrawerOpen = ref(false)
 const settingsActivePanels = ref(['models', 'identity', 'constraints', 'file'])
@@ -207,26 +193,6 @@ const PHASE_LIMIT = 500
 const helpDialogVisible = ref(false)
 const promptInputRef = ref(null)
 
-// ── O: Phase timeline filtering ──
-// phaseFilterExclude: set of phase names to HIDE (default empty = show all).
-// We use exclude semantics so new phases added by future patches show up by
-// default, instead of silently disappearing because they weren't in an
-// allowlist.
-// severityFilterExclude: same idea but per-severity ('info'/'warn'/'error').
-const phaseFilterExclude = ref(new Set())
-const severityFilterExclude = ref(new Set())
-
-// V: Phase histogram / stats panel (toggled in the Timeline toolbar).
-//   phaseStatsExpanded: drives the expand/collapse animation. Default
-//     collapsed so the panel doesn't crowd the existing filter pills
-//     until the user explicitly opens it.
-//   phaseStatsSortBy:   one of 'count' | 'mean' | 'p95' | 'max'.
-//     Tells the stats grid which column to descending-sort by. Default
-//     'count' matches the existing filter row order so the toggle
-//     doesn't re-shuffle the user's mental model.
-const phaseStatsExpanded = ref(false)
-const phaseStatsSortBy = ref('count')
-
 // W: Offline replay mode ───────────────────────────────────────────
 //   replayMode:        when true, ``phaseEvents`` is replaced by an
 //                      imported ``phase_<id>.jsonl`` file and incoming
@@ -257,16 +223,7 @@ const replayImportTarget = ref('timeline')
 // the user's expectation of the browser's native page-search.
 
 
-// ── P: Timeline auto-scroll ──
-// timelineRef: reference to the el-scrollbar of the timeline panel.
-// timelineAutoScroll: pin-to-bottom flag. Starts true. Flips to false
-// when the user scrolls up by hand; flips back to true when they scroll
-// to the bottom OR click the "回到底部" floating button.
-// SCROLL_BOTTOM_EPS: how close to the bottom counts as "at bottom" (px).
-const timelineRef = ref(null)
 const timelineAutoScroll = ref(true)
-const SCROLL_BOTTOM_EPS = 24
-
 // ── Final Answer 面板状态 ──
 // taskResult: 后端最终结果，结构 { type: 'text' | 'file', answer: string }
 //   - null：未开始 / 已重置
@@ -282,10 +239,6 @@ const hasNewFinalAnswer = ref(false)
 // 启动任务时记录 artifact 数，作为兜底的 type 推断依据（后端未显式标记时使用）
 let artifactsCountAtSubmit = 0
 
-let socket = null
-let reconnectTimer = null
-let isUnmounted = false
-
 // ── Slash command system ──
 const slashRegistry = createSlashCommandRegistry()
 const {
@@ -296,44 +249,6 @@ const {
   dismiss: dismissCmdPalette,
 } = useSlashCommand(slashRegistry)
 const cmdPaletteRef = ref(null)
-
-const MODEL_SETTINGS_STORAGE_KEY = 'vspider:model-settings:v1'
-
-const loadModelSettings = () => {
-  try {
-    const raw = window.localStorage.getItem(MODEL_SETTINGS_STORAGE_KEY)
-    if (!raw) return
-    const data = JSON.parse(raw)
-    if (typeof data.selectedModel === 'string') selectedModel.value = data.selectedModel
-    if (typeof data.selectedSemanticModel === 'string') selectedSemanticModel.value = data.selectedSemanticModel
-    if (typeof data.modelBaseUrl === 'string') modelBaseUrl.value = data.modelBaseUrl
-    if (typeof data.semanticBaseUrl === 'string') semanticBaseUrl.value = data.semanticBaseUrl
-    if (typeof data.modelTemperature === 'number') modelTemperature.value = data.modelTemperature
-    if (typeof data.modelMaxTokens === 'number') modelMaxTokens.value = data.modelMaxTokens
-  } catch (err) {
-    console.warn('[settings] failed to load model settings', err)
-  }
-}
-
-const saveModelSettings = () => {
-  try {
-    window.localStorage.setItem(MODEL_SETTINGS_STORAGE_KEY, JSON.stringify({
-      selectedModel: selectedModel.value,
-      selectedSemanticModel: selectedSemanticModel.value,
-      modelBaseUrl: modelBaseUrl.value,
-      semanticBaseUrl: semanticBaseUrl.value,
-      modelTemperature: modelTemperature.value,
-      modelMaxTokens: modelMaxTokens.value,
-    }))
-  } catch (err) {
-    console.warn('[settings] failed to save model settings', err)
-  }
-}
-
-watch(
-  [selectedModel, selectedSemanticModel, modelBaseUrl, semanticBaseUrl, modelTemperature, modelMaxTokens],
-  saveModelSettings,
-)
 
 // ── 自动切换 Tab：仅在 taskResult.type 真正发生变化时触发，避免无限循环 ──
 //   - 只读 taskResult，只写 activeBottomTab / hasNewFinalAnswer
@@ -352,209 +267,15 @@ watch(taskResult, (val, oldVal) => {
   }
 })
 
-const authProfileNames = computed(() =>
-  authProfileOptions.value.map((item) => item.name).filter(Boolean),
-)
-
 const isBotChallengeHitl = computed(() =>
   isBotChallengeReason(humanInterventionReason.value),
 )
-const selectedModelType = computed(() =>
-  ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro']
-    .includes(selectedModel.value) ? 'text' : 'vl',
-)
-
-// ─────────────────────────────────────────────────────────────
-//  轻量 Markdown 渲染器（不引入第三方依赖）
-//  支持：``` 代码块、`inline 代码`、**粗体**、*斜体*、# / ## / ###
-//        标题、- / * 列表、[text](url) 链接、段落（空行分隔）。
-//  安全：先把代码块抽成占位符，再把剩余文本整体 escapeHtml，
-//        最后才把 Markdown 标记替换为受控的 HTML 标签；
-//        链接仅放行 http/https/mailto 协议，其余统一渲染为纯文本。
-// ─────────────────────────────────────────────────────────────
-const escapeHtml = (s) =>
-  String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
-
-const renderMarkdown = (src) => {
-  if (src == null || src === '') return ''
-  let text = String(src).replace(/\r\n/g, '\n')
-
-  // 1. 抽取 ``` 代码块到占位符，避免内部内容被后续替换破坏
-  const codeBlocks = []
-  text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
-    const idx = codeBlocks.length
-    const langClass = lang ? ` lang-${escapeHtml(lang)}` : ''
-    codeBlocks.push(
-      `<pre class="md-pre"><code class="md-code${langClass}">${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`,
-    )
-    return `\u0000CB${idx}\u0000`
-  })
-
-  // 2. 抽取行内代码到占位符
-  const inlineCodes = []
-  text = text.replace(/`([^`\n]+)`/g, (_m, c) => {
-    const idx = inlineCodes.length
-    inlineCodes.push(`<code class="md-icode">${escapeHtml(c)}</code>`)
-    return `\u0000IC${idx}\u0000`
-  })
-
-  // 3. 整体 escape HTML
-  text = escapeHtml(text)
-
-  // 4. 标题 ### / ## / # （顺序：长前缀先匹配）
-  text = text.replace(/^###\s+(.+)$/gm, '<h3 class="md-h3">$1</h3>')
-  text = text.replace(/^##\s+(.+)$/gm, '<h2 class="md-h2">$1</h2>')
-  text = text.replace(/^#\s+(.+)$/gm, '<h1 class="md-h1">$1</h1>')
-
-  // 5. 粗体、斜体（粗体优先以避免 ** 被 * 抢先吃掉）
-  text = text.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>')
-  text = text.replace(/(^|[^*])\*([^*\n]+?)\*(?!\*)/g, '$1<em>$2</em>')
-
-  // 6. 链接 [text](url) —— 仅允许 http/https/mailto
-  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, label, href) => {
-    if (!/^(https?:|mailto:)/i.test(href)) return m
-    return `<a class="md-a" href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`
-  })
-
-  // 7. 无序列表：连续的 - / * 行 → <ul><li>
-  text = text.replace(
-    /(?:^|\n)((?:[-*]\s+.+(?:\n|$))+)/g,
-    (_m, block) => {
-      const items = block
-        .split('\n')
-        .filter((l) => l.trim())
-        .map((l) => `<li>${l.replace(/^[-*]\s+/, '')}</li>`)
-        .join('')
-      return `\n<ul class="md-ul">${items}</ul>\n`
-    },
-  )
-
-  // 8. 段落：空行分隔的块；已经是 <h*>/<ul>/<pre>/占位符 的块原样保留
-  text = text
-    .split(/\n{2,}/)
-    .map((chunk) => {
-      const t = chunk.trim()
-      if (!t) return ''
-      if (/^<(?:h\d|ul|pre|blockquote)/.test(t)) return t
-      if (/^\u0000CB\d+\u0000$/.test(t)) return t
-      return `<p class="md-p">${chunk.replace(/\n/g, '<br/>')}</p>`
-    })
-    .join('\n')
-
-  // 9. 还原代码块占位符
-  text = text.replace(/\u0000CB(\d+)\u0000/g, (_m, i) => codeBlocks[+i] || '')
-  text = text.replace(/\u0000IC(\d+)\u0000/g, (_m, i) => inlineCodes[+i] || '')
-
-  return text
-}
 
 const finalAnswerHtml = computed(() => renderMarkdown(finalAnswerText.value))
 
-// ── F1+F2: Final Answer 工具栏 / 折叠 ─────────────────────────────────
-// 每次任务重置时重新折叠；用户主动展开后保持展开直到下一次任务。
-const FINAL_ANSWER_COLLAPSE_THRESHOLD = 600 // 字符数；> 阈值默认折叠
-const FINAL_ANSWER_COLLAPSED_PREVIEW = 480  // 折叠时只渲染前 N 个字符
 const finalAnswerExpanded = ref(false)
 const finalAnswerCopyState = ref('idle') // 'idle' | 'ok' | 'err'
 let finalAnswerCopyTimer = null // F1: reset-to-idle debounce; cleared on unmount
-
-const finalAnswerCharCount = computed(() => (finalAnswerText.value || '').length)
-const finalAnswerLineCount = computed(() => {
-  const t = finalAnswerText.value || ''
-  if (!t) return 0
-  return t.split(/\r?\n/).length
-})
-const isFinalAnswerLong = computed(
-  () => finalAnswerCharCount.value > FINAL_ANSWER_COLLAPSE_THRESHOLD,
-)
-// 折叠时渲染的 markdown HTML（截断到预览长度，保留段落边界）
-const displayedFinalAnswerHtml = computed(() => {
-  const t = finalAnswerText.value || ''
-  if (!isFinalAnswerLong.value || finalAnswerExpanded.value) {
-    return finalAnswerHtml.value
-  }
-  // 在 preview 边界附近寻找最近的段落断点（双换行 / 句号）以避免突兀截断
-  const cap = FINAL_ANSWER_COLLAPSED_PREVIEW
-  let cut = cap
-  const slack = Math.min(120, t.length - cap)
-  if (slack > 0) {
-    const window = t.slice(cap, cap + slack)
-    const para = window.search(/\n\s*\n/)
-    if (para !== -1) cut = cap + para
-    else {
-      const period = window.search(/[。.!?！？]\s/)
-      if (period !== -1) cut = cap + period + 1
-    }
-  }
-  return renderMarkdown(t.slice(0, cut))
-})
-
-const copyFinalAnswerToClipboard = async () => {
-  const t = finalAnswerText.value || ''
-  if (!t) return
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(t)
-    } else {
-      // Fallback for non-secure context (e.g. http://localhost)
-      const ta = document.createElement('textarea')
-      ta.value = t
-      ta.setAttribute('readonly', '')
-      ta.style.position = 'absolute'
-      ta.style.left = '-9999px'
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    finalAnswerCopyState.value = 'ok'
-  } catch (e) {
-    finalAnswerCopyState.value = 'err'
-  } finally {
-    // F1: keep a handle so onUnmounted can cancel this reset; otherwise the
-    // callback fires on a detached component (writes finalAnswerCopyState).
-    if (finalAnswerCopyTimer) clearTimeout(finalAnswerCopyTimer)
-    finalAnswerCopyTimer = setTimeout(() => {
-      finalAnswerCopyTimer = null
-      finalAnswerCopyState.value = 'idle'
-    }, 1600)
-  }
-}
-
-// F3: 域 → 卡片元数据（图标 + 标签 + 着色）
-const FINAL_ANSWER_DOMAIN_META = {
-  weather: { icon: '🌤️', label: '天气', accent: '#5cc4d4' },
-  stock:   { icon: '📈', label: '股票', accent: '#7ce0a2' },
-  recipe:  { icon: '🍳', label: '菜谱', accent: '#ffb877' },
-  flight:  { icon: '✈️', label: '航班', accent: '#a594e8' },
-}
-const finalAnswerDomainMeta = computed(
-  () => FINAL_ANSWER_DOMAIN_META[finalAnswerDomain.value] || null,
-)
-
-const exportFinalAnswerAsMarkdown = () => {
-  const t = finalAnswerText.value || ''
-  if (!t) return
-  const ts = new Date()
-  const stamp =
-    `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}` +
-    `${String(ts.getDate()).padStart(2, '0')}_${String(ts.getHours()).padStart(2, '0')}` +
-    `${String(ts.getMinutes()).padStart(2, '0')}${String(ts.getSeconds()).padStart(2, '0')}`
-  const blob = new Blob([t], { type: 'text/markdown;charset=utf-8' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `final_answer_${stamp}.md`
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
 
 // appendLog now comes from createTerminalLogBuffer (see top of setup):
 // synchronous push into a plain buffer, batched flush per frame.
@@ -569,20 +290,7 @@ const exportFinalAnswerAsMarkdown = () => {
 
 const scrollToBottom = () => terminalLogPaneRef.value?.scrollToBottom()
 
-const connectWebSocket = () => {
-  if (isUnmounted) return
-  if (socket && socket.readyState === WebSocket.OPEN) return
-  if (socket && socket.readyState === WebSocket.CONNECTING) return
-
-  wsStatus.value = 'connecting'
-  socket = new WebSocket(wsUrl('/ws/logs'))
-
-  socket.onopen = () => {
-    wsStatus.value = 'connected'
-    appendLog('[SYSTEM] WebSocket connected')
-  }
-
-  socket.onmessage = async (event) => {
+const handleSocketMessage = async (event) => {
     try {
       const payload = JSON.parse(event.data)
       if (payload.type === 'log') {
@@ -744,25 +452,18 @@ const connectWebSocket = () => {
     } catch (err) {
       await appendLog(`[WARN] 无法解析消息: ${String(err)}`)
     }
-  }
-
-  socket.onclose = () => {
-    wsStatus.value = 'disconnected'
-    appendLog('[SYSTEM] WebSocket disconnected')
-    if (!isUnmounted) {
-      if (reconnectTimer) clearTimeout(reconnectTimer)
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null
-        connectWebSocket()
-      }, 2000)
-    }
-  }
-
-  socket.onerror = () => {
-    wsStatus.value = 'error'
-    appendLog('[ERROR] WebSocket error')
-  }
 }
+
+const {
+  status: wsStatus,
+  connect: connectWebSocket,
+  disconnect: disconnectWebSocket,
+} = useWebSocket({
+  onOpen: () => appendLog('[SYSTEM] WebSocket connected'),
+  onMessage: handleSocketMessage,
+  onClose: () => appendLog('[SYSTEM] WebSocket disconnected'),
+  onError: () => appendLog('[ERROR] WebSocket error'),
+})
 
 const handleUploadChange = (uploadFile, uploadFiles) => {
   if (!uploadFile || !uploadFile.raw) {
@@ -897,22 +598,6 @@ const skipHitlForm = async () => {
   await appendLog('[HITL] 用户选择跳过前端表单，请去浏览器窗口操作')
 }
 
-// ── M: Phase timeline computeds & helpers ─────────────────────────────
-// O: filteredPhaseEvents applies the exclude filters (phase + severity)
-// before grouping. Everything downstream (grouping, summary stats inside
-// the toolbar) operates on this view, so unchecking "vlm_call" instantly
-// hides those chips.
-const filteredPhaseEvents = computed(() => {
-  const exP = phaseFilterExclude.value
-  const exS = severityFilterExclude.value
-  if (exP.size === 0 && exS.size === 0) return phaseEvents.value
-  return phaseEvents.value.filter((e) => {
-    const p = String(e.phase || 'unknown')
-    const s = String(e.severity || 'info')
-    return !exP.has(p) && !exS.has(s)
-  })
-})
-
 const latestCapabilityRoute = computed(() => {
   for (let i = phaseEvents.value.length - 1; i >= 0; i -= 1) {
     const evt = phaseEvents.value[i]
@@ -927,34 +612,6 @@ const latestCapabilityExecute = computed(() => {
     if (evt && String(evt.phase || '') === 'capability_execute') return evt
   }
   return null
-})
-
-const latestCompletionGuard = computed(() => {
-  for (let i = phaseEvents.value.length - 1; i >= 0; i -= 1) {
-    const evt = phaseEvents.value[i]
-    if (evt && String(evt.phase || '') === 'completion_guard') return evt
-  }
-  return null
-})
-
-const completionEvidence = computed(() => {
-  const evt = latestCompletionGuard.value
-  if (!evt) return null
-  const evaluation = evt.evaluation && typeof evt.evaluation === 'object'
-    ? evt.evaluation
-    : {}
-  const state = evt.state && typeof evt.state === 'object' ? evt.state : {}
-  return {
-    guard: String(evt.guard || 'completion'),
-    message: String(evt.message || ''),
-    status: String(evaluation.status || ''),
-    confidence: evaluation.confidence,
-    evidence: Array.isArray(evaluation.evidence) ? evaluation.evidence : [],
-    reasons: Array.isArray(evaluation.reasons) ? evaluation.reasons : [],
-    checks: Array.isArray(evaluation.checks) ? evaluation.checks : [],
-    streak: state.streak ?? evaluation.subgoal_exit?.streak,
-    step: evt.step,
-  }
 })
 
 const capabilityTraceEvents = computed(() =>
@@ -1003,20 +660,6 @@ const capabilityAuditFindings = computed(() =>
 )
 const capabilityTraceJson = computed(() =>
   latestCapabilityRoute.value ? buildPhaseEventJsonString(latestCapabilityRoute.value) : '',
-)
-const capabilityExecutionAttempts = computed(() =>
-  Array.isArray(latestCapabilityExecute.value?.attempts)
-    ? latestCapabilityExecute.value.attempts
-    : [],
-)
-const capabilityExecutionVerification = computed(() =>
-  latestCapabilityExecute.value?.verification || {},
-)
-const capabilityExecutionRuntimeSummary = computed(() =>
-  latestCapabilityExecute.value?.runtime_summary || {},
-)
-const capabilityExecutionRuntimeAfter = computed(() =>
-  capabilityExecutionRuntimeSummary.value?.after || {},
 )
 const capabilityExecutionRuntimeDrift = computed(() =>
   latestCapabilityExecute.value?.runtime_drift || {},
@@ -1085,9 +728,6 @@ const capabilityExecutionCrawlEfficiencyAvailablePaths = computed(() =>
     ? capabilityActiveCrawlEfficiencyPlan.value.available_paths.map((item) => String(item || '')).filter(Boolean)
     : [],
 )
-const capabilityExecutionCrawlEfficiencySummary = computed(() =>
-  capabilityActiveCrawlEfficiencyPlan.value?.efficiency_summary || {},
-)
 const capabilityExecutionEfficiencyCorrelationReport = computed(() =>
   capabilityEventEfficiencyCorrelationReport(latestCapabilityExecute.value),
 )
@@ -1097,11 +737,6 @@ const capabilityExecutionEfficiencyCorrelationAlignment = computed(() =>
 const capabilityExecutionEfficiencyCorrelationRootCauses = computed(() =>
   Array.isArray(capabilityExecutionEfficiencyCorrelationReport.value?.root_causes)
     ? capabilityExecutionEfficiencyCorrelationReport.value.root_causes
-    : [],
-)
-const capabilityExecutionEfficiencyCorrelationPlannerHints = computed(() =>
-  Array.isArray(capabilityExecutionEfficiencyCorrelationReport.value?.planner_hints)
-    ? capabilityExecutionEfficiencyCorrelationReport.value.planner_hints
     : [],
 )
 const capabilityExecutionEfficiencyCorrelationActions = computed(() =>
@@ -1195,11 +830,6 @@ const capabilityFailureFixtureBatchReplayTopFailedChecks = computed(() =>
 )
 const capabilityFailureFixtureBatchReplayStatus = computed(() =>
   capabilityFailureFixtureBatchReplayReport.value?.passed ? 'passed' : 'failed',
-)
-const capabilityExecutionChecks = computed(() =>
-  Array.isArray(capabilityExecutionVerification.value?.checks)
-    ? capabilityExecutionVerification.value.checks
-    : [],
 )
 const capabilityExecuteJson = computed(() =>
   latestCapabilityExecute.value ? buildPhaseEventJsonString(latestCapabilityExecute.value) : '',
@@ -1549,43 +1179,6 @@ const capabilityRuntimePreflightLabel = computed(() => {
   if (status === 'block') return '预检阻断'
   return '未预检'
 })
-const capabilityExecutionRuntimeLabel = computed(() => {
-  const status = String(capabilityExecutionRuntimeAfter.value.preflight_status || 'unknown')
-  if (status === 'pass') return 'runtime ok'
-  if (status === 'warn') return 'runtime warn'
-  if (status === 'block') return 'runtime block'
-  return 'runtime unknown'
-})
-const capabilityExecutionDriftLabel = computed(() => {
-  const status = String(capabilityExecutionRuntimeDrift.value.status || 'unknown')
-  if (status === 'stable') return 'drift stable'
-  if (status === 'changed') return 'drift changed'
-  if (status === 'warn') return 'drift warn'
-  return 'drift unknown'
-})
-const capabilityExecutionIssueLabel = computed(() => {
-  const status = String(capabilityExecutionRuntimeIssueSummary.value.status || 'unknown')
-  if (status === 'ok') return 'runtime ok'
-  if (status === 'watch') return 'runtime watch'
-  if (status === 'warn') return 'runtime issues'
-  return 'runtime unknown'
-})
-const capabilityExecutionActionIssueLabel = computed(() => {
-  const status = String(capabilityExecutionActionIssueSummary.value.status || 'unknown')
-  if (status === 'ok') return 'action ok'
-  if (status === 'warn') return 'action issues'
-  if (status === 'error') return 'action error'
-  return 'action unknown'
-})
-
-const capabilityEfficiencyCorrelationStatusClass = computed(() => {
-  const status = String(capabilityExecutionEfficiencyCorrelationReport.value?.status || 'unknown')
-  if (status === 'aligned') return 'is-complete'
-  if (status === 'suboptimal' || status === 'needs_repair') return 'is-warning'
-  if (status === 'needs_replan') return 'is-error'
-  return 'is-skip'
-})
-
 const capabilityRoleRows = computed(() => Object.entries(capabilityModelRoles.value || {})
   .map(([key, value]) => ({
     key,
@@ -1594,257 +1187,6 @@ const capabilityRoleRows = computed(() => Object.entries(capabilityModelRoles.va
     shouldNotDo: Array.isArray(value?.should_not_do) ? value.should_not_do.slice(0, 4) : [],
     recommendedUse: value?.recommended_use || '',
   })))
-
-// Group events by step (or "no step" bucket for finalize/etc.) so the panel
-// can render one row per step with all phase chips for that step inline.
-// Order: events without a step go to the end (typically only finalize).
-const phaseTimelineGroups = computed(() => {
-  const noStepKey = '__no_step__'
-  const buckets = new Map()
-  for (const e of filteredPhaseEvents.value) {
-    const key = Number.isFinite(e.step) ? `s${e.step}` : noStepKey
-    if (!buckets.has(key)) buckets.set(key, { step: e.step, events: [] })
-    buckets.get(key).events.push(e)
-  }
-  // Stable sort: ascending step, no_step last
-  const groups = Array.from(buckets.values())
-  groups.sort((a, b) => {
-    if (Number.isFinite(a.step) && !Number.isFinite(b.step)) return -1
-    if (!Number.isFinite(a.step) && Number.isFinite(b.step)) return 1
-    if (Number.isFinite(a.step) && Number.isFinite(b.step)) return a.step - b.step
-    return 0
-  })
-  return groups
-})
-
-// Summary band over the whole run (top of the Timeline panel).
-// Counts come from the FILTERED set so the user always sees how many
-// events match their current filter; the toolbar separately shows
-// "X / Y" so they know how many are hidden.
-const phaseSummary = computed(() => {
-  const out = { total: filteredPhaseEvents.value.length, warn: 0, error: 0, byPhase: {} }
-  for (const e of filteredPhaseEvents.value) {
-    const sev = String(e.severity || 'info')
-    if (sev === 'warn') out.warn += 1
-    else if (sev === 'error') out.error += 1
-    const p = String(e.phase || 'unknown')
-    out.byPhase[p] = (out.byPhase[p] || 0) + 1
-  }
-  return out
-})
-
-// O: list of distinct phase names seen in this run, with their UNFILTERED
-// counts. Used to render the filter chip row. Sorted by count desc so the
-// noisy phases (vlm_call/action/som_inject) always appear first.
-// V: Per-phase aggregate stats. Each entry now carries:
-//   {phase, count, mean, p50, p95, max, sevCounts:{info,warn,error},
-//    durations:[...]}
-// `durations` is the sorted ascending list of duration_ms samples; we
-// keep it for the sparkline renderer (which buckets the values into
-// fixed-width vertical bars). Phases with no duration_ms field still
-// appear with count + sevCounts; their mean/p50/p95/max are null.
-//
-// Sort order: count DESC (noisy phases at the top, same as before V)
-// because that's the most useful triage axis when the run produced a
-// huge timeline.
-//
-// Helpers (defined inline so this stays a single computed expression
-// for Vue's dependency tracking):
-//   pickPercentile(sorted, p):  linear interpolation, returns null on
-//                                empty input. We don't need the
-//                                full numpy-grade nearest-rank dance —
-//                                p50/p95 over <=500 samples is plenty.
-const phaseFilterOptions = computed(() => {
-  const acc = new Map() // phase -> {count, durs:[], sev:{info,warn,error}}
-  for (const e of phaseEvents.value) {
-    const p = String(e.phase || 'unknown')
-    let bucket = acc.get(p)
-    if (!bucket) {
-      bucket = { count: 0, durs: [], sev: { info: 0, warn: 0, error: 0 } }
-      acc.set(p, bucket)
-    }
-    bucket.count += 1
-    if (Number.isFinite(e.duration_ms)) {
-      bucket.durs.push(Number(e.duration_ms))
-    }
-    const sev = String(e.severity || 'info')
-    if (bucket.sev[sev] != null) bucket.sev[sev] += 1
-  }
-
-  const pickPercentile = (sorted, p) => {
-    if (!sorted.length) return null
-    if (sorted.length === 1) return sorted[0]
-    // Linear interpolation between the two nearest ranks.
-    const idx = (sorted.length - 1) * p
-    const lo = Math.floor(idx)
-    const hi = Math.ceil(idx)
-    if (lo === hi) return sorted[lo]
-    return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo)
-  }
-
-  const out = []
-  for (const [phase, b] of acc.entries()) {
-    const sorted = b.durs.slice().sort((a, c) => a - c)
-    const sum = sorted.reduce((s, x) => s + x, 0)
-    out.push({
-      phase,
-      count: b.count,
-      mean: sorted.length ? sum / sorted.length : null,
-      p50: pickPercentile(sorted, 0.5),
-      p95: pickPercentile(sorted, 0.95),
-      max: sorted.length ? sorted[sorted.length - 1] : null,
-      sevCounts: { ...b.sev },
-      // Cap durations passed to the sparkline at 60 samples — we don't
-      // need every point to communicate the shape, and the renderer
-      // would just bucket them anyway.
-      durations: sorted.length > 60
-        ? sorted.filter((_, i) => i % Math.ceil(sorted.length / 60) === 0)
-        : sorted,
-    })
-  }
-  return out.sort((a, b) => b.count - a.count)
-})
-
-// V: Sorted view of phaseFilterOptions for the stats grid. The base
-// computed is already count-DESC; here we re-sort when the user picks a
-// different axis (mean / p95 / max). Phases with no duration data sink
-// to the bottom regardless of axis (their stat is null).
-const phaseStatsSorted = computed(() => {
-  const key = phaseStatsSortBy.value
-  if (key === 'count') return phaseFilterOptions.value
-  return phaseFilterOptions.value.slice().sort((a, b) => {
-    const av = a[key]
-    const bv = b[key]
-    const aMissing = av == null
-    const bMissing = bv == null
-    if (aMissing && bMissing) return 0
-    if (aMissing) return 1   // missing → bottom
-    if (bMissing) return -1
-    return bv - av           // descending
-  })
-})
-
-// V: Compute the SVG path for one phase's mini sparkline. The bars go
-// from left (oldest sample) to right (newest sample) with each bar
-// height proportional to that sample's duration, normalized against the
-// phase's local max so cheap phases still get readable bars.
-//
-// The SVG uses viewBox="0 0 100 24" so the consumer can size it freely
-// via CSS without having to rewrite the path.
-const phaseSparklinePath = (durations) => {
-  if (!durations || durations.length === 0) return ''
-  const w = 100
-  const h = 24
-  const maxV = durations.reduce((m, x) => (x > m ? x : m), 0) || 1
-  // Bar geometry: leave 1px gap between bars when possible.
-  const n = durations.length
-  const barW = Math.max(1, w / n - 0.6)
-  const stride = w / n
-  let d = ''
-  for (let i = 0; i < n; i += 1) {
-    const x = i * stride
-    const barH = (durations[i] / maxV) * (h - 2) + 1
-    const y = h - barH
-    d += `M${x.toFixed(2)},${h} L${x.toFixed(2)},${y.toFixed(2)} `
-        + `L${(x + barW).toFixed(2)},${y.toFixed(2)} `
-        + `L${(x + barW).toFixed(2)},${h} Z `
-  }
-  return d.trim()
-}
-
-// V: Friendly formatter for ms values inside the stats grid.
-//   12.4ms / 1.2s / —
-const formatPhaseStatMs = (v) => {
-  if (v == null || !Number.isFinite(v)) return '—'
-  if (v < 1000) return `${v.toFixed(1)}ms`
-  return `${(v / 1000).toFixed(2)}s`
-}
-
-// Same as phaseFilterOptions but per-severity.
-const severityFilterOptions = computed(() => {
-  const counts = { info: 0, warn: 0, error: 0 }
-  for (const e of phaseEvents.value) {
-    const s = String(e.severity || 'info')
-    if (counts[s] != null) counts[s] += 1
-  }
-  // Only show severities that actually occur (don't waste space on empty)
-  return ['info', 'warn', 'error']
-    .filter((s) => counts[s] > 0)
-    .map((s) => ({ severity: s, count: counts[s] }))
-})
-
-// True when any filter is active — drives visual state of the "重置" button
-const phaseFilterActive = computed(
-  () => phaseFilterExclude.value.size > 0 || severityFilterExclude.value.size > 0,
-)
-
-// Toggle a phase in/out of the exclude set. We re-assign the Set so Vue
-// notices the change (Sets aren't deeply reactive otherwise).
-const togglePhaseFilter = (phase) => {
-  const next = new Set(phaseFilterExclude.value)
-  if (next.has(phase)) next.delete(phase)
-  else next.add(phase)
-  phaseFilterExclude.value = next
-}
-
-const toggleSeverityFilter = (severity) => {
-  const next = new Set(severityFilterExclude.value)
-  if (next.has(severity)) next.delete(severity)
-  else next.add(severity)
-  severityFilterExclude.value = next
-}
-
-const resetPhaseFilters = () => {
-  phaseFilterExclude.value = new Set()
-  severityFilterExclude.value = new Set()
-}
-
-// Per-phase visual palette. Falls back to a neutral grey when phase unknown.
-// Color follows severity, NOT phase name, so warn/error always pop.
-//
-// U: when the backend included a `notice_severity` field (the BrowserEnv
-// `_last_notice_severity` snapshot at emit time), use the HIGHER of
-// (severity, notice_severity). This catches the common case where the
-// action itself succeeded (severity=info) but the agent-visible notice
-// it produced was a warning (e.g. "TYPE NO-OP: input unchanged") —
-// without notice_severity, those chips would be deceptively green.
-const _SEV_RANK = { info: 0, warn: 1, error: 2 }
-function _effectiveSeverity(evt) {
-  const a = String(evt.severity || 'info')
-  const b = String(evt.notice_severity || a)
-  return (_SEV_RANK[b] ?? 0) > (_SEV_RANK[a] ?? 0) ? b : a
-}
-function phaseChipStyle(evt) {
-  const sev = _effectiveSeverity(evt)
-  if (sev === 'error') return { background: '#fee2e2', color: '#991b1b', border: '#fca5a5' }
-  if (sev === 'warn')  return { background: '#fef3c7', color: '#92400e', border: '#fcd34d' }
-  return { background: '#dcf6f2', color: '#0b7d74', border: '#9ee5dc' }
-}
-
-// Short, single-line label for a chip ("vlm_call · 2.3s")
-function phaseChipLabel(evt) {
-  const p = String(evt.phase || 'unknown')
-  const d = evt.duration_ms
-  if (Number.isFinite(d)) {
-    const sec = d >= 1000 ? `${(d / 1000).toFixed(1)}s` : `${Math.round(d)}ms`
-    return `${p} · ${sec}`
-  }
-  return p
-}
-
-// Detail bubble below the chip — message + key extras (action_name,
-// element_count, guard, etc.). Returns '' to suppress the bubble.
-function phaseChipDetail(evt) {
-  const parts = []
-  if (evt.message) parts.push(String(evt.message))
-  if (evt.action_name) parts.push(`action=${evt.action_name}`)
-  if (evt.element_count != null) parts.push(`${evt.element_count} els`)
-  if (evt.frame_count != null) parts.push(`${evt.frame_count} frames`)
-  if (evt.guard) parts.push(`guard=${evt.guard}`)
-  if (evt.evaluation?.status) parts.push(`status=${evt.evaluation.status}`)
-  if (evt.answer_domain) parts.push(`domain=${evt.answer_domain}`)
-  return parts.join(' · ')
-}
 
 const clearPhaseEvents = () => {
   phaseEvents.value = []
@@ -2431,77 +1773,11 @@ const _parseJsonlText = (text) => {
   return { events: out, total, bad }
 }
 
-const handleReplayFileChange = async (event) => {
-  const target = event && event.target
-  const file = target && target.files && target.files[0]
-  if (!file) return
-
-  // Sanity cap — refuse files > 16 MB. A typical 200-step run produces
-  // a phase JSONL well under 1 MB; anything larger is almost certainly
-  // an accidental selection (or malicious upload from a screenshot).
-  const MAX_BYTES = 16 * 1024 * 1024
-  if (file.size > MAX_BYTES) {
-    ElMessage.error(
-      `文件过大 (${(file.size / 1024 / 1024).toFixed(1)} MB)，` +
-      `请选择 ≤ 16 MB 的 phase JSONL 文件`,
-    )
-    return
-  }
-
-  let text = ''
-  try {
-    text = await file.text()
-  } catch (err) {
-    ElMessage.error(`读取失败：${String(err)}`)
-    return
-  }
-
-  const { events, total, bad } = _parseJsonlText(text)
-  if (events.length === 0) {
-    ElMessage.warning('文件中没有可识别的 phase 事件（请确认是 phase_<id>.jsonl 格式）')
-    return
-  }
-
-  // Decorate with synthetic _ts so render code that reads it (the chip
-  // sort path in M) keeps working without a special case for replay.
-  for (const e of events) {
-    if (typeof e._ts !== 'number') {
-      e._ts = Number.isFinite(e.ts) ? e.ts : Date.now() / 1000
-    }
-  }
-
-  // Replace the buffer atomically — assign a fresh array so Vue picks
-  // up the change in one tick instead of N pushes (PHASE_LIMIT splice
-  // would also fire on every push).
-  phaseEvents.value = events
-  replayMode.value = true
-  replaySourceName.value = file.name || 'imported.jsonl'
-
-  // Reset filters and pin to bottom: the new buffer's phase set may
-  // not match what was excluded before.
-  phaseFilterExclude.value = new Set()
-  severityFilterExclude.value = new Set()
-  timelineAutoScroll.value = true
-
-  // Switch to the requested tab so the user sees the replay target immediately.
-  setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')
-
-  if (bad > 0) {
-    ElMessage.warning(
-      `已导入 ${events.length} / ${total} 条事件（跳过 ${bad} 行损坏数据）`,
-    )
-  } else {
-    ElMessage.success(`已导入 ${events.length} 条事件，进入回放模式`)
-  }
-}
-
 const exitReplayMode = () => {
   replayMode.value = false
   replaySourceName.value = ''
   phaseEvents.value = []
   hasNewCapability.value = false
-  phaseFilterExclude.value = new Set()
-  severityFilterExclude.value = new Set()
   ElMessage.info('已退出回放模式')
 }
 
@@ -2517,72 +1793,12 @@ const handleTimelineImportReplay = (rawText, filename) => {
   phaseEvents.value = events
   replayMode.value = true
   replaySourceName.value = filename
-  phaseFilterExclude.value = new Set()
-  severityFilterExclude.value = new Set()
   setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')
   if (bad > 0) {
     ElMessage.warning(`已导入 ${events.length} / ${total} 条事件（跳过 ${bad} 行损坏数据）`)
   } else {
     ElMessage.success(`已导入 ${events.length} 条事件，进入回放模式`)
   }
-}
-
-// ── P: Timeline scroll helpers ─────────────────────────────────────────
-// Get the inner wrap element of el-scrollbar so we can read scrollTop /
-// scrollHeight / clientHeight directly. el-scrollbar exposes wrapRef in
-// modern Element Plus; older builds expose .wrap$/. wrap_.
-function _timelineWrap() {
-  const sb = timelineRef.value
-  if (!sb) return null
-  return sb.wrapRef || sb.wrap$ || sb.wrap_ || null
-}
-
-function _isAtBottom(wrap) {
-  if (!wrap) return true
-  const remaining = wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight
-  return remaining <= SCROLL_BOTTOM_EPS
-}
-
-const scrollTimelineToBottom = async () => {
-  await nextTick()
-  const sb = timelineRef.value
-  if (!sb) return
-  if (typeof sb.setScrollTop === 'function') {
-    sb.setScrollTop(Number.MAX_SAFE_INTEGER)
-  } else {
-    const wrap = _timelineWrap()
-    if (wrap) wrap.scrollTop = wrap.scrollHeight
-  }
-  timelineAutoScroll.value = true
-}
-
-// T: Scroll Timeline to top. Inverse of scrollTimelineToBottom. Used by
-// the Home shortcut. We DON'T touch timelineAutoScroll here — jumping to
-// top is a "give me history" gesture, the user almost certainly doesn't
-// want chips to keep auto-following the tail and yanking them back.
-const scrollTimelineToTop = async () => {
-  await nextTick()
-  const sb = timelineRef.value
-  if (!sb) return
-  if (typeof sb.setScrollTop === 'function') {
-    sb.setScrollTop(0)
-  } else {
-    const wrap = _timelineWrap()
-    if (wrap) wrap.scrollTop = 0
-  }
-  timelineAutoScroll.value = false
-}
-
-// Called by el-scrollbar's @scroll. Element Plus passes
-// {scrollLeft, scrollTop} but we re-read from wrapRef to also get the
-// scrollHeight (not provided in the event payload).
-const onTimelineScroll = () => {
-  const wrap = _timelineWrap()
-  if (!wrap) return
-  // Pin auto-scroll iff the user is already near the bottom. This makes
-  // the panel behave like a terminal: scroll up to read history → tail
-  // pauses; scroll back to bottom → tail resumes.
-  timelineAutoScroll.value = _isAtBottom(wrap)
 }
 
 // Build the same _ts-stripped JSON string for an arbitrary event.
@@ -2682,151 +1898,34 @@ const focusPromptInput = () => {
   }
 }
 
-// Should the current focus suppress global shortcuts? True when the user
-// is typing into a text-bearing element.
-const _isTypingTarget = (target) => {
-  if (!target) return false
-  const tag = String(target.tagName || '').toUpperCase()
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
-  if (target.isContentEditable) return true
-  return false
+const keyboardActions = {
+  submitIfIdle: () => { if (!isRunning.value) submitTask() },
+  terminalSearchOpen: () => terminalLogPaneRef.value?.openTerminalSearch(),
+  toggleHelp: () => { helpDialogVisible.value = !helpDialogVisible.value },
+  focusPrompt: () => focusPromptInput(),
+  selectTab: (i) => setActiveBottomTab(TAB_ORDER[i]),
+  phasePrev: () => timelinePanelRef.value?.goToPrevPhaseEvent(),
+  phaseNext: () => timelinePanelRef.value?.goToNextPhaseEvent(),
+  failedPrev: () => failedRunsPaneRef.value?.goToPrevFailedRun(),
+  failedNext: () => failedRunsPaneRef.value?.goToNextFailedRun(),
+  terminalSearchClose: () => terminalLogPaneRef.value?.closeTerminalSearch(),
+  terminalSearchPrev: () => terminalLogPaneRef.value?.terminalSearchPrev(),
+  terminalSearchNext: () => terminalLogPaneRef.value?.terminalSearchNext(),
+  exportTimeline: () => timelinePanelRef.value?.exportPhaseEventsAsJsonl(),
+  timelineBottom: () => timelinePanelRef.value?.scrollToBottom(),
+  timelineTop: () => timelinePanelRef.value?.scrollToTop(),
+  exportCapability: () => exportCapabilityTraceAsJsonl(),
 }
 
-const handleGlobalKeydown = (event) => {
-  // Use ctrl OR meta as the primary modifier so macOS users get the same
-  // bindings as Windows/Linux users without re-learning anything.
-  const primary = event.ctrlKey || event.metaKey
-  const typing = _isTypingTarget(event.target)
+const getKeyboardContext = () => ({
+  activeTab: activeBottomTab.value,
+  tabCount: TAB_ORDER.length,
+  phaseDialogOpen: !!timelinePanelRef.value?.phaseDialogVisible,
+  failedDialogOpen: !!failedRunsPaneRef.value?.failedRunDialogVisible,
+  terminalSearchVisible: !!terminalLogPaneRef.value?.searchVisible,
+})
 
-  // ── Ctrl+Enter: submit task (works even from inside the textarea) ──
-  if (primary && event.key === 'Enter') {
-    event.preventDefault()
-    if (!isRunning.value) submitTask()
-    return
-  }
-
-  if (
-    activeBottomTab.value === 'terminal'
-    && primary
-    && (event.key === 'f' || event.key === 'F')
-  ) {
-    event.preventDefault()
-    terminalLogPaneRef.value?.openTerminalSearch()
-    return
-  }
-
-  // Everything below is suppressed while typing (except dialog navigation,
-  // which is impossible to reach while editing anyway because the dialog
-  // grabs focus).
-  if (typing) return
-
-  // ── Ctrl+/: open the cheat-sheet dialog ──
-  // Browser key for "/" can come through as event.key === '/' or '?'
-  // depending on Shift state. We also accept Ctrl+? for laptops where
-  // the slash requires Shift.
-  if (primary && (event.key === '/' || event.key === '?')) {
-    event.preventDefault()
-    helpDialogVisible.value = !helpDialogVisible.value
-    return
-  }
-
-  // ── Ctrl+K: focus the Prompt input ──
-  if (primary && (event.key === 'k' || event.key === 'K')) {
-    event.preventDefault()
-    focusPromptInput()
-    return
-  }
-
-  // ── Ctrl+1..6: switch bottom tab ──
-  if (primary && event.key >= '1' && event.key <= '9') {
-    const i = parseInt(event.key, 10) - 1
-    if (i >= 0 && i < TAB_ORDER.length) {
-      event.preventDefault()
-      setActiveBottomTab(TAB_ORDER[i])
-      return
-    }
-  }
-
-  // ── Phase dialog navigation: ← / → between events ──
-  if (timelinePanelRef.value?.phaseDialogVisible) {
-    if (event.key === 'ArrowLeft') {
-      event.preventDefault()
-      timelinePanelRef.value?.goToPrevPhaseEvent()
-      return
-    }
-    if (event.key === 'ArrowRight') {
-      event.preventDefault()
-      timelinePanelRef.value?.goToNextPhaseEvent()
-      return
-    }
-  }
-
-  // ── K6: Failed-run dialog navigation: ← / → between rows ──
-  // Same pattern as the phase dialog but driven by failedRunsList. We
-  // keep this branch separate (not unified with phaseDialog) because
-  // the two dialogs are mutually exclusive in practice and combining
-  // them would obscure which list is being navigated.
-  if (failedRunsPaneRef.value?.failedRunDialogVisible) {
-    if (event.key === 'ArrowLeft') {
-      event.preventDefault()
-      failedRunsPaneRef.value?.goToPrevFailedRun()
-      return
-    }
-    if (event.key === 'ArrowRight') {
-      event.preventDefault()
-      failedRunsPaneRef.value?.goToNextFailedRun()
-      return
-    }
-  }
-
-  if (activeBottomTab.value === 'terminal' && terminalLogPaneRef.value?.searchVisible) {
-    if (event.key === 'Escape') {
-      event.preventDefault()
-      terminalLogPaneRef.value?.closeTerminalSearch()
-      return
-    }
-    if (event.key === 'Enter' && event.shiftKey) {
-      event.preventDefault()
-      terminalLogPaneRef.value?.terminalSearchPrev()
-      return
-    }
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      terminalLogPaneRef.value?.terminalSearchNext()
-      return
-    }
-  }
-
-  // ── Timeline tab-only shortcuts ──
-  if (activeBottomTab.value === 'timeline') {
-    // Ctrl+E: export the current filtered Timeline as JSONL
-    if (primary && (event.key === 'e' || event.key === 'E')) {
-      event.preventDefault()
-      exportPhaseEventsAsJsonl()
-      return
-    }
-    // End: jump to bottom + resume auto-follow
-    if (event.key === 'End' && !primary) {
-      event.preventDefault()
-      timelinePanelRef.value?.scrollToBottom()
-      return
-    }
-    // Home: jump to top + pause auto-follow
-    if (event.key === 'Home' && !primary) {
-      event.preventDefault()
-      timelinePanelRef.value?.scrollToTop()
-      return
-    }
-  }
-
-  if (activeBottomTab.value === 'capability') {
-    if (primary && (event.key === 'e' || event.key === 'E')) {
-      event.preventDefault()
-      exportCapabilityTraceAsJsonl()
-      return
-    }
-  }
-}
+useKeyboardCommand({ getContext: getKeyboardContext, actions: keyboardActions })
 
 const refreshOutputContractPreview = async () => {
   const text = String(prompt.value || '').trim()
@@ -2899,10 +1998,6 @@ const submitTask = async () => {
   phaseEvents.value = []
   hasNewPhase.value = false
   hasNewCapability.value = false
-  // O: drop any filters left over from the previous run; phase set may
-  // differ and an excluded phase from before would silently hide events.
-  phaseFilterExclude.value = new Set()
-  severityFilterExclude.value = new Set()
   // W: starting a fresh run implicitly exits replay mode — otherwise
   // the WS phase events for the new run would be silently dropped by
   // the gate in the WS handler.
@@ -3038,22 +2133,10 @@ onMounted(() => {
   // K3: seed the failed-runs drawer with historic records so the
   // tab is informative even before the user runs anything in this session.
   failedRunsPaneRef.value?.fetchFailedRuns()
-  // T: register the global keyboard shortcut dispatcher. ``window`` (not
-  // document) so the listener fires regardless of which element has
-  // focus and even when the page has a click-outside-the-app gesture.
-  window.addEventListener('keydown', handleGlobalKeydown)
 })
 
 onUnmounted(() => {
-  isUnmounted = true
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
-  }
-  if (socket) {
-    socket.close()
-    socket = null
-  }
+  disconnectWebSocket()
   // S: cancel any pending Timeline chip single-click dialog-open so the
   // callback doesn't fire after the component is gone (would touch
   // selectedPhaseEvent/phaseDialogVisible refs and crash on detached state).
@@ -3070,10 +2153,6 @@ onUnmounted(() => {
     clearTimeout(finalAnswerCopyTimer)
     finalAnswerCopyTimer = null
   }
-  // T: drop the global keyboard listener so HMR / route changes don't
-  // leave a zombie listener behind (would crash trying to use closed-
-  // over refs).
-  window.removeEventListener('keydown', handleGlobalKeydown)
 })
 // B: 按钮墙收纳进下拉后的 command 分发（指向原有 handler，不改行为）
 const handleCapabilityMoreAction = (command) => {
@@ -3510,985 +2589,4 @@ const handleCapabilityMoreAction = (command) => {
   </main>
 </template>
 
-<style scoped>
-:global(html.dark),
-:global(body) {
-  min-height: 100%;
-  background: var(--vsp-bg);
-}
-
-:global(body) {
-  margin: 0;
-}
-
-.app-shell {
-  position: relative;
-  display: grid;
-  grid-template-columns: minmax(300px, 30%) minmax(0, 1fr);
-  gap: 12px;
-  height: 100vh;
-  overflow: hidden;
-  padding: 12px;
-  background: var(--vsp-bg);
-  color: var(--vsp-text);
-}
-
-.global-progress-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  z-index: 100;
-  background: linear-gradient(90deg, transparent, var(--vsp-accent), transparent);
-  background-size: 300% 100%;
-  animation: progress-sweep 1.8s ease-in-out infinite;
-}
-
-@keyframes progress-sweep {
-  0% { background-position: 100% 0; }
-  100% { background-position: -100% 0; }
-}
-
-.vspider-panel {
-  background: var(--vsp-surface);
-  border: 1px solid var(--vsp-border);
-  border-radius: 10px;
-  box-shadow: 0 1px 3px rgb(0 0 0 / 0.06), 0 1px 2px rgb(0 0 0 / 0.04);
-}
-
-/* D: 主次层级 — 主画面保留重投影，其余面板轻量化 */
-/* (preview-panel removed — now uses .pip-preview) */
-
-.control-panel {
-  display: flex;
-  height: 100%;
-  min-height: 0;
-  overflow: hidden;
-  flex-direction: column;
-}
-
-.brand-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
-}
-
-.brand-text {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  color: var(--vsp-text-1);
-}
-
-.panel-title h2 {
-  margin: 0;
-  font-size: 18px;
-  line-height: 1.25;
-  letter-spacing: 0;
-}
-
-.panel-title p {
-  margin: 4px 0 0;
-  color: var(--vsp-text-faint);
-  font-size: 12px;
-}
-
-.control-scroll {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 14px 18px 16px;
-}
-
-.field-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 16px;
-}
-
-.prompt-input-wrap {
-  position: relative;
-}
-
-/* (brand-header removed — now uses .brand-row + .brand-text) */
-
-.url-field-collapsible {
-  margin-bottom: 8px;
-}
-
-/* (prompt-label-row removed — url-toggle moved to brand-row) */
-
-.url-toggle {
-  font-size: 12px;
-  color: var(--vsp-accent);
-  cursor: pointer;
-  padding: 2px 8px;
-  border-radius: 4px;
-  border: 1px dashed rgb(var(--rgb-accent) / 0.3);
-  transition: background 0.15s;
-}
-
-.url-toggle:hover {
-  background: rgb(var(--rgb-accent) / 0.08);
-}
-
-.output-contract-inline {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 0 8px;
-  font-size: 12px;
-}
-
-.output-contract-inline__loading {
-  color: var(--vsp-text-faint);
-  font-size: 12px;
-}
-
-.output-contract-inline__arrow {
-  color: var(--vsp-text-faint);
-}
-
-.action-bar {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 6px 0 4px;
-}
-
-.action-bar .output-contract-inline {
-  padding: 0;
-}
-
-.action-buttons {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.action-buttons .run-button {
-  flex: 1;
-}
-
-.settings-toggle {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border: 1px solid var(--vsp-border);
-  border-radius: 8px;
-  background: transparent;
-  color: var(--vsp-text-faint);
-  cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
-  font-size: 18px;
-}
-
-.settings-toggle:hover {
-  color: var(--vsp-accent);
-  border-color: rgb(var(--rgb-accent) / 0.4);
-  background: rgb(var(--rgb-accent) / 0.08);
-}
-
-.field-group label,
-.field-title-row label {
-  color: var(--vsp-text-label);
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.field-title-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.field-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.full-width {
-  width: 100%;
-}
-
-.model-center {
-  padding: 12px;
-  border: 1px solid rgb(var(--rgb-accent) / 0.16);
-  border-radius: 8px;
-  background: rgb(var(--rgb-accent) / 0.035);
-}
-
-.proxy-auth-row {
-  display: flex;
-  gap: 8px;
-  margin-top: 4px;
-}
-
-.constraint-inline-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 8px;
-  font-size: 13px;
-  color: var(--vsp-text-label);
-}
-
-:deep(.model-advanced-fold .el-collapse-item__header) {
-  font-size: 12px;
-  height: 28px;
-  color: var(--vsp-text-2);
-}
-
-:deep(.model-advanced-fold .el-collapse-item__content) {
-  padding-bottom: 4px;
-}
-
-.model-section {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 12px;
-}
-
-.model-section > label {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--vsp-text-label);
-}
-
-.model-connect-row {
-  display: flex;
-  gap: 6px;
-}
-
-.model-connect-row .el-input {
-  flex: 1;
-}
-
-.model-warning {
-  margin: 0;
-  color: var(--vsp-warn-muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.advanced-collapse {
-  --el-collapse-border-color: var(--vsp-border);
-  --el-collapse-header-bg-color: transparent;
-  --el-collapse-content-bg-color: transparent;
-  --el-collapse-header-text-color: var(--vsp-text-label);
-  --el-collapse-content-text-color: var(--vsp-text-label);
-  margin-top: 2px;
-}
-
-.upload-icon {
-  color: var(--vsp-accent);
-  font-size: 26px;
-}
-
-.upload-copy,
-.file-status {
-  color: var(--vsp-text-muted-alt);
-  font-size: 13px;
-}
-
-.file-status {
-  margin: 8px 0 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.attachment-intent-select {
-  width: 100%;
-  margin-top: 8px;
-}
-
-.field-hint {
-  color: var(--vsp-text-muted-alt);
-  font-weight: 400;
-  font-size: 12px;
-}
-
-.output-contract-preview__card {
-  padding: 10px 12px;
-  border: 1px solid rgb(var(--rgb-accent) / 0.25);
-  border-radius: 8px;
-  background: rgb(var(--rgb-accent) / 0.06);
-  font-size: 13px;
-}
-
-.output-contract-preview__row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-
-.output-contract-preview__label {
-  color: var(--vsp-text-muted-alt);
-}
-
-.output-contract-preview__sep {
-  color: var(--vsp-gray-500);
-}
-
-.output-contract-preview__reasons {
-  margin: 8px 0 0;
-  color: var(--vsp-text-muted-alt);
-  font-size: 12px;
-  line-height: 1.4;
-}
-
-.output-contract-preview__loading {
-  color: var(--vsp-text-muted-alt);
-  font-size: 13px;
-}
-
-
-.solver-on {
-  color: var(--vsp-accent);
-}
-
-.solver-off {
-  color: var(--vsp-warn-brown);
-}
-
-.advanced-collapse label {
-  display: block;
-  margin: 10px 0 6px;
-  color: var(--vsp-text-2);
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.action-footer {
-  position: sticky;
-  bottom: 0;
-  z-index: 10;
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  padding: 16px 22px 20px;
-  border-top: 1px solid var(--vsp-border);
-  background: var(--vsp-surface);
-}
-
-.run-button {
-  --el-button-bg-color: var(--vsp-accent);
-  --el-button-border-color: var(--vsp-accent);
-  --el-button-hover-bg-color: var(--vsp-accent-bright);
-  --el-button-hover-border-color: var(--vsp-accent-bright);
-  --el-button-text-color: var(--vsp-surface-mint);
-  font-weight: 700;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-
-.run-button:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgb(var(--rgb-accent) / 0.3);
-}
-
-.run-button:active:not(:disabled) {
-  transform: translateY(0);
-  box-shadow: none;
-}
-
-.stop-button {
-  --el-button-bg-color: rgb(var(--rgb-rose) / 0.1);
-  --el-button-border-color: var(--vsp-danger-rose);
-  --el-button-text-color: var(--vsp-danger-rose);
-  --el-button-hover-bg-color: var(--vsp-danger-rose);
-  --el-button-hover-border-color: var(--vsp-danger-rose);
-  --el-button-hover-text-color: var(--vsp-bg);
-}
-
-.stop-button:hover {
-  box-shadow: 0 0 15px rgb(var(--rgb-danger) / 0.45);
-}
-
-.monitor-panel {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.terminal-panel {
-  display: flex;
-  min-height: 0;
-  flex: 1;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.terminal-panel--full {
-  height: 100%;
-}
-
-/* (PIP removed — screenshot moved to SpiderAssistant drawer) */
-
-.panel-title {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 16px 18px 12px;
-}
-
-.panel-title.compact {
-  padding-bottom: 10px;
-}
-
-.live-indicator,
-.status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  color: var(--vsp-accent);
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.live-indicator i {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--vsp-accent);
-  box-shadow: 0 0 0 0 rgb(var(--rgb-accent) / 0.58);
-  animation: pulse-live 1.6s infinite;
-  transition: background 0.3s ease;
-}
-
-.live-indicator.ws-connecting {
-  color: var(--vsp-warn-soft);
-}
-
-.live-indicator.ws-connecting i {
-  background: var(--vsp-warn);
-  box-shadow: 0 0 0 0 rgb(var(--rgb-warn) / 0.5);
-  animation: pulse-connecting 1s infinite;
-}
-
-.live-indicator.ws-disconnected i,
-.live-indicator.ws-error i {
-  background: var(--vsp-danger-rose);
-  box-shadow: none;
-  animation: none;
-}
-
-.live-indicator.ws-disconnected,
-.live-indicator.ws-error {
-  color: var(--vsp-danger-rose);
-}
-
-@keyframes pulse-connecting {
-  0%, 100% { opacity: 0.4; }
-  50% { opacity: 1; }
-}
-
-.status-pill {
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: rgb(var(--rgb-accent) / 0.08);
-  border: 1px solid rgb(var(--rgb-accent) / 0.2);
-}
-
-.status-pill.error,
-.status-pill.disconnected {
-  color: var(--vsp-danger-rose);
-  background: rgb(var(--rgb-rose) / 0.08);
-  border-color: rgb(var(--rgb-rose) / 0.24);
-}
-
-/* (preview-stage / preview-placeholder removed — now uses .pip-*) */
-
-/* ── Skeleton placeholders ─────────────────────────────────────────── */
-.skeleton-hint {
-  margin: 0;
-  color: var(--vsp-text-dim-alt);
-  font-size: 12.5px;
-  text-align: center;
-  opacity: 0.6;
-}
-
-.capability-skeleton {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px 16px;
-}
-
-/* (HITL overlay removed — moved to SpiderAssistant drawer) */
-
-
-/* ── M: Phase timeline panel ───────────────────────────────────────── */
-
-
-.capability-replay-banner {
-  margin: 0;
-}
-
-
-.capability-scroll {
-  height: 245px;
-  border-radius: 8px;
-  background: var(--vsp-bg-deep);
-  border: 1px solid rgb(var(--rgb-cyan) / 0.22);
-}
-
-.capability-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  padding: 12px;
-}
-
-.capability-hero {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 14px;
-  border-radius: 10px;
-  background:
-    linear-gradient(135deg, rgb(var(--rgb-cyan) / 0.2), rgb(var(--rgb-accent) / 0.06)),
-    var(--vsp-slate-900);
-  border: 1px solid rgb(var(--rgb-cyan) / 0.35);
-}
-
-.capability-kicker {
-  color: var(--vsp-cyan-300);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.capability-hero h3 {
-  margin: 4px 0;
-  color: var(--vsp-slate-50);
-  font-size: 18px;
-}
-
-.capability-hero p {
-  margin: 0;
-  color: var(--vsp-text-2);
-  font-size: 12.5px;
-}
-
-.capability-count {
-  align-self: flex-start;
-  padding: 4px 10px;
-  border-radius: 999px;
-  color: var(--vsp-cyan-200);
-  background: rgb(var(--rgb-cyan) / 0.18);
-  border: 1px solid rgb(var(--rgb-cyan) / 0.45);
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 12px;
-}
-
-.capability-hero-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.bottom-tabs {
-  display: flex;
-  min-height: 0;
-  height: 100%;
-  flex-direction: column;
-  padding: 8px 14px 14px;
-}
-
-:deep(.bottom-tabs .el-tabs__header) {
-  margin: 0 0 8px;
-}
-
-:deep(.bottom-tabs .el-tabs__content) {
-  min-height: 0;
-  flex: 1;
-}
-
-:deep(.bottom-tabs .el-tab-pane) {
-  height: 100%;
-  animation: tab-fade-in 0.22s ease-out;
-}
-
-@keyframes tab-fade-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.artifact-badge {
-  line-height: 1;
-}
-
-:deep(.artifact-badge .el-badge__content.is-dot) {
-  animation: badge-pop 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-@keyframes badge-pop {
-  0% { transform: scale(0); opacity: 0; }
-  60% { transform: scale(1.4); }
-  100% { transform: scale(1); opacity: 1; }
-}
-
-/* K3: failed-runs panel ───────────────────────────────────────────
- * .failed-runs-count sits to the LEFT of the Refresh button.
- * Override the parent flex's `justify-content: flex-end` by pushing
- * the toolbar into space-between mode for this panel via margin.
- */
-
-
-/* K6: clickable rows in 失败记录 table */
-
-/* ── K6: Failed-run detail dialog ───────────────────────────────────
- * Three stacked sections: structured meta, phase preview list,
- * full JSON dump. Width is wide enough to keep JSON unwrapped at
- * 80 columns without horizontal scroll for typical traces.
- */
-
-
-.artifact-table {
-  --el-table-bg-color: transparent;
-  --el-table-tr-bg-color: transparent;
-  --el-table-header-bg-color: var(--vsp-slate-800);
-  --el-table-border-color: var(--vsp-slate-700);
-  --el-table-text-color: var(--vsp-text-muted);
-  --el-table-header-text-color: var(--vsp-text-strong);
-  background: transparent;
-}
-
-:deep(.artifact-table .el-table__inner-wrapper::before) {
-  display: none;
-}
-
-:deep(.artifact-table th.el-table__cell),
-:deep(.artifact-table tr),
-:deep(.artifact-table td.el-table__cell) {
-  background: transparent;
-  border-bottom-color: var(--vsp-slate-700);
-}
-
-:deep(.artifact-table .dark-table-header) {
-  background: var(--vsp-bg) !important;
-  color: var(--vsp-text-label);
-}
-
-.download-link {
-  color: var(--vsp-accent);
-  font-weight: 700;
-  text-decoration: none;
-}
-
-.download-link:hover {
-  color: var(--vsp-accent-bright);
-}
-
-:deep(.el-input__wrapper),
-:deep(.el-textarea__inner),
-:deep(.el-select__wrapper) {
-  background: var(--vsp-bg);
-  border-radius: 8px;
-  box-shadow: 0 0 0 1px var(--vsp-border) inset;
-}
-
-:deep(.el-input__wrapper.is-focus),
-:deep(.el-textarea__inner:focus),
-:deep(.el-select__wrapper.is-focused) {
-  box-shadow:
-    0 0 0 1px var(--vsp-accent) inset,
-    0 0 0 3px rgb(var(--rgb-accent) / 0.14);
-}
-
-:deep(.compact-upload .el-upload) {
-  width: 100%;
-}
-
-:deep(.compact-upload .el-upload-dragger) {
-  display: flex;
-  min-height: 112px;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 18px 14px;
-  background: var(--vsp-bg);
-  border-color: var(--vsp-border);
-  border-radius: 8px;
-}
-
-:deep(.auth-dialog .el-dialog) {
-  background: var(--vsp-surface);
-  border: 1px solid var(--vsp-border);
-  border-radius: 8px;
-}
-
-/* ── N: Phase event detail dialog ──────────────────────────────────── */
-
-
-/* ── Final Answer 面板 ──
- *
- * 与 Live Terminal / Artifacts 同处于 .bottom-tabs 中。
- * 字体故意比 .log-line (13px) 大一档（14.5px），优化长文本阅读。
- * 不复用 .terminal-scroll 的等宽字体，避免 Markdown 标题/列表观感生硬。
- */
-
-
-/* 状态 A：等待 */
-
-
-.typing-dots {
-  display: inline-flex;
-  gap: 6px;
-}
-
-.typing-dots span {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--vsp-accent);
-  opacity: 0.35;
-  animation: typing-bounce 1.2s infinite ease-in-out;
-}
-
-.typing-dots span:nth-child(2) {
-  animation-delay: 0.18s;
-}
-
-.typing-dots span:nth-child(3) {
-  animation-delay: 0.36s;
-}
-
-@keyframes typing-bounce {
-  0%, 80%, 100% {
-    opacity: 0.25;
-    transform: translateY(0);
-  }
-  40% {
-    opacity: 1;
-    transform: translateY(-4px);
-  }
-}
-
-/* 状态 C：兜底文案（可能上面叠加一段 Markdown 文件摘要） */
-
-/* 后端 _synthesize_file_mode_summary 合成的 Markdown 摘要 */
-
-
-.tab-jump {
-  margin: 0 4px;
-  color: var(--vsp-accent);
-  font-weight: 600;
-  text-decoration: none;
-  border-bottom: 1px dashed rgb(var(--rgb-accent) / 0.5);
-  cursor: pointer;
-}
-
-.tab-jump:hover {
-  color: var(--vsp-accent-bright);
-  border-bottom-color: var(--vsp-accent-bright);
-}
-
-
-/* 状态 B：Markdown 渲染区 */
-
-
-@keyframes pulse-live {
-  0% {
-    box-shadow: 0 0 0 0 rgb(var(--rgb-accent) / 0.58);
-  }
-  70% {
-    box-shadow: 0 0 0 8px rgb(var(--rgb-accent) / 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgb(var(--rgb-accent) / 0);
-  }
-}
-
-@media (max-width: 1100px) {
-  .app-shell {
-    grid-template-columns: 1fr;
-    overflow-y: auto;
-  }
-
-  .control-panel,
-  .monitor-panel {
-    min-height: 720px;
-  }
-}
-/* A: Capability fold */
-:deep(.capability-fold .el-collapse-item__header) {
-  font-size: 13px;
-  padding: 0 4px;
-  height: 32px;
-  color: var(--vsp-text-2);
-}
-
-:deep(.capability-fold .el-collapse-item__content) {
-  padding-bottom: 8px;
-}
-
-/* C: 折叠标题回显当前选择 */
-.collapse-title-echo {
-  margin-left: 8px;
-  max-width: 55%;
-  overflow: hidden;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--vsp-text-faint);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* C2: 高级配置入口（抽屉触发器） */
-.settings-summary {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  width: 100%;
-  margin-top: 2px;
-  padding: 10px 12px;
-  text-align: left;
-  background: transparent;
-  border: 1px dashed var(--vsp-border);
-  border-radius: 8px;
-  color: var(--vsp-text-label);
-  cursor: pointer;
-  transition: border-color 0.2s ease, background 0.2s ease;
-}
-
-.settings-summary:hover {
-  border-color: var(--vsp-accent);
-  background: rgb(var(--rgb-accent) / 0.04);
-}
-
-.settings-summary__title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.settings-summary__open {
-  margin-left: auto;
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--vsp-text-2);
-}
-
-.settings-summary__echo {
-  overflow: hidden;
-  font-size: 12px;
-  color: var(--vsp-text-2);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-/* C2: 抽屉视觉打磨 — 卡片化分组、与主面板同一套 token */
-:global(.settings-drawer.el-drawer) {
-  background: linear-gradient(180deg, #f7faf9 0%, var(--vsp-bg) 42%, var(--vsp-bg-deep) 100%);
-  border-left: 1px solid var(--vsp-border);
-  box-shadow: -16px 0 44px rgb(var(--rgb-teal-deep) / 0.16);
-}
-
-:global(.settings-drawer .el-drawer__header) {
-  margin-bottom: 0;
-  padding: 16px 20px;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  color: var(--vsp-teal-deep);
-  border-bottom: 1px solid var(--vsp-border);
-  /* faint brand tint + a 56x2 emerald→cyan hairline pinned bottom-left, drawn
-     as background layers. (A scoped :global(...)::after mis-compiles and leaks
-     its declarations onto the header element, collapsing it to a tiny box.) */
-  background:
-    linear-gradient(90deg, var(--vsp-accent), var(--vsp-cyan-bright)) 0 100% / 56px 2px no-repeat,
-    linear-gradient(90deg, rgb(var(--rgb-accent) / 0.06), transparent 55%);
-}
-
-:global(.settings-drawer .el-drawer__title) {
-  white-space: nowrap;
-}
-
-:global(.settings-drawer .el-drawer__body) {
-  padding: 14px 20px 20px;
-}
-
-.drawer-collapse {
-  --el-collapse-border-color: transparent;
-  border-top: none;
-  border-bottom: none;
-}
-
-.drawer-collapse :deep(.el-collapse-item) {
-  margin-bottom: 12px;
-  overflow: hidden;
-  background: var(--vsp-surface);
-  border: 1px solid var(--vsp-border);
-  border-radius: 10px;
-  box-shadow: 0 1px 3px rgb(var(--rgb-teal-deep) / 0.05), 0 1px 2px rgb(var(--rgb-teal-deep) / 0.04);
-  transition: border-color 0.18s ease, box-shadow 0.18s ease;
-}
-
-.drawer-collapse :deep(.el-collapse-item:hover) {
-  border-color: rgb(var(--rgb-accent) / 0.28);
-  box-shadow: 0 2px 8px rgb(var(--rgb-teal-deep) / 0.07);
-}
-
-.drawer-collapse :deep(.el-collapse-item__header) {
-  height: 44px;
-  padding: 0 14px;
-  font-weight: 600;
-  color: var(--vsp-text-strong);
-  background: transparent;
-  border-bottom: none;
-}
-
-.drawer-collapse :deep(.el-collapse-item.is-active) {
-  border-color: rgb(var(--rgb-accent) / 0.4);
-  box-shadow: 0 4px 14px rgb(var(--rgb-accent) / 0.14);
-}
-.drawer-collapse :deep(.el-collapse-item.is-active .el-collapse-item__header) {
-  color: var(--vsp-accent);
-  background: linear-gradient(90deg, rgb(var(--rgb-accent) / 0.1), rgb(var(--rgb-cyan) / 0.05));
-  border-bottom: 1px solid rgb(var(--rgb-accent) / 0.2);
-}
-
-.drawer-collapse :deep(.el-collapse-item__content) {
-  padding: 12px 14px 14px;
-}
-
-.drawer-collapse :deep(.el-collapse-item__wrap) {
-  background: transparent;
-  border-bottom: none;
-}
-
-.drawer-collapse .field-group {
-  margin-bottom: 0;
-}
-
-.sp-hitl-notice {
-  padding: 10px 14px;
-  border-radius: 8px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  margin-bottom: 12px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  font-size: 13px;
-  color: #991b1b;
-}
-
-.sp-hitl-notice p { margin: 0; }
-</style>
+<style src="./styles/app.css" scoped></style>

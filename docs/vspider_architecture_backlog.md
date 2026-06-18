@@ -3739,3 +3739,78 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 关键设计: 复用既有有机结果挑选器（adRe 广告过滤 + 排 nav/侧栏/搜索引擎自链）；新增落地二次校验（doubleclick / gclid / aclk 等）+ 候选轮替。
 - 回归: tests/test_search_nav_action.py（stub-frame：广告 href 跳过 / 落地广告跳转跳过 / 同搜索域跳过 / 全广告失败 / 无候选）。
 - 风险: 低（新增能力，未改既有动作语义；guard 触发条件未放宽）。
+
+## Slice D-UI-1 (M4 简便): markdown 渲染器从 App.vue 抽离 (done, P3)
+
+- 能力名: markdown_render_extraction（轻量 Markdown 渲染器从 App.vue <script setup> 抽成可复用/可测模块）。
+- 影响层: vspider-ui/src/App.vue → vspider-ui/src/composables/markdownRender.js（纯函数 escapeHtml + renderMarkdown）。
+- 改动: App.vue 删除内联 89 行（注释 + escapeHtml + renderMarkdown），改为 `import { renderMarkdown }`；两处 computed（finalAnswerHtml / displayedFinalAnswerHtml）调用点不变；行为零变更。
+- 动机: App.vue 仍 ~4150 行巨兽（mission §三 文件体量警戒线）；renderMarkdown 此前困在 script setup 内无法单测，抽出后可测、可复用（§四 可测）。
+- 新增 contract 字段: 无。
+- Tests: 新增 vspider-ui/tests/markdownRender.test.js 11 例（escapeHtml / 标题 / 粗斜体 / 行内+围栏代码 / 链接白名单+XSS 兜底 / 列表 / 段落）；vspider-ui vitest 28 passed；npm run build 绿（1684 模块，+1）。
+- 风险: 低（纯函数平移，无逻辑变更；index bundle 体积不变 187.67kB）。
+- 后续 slice 候选: useModelSettings（模型配置）/ useWebSocket（WS 连接）/ usePhaseTrace（相位轨迹导出+过滤）/ useKeyboardCommand（快捷键+命令面板）/ scoped CSS 抽离（~981 行）。
+
+## Slice D-UI-2 (M4 简便): 模型配置从 App.vue 抽离 (done, P3)
+
+- 能力名: model_settings_extraction（VLM + 语义模型配置状态与持久化抽成 composable）。
+- 影响层: App.vue → composables/useModelSettings.js（selectedModel/Semantic、temperature/maxTokens、base/apiKey、远程模型拉取、load/save、selectedModelType）。
+- 改动: App.vue 改为 `import { useModelSettings }` 解构；localStorage 白名单持久化（apiKey 永不落盘）；行为零变更。
+- 新增 contract 字段: 无。
+- Tests: tests/useModelSettings.test.js（selectedModelType 推断 / 持久化白名单 round-trip / fetchRemoteModels happy+guard）。
+- 风险: 低（响应式状态平移，无逻辑变更）。
+
+## Slice D-UI-3 (M4 简便 + M2 高效): WebSocket 生命周期从 App.vue 抽离 (done, P3)
+
+- 能力名: websocket_lifecycle_extraction（连接 / 自动重连 / 卸载清理抽成 composable，业务消息路由经 onMessage 回调留 App.vue）。
+- 影响层: App.vue → composables/useWebSocket.js；App.vue 删除 socket/reconnectTimer/isUnmounted/wsStatus 与 wsUrl import，onMounted→connectWebSocket()、onUnmounted→disconnectWebSocket()；原 onmessage 体抽成 handleSocketMessage（仍持有全部组件状态）。
+- 改动: 行为逐字保留（连接守卫 OPEN/CONNECTING、2s 重连、卸载阻断重连）。
+- 新增 contract 字段: 无。
+- Tests: tests/useWebSocket.test.js 10 例（mock WebSocket + 假定时器：open/message/error/重连/连接去重/卸载守卫）；vitest 38 passed；npm run build 绿（1686 模块）。
+- 风险: 低（生命周期平移，message 路由不动）。
+
+## Slice D-UI-4 (M4 简便 + M1 准确): 相位轨迹逻辑共享化 + App.vue 死代码清除 (done, P2)
+
+- 能力名: phase_trace_shared_composable + appvue_dead_phase_removal。
+- 影响层: 新增 composables/usePhaseTrace.js（filteredPhaseEvents / phaseTimelineGroups / phaseSummary / phaseFilterOptions / phaseStatsSorted / severityFilterOptions / phaseFilterActive / completionEvidence + 纯助手 phaseChipStyle·Label·Detail / phaseSparklinePath / formatPhaseStatMs / toggle·reset）；TimelinePanel.vue 改用 `usePhaseTrace(toRef(props,'phaseEvents'))`，删内联 ~220 行。
+- 关键发现: App.vue 内同名相位过滤/统计/chip cluster 自上次 TimelinePanel 组件化后已无任何活引用（template 起于 2920 行，全文 grep 证实仅互相引用），系遗留死代码 → 删除 ~250 行（A1 状态声明 / A2 filteredPhaseEvents / A3 大块 ~10KB / A4–A7 四处 reset 死写）。
+- 新增 contract 字段: 无。
+- Tests: tests/usePhaseTrace.test.js 16 例（过滤/toggle/reset/summary/stats 排序 null 下沉/severity/分组/completion/chip 助手 + notice_severity 升级）；vitest 54 passed（6 文件）；npm run build 绿（1687 模块，index js 188.54→187.26kB）。
+- 风险: 低-中（TimelinePanel 为唯一活路径，行为逐字保留；App.vue 删除经全文 grep + build 双重确认无悬空引用）。
+
+## Slice D-UI-5 (M4 简便 + M1 准确): 全局键盘快捷键派发器从 App.vue 抽离 + 修复 Ctrl+E bug (done, P2)
+
+- 能力名: keyboard_command_extraction（全局 keydown 派发器抽成可单测的纯 resolver + 监听生命周期 composable）。
+- 影响层: 新增 composables/useKeyboardCommand.js（纯 `resolveKeyboardAction(event, ctx)` + `isTypingTarget` + `useKeyboardCommand({getContext, actions})` 自挂/卸 window keydown）；App.vue 删除 `_isTypingTarget` + `handleGlobalKeydown`（~135 行）与 onMounted/onUnmounted 的 add/removeEventListener，改为注入 keyboardActions + getKeyboardContext。
+- 改动: 派发逻辑逐字保留（primary=ctrl||meta、Ctrl+Enter/终端 Ctrl+F 输入态仍生效、其余输入态抑制、Ctrl+数字越界不拦截、相位/失败对话框方向键、终端搜索 Esc/Enter、timeline/capability 标签 Ctrl+E 与 End/Home）。
+- 顺带修复既有 bug: 原 handleGlobalKeydown 在 timeline 标签 Ctrl+E 调用 `exportPhaseEventsAsJsonl()`，但该函数自 TimelinePanel 组件化后 App.vue 内从未定义（HEAD 即如此，Ctrl+E 会 ReferenceError）→ 现 TimelinePanel `defineExpose` 暴露 `exportPhaseEventsAsJsonl`，App.vue 经 `timelinePanelRef.value?.exportPhaseEventsAsJsonl()` 调用，快捷键恢复可用。
+- 备注: 命令面板（slash 命令）此前已是独立 composable `useSlashCommand` + `CommandPalette.vue` + `registerBuiltinCommands`，本 slice 不动其 17-依赖薄接线（避免 omnibus）。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useKeyboardCommand.test.js 15 例（isTypingTarget + resolver 穷举：输入态豁免/抑制、全局键、Ctrl+数字越界、对话框方向键、终端搜索、标签级导出/滚动、未绑定键）；vitest 69 passed（7 文件）；npm run build 绿（1688 模块）。
+- 风险: 低（resolver 纯函数可测且逐字对照原 if-chain；动作经注入，listener 生命周期由 composable 自管；bug 修复为既有缺陷的最小闭合）。
+
+## Slice D-UI-6 (M4 简便): App.vue scoped 样式抽到外部 CSS (done, P3)
+
+- 能力名: appvue_scoped_css_externalize（App.vue 的 981 行 `<style scoped>` 抽到 styles/app.css，沿用仓内 `<style src scoped>` 组件样式约定，如 TimelinePanel/FinalAnswerPane 等）。
+- 影响层: App.vue → styles/app.css；App.vue 的 `<style scoped>…</style>`（原 2914–3895）整体替换为 `<style src="./styles/app.css" scoped></style>`。
+- 改动: 行为零变更——Vue SFC 编译器对 `<style src scoped>` 仍按 App.vue 组件作用域加 data-v 哈希，`:global()` 等特性照常；App.vue 由 ~3896 行降至 ~2915 行。
+- 新增 contract 字段: 无。
+- Tests: 无新增（纯 CSS 改动）；vitest 69 passed 不变；npm run build 绿，**index CSS 87.68kB 字节完全不变**（证明样式零丢失、作用域完整），index js 188.02kB 不变。
+- 风险: 低（纯样式平移 + 既有 src-scoped 约定；CSS bundle 字节一致双重确认）。
+
+## 方向D（前端 App.vue 拆分）阶段小结
+
+- D-UI-1 markdownRender / D-UI-2 useModelSettings / D-UI-3 useWebSocket / D-UI-4 usePhaseTrace(共享化+死代码清除) / D-UI-5 useKeyboardCommand(+Ctrl+E bug 修复) / D-UI-6 scoped CSS 外置。
+- 累计：App.vue 从 ~4150 行降至 ~2915 行（script ~2900→约 1930，<style> 981 行外置）；新增 6 个 composable + 1 个 styles/app.css；vspider-ui vitest 由 28 → 69 例；每步 npm run build 均绿。
+- 后续候选：useTaskSubmit 链路已部分独立（composables/useTaskSubmit.js）；可继续按 phase-trace 模式审查 App.vue 是否还有「组件化后遗留死代码」；或抽 capability-trace 相关 computed 群。
+
+## Slice D-UI-7 (M1 准确 + M4 简便): App.vue 组件化遗留死代码全量清除 (done, P2)
+
+- 能力名: appvue_dead_code_sweep（迭代死代码分析 + 全量删除上次组件化后遗留、无任何活引用的顶层符号）。
+- 影响层: 仅 App.vue `<script setup>`（template / style / 子组件均未动）。
+- 审计方法: 脚本提取 240 个顶层声明 → 统计「去注释全文（script+template）仅定义处出现」(count==1=直接死) → 迭代消除「引用全部落在死块内」者(传递死)；App.vue 无 defineExpose，模板按 rfind 取根 `</template>` 避免具名插槽截断。
+- 结论与删除: 34 个死符号、合并 14 个区间、共删 **322 行**（含紧邻注释/空行）。分布：Final Answer(→FinalAnswerPane.vue)、Timeline(→TimelinePanel.vue)、Capability 执行遥测(→CapabilityExecutionTelemetry/ReplayPane)、authProfileNames(→AuthDialog)。代表：completionEvidence/latestCompletionGuard、displayedFinalAnswerHtml/copyFinalAnswerToClipboard/exportFinalAnswerAsMarkdown、capabilityExecution{Attempts/Checks/Verification/RuntimeAfter/...}、scrollTimelineToTop/Bottom/_timelineWrap/_isAtBottom 等。
+- 新增 contract 字段: 无。
+- Tests: 删后全文 grep 34 死名 0 残留；活邻符号（finalAnswerText/Expanded/Status、timelineAutoScroll/timelinePanelRef、authProfileOptions 等）存活；ReadLints clean；npm run build 绿（1688 模块，index js **188.02→185.54kB**，-2.48kB）；vitest 69 passed 不变。
+- App.vue 行数: 2915 → **2593 行**（-322）。本会话累计 ~4150 → 2593（-1557）。
+- 风险: 低（迭代分析 + count==1 全文双重确认无活引用；仅删 script 死块，template/style 零触碰；build+vitest+lint 三绿）。
