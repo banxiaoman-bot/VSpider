@@ -14,14 +14,21 @@ from fastapi import Body, FastAPI, HTTPException
 logger = logging.getLogger("api_routes.spider_api")
 
 
-def register_spider_routes(app: FastAPI, *, spider_lite: Any) -> None:
+def register_spider_routes(app: FastAPI, *, spider_lite: Any = None, get_spider_lite: Any = None) -> None:
     """Mount all spider routes on *app*.
 
     Parameters
     ----------
     spider_lite:
         The ``SpiderLiteManager`` instance (shared with api_server).
+        Deprecated in favour of *get_spider_lite* for testability.
+    get_spider_lite:
+        Callable returning the ``SpiderLiteManager``. Allows tests to
+        monkeypatch the module attribute after registration.
     """
+    if get_spider_lite is None:
+        _sl = spider_lite
+        get_spider_lite = lambda: _sl  # noqa: E731
 
     @app.post("/api/spider/run", summary="运行轻量 Spider 爬取（Y24）")
     async def run_spider_lite(payload: dict[str, Any] = Body(...)) -> dict:
@@ -29,7 +36,7 @@ def register_spider_routes(app: FastAPI, *, spider_lite: Any) -> None:
             run_payload = dict(payload or {})
             run_payload.setdefault("persist_run_contracts", True)
             run_payload.setdefault("source", "api")
-            result = spider_lite.run(run_payload)
+            result = get_spider_lite().run(run_payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -39,21 +46,21 @@ def register_spider_routes(app: FastAPI, *, spider_lite: Any) -> None:
 
     @app.get("/api/spider/runs", summary="列出轻量 Spider 运行记录（Y24）")
     async def list_spider_lite_runs() -> dict:
-        return {"status": "success", "runs": spider_lite.list_runs()}
+        return {"status": "success", "runs": get_spider_lite().list_runs()}
 
     @app.get(
         "/api/spider/page_cache/{session_id}",
         summary="读取 Spider 页面响应缓存状态（Y25）",
     )
     async def get_spider_page_cache(session_id: str) -> dict:
-        return {"status": "success", "result": spider_lite.cache_state(session_id)}
+        return {"status": "success", "result": get_spider_lite().cache_state(session_id)}
 
     @app.get(
         "/api/spider/page_cache/{session_id}/entries",
         summary="列出 Spider 页面响应缓存条目（Y25）",
     )
     async def list_spider_page_cache_entries(session_id: str) -> dict:
-        return {"status": "success", "entries": spider_lite.cache_entries(session_id)}
+        return {"status": "success", "entries": get_spider_lite().cache_entries(session_id)}
 
     @app.post(
         "/api/spider/{run_id}/export",
@@ -63,7 +70,7 @@ def register_spider_routes(app: FastAPI, *, spider_lite: Any) -> None:
         run_id: str, payload: dict[str, Any] = Body(default_factory=dict)
     ) -> dict:
         try:
-            artifact = spider_lite.export_feed(
+            artifact = get_spider_lite().export_feed(
                 run_id,
                 format=str(
                     payload.get("format") or payload.get("export_format") or "jsonl"
@@ -91,7 +98,7 @@ def register_spider_routes(app: FastAPI, *, spider_lite: Any) -> None:
         run_id: str, fields: str = "", offset: int = 0, limit: int = 1000
     ) -> dict:
         try:
-            result = spider_lite.items(
+            result = get_spider_lite().items(
                 run_id,
                 fields=[
                     part.strip()
@@ -112,7 +119,7 @@ def register_spider_routes(app: FastAPI, *, spider_lite: Any) -> None:
         summary="读取轻量 Spider 运行详情（Y24）",
     )
     async def get_spider_lite_run(run_id: str) -> dict:
-        result = spider_lite.get_run(run_id)
+        result = get_spider_lite().get_run(run_id)
         if result is None:
             raise HTTPException(status_code=404, detail="spider run not found")
         return {"status": "success", "result": result}

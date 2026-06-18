@@ -200,7 +200,8 @@ def test_api_replay_dry_run_endpoint(monkeypatch: pytest.MonkeyPatch, local_tmp_
 def test_api_replay_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    runs_src = (root / "api_routes" / "runs_api.py").read_text(encoding="utf-8")
     assert "from visual_web_agent import api_replay as _api_replay" in api_src
-    assert '@app.post("/api/runs/{run_id}/network/replay"' in api_src
-    assert "_api_replay.build_replay_plan" in api_src
-    assert "_api_replay.replay_candidate" in api_src
+    assert '@app.post(' in runs_src and "network/replay" in runs_src
+    assert "api_replay.build_replay_plan" in runs_src
+    assert "api_replay.replay_candidate" in runs_src

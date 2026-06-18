@@ -143,7 +143,8 @@ def test_queue_state_source_wiring() -> None:
     assert "def _persist_queue_snapshot_safe() -> None:" in qc_src
     assert 'snapshot["execution_queue"]' in qc_src
     assert "_queue_state.save_snapshot(snapshot)" in qc_src
-    assert "\"persisted\": _queue_state.load_public_snapshot()" in api_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    assert "queue_state.load_public_snapshot()" in tq_src
     assert "def save_snapshot(" in state_src
     assert "def load_snapshot(" in state_src
     assert "def load_public_snapshot(" in state_src

@@ -219,53 +219,6 @@ app_browser_control_router = create_browser_control_router(BrowserControlApiDeps
 ))
 
 
-_AUTH_SESSION_LOCK = asyncio.Lock()
-_AUTH_SESSION: dict[str, Any] | None = None
-
-
-def _auth_dir() -> Path:
-    try:
-        from visual_web_agent import config
-
-        return Path(getattr(config, "AUTH_DIR", "") or ".auth").resolve()
-    except Exception:
-        return (Path(__file__).resolve().parent / ".auth").resolve()
-
-
-def _sanitize_profile_name(value: str) -> str:
-    name = (value or "").strip()
-    if name.endswith(".json"):
-        name = name[:-5]
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
-    if not name:
-        raise ValueError("profile name is required")
-    return name
-
-
-def _default_profile_name(url: str) -> str:
-    from urllib.parse import urlparse
-
-    host = (urlparse(url).hostname or "site").lower()
-    for prefix in ("www.", "passport.", "login."):
-        if host.startswith(prefix):
-            host = host[len(prefix):]
-    return _sanitize_profile_name(f"{host.split('.')[0] or 'site'}_default")
-
-
-async def _close_auth_session(session: dict[str, Any]) -> None:
-    for key in ("context", "browser"):
-        obj = session.get(key)
-        if obj:
-            try:
-                await obj.close()
-            except Exception:
-                pass
-    playwright = session.get("playwright")
-    if playwright:
-        try:
-            await playwright.stop()
-        except Exception:
-            pass
 
 
 def _start_queue_workers(background_tasks: BackgroundTasks) -> tuple[list[str], dict[str, Any]]:
@@ -630,6 +583,29 @@ async def download_run_artifact(run_id: str, filename: str):
     return FileResponse(path)
 
 
+@app.get("/download/runs/{run_id}/bundle.zip", summary="打包下载 run 全部可下载产物（>5 个文件场景）")
+async def download_run_bundle(run_id: str):
+    from pathlib import Path as _Path
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    try:
+        from visual_web_agent.data_writers.packaging import build_run_bundle
+    except Exception as exc:  # pragma: no cover - import guard
+        raise HTTPException(status_code=500, detail="packaging unavailable") from exc
+    try:
+        result = build_run_bundle(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    path = str(result.get("path") or "")
+    if not result.get("bundled") or not path or not _Path(path).exists():
+        raise HTTPException(status_code=404, detail="no downloadable files to bundle")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"{run_id}_bundle.zip",
+    )
+
+
 app.mount("/download", StaticFiles(directory=str(ARTIFACT_DIR)), name="artifacts")
 app.include_router(app_browser_control_router)
 app.include_router(create_capability_router(CapabilityApiDeps(
@@ -671,216 +647,13 @@ async def ws_logs(websocket: WebSocket) -> None:
         manager.disconnect(websocket)
 
 
-@app.get("/api/auth/profiles", summary="列出 Auth Matrix profiles")
-async def list_auth_profiles() -> dict:
-    auth_root = _auth_dir()
-    auth_root.mkdir(parents=True, exist_ok=True)
-    profiles: list[dict[str, Any]] = []
-
-    for path in sorted(auth_root.glob("*.json")):
-        if not path.is_file():
-            continue
-        item: dict[str, Any] = {
-            "name": path.stem,
-            "filename": path.name,
-            "size": path.stat().st_size,
-            "modified_at": path.stat().st_mtime,
-            "cookies": 0,
-            "origins": 0,
-            "cf_clearance": False,
-            "cf_clearance_expires_in_hours": None,
-        }
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            item["cookies"] = len(data.get("cookies") or [])
-            item["origins"] = len(data.get("origins") or [])
-            try:
-                from visual_web_agent.auth_harvester import inspect_cf_clearance
-
-                host_guess = path.stem.replace("_", ".")
-                has_cf, cf_hours = inspect_cf_clearance(data, host_guess)
-                item["cf_clearance"] = has_cf
-                item["cf_clearance_expires_in_hours"] = cf_hours
-            except Exception:
-                pass
-        except Exception as exc:
-            item["warning"] = f"{type(exc).__name__}: {exc}"
-        profiles.append(item)
-
-    return {"status": "success", "auth_dir": str(auth_root), "profiles": profiles}
-
-
-@app.get("/api/runtime/captcha_solver", summary="Captcha Solver 配置状态")
-async def captcha_solver_status() -> dict:
-    import os
-
-    provider = (os.getenv("VSPIDER_CAPTCHA_SOLVER") or "capsolver").strip().lower()
-    api_key = (os.getenv("VSPIDER_CAPTCHA_API_KEY") or "").strip()
-    enabled = bool(api_key) and provider in {"capsolver", "2captcha"}
-    return {
-        "status": "success",
-        "enabled": enabled,
-        "provider": provider,
-        "configured": bool(api_key),
-    }
-
-
-@app.get("/api/output_contract/preview", summary="推断任务输出契约预览")
-async def output_contract_preview(goal: str = "") -> dict:
-    text = (goal or "").strip()
-    if not text:
-        return {"status": "error", "message": "goal is required"}
-    try:
-        from visual_web_agent.io_contract import infer_output_contract
-
-        oc = infer_output_contract(text)
-        return {"status": "success", "output_contract": oc.to_dict()}
-    except Exception as exc:
-        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
-
-
-@app.post("/api/auth/manual/start", summary="打开人工登录浏览器窗口")
-async def start_manual_auth(
-    target_url: str = Form(..., description="需要人工登录的网站 URL"),
-    profile: str = Form("", description="保存到 .auth/<profile>.json"),
-) -> dict:
-    global _AUTH_SESSION
-
-    url = target_url.strip()
-    if not url:
-        return {"status": "error", "message": "target_url is required"}
-
-    try:
-        profile_name = _sanitize_profile_name(profile or _default_profile_name(url))
-    except ValueError as exc:
-        return {"status": "error", "message": str(exc)}
-
-    async with _AUTH_SESSION_LOCK:
-        if _AUTH_SESSION is not None:
-            return {
-                "status": "error",
-                "message": (
-                    "已有人工登录窗口正在进行；请先保存或取消当前登录态录制。"
-                ),
-            }
-
-        try:
-            from playwright.async_api import async_playwright
-
-            playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(headless=False)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                ignore_https_errors=True,
-            )
-            page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            _AUTH_SESSION = {
-                "playwright": playwright,
-                "browser": browser,
-                "context": context,
-                "page": page,
-                "profile": profile_name,
-                "target_url": url,
-                "started_at": time.time(),
-            }
-        except Exception as exc:
-            if "context" in locals():
-                await _close_auth_session({
-                    "context": locals().get("context"),
-                    "browser": locals().get("browser"),
-                    "playwright": locals().get("playwright"),
-                })
-            logger.exception("[AUTH UI] Failed to start manual auth")
-            return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
-
-    await manager.send_log(
-        f"[AUTH] 已打开人工登录窗口，登录完成后点击保存：{profile_name}",
-        level="info",
-    )
-    return {
-        "status": "success",
-        "message": "人工登录窗口已打开。登录完成后点击保存登录态。",
-        "profile": profile_name,
-    }
-
-
-@app.post("/api/auth/manual/save", summary="保存人工登录状态")
-async def save_manual_auth() -> dict:
-    global _AUTH_SESSION
-
-    async with _AUTH_SESSION_LOCK:
-        if _AUTH_SESSION is None:
-            return {"status": "error", "message": "没有正在进行的人工登录会话"}
-
-        session = _AUTH_SESSION
-        _AUTH_SESSION = None
-
-    profile_name = session["profile"]
-    output_path = _auth_dir() / f"{profile_name}.json"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        state = await session["context"].storage_state()
-        output_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        cookie_count = len(state.get("cookies") or [])
-        origin_count = len(state.get("origins") or [])
-        message = (
-            f"已保存 auth profile {profile_name} "
-            f"(cookies={cookie_count}, origins={origin_count})"
-        )
-        await manager.send_log(f"[AUTH] {message}", level="info")
-        return {
-            "status": "success",
-            "message": message,
-            "profile": profile_name,
-            "path": str(output_path),
-            "cookies": cookie_count,
-            "origins": origin_count,
-        }
-    except Exception as exc:
-        logger.exception("[AUTH UI] Failed to save manual auth")
-        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
-    finally:
-        await _close_auth_session(session)
-
-
-@app.post("/api/auth/manual/cancel", summary="取消人工登录状态录制")
-async def cancel_manual_auth() -> dict:
-    global _AUTH_SESSION
-
-    async with _AUTH_SESSION_LOCK:
-        if _AUTH_SESSION is None:
-            return {"status": "success", "message": "没有正在进行的人工登录会话"}
-        session = _AUTH_SESSION
-        _AUTH_SESSION = None
-
-    await _close_auth_session(session)
-    await manager.send_log("[AUTH] 已取消人工登录态录制", level="warn")
-    return {"status": "success", "message": "已取消人工登录态录制"}
-
-
-@app.post("/api/human/resume", summary="人工处理完成后恢复 Agent")
-async def resume_human_intervention() -> dict:
-    _broadcast_resume_human()
-    await manager.send_status("human_resumed")
-    await manager.send_log("[HITL] 操作员确认完成，Agent 恢复执行", level="info")
-    return {"status": "success", "message": "Agent resume signal sent"}
-
-
-@app.post("/api/human/form_submit", summary="前端 HITL 表单提交")
-async def submit_hitl_form_endpoint(payload: dict) -> dict:
-    fields = payload.get("fields", {})
-    if not fields:
-        return {"status": "error", "message": "No fields provided"}
-    _broadcast_submit_hitl_form(fields)
-    await manager.send_status("human_resumed")
-    filled = ", ".join(f"{k}=***" for k in fields)
-    await manager.send_log(f"[HITL] 用户通过前端表单提交了 {len(fields)} 个字段: {filled}", level="info")
-    return {"status": "success", "message": f"Form submitted with {len(fields)} fields"}
+from api_routes.auth_api import register_auth_routes as _register_auth_routes  # noqa: E402
+_register_auth_routes(
+    app,
+    manager=manager,
+    broadcast_resume_human=_broadcast_resume_human,
+    broadcast_submit_hitl_form=_broadcast_submit_hitl_form,
+)
 
 
 @app.get("/api/artifacts", summary="列出 VSpider 产出文件")
@@ -1255,196 +1028,12 @@ async def get_robots_policy(domain: str) -> dict:
     return {"status": "success", "result": _robots_policy.public_rules(domain)}
 
 
-@app.post("/api/spider/run", summary="运行轻量 Spider 爬取（Y24）")
-async def run_spider_lite(payload: dict[str, Any] = Body(...)) -> dict:
-    try:
-        run_payload = dict(payload or {})
-        run_payload.setdefault("persist_run_contracts", True)
-        run_payload.setdefault("source", "api")
-        result = _spider_lite.run(run_payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.warning("[SPIDER] run failed: %s", exc)
-        raise HTTPException(status_code=500, detail="spider run failed") from exc
-    return {"status": "success", "result": result}
+from api_routes.spider_api import register_spider_routes as _register_spider_routes  # noqa: E402
+_register_spider_routes(app, get_spider_lite=lambda: _spider_lite)
 
 
-@app.get("/api/spider/runs", summary="列出轻量 Spider 运行记录（Y24）")
-async def list_spider_lite_runs() -> dict:
-    return {"status": "success", "runs": _spider_lite.list_runs()}
-
-
-@app.get("/api/spider/page_cache/{session_id}", summary="读取 Spider 页面响应缓存状态（Y25）")
-async def get_spider_page_cache(session_id: str) -> dict:
-    return {"status": "success", "result": _spider_lite.cache_state(session_id)}
-
-
-@app.get("/api/spider/page_cache/{session_id}/entries", summary="列出 Spider 页面响应缓存条目（Y25）")
-async def list_spider_page_cache_entries(session_id: str) -> dict:
-    return {"status": "success", "entries": _spider_lite.cache_entries(session_id)}
-
-
-@app.post("/api/spider/{run_id}/export", summary="导出轻量 Spider items feed（Y27）")
-async def export_spider_lite_feed(run_id: str, payload: dict[str, Any] = Body(default_factory=dict)) -> dict:
-    try:
-        artifact = _spider_lite.export_feed(
-            run_id,
-            format=str(payload.get("format") or payload.get("export_format") or "jsonl"),
-            filename=str(payload.get("filename") or payload.get("export_filename") or ""),
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.warning("[SPIDER] export failed: %s", exc)
-        raise HTTPException(status_code=500, detail="spider export failed") from exc
-    return {"status": "success", "artifact": artifact}
-
-
-@app.get("/api/spider/{run_id}/items", summary="查询轻量 Spider items 数据（Y28）")
-async def get_spider_lite_items(run_id: str, fields: str = "", offset: int = 0, limit: int = 1000) -> dict:
-    try:
-        result = _spider_lite.items(
-            run_id,
-            fields=[part.strip() for part in str(fields or "").split(",") if part.strip()],
-            offset=int(offset or 0),
-            limit=int(limit or 1000),
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "success", "result": result}
-
-
-@app.get("/api/spider/{run_id}", summary="读取轻量 Spider 运行详情（Y24）")
-async def get_spider_lite_run(run_id: str) -> dict:
-    result = _spider_lite.get_run(run_id)
-    if result is None:
-        raise HTTPException(status_code=404, detail="spider run not found")
-    return {"status": "success", "result": result}
-
-
-@app.get("/api/failed_runs", summary="列出最近的失败 run（K2）")
-async def get_failed_runs(limit: int = 50) -> dict:
-    """返回最新的 ``limit`` 条失败 run 记录。
-
-    每条记录是 ``failure_archive.list_failed_runs`` 输出的字典，
-    包含 schema_version/run_id/ts/reason/goal/duration_s 等字段，
-    以及一个 ``paths_exist`` 子字典指明 HTML 日志 / phase jsonl /
-    event jsonl 是否仍存在，前端据此决定按钮是否可用。
-    """
-    try:
-        # ``base_dir`` / ``project_root`` 默认即可：模块自己解析项目根。
-        records = _failure_archive.list_failed_runs(limit=int(limit or 50))
-    except Exception as exc:
-        logger.warning("[FAILED RUNS] list error: %s", exc)
-        records = []
-    return {"status": "success", "count": len(records), "items": records}
-
-
-@app.get("/api/failed_runs/{run_id}/log", summary="下载失败 run 的 HTML 轨迹日志（K2）")
-async def get_failed_run_html_log(run_id: str):
-    """返回 ``logs/run_log_<run_id>.html``。run_id 必须仅含 ASCII
-    字母/数字/下划线，避免 path traversal；不存在则 404。
-    """
-    rid = (run_id or '').strip()
-    # 仅允许 _0-9A-Za-z 的运行 ID（HtmlLogger 用 strftime 生成，
-    # 形如 20260524_191800，所以这条白名单足够保守）。
-    if not rid or not all(c.isalnum() or c == '_' for c in rid):
-        raise HTTPException(status_code=400, detail="invalid run_id")
-    log_path = Path("logs") / f"run_log_{rid}.html"
-    if not log_path.exists() or not log_path.is_file():
-        raise HTTPException(status_code=404, detail="log not found")
-    return FileResponse(
-        path=str(log_path),
-        media_type="text/html; charset=utf-8",
-        filename=log_path.name,
-    )
-
-
-@app.get(
-    "/api/failed_runs/{run_id}/phase_events",
-    summary="返回失败 run 的 phase 事件列表（K6）",
-)
-async def get_failed_run_phase_events(run_id: str, limit: int = 200) -> dict:
-    """K6: read ``logs/phase_<run_id>.jsonl`` and return parsed events.
-
-    Used by the failed-runs detail dialog so users can re-inspect the
-    Timeline of a historic run even after the in-memory ``phaseEvents``
-    buffer has been cleared by a newer task.
-
-    Response shape::
-
-        {
-            "status":    "success",
-            "count":     N,        # events RETURNED (after limit)
-            "total":     M,        # events SEEN on disk (>= count)
-            "truncated": bool,     # True when total > limit
-            "events":    [<event>, ...]   # parsed JSON dicts
-        }
-
-    Behavior:
-        * Invalid run_id (anything outside [0-9A-Za-z_]) -> 400
-        * phase_<id>.jsonl missing                       -> 404
-        * limit <= 0 is treated as the default (200)
-        * Malformed lines are skipped silently but counted in `total`,
-          so a mismatch between `total` and `len(events)` flags corruption.
-        * When truncated, we keep the LAST N events (the failure tail
-          is more diagnostically useful than the head).
-    """
-    rid = (run_id or "").strip()
-    if not rid or not all(c.isalnum() or c == "_" for c in rid):
-        raise HTTPException(status_code=400, detail="invalid run_id")
-    phase_path = Path("logs") / f"phase_{rid}.jsonl"
-    if not phase_path.exists() or not phase_path.is_file():
-        raise HTTPException(status_code=404, detail="phase log not found")
-
-    try:
-        n = int(limit)
-    except (TypeError, ValueError):
-        n = 200
-    if n <= 0:
-        n = 200
-
-    events: list[dict] = []
-    total = 0
-    try:
-        with phase_path.open("r", encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                total += 1
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    # Malformed line: skipped from `events` but still
-                    # contributes to `total` so the caller can detect drift.
-                    continue
-                if isinstance(obj, dict):
-                    events.append(obj)
-    except Exception as exc:
-        logger.warning(
-            "[FAILED RUNS] phase log read error %s: %s", phase_path, exc,
-        )
-        raise HTTPException(
-            status_code=500, detail="phase log read failed",
-        ) from exc
-
-    truncated = total > n
-    if truncated:
-        events = events[-n:]
-
-    return {
-        "status": "success",
-        "count": len(events),
-        "total": total,
-        "truncated": truncated,
-        "events": events,
-    }
+from api_routes.failed_runs_api import register_failed_runs_routes as _register_failed_runs_routes  # noqa: E402
+_register_failed_runs_routes(app, failure_archive=_failure_archive)
 
 
 @app.post("/api/start_batch", summary="启动批处理任务（后台执行）")
@@ -1833,238 +1422,41 @@ async def stop_batch() -> dict:
     }
 
 
-@app.get("/api/task_queue", summary="查看任务队列")
-async def get_task_queue() -> dict:
-    return {
-        "status": "success",
-        "queue": _queue_snapshot(),
-        "persisted": _queue_state.load_public_snapshot(),
-    }
+from api_routes.task_queue_api import register_task_queue_routes as _register_task_queue_routes  # noqa: E402
+_register_task_queue_routes(
+    app,
+    manager=manager,
+    queue_state=_queue_state,
+    queue_snapshot=_queue_snapshot,
+    queue_metrics=queue_metrics,
+    queue_worker_config=_queue_worker_config,
+    cancel_queued_task=cancel_queued_task,
+    pause_task_queue=pause_task_queue,
+    resume_task_queue=resume_task_queue,
+    recover_queued_tasks=recover_queued_tasks,
+    scan_stale_queue_workers=scan_stale_queue_workers,
+    start_queue_workers=_start_queue_workers,
+    get_browser_pool_status=_get_browser_pool_status,
+    get_browser_runtime_status=_get_browser_runtime_status,
+    get_browser_session_pool_status=_get_browser_session_pool_status,
+    browser_control=_browser_control,
+)
 
 
-@app.get("/api/task_queue/metrics", summary="查看任务队列指标（Y17）")
-async def get_task_queue_metrics(run_limit: int = 200) -> dict:
-    return {
-        "status": "success",
-        "metrics": queue_metrics(run_limit=run_limit),
-    }
-
-
-@app.get("/api/browser_pool", summary="查看浏览器资源池状态（Y8-A）")
-async def get_browser_pool_status() -> dict:
-    pool = _get_browser_pool_status()
-    backend = _browser_control.backend_status()
-    return {
-        "status": "success",
-        "pool": pool,
-        "runtime": _get_browser_runtime_status(pool_status=pool, backend_status=backend),
-    }
-
-
-@app.get("/api/browser_sessions", summary="查看跨系统 Session Pool 状态（E1）")
-async def get_browser_sessions() -> dict:
-    return {
-        "status": "success",
-        "result": _get_browser_session_pool_status(),
-    }
-
-
-@app.delete("/api/task_queue/{task_id}", summary="取消尚未开始的排队任务")
-async def delete_queued_task(task_id: str) -> dict:
-    ok, message = cancel_queued_task(task_id)
-    await manager.send_log(f"[QUEUE] {message}: {task_id}", level="warn" if ok else "info")
-    return {
-        "status": "success" if ok else "error",
-        "message": message,
-        "queue": _queue_snapshot(),
-        "persisted": _queue_state.load_public_snapshot(),
-    }
-
-
-@app.post("/api/task_queue/pause", summary="暂停队列领取新任务（Y15）")
-async def pause_queue(reason: str = "") -> dict:
-    queue = pause_task_queue(reason)
-    await manager.send_log(
-        f"[QUEUE] 队列已暂停{': ' + reason if reason else ''}",
-        level="warn",
-    )
-    return {
-        "status": "success",
-        "queue": queue,
-        "persisted": _queue_state.load_public_snapshot(),
-    }
-
-
-@app.post("/api/task_queue/resume", summary="恢复队列领取新任务（Y15）")
-async def resume_queue(background_tasks: BackgroundTasks) -> dict:
-    queue, should_start_worker = resume_task_queue()
-    started_workers: list[str] = []
-    worker_config = _queue_worker_config()
-    if should_start_worker:
-        started_workers, worker_config = _start_queue_workers(background_tasks)
-        queue = _queue_snapshot()
-    await manager.send_log("[QUEUE] 队列已恢复", level="info")
-    return {
-        "status": "success",
-        "queue": queue,
-        "started_workers": started_workers,
-        "worker_config": worker_config,
-        "persisted": _queue_state.load_public_snapshot(),
-    }
-
-
-@app.post("/api/task_queue/recover", summary="从持久化快照恢复队列（Y10）")
-async def recover_task_queue() -> dict:
-    result = recover_queued_tasks()
-    await manager.send_log(
-        (
-            f"[QUEUE RECOVERY] recovered={result['recovered_count']} "
-            f"interrupted={result['interrupted_count']}"
-        ),
-        level="warn" if result["interrupted_count"] else "info",
-    )
-    return {
-        "status": "success",
-        "recovery": result,
-        "queue": _queue_snapshot(),
-        "persisted": _queue_state.load_public_snapshot(),
-    }
-
-
-@app.post("/api/task_queue/watchdog", summary="扫描并标记 stale 队列 worker（Y12）")
-async def run_task_queue_watchdog() -> dict:
-    result = scan_stale_queue_workers()
-    await manager.send_log(
-        (
-            f"[QUEUE WATCHDOG] stale_workers={result['stale_worker_count']} "
-            f"affected_tasks={result['affected_task_count']}"
-        ),
-        level="warn" if result["stale_worker_count"] else "info",
-    )
-    return {
-        "status": "success",
-        "watchdog": result,
-        "queue": _queue_snapshot(),
-        "persisted": _queue_state.load_public_snapshot(),
-    }
-
-
-@app.get("/api/runs", summary="列出任务运行记录")
-async def list_runs(limit: int = 50, status: str = "") -> dict:
-    try:
-        items = _run_registry.list_runs(limit=limit, status=status or None)
-    except Exception as exc:
-        logger.warning("[RUN REGISTRY] list_runs failed: %s", exc)
-        raise HTTPException(status_code=500, detail="run registry read failed") from exc
-    return {
-        "status": "success",
-        "count": len(items),
-        "runs": items,
-    }
-
-
-@app.get("/api/runs/{run_id}/network", summary="列出 run 捕获到的候选网络数据接口")
-async def get_run_network_candidates(
-    run_id: str,
-    limit: int = 100,
-    min_score: int = 0,
-) -> dict:
-    items = _network_intelligence.list_candidates(
-        run_id,
-        limit=limit,
-        min_score=min_score,
-    )
-    summary = _network_intelligence.summarize_candidates(items)
-    return {
-        "status": "success",
-        "run_id": run_id,
-        "count": len(items),
-        "items": items,
-        "summary": summary,
-    }
-
-
-@app.post("/api/runs/{run_id}/network/replay", summary="基于候选网络接口生成或执行 API Replay")
-async def replay_run_network_candidate(
-    run_id: str,
-    endpoint: str = "",
-    page: int = 1,
-    page_size: int = 50,
-    execute: bool = False,
-    paginate: bool = False,
-    max_pages: int = 20,
-) -> dict:
-    candidates = _network_intelligence.list_candidates(run_id, limit=200)
-    candidate = _api_replay.choose_candidate(candidates, endpoint=endpoint)
-    if candidate is None:
-        raise HTTPException(status_code=404, detail="network candidate not found")
-    plan = _api_replay.build_replay_plan(
-        candidate,
-        page=max(1, int(page or 1)),
-        page_size=max(1, min(int(page_size or 50), 500)),
-    )
-    if not execute:
-        return {
-            "status": "success",
-            "run_id": run_id,
-            "dry_run": True,
-            "candidate": candidate,
-            "plan": plan,
-        }
-    try:
-        if paginate:
-            result = _api_replay.paginate_replay(
-                run_id=run_id,
-                candidate=candidate,
-                page_size=max(1, min(int(page_size or 50), 500)),
-                start_page=max(1, int(page or 1)),
-                max_pages=max(1, min(int(max_pages or 20), 100)),
-            )
-        else:
-            result = _api_replay.replay_candidate(
-                run_id=run_id,
-                candidate=candidate,
-                page=max(1, int(page or 1)),
-                page_size=max(1, min(int(page_size or 50), 500)),
-            )
-    except Exception as exc:
-        logger.warning("[API REPLAY] replay failed for %s: %s", run_id, exc)
-        raise HTTPException(status_code=502, detail=f"api replay failed: {type(exc).__name__}") from exc
-    return result
-
-
-@app.get("/api/runs/{run_id}", summary="读取单个任务运行记录")
-async def get_run(run_id: str) -> dict:
-    rec = _run_registry.load_run(run_id)
-    if rec is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return {
-        "status": "success",
-        "run": rec,
-        "contracts": _load_run_contract_bundle(run_id),
-    }
-
-
-@app.post("/api/runs/{run_id}/retry", summary="手动重试失败/停止的任务（Y16）")
-async def retry_run(run_id: str, background_tasks: BackgroundTasks) -> dict:
-    ok, message, retry = retry_run_as_queued_task(run_id)
-    started_workers: list[str] = []
-    worker_config = _queue_worker_config()
-    if ok and retry.get("should_start_worker"):
-        started_workers, worker_config = _start_queue_workers(background_tasks)
-    await manager.send_log(
-        f"[QUEUE RETRY] {message}: {run_id}",
-        level="info" if ok else "warn",
-    )
-    return {
-        "status": "success" if ok else "error",
-        "message": message,
-        "retry": retry,
-        "queue": _queue_snapshot(),
-        "started_workers": started_workers,
-        "worker_config": worker_config,
-        "persisted": _queue_state.load_public_snapshot(),
-    }
+from api_routes.runs_api import register_runs_routes as _register_runs_routes  # noqa: E402
+_register_runs_routes(
+    app,
+    manager=manager,
+    run_registry=_run_registry,
+    network_intelligence=_network_intelligence,
+    api_replay=_api_replay,
+    load_run_contract_bundle=_load_run_contract_bundle,
+    queue_snapshot=_queue_snapshot,
+    queue_worker_config=_queue_worker_config,
+    queue_state=_queue_state,
+    retry_run_as_queued_task=retry_run_as_queued_task,
+    start_queue_workers=_start_queue_workers,
+)
 
 
 @app.get("/health", summary="健康检查")
@@ -2072,7 +1464,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "ws_connections": len(manager.active),
-        "loop_ready": _API_LOOP is not None,
+        "loop_ready": get_api_loop() is not None,
         "task": _task_snapshot(),
     }
 

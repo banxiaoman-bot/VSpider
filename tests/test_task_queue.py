@@ -983,13 +983,15 @@ def test_task_queue_source_wiring() -> None:
     assert "from visual_web_agent import queue_state as _queue_state" in qc_src
     assert "async def _queue_worker(worker_id: str = \"worker_default\") -> None:" in api_src
     assert "def _enqueue_task(" in qc_src
-    assert '@app.get("/api/task_queue"' in api_src
-    assert '@app.get("/api/task_queue/metrics"' in api_src
-    assert '"persisted": _queue_state.load_public_snapshot()' in api_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    runs_src = (root / "api_routes" / "runs_api.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/task_queue"' in tq_src
+    assert '@app.get("/api/task_queue/metrics"' in tq_src
+    assert "queue_state.load_public_snapshot()" in tq_src
     assert 'snapshot["execution_queue"]' in qc_src
-    assert '@app.post("/api/task_queue/pause"' in api_src
-    assert '@app.post("/api/task_queue/resume"' in api_src
-    assert '@app.post("/api/task_queue/recover"' in api_src
-    assert '@app.post("/api/task_queue/watchdog"' in api_src
-    assert '@app.post("/api/runs/{run_id}/retry"' in api_src
-    assert '@app.delete("/api/task_queue/{task_id}"' in api_src
+    assert '@app.post("/api/task_queue/pause"' in tq_src
+    assert '@app.post("/api/task_queue/resume"' in tq_src
+    assert '@app.post("/api/task_queue/recover"' in tq_src
+    assert '@app.post("/api/task_queue/watchdog"' in tq_src
+    assert '@app.post(' in runs_src and "retry" in runs_src
+    assert '@app.delete("/api/task_queue/{task_id}"' in tq_src

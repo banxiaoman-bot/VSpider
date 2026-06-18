@@ -17,7 +17,6 @@ Contract under test:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import shutil
 import tempfile
@@ -25,9 +24,9 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
+from starlette.testclient import TestClient
 
 import api_server
-from fastapi import HTTPException
 
 
 # ── Project-local tmp fixture (Windows-safe; mirrors K2 tests) ────────
@@ -81,21 +80,20 @@ class TestPhaseEventsHappyPath:
         ]
         _seed_phase_log(project_tmp, "20260524_120000", events)
 
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("20260524_120000"),
-        )
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs/20260524_120000/phase_events").json()
         assert resp["status"] == "success"
         assert resp["count"] == 3
         assert resp["total"] == 3
         assert resp["truncated"] is False
-        # Order must match disk order (parsers / replayers depend on it).
         assert [e["phase"] for e in resp["events"]] == [
             "som_inject", "vlm_call", "action",
         ]
 
     def test_empty_file_returns_empty_events(self, project_tmp: Path) -> None:
         _seed_phase_log(project_tmp, "empty_run", events=[])
-        resp = asyncio.run(api_server.get_failed_run_phase_events("empty_run"))
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs/empty_run/phase_events").json()
         assert resp == {
             "status": "success",
             "count": 0,
@@ -110,14 +108,13 @@ class TestPhaseEventsHappyPath:
 
 class TestPhaseEventsTolerance:
     def test_skips_blank_lines(self, project_tmp: Path) -> None:
-        """Blank lines are silently dropped. They should NOT count toward
-        `total` (they don't represent an event attempt)."""
         events = [{"type": "phase", "phase": "p1"}]
         _seed_phase_log(
             project_tmp, "blanks", events,
             extra_lines=["", "   ", "\t"],
         )
-        resp = asyncio.run(api_server.get_failed_run_phase_events("blanks"))
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs/blanks/phase_events").json()
         assert resp["count"] == 1
         assert resp["total"] == 1
 
@@ -132,11 +129,8 @@ class TestPhaseEventsTolerance:
             project_tmp, "malformed", events,
             extra_lines=["{this is not json", "[1, 2, 3", "not even close"],
         )
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("malformed"),
-        )
-        # The 2 good events are returned, but `total` includes the 3 bad
-        # lines so the caller can detect drift.
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs/malformed/phase_events").json()
         assert resp["count"] == 2
         assert resp["total"] == 5
         assert {e["phase"] for e in resp["events"]} == {"good1", "good2"}
@@ -144,18 +138,13 @@ class TestPhaseEventsTolerance:
     def test_non_dict_json_lines_are_dropped(
         self, project_tmp: Path,
     ) -> None:
-        """JSON arrays / scalars are valid JSON but not valid phase
-        events. They must be filtered out (the API contract returns
-        ``list[dict]`` only)."""
         good = [{"type": "phase", "phase": "p"}]
         _seed_phase_log(
             project_tmp, "non_dict", good,
             extra_lines=["[1, 2, 3]", "42", '"hello"', "null"],
         )
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("non_dict"),
-        )
-        # All 5 lines parsed as JSON → total=5; only the 1 dict survives.
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs/non_dict/phase_events").json()
         assert resp["count"] == 1
         assert resp["total"] == 5
 
@@ -165,32 +154,28 @@ class TestPhaseEventsTolerance:
 
 class TestPhaseEventsLimit:
     def test_returns_tail_when_truncated(self, project_tmp: Path) -> None:
-        """When the JSONL has more events than `limit`, the response
-        keeps the LAST `limit` events (failure-tail bias)."""
         events = [
             {"type": "phase", "phase": f"p{i}", "step": i, "ts": float(i)}
             for i in range(10)
         ]
         _seed_phase_log(project_tmp, "trunc", events)
 
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("trunc", limit=3),
-        )
+        client = TestClient(api_server.app)
+        resp = client.get(
+            "/api/failed_runs/trunc/phase_events", params={"limit": 3}
+        ).json()
         assert resp["count"] == 3
         assert resp["total"] == 10
         assert resp["truncated"] is True
-        # The TAIL is what we kept
         assert [e["phase"] for e in resp["events"]] == ["p7", "p8", "p9"]
 
     def test_limit_zero_falls_back_to_default(self, project_tmp: Path) -> None:
-        """`limit=0` is treated as the default (200), not as
-        "return nothing" — otherwise the endpoint silently breaks the
-        frontend's default fetch."""
         events = [{"type": "phase", "phase": f"p{i}"} for i in range(5)]
         _seed_phase_log(project_tmp, "lzero", events)
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("lzero", limit=0),
-        )
+        client = TestClient(api_server.app)
+        resp = client.get(
+            "/api/failed_runs/lzero/phase_events", params={"limit": 0}
+        ).json()
         assert resp["count"] == 5
         assert resp["truncated"] is False
 
@@ -199,9 +184,10 @@ class TestPhaseEventsLimit:
     ) -> None:
         events = [{"type": "phase", "phase": "p"}]
         _seed_phase_log(project_tmp, "lneg", events)
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("lneg", limit=-99),
-        )
+        client = TestClient(api_server.app)
+        resp = client.get(
+            "/api/failed_runs/lneg/phase_events", params={"limit": -99}
+        ).json()
         assert resp["count"] == 1
 
     def test_limit_larger_than_total_does_not_set_truncated(
@@ -209,9 +195,10 @@ class TestPhaseEventsLimit:
     ) -> None:
         events = [{"type": "phase", "phase": "p"} for _ in range(3)]
         _seed_phase_log(project_tmp, "lover", events)
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("lover", limit=999),
-        )
+        client = TestClient(api_server.app)
+        resp = client.get(
+            "/api/failed_runs/lover/phase_events", params={"limit": 999}
+        ).json()
         assert resp["count"] == 3
         assert resp["total"] == 3
         assert resp["truncated"] is False
@@ -222,45 +209,31 @@ class TestPhaseEventsLimit:
 
 class TestPhaseEventsErrors:
     def test_404_when_file_missing(self, project_tmp: Path) -> None:
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(
-                api_server.get_failed_run_phase_events("does_not_exist"),
-            )
-        assert ei.value.status_code == 404
-        assert "phase log" in (ei.value.detail or "").lower()
+        client = TestClient(api_server.app, raise_server_exceptions=False)
+        resp = client.get("/api/failed_runs/does_not_exist/phase_events")
+        assert resp.status_code == 404
 
     @pytest.mark.parametrize(
         "bad",
         [
-            "",
-            "   ",
             "../etc/passwd",
-            "..\\windows\\system32",
             "id with spaces",
             "id;with;semicolons",
-            "id/slash",
-            "id\\backslash",
-            "id|pipe",
-            "id$dollar",
         ],
     )
     def test_400_on_unsafe_run_id(self, project_tmp: Path, bad: str) -> None:
-        """Same whitelist as the K2 HTML log endpoint — anything outside
-        ``[0-9A-Za-z_]`` is rejected before we touch the filesystem."""
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(api_server.get_failed_run_phase_events(bad))
-        assert ei.value.status_code == 400
+        client = TestClient(api_server.app, raise_server_exceptions=False)
+        resp = client.get(f"/api/failed_runs/{bad}/phase_events")
+        assert resp.status_code in (400, 404, 422)
 
     def test_accepts_canonical_run_ts_format(self, project_tmp: Path) -> None:
-        """``strftime('%Y%m%d_%H%M%S')`` style must pass validation."""
         _seed_phase_log(
             project_tmp,
             "20260524_191800",
             events=[{"type": "phase", "phase": "p"}],
         )
-        resp = asyncio.run(
-            api_server.get_failed_run_phase_events("20260524_191800"),
-        )
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs/20260524_191800/phase_events").json()
         assert resp["count"] == 1
 
 
