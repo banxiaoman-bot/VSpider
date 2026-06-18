@@ -681,6 +681,7 @@ def save_to_excel(
     filename: str = "output.xlsx",
     filters: list[FilterRule] = None,
     unique_key: str | list[str] = None,
+    run_id: str = "",
 ) -> str:
     """
     将 VLM extract 动作提取的数据保存至 Excel。
@@ -690,6 +691,7 @@ def save_to_excel(
         filename: 输出文件名
         filters: 可选过滤规则
         unique_key: 去重字段
+        run_id: run 标识，传入后 register_artifact 会写入 manifest
     """
     filepath = resolve_output_path(filename)
 
@@ -719,6 +721,7 @@ def save_to_excel(
     logger.info(f"[VLM Extract] Saved to: {abs_path} (total {total} rows)")
     register_artifact(
         abs_path,
+        run_id=run_id,
         kind="dataset_rows",
         mime=_XLSX_MIME,
         produced_by="vlm_extract",

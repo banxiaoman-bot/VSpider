@@ -332,13 +332,14 @@ def test_spider_lite_source_wiring() -> None:
 
     assert "from visual_web_agent.spider_lite import SpiderLiteManager" in api_src
     assert "_spider_lite = SpiderLiteManager(robots_policy=_robots_policy)" in api_src
-    assert '@app.post("/api/spider/run"' in api_src
-    assert '@app.get("/api/spider/runs"' in api_src
-    assert '@app.get("/api/spider/page_cache/{session_id}"' in api_src
-    assert '@app.get("/api/spider/page_cache/{session_id}/entries"' in api_src
-    assert '@app.post("/api/spider/{run_id}/export"' in api_src
-    assert '@app.get("/api/spider/{run_id}/items"' in api_src
-    assert '@app.get("/api/spider/{run_id}"' in api_src
+    spider_api_src = (root / "api_routes" / "spider_api.py").read_text(encoding="utf-8")
+    assert '@app.post("/api/spider/run"' in spider_api_src
+    assert '@app.get("/api/spider/runs"' in spider_api_src
+    assert '@app.get(' in spider_api_src and "page_cache/{session_id}" in spider_api_src
+    assert '@app.get(' in spider_api_src and "page_cache/{session_id}/entries" in spider_api_src
+    assert '@app.post(' in spider_api_src and "{run_id}/export" in spider_api_src
+    assert '@app.get(' in spider_api_src and "{run_id}/items" in spider_api_src
+    assert '@app.get(' in spider_api_src and "spider/{run_id}" in spider_api_src
     assert "class SpiderLiteManager:" in spider_src
     assert "PageResponseCache" in spider_src
     assert "def cache_entries(" in spider_src

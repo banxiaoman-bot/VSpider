@@ -108,7 +108,8 @@ class TestE1SourcePins:
             "from visual_web_agent.browser_session_pool import get_browser_session_pool_status"
             in src
         )
-        assert '@app.get("/api/browser_sessions"' in src
+        tq_src = (_ROOT / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+        assert '@app.get("/api/browser_sessions"' in tq_src
 
 
 # ---------------------------------------------------------------------------

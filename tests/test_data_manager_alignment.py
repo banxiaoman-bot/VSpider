@@ -1,9 +1,8 @@
-import pandas as pd
+import pytest
 
-try:
-    from .data_manager import _align_new_columns_to_existing
-except ImportError:
-    from data_manager import _align_new_columns_to_existing
+pd = pytest.importorskip("pandas")
+
+from visual_web_agent.data_manager import _align_new_columns_to_existing
 
 
 def test_schema_alignment_does_not_treat_position_as_rank():

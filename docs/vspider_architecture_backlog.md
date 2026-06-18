@@ -3614,3 +3614,64 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
   - som_injector.py 存在
   - api_routes/ 包含 spider_api.py
 - M4 里程碑收口：G0-G7 + C1-C2 + B1 共 12 个 slice 全部完成。
+
+## Slice C3 (M5 契约): output_contract 兜底消除 (done)
+
+- 能力名: output_contract_enforcement（消除 save_run_dataset 中绕过 save_artifact 的 legacy 路径）。
+- 影响层: data_writers/dispatch.py save_run_dataset → save_artifact 统一路由。
+- 改动:
+  - 新增 `_merge_and_dedupe_xlsx` + `_coerce_to_rows`：读已有 xlsx、合并、按 unique_key 去重。
+  - 支持 tooltip 动态 key 和普通列名 key 两种去重。
+  - 删除 `save_to_excel` 回退分支：所有路径经 `save_artifact` → `finalize_file_artifact` → manifest。
+  - L187 `or "files_folder"` 已确认无需改动（非 `or "xlsx"`）。
+- 新增 contract 字段: 无。
+- Tests: tests/test_data_writers_dispatch.py 更新 1 例 + 新增 1 例（dedup 回归）。
+- 验证: 30 passed（dispatch）+ 3850 passed 全量 0 failed。
+
+## Slice T1 (M5 治理): test 文件归位 (done)
+
+- 能力名: test_file_consolidation（visual_web_agent/ 下 10 个 test_*.py 归入 tests/）。
+- 改动:
+  - 删除 7 个 ad-hoc 调试脚本（test_baidu_login / test_focus / test_wrapper_click / test_som / test_som_baidu / test_eval / test_mb）。
+  - 迁移 test_data_manager.py → tests/test_data_manager_alignment.py（修复 import）。
+  - 合并 test_data_sanitizer.py 内容到 tests/test_data_sanitizer.py（+10 个测试）。
+  - 迁移 test_new_modules.py → tests/test_new_modules.py（修复 12 处 bare import + 2 处 Path）。
+- 新增 contract 字段: 无。
+- Tests: 全量从 3766 → 3850（+84 个归位测试），0 failed。
+
+## Slice R1 (M5 注册表): action_registry 元数据 + 派发扩展 (done)
+
+- 能力名: registry_metadata_expansion（VLM 原语元数据注册 + 热循环派发白名单扩展）。
+- 影响层: action_registry.py + main.py `_registry_dispatch_actions`。
+- 改动:
+  - `_registry_dispatch_actions` 新增 `date_pick` / `cascader_pick`（已绑定 handler 但缺白名单）。
+  - 新增 16 个 VLM 原语元数据注册：click_text / type_text / scroll_page / click_point / click_new_tab / press_key / find_text / wait_action / goto_url / switch_tab / close_tab / select_option / done_signal / ask_human / drag_and_drop / save_to_memory。
+  - 仅元数据注册，执行路径不变（仍走 browser.execute_action）。
+- 新增 contract 字段: 无。
+- Tests: 63 passed（registry + router）+ 3850 passed 全量 0 failed。
+
+## Slice R2 (M5 注册表): extract 抽离 main.py (pending, P1)
+
+- 能力名: extract_action_extraction（~800 行 extract 逻辑从 main.py 移入 actions/extract_action.py）。
+- 影响层: main.py ~L12601-13366 → actions/extract_action.py。
+- 计划: 3 步——① 定义 ExtractContext + run_extract 签名; ② 移代码; ③ 接入注册表。
+- 风险: 高（闭包大量局部变量，核心数据路径）。
+- 前置: C3 + R1 已完成。
+
+## Slice C4 (M5 契约): input_contract 落地 (pending, P1)
+
+- 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。
+- 影响层: main.py run 初始化 → io_contract/persistence.py。
+- 前置: C3 已完成。
+
+## Slice X1 (M5 调度): 跨系统 context 切换 (pending, P2)
+
+- 能力名: cross_system_dispatch（按 system_id 切 BrowserSession context / storage_state）。
+- 影响层: workflow_graph cross_system risk_flag → execution_kernel。
+- 前置: C4 已完成。
+
+## Slice G8 (M5 拆分): form_engine 抽离 main.py (pending, P3)
+
+- 能力名: form_engine_extraction（~3500 行 form 引擎从 main.py 移入 phases/ 或独立模块）。
+- 影响层: main.py → form_engine.py / phases/form.py。
+- 前置: R2 已完成。

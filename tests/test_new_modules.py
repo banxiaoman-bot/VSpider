@@ -9,14 +9,11 @@
 """
 
 import asyncio
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
 
 # ─── Loop Detector Tests ────────────────────────────────────────────────────
 
-from loop_detector import (
+from visual_web_agent.loop_detector import (
     ActionLoopDetector,
     LoopDetectorConfig,
     PageFingerprint,
@@ -81,7 +78,7 @@ def test_loop_detector_reset():
 
 # ─── Judge Tests ─────────────────────────────────────────────────────────────
 
-from judge import TaskJudge, JudgeConfig, JudgeResult
+from visual_web_agent.judge import TaskJudge, JudgeConfig, JudgeResult
 
 
 def test_judge_disabled_always_passes():
@@ -123,7 +120,7 @@ def test_judge_result_dataclass():
 
 # ─── A11y Enhancer Tests ────────────────────────────────────────────────────
 
-from a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata
+from visual_web_agent.a11y_enhancer import A11yEnhancer, A11yEnhancerConfig, PageMetadata
 
 
 def test_a11y_enhancer_passthrough_empty():
@@ -182,7 +179,7 @@ def test_a11y_enhancer_disabled_features():
 
 # ─── Message Compaction Tests ────────────────────────────────────────────────
 
-from message_compaction import MessageCompactor, CompactionConfig
+from visual_web_agent.message_compaction import MessageCompactor, CompactionConfig
 
 
 def test_compaction_config_defaults():
@@ -243,7 +240,7 @@ def test_compactor_compact_keeps_recent():
 
 # ─── Failure Classifier Tests ────────────────────────────────────────────────
 
-from failure_classifier import classify_and_log, FailureStats
+from visual_web_agent.failure_classifier import classify_and_log, FailureStats
 
 
 def test_failure_classifier_timeout():
@@ -299,7 +296,7 @@ def test_failure_stats_summary():
 
 # ─── Prompts Templates Tests ─────────────────────────────────────────────────
 
-from prompts_templates import load_template, load_all_templates, list_templates
+from visual_web_agent.prompts_templates import load_template, load_all_templates, list_templates
 
 
 def test_load_system_prompt_template():
@@ -347,7 +344,7 @@ def test_template_cache_works():
 
 def test_prompt_skills_core_prompt_loaded():
     """prompt_skills.CORE_PROMPT 应从模板或 fallback 加载成功。"""
-    from prompt_skills import CORE_PROMPT, JSON_SCHEMA_PROMPT
+    from visual_web_agent.prompt_skills import CORE_PROMPT, JSON_SCHEMA_PROMPT
     assert len(CORE_PROMPT) > 50
     assert "VSpider" in CORE_PROMPT
     assert len(JSON_SCHEMA_PROMPT) > 50
@@ -359,7 +356,7 @@ def test_prompt_skills_core_prompt_loaded():
 import tempfile
 import shutil
 
-from response_cache import (
+from visual_web_agent.response_cache import (
     ResponseCache,
     CacheMode,
     CacheEntry,
@@ -535,7 +532,7 @@ def test_cache_stats_summary_format():
 
 # ─── Element Tracker Tests ──────────────────────────────────────────────────
 
-from element_tracker import (
+from visual_web_agent.element_tracker import (
     ElementTracker,
     ElementSignature,
     RelocateResult,
@@ -748,7 +745,7 @@ def test_vlm_client_tracker_public_api():
     验证最小集成是否成功：构造 VLMClient → track 一个元素 → 在
     重排后的快照里 relocate 应能找回新 SoM ID。
     """
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     client = VLMClient()
     # 默认 ELEMENT_TRACKER_ENABLED=true，应有 tracker 实例
     assert client._element_tracker_enabled
@@ -781,7 +778,7 @@ def test_vlm_client_tracker_public_api():
 
 def test_vlm_client_tracker_disabled_methods_are_noop():
     """当 tracker 开关关闭时，所有 public API 应安全降级为 no-op。"""
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     client = VLMClient()
     # 手动关闭模拟用户配置
     client._element_tracker_enabled = False
@@ -798,7 +795,7 @@ def test_vlm_client_tracker_disabled_methods_are_noop():
 
 def test_vlm_client_named_anchor_section_empty_when_no_tracking():
     """没有任何已追踪元素时，_build_named_anchor_section 应返回空串。"""
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     client = VLMClient()
     section = client._build_named_anchor_section(
         som_elements=[_make_element(som_id=1)], current_step=1,
@@ -808,7 +805,7 @@ def test_vlm_client_named_anchor_section_empty_when_no_tracking():
 
 def test_vlm_client_named_anchor_section_includes_tracked():
     """已追踪元素被重新定位后，应出现在 named anchor 段落里。"""
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     client = VLMClient()
     # track 一个元素
     client.track_element(
@@ -833,7 +830,7 @@ def test_vlm_client_named_anchor_section_includes_tracked():
 
 def test_vlm_client_named_anchor_section_marks_missing_element():
     """当原元素已不存在于新快照时，应被标记为 ✗ 未找到。"""
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     client = VLMClient()
     client.track_element(
         "last_click",
@@ -853,7 +850,7 @@ def test_vlm_client_named_anchor_section_marks_missing_element():
 
 def test_vlm_client_named_anchor_section_disabled_returns_empty():
     """开关关闭时段落应是空串，不引入 prompt 噪音。"""
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     client = VLMClient()
     client.track_element("last_click", _make_element(som_id=1))
     client._element_tracker_enabled = False
@@ -865,7 +862,7 @@ def test_vlm_client_named_anchor_section_disabled_returns_empty():
 
 # ─── Chat Submit Tests ──────────────────────────────────────────────────────
 
-from chat_send_locator import (
+from visual_web_agent.chat_send_locator import (
     find_send_button,
     normalize_point_to_thousand,
     _build_locator_js,
@@ -963,10 +960,9 @@ def test_som_inject_marks_icon_only_buttons():
     20-90px 接近正方形的紧凑形状，即便没有名字也接受
     """
     from pathlib import Path
-    js_path = Path(__file__).parent / "som_inject_v6.js"
+    js_path = Path(__file__).resolve().parents[1] / "visual_web_agent" / "som_inject_v6.js"
     assert js_path.exists(), "som_inject_v6.js 不存在"
     js = js_path.read_text(encoding="utf-8")
-    # ── deriveName 兜底逻辑必须存在 ──
     assert "svg > title" in js, "deriveName 应优先读 SVG <title>"
     assert "innerIcon" in js, "deriveName 应有 innerIcon 兜底分支"
     assert "[icon]" in js, "deriveName 应有 [icon] 通用占位符"
@@ -982,7 +978,7 @@ def test_som_inject_marks_icon_only_buttons():
 def test_som_inject_marks_reply_toolbar_icons():
     """Reply action toolbars use compact SVG-only controls below AI answers."""
     from pathlib import Path
-    js_path = Path(__file__).parent / "som_inject_v6.js"
+    js_path = Path(__file__).resolve().parents[1] / "visual_web_agent" / "som_inject_v6.js"
     js = js_path.read_text(encoding="utf-8")
 
     assert "_isIconToolbarCandidate" in js
@@ -1086,7 +1082,7 @@ def test_find_send_button_handles_non_dict_result():
 
 def test_chat_submit_action_in_schema():
     """chat_submit 必须出现在 VSpiderAction.action 的 Literal 枚举里。"""
-    from vlm_client import VSpiderAction
+    from visual_web_agent.vlm_client import VSpiderAction
     # Pydantic v2 schema 下 Literal 字段的 allowed 值在 model_fields 元数据里
     field = VSpiderAction.model_fields["action"]
     # 拿到 Literal 的全部允许值
@@ -1112,7 +1108,7 @@ def test_chat_submit_action_in_schema():
 
 def test_chat_submit_handler_registered():
     """chat_submit 必须在 ActionRegistry 里有对应 handler。"""
-    from action_registry import build_default_action_registry
+    from visual_web_agent.action_registry import build_default_action_registry
     reg = build_default_action_registry()
     tools = reg.list_tools(include_disabled=False)
     names = [t["name"] if isinstance(t, dict) else getattr(t, "name", str(t)) for t in tools]
@@ -1125,7 +1121,7 @@ def test_vlm_client_replay_short_circuits_llm():
     这验证了 vlm_client.py 中 ask() 顶部插入的 cache.lookup 钩子工作正常。
     构造一个带预置缓存的 VLMClient，调用 ask() 时不会触发任何真实 HTTP 请求。
     """
-    from vlm_client import VLMClient
+    from visual_web_agent.vlm_client import VLMClient
     with tempfile.TemporaryDirectory() as tmp:
         sid = "e2e_session"
         # ── 预置缓存 ──
