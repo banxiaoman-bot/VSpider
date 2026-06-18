@@ -14,6 +14,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+try:  # pragma: no cover - import shim mirrors main.py
+    from ..data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows
+    from ..phases.goal_parser import (
+        _goal_is_tooltip_extract,
+        _normalize_output_field_key,
+        _parse_goal_target_count,
+    )
+except ImportError:  # pragma: no cover
+    from data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows
+    from phases.goal_parser import (
+        _goal_is_tooltip_extract,
+        _normalize_output_field_key,
+        _parse_goal_target_count,
+    )
+import re
+
 
 @dataclass
 class ExtractState:
@@ -60,7 +76,10 @@ class ExtractDeps:
     browser: Any
     logger: Any
     evaluate_rows_with_frame_fallback: Callable[..., Any]
-    normalize_extracted_row_fields: Callable[..., Any]
+    goal: str
+    goal_output_mode: str
+    requested_output_fields: Any
+    data_controller: Any
 
 
 class ExtractRuntime:
@@ -279,7 +298,7 @@ class ExtractRuntime:
             rows = result.get("rows") or []
             source_text = str(result.get("sourceText") or "")
             if isinstance(rows, list) and len(rows) >= 2:
-                rows = self.deps.normalize_extracted_row_fields(rows)
+                rows = self.normalize_extracted_row_fields(rows)
                 self.deps.logger.info(
                     "[EXTRACT DOM] list rows=%s source_chars=%s",
                     len(rows),
@@ -791,3 +810,449 @@ class ExtractRuntime:
             "3) 都没有时才用截图视觉抽取，并在结果中明确告知用户精度受限。"
         )
         return notice
+
+    def sanitize_extraction_candidate(self, 
+        *,
+        name: str,
+        data,
+        source_text: str = "",
+        data_shape: dict | None = None,
+    ) -> dict:
+        target_count = _parse_goal_target_count(self.deps.goal)
+        target_remaining = (
+            None if target_count is None
+            else max(0, target_count - self.state.total_extracted_rows)
+        )
+        raw_data = data
+        if self.deps.requested_output_fields and isinstance(data, list):
+            filtered_rows, schema_stats = self.deps.data_controller.filter_undercomplete_rows(
+                data,
+                normalize_row=lambda row: (
+                    self.normalize_extracted_row_fields([row], project=True)[0]
+                ),
+            )
+            if schema_stats.get("dropped"):
+                self.deps.logger.info(
+                    "[EXTRACT SCHEMA] %s dropped %s under-complete rows "
+                    "(required_hits=%s/%s)",
+                    name,
+                    schema_stats.get("dropped"),
+                    schema_stats.get("required_hits"),
+                    schema_stats.get("total_fields"),
+                )
+            raw_data = filtered_rows
+        trial_seen = set(self.state.seen_extract_row_keys)
+        result = sanitize_extracted_rows(
+            raw_data=raw_data,
+            source_text=source_text,
+            seen_fingerprints=trial_seen,
+            target_remaining=target_remaining,
+        )
+        rows = result.rows
+        completeness = 0.0
+        if rows:
+            widths = []
+            for row in rows:
+                if isinstance(row, dict):
+                    widths.append(
+                        sum(
+                            1
+                            for value in row.values()
+                            if value is not None and str(value).strip()
+                        )
+                    )
+            completeness = (
+                sum(widths) / max(len(widths), 1)
+                if widths else 1.0
+            )
+        shape = data_shape or {}
+        source = name.upper()
+        score = result.accepted * 100.0 + completeness * 5.0
+        score -= result.duplicates * 8.0
+        score -= result.rejected_total * 12.0
+        if "DOM_CARDS" in source:
+            score += 58.0
+            if result.accepted >= 2:
+                score += 12.0
+        elif "DOM_LIST" in source:
+            if int(shape.get("repeated_list_items") or 0) >= result.accepted >= 2:
+                score += 45.0
+            else:
+                score += 25.0
+        elif "DOM_TABLE" in source:
+            if int(shape.get("table_rows") or 0) >= result.accepted >= 2:
+                score += 35.0
+            else:
+                score += 12.0
+        elif "FULL_PAGE" in source or "AX_TREE" in source or "INNER_TEXT" in source:
+            if int(shape.get("repeated_class_count") or 0) >= 5:
+                score += 25.0
+            if result.accepted >= 10:
+                score += 20.0
+        elif "VIEWPORT" in source or "VLM" in source:
+            score += 3.0
+
+        return {
+            "name": name,
+            "rows": rows,
+            "accepted": result.accepted,
+            "duplicates": result.duplicates,
+            "rejected": result.rejected_total,
+            "fingerprints": set(result.fingerprints),
+            "score": score,
+            "source_text": source_text,
+            "data_shape": shape,
+            "data_signature": self.deps.data_controller.rows_signature(rows),
+        }
+
+    def expected_rows_from_data_shape(self, data_shape: dict | None) -> int:
+        """Estimate how many structured rows the current page physically exposes.
+
+        This is a guardrail for dense list/table pages: if the DOM clearly
+        contains ~25 repeated items, a viewport-only 3-row extraction should
+        not be treated as a complete page batch.
+        """
+        shape = data_shape or {}
+        try:
+            table_rows = int(shape.get("table_rows") or 0)
+            table_cells = int(shape.get("table_cells") or 0)
+            repeated = int(shape.get("repeated_class_count") or 0)
+            repeated_avg_text = int(shape.get("repeated_avg_text") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+        expected = 0
+        if table_rows >= 3 and table_cells >= 2:
+            expected = max(expected, table_rows)
+        if repeated >= 5 and repeated_avg_text >= 20:
+            expected = max(expected, repeated)
+        return expected
+
+    def candidate_min_expected_rows(self, candidate: dict) -> int:
+        target_count = _parse_goal_target_count(self.deps.goal)
+        target_remaining = (
+            None if target_count is None
+            else max(0, target_count - self.state.total_extracted_rows)
+        )
+        expected_rows = self.expected_rows_from_data_shape(
+            candidate.get("data_shape") or {}
+        )
+        if expected_rows < 10:
+            return 0
+        # Dense pages should usually be extracted as a page batch, but if
+        # the remaining target is small we only require that many rows.
+        # Use magnitude matching, not strict equality: DOM probes may count
+        # ads, skeleton rows, placeholders, or hidden repeated nodes.
+        page_floor = max(10, int(expected_rows * 0.7))
+        if target_remaining is not None:
+            return min(expected_rows, target_remaining, page_floor)
+        return min(expected_rows, page_floor)
+
+    def is_under_yield_viewport_candidate(self, candidate: dict) -> bool:
+        source = str(candidate.get("name") or "").upper()
+        if "VIEWPORT" not in source and "VLM" not in source:
+            return False
+        shape = candidate.get("data_shape") or {}
+        if bool(shape.get("physically_drained")):
+            return False
+        minimum = self.candidate_min_expected_rows(candidate)
+        if minimum <= 0:
+            return False
+        return int(candidate.get("accepted") or 0) < minimum
+
+    def choose_best_extraction_candidate(self, candidates: list[dict]) -> dict | None:
+        viable = [c for c in candidates if c.get("accepted", 0) > 0]
+        if not viable:
+            return None
+        filtered: list[dict] = []
+        for c in viable:
+            if self.is_under_yield_viewport_candidate(c):
+                self.deps.logger.info(
+                    "[EXTRACT ARBITER] reject under-yield viewport candidate: "
+                    "accepted=%s min_expected=%s shape=%s",
+                    c.get("accepted"),
+                    self.candidate_min_expected_rows(c),
+                    c.get("data_shape"),
+                )
+                continue
+            filtered.append(c)
+        viable = filtered
+        if not viable:
+            return None
+        def _candidate_priority(candidate: dict) -> int:
+            source = str(candidate.get("name") or "").upper()
+            if self.deps.goal_output_mode == "answer":
+                if "VIEWPORT" in source or "VLM" in source:
+                    return 6
+                if "FULL_PAGE" in source or "AX_TREE" in source or "INNER_TEXT" in source:
+                    return 5
+                if "DOM_CARDS" in source:
+                    return 3
+                if "DOM_TABLE" in source:
+                    return 2
+                if "DOM_LIST" in source:
+                    return 1
+                return 0
+            if "DOM_CARDS" in source:
+                return 5
+            if "DOM_LIST" in source:
+                return 4
+            if "DOM_TABLE" in source:
+                return 3
+            if "FULL_PAGE" in source or "LIST_ITEMS_TEXT" in source:
+                return 2
+            if "VIEWPORT" in source or "VLM" in source:
+                return 1
+            return 0
+
+        if self.deps.goal_output_mode == "answer":
+            viable.sort(
+                key=lambda c: (
+                    _candidate_priority(c),
+                    float(c.get("score") or 0),
+                    -int(c.get("accepted") or 0),
+                ),
+                reverse=True,
+            )
+        else:
+            viable.sort(
+                key=lambda c: (
+                    float(c.get("score") or 0),
+                    int(c.get("accepted") or 0),
+                    _candidate_priority(c),
+                ),
+                reverse=True,
+            )
+        chosen = viable[0]
+        self.deps.logger.info(
+            "[EXTRACT ARBITER] candidates=%s | selected=%s score=%.1f accepted=%s",
+            "; ".join(
+                f"{c.get('name')}:score={float(c.get('score') or 0):.1f},"
+                f"accepted={c.get('accepted')},dup={c.get('duplicates')},rej={c.get('rejected')}"
+                for c in candidates
+            ),
+            chosen.get("name"),
+            float(chosen.get("score") or 0),
+            chosen.get("accepted"),
+        )
+        return chosen
+
+    def commit_extraction_candidate(self, candidate: dict) -> tuple[list, int, int, int, str]:
+        self.state.seen_extract_row_keys.update(candidate.get("fingerprints") or set())
+        return (
+            candidate.get("rows") or [],
+            int(candidate.get("accepted") or 0),
+            int(candidate.get("duplicates") or 0),
+            int(candidate.get("rejected") or 0),
+            str(candidate.get("source_text") or ""),
+        )
+
+    def record_extract_progress(self, rows, accepted_count: int) -> tuple[int, int]:
+        if not _goal_is_tooltip_extract(self.deps.goal):
+            self.state.total_extracted_rows += accepted_count
+            return accepted_count, self.state.total_extracted_rows
+
+        new_triggers = 0
+        for row in rows or []:
+            if isinstance(row, dict):
+                trigger_key = extract_tooltip_primary_key(row)
+            else:
+                trigger_key = str(row).strip()
+            if trigger_key and trigger_key not in self.state.tooltip_trigger_keys:
+                self.state.tooltip_trigger_keys.add(trigger_key)
+                new_triggers += 1
+        self.state.total_extracted_rows = len(self.state.tooltip_trigger_keys)
+        return new_triggers, self.state.total_extracted_rows
+
+    def field_aliases(self, field: str) -> set[str]:
+        norm = _normalize_output_field_key(field)
+        aliases = {norm} if norm else set()
+        alias_map = {
+            "url": {"url", "link", "href", "primaryurl", "sourceurl", "detailurl", "网址", "链接"},
+            "link": {"url", "link", "href", "primaryurl", "sourceurl", "detailurl", "网址", "链接"},
+            "href": {"url", "link", "href"},
+            "title": {"title", "name", "heading", "subject", "标题", "名称", "名字"},
+            "标题": {"title", "name", "heading", "subject", "标题", "名称", "名字"},
+            "name": {"name", "title", "名称", "姓名", "名字"},
+            "名称": {"name", "title", "名称", "姓名", "名字"},
+            "position": {"position", "职位", "职务", "岗位"},
+            "office": {"office", "location", "city", "地区", "地点", "办公室"},
+            "age": {"age", "年龄"},
+            "time": {"time", "date", "age", "created", "published", "时间", "日期"},
+            "author": {"author", "user", "username", "by", "作者", "用户"},
+            "rating": {"rating", "score", "评分", "分数", "星级"},
+            "score": {"rating", "score", "评分", "分数", "星级"},
+            "评分": {"rating", "score", "评分", "分数", "星级"},
+            "points": {"points", "score", "votes", "积分", "分数", "点赞"},
+            "comments": {"comments", "commentcount", "reviewcount", "评论", "评论数"},
+            "reviewcount": {"comments", "commentcount", "reviewcount", "评论", "评论数"},
+            "reviews": {"reviews", "reviewcount", "votes", "评价人数", "评价数", "评论数"},
+            "评价人数": {"reviews", "reviewcount", "votes", "评价人数", "评价数", "评论数"},
+            "summary": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+            "description": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+            "intro": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+            "一句话简介": {"summary", "description", "intro", "简介", "摘要", "一句话简介"},
+        }
+        for key, values in alias_map.items():
+            if norm == key or norm in values:
+                aliases.update(values)
+        return aliases
+
+    def requested_field_coverage(self, row: dict) -> tuple[int, int]:
+        if not self.deps.requested_output_fields or not isinstance(row, dict):
+            return 0, 0
+        normalized_keys = {
+            key: _normalize_output_field_key(key)
+            for key in row.keys()
+            if row.get(key) is not None and str(row.get(key)).strip()
+        }
+        hit = 0
+        total = 0
+        for field in self.deps.requested_output_fields:
+            aliases = self.field_aliases(field)
+            if not aliases:
+                continue
+            total += 1
+            for norm_key in normalized_keys.values():
+                if (
+                    norm_key in aliases
+                    or any(alias and alias in norm_key for alias in aliases)
+                    or any(alias and norm_key in alias for alias in aliases)
+                ):
+                    hit += 1
+                    break
+        return hit, total
+
+    def project_row_to_requested_fields(self, row: dict) -> dict:
+        if not self.deps.requested_output_fields or not isinstance(row, dict):
+            return row
+
+        normalized_keys = {
+            key: _normalize_output_field_key(key)
+            for key in row.keys()
+        }
+        column_keys = sorted(
+            [
+                key for key, norm in normalized_keys.items()
+                if re.fullmatch(r"column\d+", norm or "")
+            ],
+            key=lambda key: int(re.search(r"\d+", normalized_keys[key]).group(0)),
+        )
+        requested = [
+            field for field in self.deps.requested_output_fields
+            if _normalize_output_field_key(field)
+        ]
+        if not requested:
+            return row
+
+        if (
+            column_keys
+            and len(column_keys) >= len(requested)
+            and len(column_keys) >= max(2, len(row) - 1)
+        ):
+            return {
+                field: row.get(key)
+                for field, key in zip(requested, column_keys)
+            }
+
+        projected = {}
+        used_keys: set[str] = set()
+        for field in requested:
+            aliases = self.field_aliases(field)
+            best_key = None
+            best_score = 0
+            for key, norm_key in normalized_keys.items():
+                if key in used_keys or not norm_key:
+                    continue
+                score = 0
+                if norm_key in aliases:
+                    score = 100
+                elif any(alias and alias in norm_key for alias in aliases):
+                    score = 80
+                elif any(alias and norm_key in alias for alias in aliases):
+                    score = 70
+                if score > best_score:
+                    best_key = key
+                    best_score = score
+            if best_key is not None:
+                projected[field] = row.get(best_key)
+                used_keys.add(best_key)
+
+        if not projected and column_keys:
+            return {
+                field: row.get(key)
+                for field, key in zip(requested, column_keys)
+            }
+
+        return projected or row
+
+    def normalize_extracted_row_fields(self, rows: list, *, project: bool = True) -> list:
+        """Stabilize common forum/list fields before saving."""
+        out: list = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                out.append(row)
+                continue
+            normalized = dict(row)
+            if "time" not in normalized and normalized.get("age"):
+                normalized["time"] = normalized.get("age")
+            normalized.pop("age", None)
+
+            for key in ("points", "score", "votes", "review_count", "comments", "comment_count"):
+                if key in normalized and normalized.get(key) is not None:
+                    normalized[key] = self.first_int_value(normalized.get(key))
+
+            if "review_count" not in normalized and "comments" in normalized:
+                normalized["review_count"] = normalized.get("comments")
+            normalized.pop("comments", None)
+
+            for legacy_key in ("story_url", "discussion_url"):
+                if legacy_key in normalized and "source_url" not in normalized and "detail_url" not in normalized:
+                    role = "detail" if legacy_key == "discussion_url" else "source"
+                    normalized[f"{role}_url"] = normalized.get(legacy_key)
+                normalized.pop(legacy_key, None)
+
+            for url_key in ("primary_url", "source_url", "detail_url", "url", "link", "href"):
+                raw_url = normalized.get(url_key)
+                if not (raw_url and self.is_probable_url(raw_url)):
+                    continue
+                role = self.classify_url_role(raw_url)
+                if role == "detail":
+                    normalized.setdefault("detail_url", raw_url)
+                else:
+                    normalized.setdefault("source_url", raw_url)
+            if normalized.get("source_url"):
+                normalized["primary_url"] = normalized.get("source_url")
+            elif normalized.get("detail_url"):
+                normalized["primary_url"] = normalized.get("detail_url")
+            if normalized.get("primary_url"):
+                normalized["url"] = normalized.get("primary_url")
+            if project:
+                normalized = self.project_row_to_requested_fields(normalized)
+            out.append(normalized)
+        return out
+
+    def first_int_value(self, value: object) -> int | object:
+        text = str(value or "").strip()
+        match = re.search(r"\d[\d,]*", text)
+        if not match:
+            return value
+        try:
+            return int(match.group(0).replace(",", ""))
+        except ValueError:
+            return value
+
+    def classify_url_role(self, value: object) -> str:
+        """Classify a URL into a generic extraction role."""
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        if "news.ycombinator.com/item" in text:
+            return "detail"
+        if re.search(r"/(item|story|post|posts|article|articles|thread|threads|comment|comments|detail|details|product|products|issues?)(/|\\?|#|$)", text):
+            return "detail"
+        return "source"
+
+    def is_probable_url(self, value: object) -> bool:
+        text = str(value or "").strip()
+        return bool(re.match(r"^https?://", text, flags=re.IGNORECASE))

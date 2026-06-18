@@ -98,14 +98,26 @@ class _StubBrowser:
         return self._page
 
 
-def _mk_runtime(*, browser=None, eval_fb=None, normalize=None):
+def _mk_runtime(
+    *,
+    browser=None,
+    eval_fb=None,
+    goal="抓 10 条",
+    goal_output_mode="dataset",
+    requested_output_fields=None,
+    data_controller=None,
+    state=None,
+):
     deps = ExtractDeps(
         browser=browser if browser is not None else _StubBrowser(_StubFrame()),
         logger=logging.getLogger("test-extract-runtime"),
         evaluate_rows_with_frame_fallback=eval_fb or _async_none,
-        normalize_extracted_row_fields=normalize or (lambda rows, **_k: rows),
+        goal=goal,
+        goal_output_mode=goal_output_mode,
+        requested_output_fields=[] if requested_output_fields is None else requested_output_fields,
+        data_controller=data_controller,
     )
-    return ExtractRuntime(deps, ExtractState())
+    return ExtractRuntime(deps, state if state is not None else ExtractState())
 
 
 def test_extract_runtime_holds_deps_and_state():
@@ -114,7 +126,10 @@ def test_extract_runtime_holds_deps_and_state():
         browser=None,
         logger=logging.getLogger("t"),
         evaluate_rows_with_frame_fallback=_async_none,
-        normalize_extracted_row_fields=lambda rows, **_k: rows,
+        goal="g",
+        goal_output_mode="dataset",
+        requested_output_fields=[],
+        data_controller=None,
     )
     rt = ExtractRuntime(deps, state)
     assert rt.deps is deps
@@ -128,18 +143,15 @@ def test_extract_list_rows_via_dom_returns_rows_and_source():
             "sourceText": "src-text",
         }
 
-    seen = {}
-
-    def fake_norm(rows, *, project=True):
-        seen["rows"] = rows
-        return rows
-
-    rt = _mk_runtime(eval_fb=fake_eval, normalize=fake_norm)
+    # normalize_extracted_row_fields is now a real method; with no
+    # requested fields it passes rows through unchanged (relative urls
+    # are not probable, so no rewriting).
+    rt = _mk_runtime(eval_fb=fake_eval)
     rows, source = asyncio.run(rt.extract_list_rows_via_dom("t"))
     assert len(rows) == 2
     assert rows[0]["title"] == "A"
+    assert rows[1]["url"] == "/b"
     assert source == "src-text"
-    assert seen["rows"][1]["url"] == "/b"
 
 
 def test_extract_list_rows_via_dom_empty_on_non_dict():
@@ -223,3 +235,132 @@ def test_detect_canvas_grid_not_found_returns_empty():
     rt = _mk_runtime(browser=_StubBrowser(frame))
     notice = asyncio.run(rt.detect_canvas_grid("t"))
     assert notice == {}
+
+
+# ── S1c: ExtractRuntime arbiter + normalizer methods ────────────────────
+
+
+class _StubDataController:
+    """Minimal PageDataController stand-in for sanitize_extraction_candidate."""
+
+    def __init__(self):
+        self.signature = "sig"
+
+    def filter_undercomplete_rows(self, data, normalize_row=None):
+        return data, {"dropped": 0, "required_hits": 0, "total_fields": 0}
+
+    def rows_signature(self, rows):
+        return self.signature
+
+
+def test_field_aliases_expands_synonyms():
+    rt = _mk_runtime()
+    url_aliases = rt.field_aliases("url")
+    assert "link" in url_aliases and "href" in url_aliases
+    assert "name" in rt.field_aliases("title")
+
+
+def test_first_int_value_parses_or_passes_through():
+    rt = _mk_runtime()
+    assert rt.first_int_value("1,234 points") == 1234
+    assert rt.first_int_value("no-digits") == "no-digits"
+
+
+def test_classify_url_role_detail_vs_source():
+    rt = _mk_runtime()
+    assert rt.classify_url_role("https://x.com/item/9") == "detail"
+    assert rt.classify_url_role("https://x.com/list") == "source"
+    assert rt.classify_url_role("") == ""
+
+
+def test_is_probable_url_scheme_only():
+    rt = _mk_runtime()
+    assert rt.is_probable_url("https://a.com") is True
+    assert rt.is_probable_url("HTTP://a.com") is True
+    assert rt.is_probable_url("/relative") is False
+
+
+def test_project_row_keeps_requested_fields_only():
+    rt = _mk_runtime(requested_output_fields=["title", "url"])
+    row = {"title": "T", "url": "https://e.com/x", "junk": "drop me"}
+    projected = rt.project_row_to_requested_fields(row)
+    assert set(projected.keys()) == {"title", "url"}
+    assert projected["title"] == "T"
+
+
+def test_requested_field_coverage_counts_hits():
+    rt = _mk_runtime(requested_output_fields=["title", "url"])
+    hit, total = rt.requested_field_coverage({"title": "T", "url": "https://e.com/x"})
+    assert total == 2
+    assert hit == 2
+
+
+def test_normalize_maps_age_to_time_and_ints_points():
+    rt = _mk_runtime(requested_output_fields=[])
+    out = rt.normalize_extracted_row_fields(
+        [{"title": "T", "age": "3 hours ago", "points": "1,234"}], project=False
+    )
+    assert out[0]["time"] == "3 hours ago"
+    assert "age" not in out[0]
+    assert out[0]["points"] == 1234
+
+
+def test_expected_rows_from_data_shape_dense_table():
+    rt = _mk_runtime()
+    assert rt.expected_rows_from_data_shape({"table_rows": 25, "table_cells": 5}) == 25
+    assert rt.expected_rows_from_data_shape({}) == 0
+
+
+def test_record_extract_progress_dataset_increments_state():
+    state = ExtractState()
+    rt = _mk_runtime(state=state)
+    new_rows, total = rt.record_extract_progress([{"a": 1}], 5)
+    assert new_rows == 5
+    assert total == 5
+    assert state.total_extracted_rows == 5
+
+
+def test_commit_extraction_candidate_updates_seen_keys():
+    state = ExtractState()
+    rt = _mk_runtime(state=state)
+    rows, accepted, dups, rejected, src = rt.commit_extraction_candidate(
+        {
+            "rows": [{"a": 1}],
+            "accepted": 1,
+            "duplicates": 0,
+            "rejected": 0,
+            "source_text": "s",
+            "fingerprints": {"fp1"},
+        }
+    )
+    assert accepted == 1
+    assert rows == [{"a": 1}]
+    assert "fp1" in state.seen_extract_row_keys
+
+
+def test_choose_best_extraction_candidate_dataset_picks_highest_score():
+    rt = _mk_runtime(goal_output_mode="dataset")
+    low = {"name": "DOM_TABLE", "accepted": 2, "score": 10.0, "data_shape": {}}
+    high = {"name": "DOM_CARDS", "accepted": 5, "score": 99.0, "data_shape": {}}
+    assert rt.choose_best_extraction_candidate([low, high]) is high
+
+
+def test_choose_best_extraction_candidate_none_when_no_accepted():
+    rt = _mk_runtime()
+    assert rt.choose_best_extraction_candidate([{"name": "X", "accepted": 0}]) is None
+
+
+def test_sanitize_extraction_candidate_returns_scored_candidate():
+    rt = _mk_runtime(requested_output_fields=[], data_controller=_StubDataController())
+    candidate = rt.sanitize_extraction_candidate(
+        name="dom_cards",
+        data=[
+            {"title": "Item one", "url": "https://e.com/1"},
+            {"title": "Item two", "url": "https://e.com/2"},
+        ],
+        source_text="src",
+    )
+    assert candidate["name"] == "dom_cards"
+    assert isinstance(candidate["score"], float)
+    assert candidate["data_signature"] == "sig"
+    assert "rows" in candidate
