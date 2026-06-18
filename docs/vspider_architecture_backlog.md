@@ -3814,3 +3814,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 删后全文 grep 34 死名 0 残留；活邻符号（finalAnswerText/Expanded/Status、timelineAutoScroll/timelinePanelRef、authProfileOptions 等）存活；ReadLints clean；npm run build 绿（1688 模块，index js **188.02→185.54kB**，-2.48kB）；vitest 69 passed 不变。
 - App.vue 行数: 2915 → **2593 行**（-322）。本会话累计 ~4150 → 2593（-1557）。
 - 风险: 低（迭代分析 + count==1 全文双重确认无活引用；仅删 script 死块，template/style 零触碰；build+vitest+lint 三绿）。
+
+## Slice D-UI-8 (M4 简便 + M1 准确): capability-trace 派生层抽离 + 修复跨组件 ReferenceError (done, P2)
+
+- 能力名: capability_trace_extraction（route/execute 事件 → intent/plan/rows/summary/health 等 44 个派生 computed 抽成 useCapabilityTrace）+ phase_preview_format 共享化。
+- 影响层: 新增 composables/useCapabilityTrace.js（`useCapabilityTrace(phaseEvents)` 返回 44 computed + 过滤态 capabilityTraceFilter/SearchQuery + 内含 buildPhaseEventJsonString 纯助手）；新增 composables/phasePreviewFormat.js（formatPhasePreviewSeverity/Ts 共享纯函数）；App.vue 改用 destructure 接线、删除 capabilityTraceUtils 死 import；FailedRunsPane.vue 改从 phasePreviewFormat 导入（去重）。
+- 抽离方法: 脚本依已验证精确行跨度**逐字提取** 601-746 + 834-1130 + 1168-1189（跳过 browserRuntime* 活代码），零转写；composable 保持原定义顺序（computed 惰性求值，引用关系不变）。
+- 顺带修复既有 bug: capabilityTraceRows 自 HEAD 起即引用「从未在 App.vue 定义」的 formatPhasePreviewSeverity/Ts（仅 FailedRunsPane 有定义），命中即 ReferenceError。抽离后由 TDD 冒烟测试暴露 → 抽 phasePreviewFormat 共享 util 修复。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useCapabilityTrace.test.js 9 例（选取/intent/rows/summary/filter/反应性 + 全 46 返回值「求值不抛错」冒烟，含空事件）；vitest 78 passed（8 文件）；npm run build 绿（1690 模块）。
+- App.vue 行数: 2593 → **2146 行**（-447）。本会话累计 ~4150 → 2146（约 -48%）。
+- 风险: 低-中（44 computed 逐字平移 + 依赖分析 + 冒烟测试穷举求值确认无悬空引用；跨组件 bug 一并闭合）。

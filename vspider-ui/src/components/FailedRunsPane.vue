@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { API_BASE, apiFetch } from '../api/client.js'
+import { formatPhasePreviewSeverity, formatPhasePreviewTs } from '../composables/phasePreviewFormat.js'
 
 const failedRunsList = ref([])
 const failedRunsLoading = ref(false)
@@ -123,17 +124,6 @@ const copyFailedRunJson = async () => {
   const ok = await _writeToClipboard(selectedFailedRunJson.value)
   if (ok) ElMessage.success('已复制 JSON')
   else ElMessage.error('复制失败：浏览器拒绝了剪贴板写入')
-}
-
-const formatPhasePreviewSeverity = (sev) => {
-  const s = String(sev || 'info').toLowerCase()
-  if (s === 'warn' || s === 'warning') return 'warn'
-  if (s === 'error' || s === 'err') return 'error'
-  return 'info'
-}
-const formatPhasePreviewTs = (ts) => {
-  if (!Number.isFinite(ts)) return ''
-  try { const d = new Date(ts * 1000); const pad = (n) => String(n).padStart(2, '0'); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` } catch (_) { return '' }
 }
 
 defineExpose({ fetchFailedRuns, failedRunsList, goToPrevFailedRun, goToNextFailedRun, failedRunDialogVisible })
