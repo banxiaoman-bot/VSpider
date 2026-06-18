@@ -963,5 +963,16 @@ def build_default_action_registry() -> ActionRegistry:
         changes_state=False,
         risk="low",
     ))
+    register(ActionTool(
+        name="open_top_search_result",
+        capability="navigation",
+        description="On a search-results page, deterministically open the first non-ad organic result and navigate to it (ads / sponsored / paid-click redirects / same-engine internal links excluded, with a landing-page second pass + candidate rotation). Set target_id=2..5 to also surface the top-N clean results for browsing (capped, still one navigation).",
+        actions=("open_top_search_result",),
+        aliases=("打开搜索结果", "打开第一个结果", "搜索并打开", "open top result", "open first result"),
+        tags=("search", "navigation"),
+        evidence=("result_url", "result_title", "ads_skipped", "results_count"),
+        deterministic=True,
+        risk="low",
+    ))
 
     return registry

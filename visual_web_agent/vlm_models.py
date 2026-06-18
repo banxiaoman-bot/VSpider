@@ -210,6 +210,7 @@ class VSpiderAction(BaseModel):
         "vscroll_capture", # 虚拟列表一键全量采集：交替收行+推进容器滚动并按行文本去重直到触底；type_value=可选行数上限，落 dataset_rows jsonl + 写回 memory
         "html_snapshot",  # 整页 HTML 快照落盘并登记 manifest：type_value=可选文件名；路径写回 memory
         "screenshot",     # 截图落盘并登记 manifest：type_value="full" 整页截图，缺省视口；路径写回 memory
+        "open_top_search_result", # 搜索结果页：确定性打开首个非广告有机结果并导航（落地二次广告校验 + 候选轮替）
     ] = Field(..., description="要执行的动作类型")
     target_id: int = Field(
         default=0,

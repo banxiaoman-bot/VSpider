@@ -67,6 +67,10 @@ try:
     from .. import snapshot_actions as _snapshot_actions  # noqa: F401
 except ImportError:
     import snapshot_actions as _snapshot_actions  # type: ignore  # noqa: F401
+try:
+    from .. import search_nav_action as _search_nav_action  # noqa: F401
+except ImportError:
+    import search_nav_action as _search_nav_action  # type: ignore  # noqa: F401
 
 __all__ = [
     "ActionContext", "ActionHandler", "ActionRegistry", "UnknownActionError", "ActionExecutionError",

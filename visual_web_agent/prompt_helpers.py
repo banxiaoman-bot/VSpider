@@ -16,7 +16,7 @@ __all__ = [
     "_LOGIN_KEYWORDS", "_LOGIN_TRIGGERS", "_MEMORY_TRIGGERS",
     "_MULTI_TAB_KEYWORDS", "_MULTI_TAB_TRIGGERS", "_PAGE_TO_MARKDOWN_TRIGGERS",
     "_PROMPT_INTRO", "_RELATIVE_DATE_TRIGGERS", "_RESUME_RUN_TRIGGERS",
-    "_ROW_ACTION_TRIGGERS", "_SEMANTIC_TRIGGERS", "_SNAPSHOT_TRIGGERS",
+    "_ROW_ACTION_TRIGGERS", "_SEARCH_NAV_TRIGGERS", "_SEMANTIC_TRIGGERS", "_SNAPSHOT_TRIGGERS",
     "_STEPPER_TRIGGERS", "_TOOLTIP_TRIGGERS", "_TREE_KEYWORDS", "_TREE_TRIGGERS",
     "_UPLOAD_KEYWORDS", "_URL_RE", "_VSCROLL_CAPTURE_TRIGGERS",
     "_looks_like_bulk_extract", "_looks_like_login_surface", "_resolver_matches",
@@ -375,6 +375,14 @@ _RESUME_RUN_TRIGGERS = (
     "续跑", "断点续跑", "断点续传", "接着上次", "继续上次", "上次没做完", "上次没完成",
     "接着之前", "继续之前", "resume", "resume run", "continue last", "continue previous",
     "pick up where", "left off",
+)
+_SEARCH_NAV_TRIGGERS = (
+    "搜索并打开", "搜索后打开", "先搜索", "打开第一个结果", "打开搜索结果",
+    "第一个结果", "首个结果", "最相关的结果", "用搜索引擎",
+    "search and open", "open the first result", "open the top result",
+    "first result", "top result", "search result", "search results",
+    "/search?q", "bing.com/search", "google.com/search", "baidu.com/s?",
+    "so.com/s", "sogou.com/web",
 )
 
 

@@ -3675,3 +3675,11 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 能力名: form_engine_extraction（~3500 行 form 引擎从 main.py 移入 phases/ 或独立模块）。
 - 影响层: main.py → form_engine.py / phases/form.py。
 - 前置: R2 已完成。
+
+## Slice SEARCH-NAV (M4 通用): 搜索优先 + 落地去广告导航 (done, P1)
+
+- 能力名: open_top_search_result（无 URL 落到 SERP 时，确定性打开首个非广告有机结果并导航）。
+- 影响层: search_result_guards.py（top-N 探针 + is_ad_redirect_url + open_top_organic_result）→ search_nav_action.py（handler）→ action_registry / capability_router / prompt_skills / prompt_helpers / prompts / vlm_models。
+- 关键设计: 复用既有有机结果挑选器（adRe 广告过滤 + 排 nav/侧栏/搜索引擎自链）；新增落地二次校验（doubleclick / gclid / aclk 等）+ 候选轮替。
+- 回归: tests/test_search_nav_action.py（stub-frame：广告 href 跳过 / 落地广告跳转跳过 / 同搜索域跳过 / 全广告失败 / 无候选）。
+- 风险: 低（新增能力，未改既有动作语义；guard 触发条件未放宽）。

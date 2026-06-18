@@ -60,6 +60,57 @@ def is_ad_like_text(text: str | None) -> bool:
     return bool(_AD_TEXT_RE.search(snippet))
 
 
+# Ad-redirect / paid-click URL signatures for the landing-page second pass. A
+# result that looked organic in-page but whose href (or final landing URL)
+# matches these is a sponsored / tracking redirect, not an organic destination
+# -- open_top_organic_result drops it and rotates to the next candidate.
+_AD_REDIRECT_HOST_RE = re.compile(
+    r"(doubleclick\.net|googleadservices\.com|googlesyndication\.com|"
+    r"adservice\.|adnxs\.com|adsystem\.|2mdn\.net|adform\.net|"
+    r"taboola\.com|outbrain\.com|criteo\.com|zedo\.com)",
+    re.I,
+)
+_AD_REDIRECT_PATH_RE = re.compile(
+    r"/(aclk|aclick|pagead|adclick|adserver|adservice)(/|$|\?|=)", re.I
+)
+_AD_REDIRECT_PARAM_RE = re.compile(
+    r"(?:^|[?&])(adurl|gclid|msclkid|dclid|gclsrc|wbraid|gbraid|fbclid)=", re.I
+)
+_AD_REDIRECT_CPC_RE = re.compile(
+    r"(?:^|[?&])utm_(?:medium|source)=(?:cpc|ppc|ads?|sponsored|paid)", re.I
+)
+
+
+def is_ad_redirect_url(url: str | None) -> bool:
+    """Heuristic: is this URL a sponsored / paid-click / tracking redirect?
+
+    Inspects host (ad networks), path (``/aclk``, ``/aclick``, ``/pagead`` ...)
+    and query (``gclid`` / ``msclkid`` / ``adurl`` / ``utm_medium=cpc`` ...).
+    Used by :func:`open_top_organic_result` as a landing-page second pass so a
+    candidate that *looked* organic in-page but resolves to an ad redirect is
+    dropped and the next candidate is tried. Empty / falsy input -> False.
+    """
+    if not url:
+        return False
+    text = str(url).strip()
+    if not text:
+        return False
+    try:
+        parsed = urlparse(text)
+        host = parsed.netloc.split("@")[-1].split(":")[0].lower()
+        path = parsed.path or ""
+        query = parsed.query or ""
+    except Exception:
+        host, path, query = "", "", text
+    if host and _AD_REDIRECT_HOST_RE.search(host):
+        return True
+    if _AD_REDIRECT_PATH_RE.search(path):
+        return True
+    if _AD_REDIRECT_PARAM_RE.search(query) or _AD_REDIRECT_CPC_RE.search(query):
+        return True
+    return False
+
+
 _SEARCH_PARAM_NAMES = ("q", "query", "wd", "word", "keyword", "text", "p")
 _TAB_META_ACTIONS = {"switch_tab", "close_tab", "done", "ask_human", "error"}
 
@@ -127,7 +178,7 @@ def _has_non_current_open_tab(browser: Any) -> bool:
     return any(p is not page for p in pages)
 
 
-def _probe_script(expected_query: str) -> str:
+def _probe_script(expected_query: str, limit: int = 1) -> str:
     # The script is generated with a literal query to keep the Playwright call
     # compatible with the simple fake frames used in unit tests.
     query_json = json.dumps(expected_query or "", ensure_ascii=False)
@@ -199,7 +250,7 @@ def _probe_script(expected_query: str) -> str:
         }});
     }}
     candidates.sort((a, b) => b.score - a.score || a.top - b.top || a.left - b.left);
-    return candidates[0] || null;
+    const _limit = {max(1, int(limit or 1))}; if (_limit <= 1) return candidates[0] || null; return candidates.slice(0, _limit);
 }}
 """
 
@@ -219,6 +270,136 @@ async def _probe_first_organic_result(browser: Any, expected_query: str) -> dict
         if isinstance(result, dict):
             return result
     return None
+
+
+def _host(url: str) -> str:
+    try:
+        return urlparse(url or "").netloc.split("@")[-1].split(":")[0].strip().lower()
+    except Exception:
+        return ""
+
+
+async def _probe_organic_results(
+    browser: Any, expected_query: str, *, limit: int = 6
+) -> list[dict[str, Any]]:
+    """Return up to ``limit`` ranked organic (ad-filtered) result candidates."""
+    page = await browser._ensure_active_page(reason="search result guard")
+    if not page:
+        return []
+    script = _probe_script(expected_query, max(1, int(limit or 1)))
+    for frame in getattr(page, "frames", []) or [getattr(page, "main_frame", None)]:
+        if frame is None:
+            continue
+        try:
+            result = await frame.evaluate(script)
+        except Exception:
+            continue
+        if isinstance(result, list) and result:
+            return [r for r in result if isinstance(r, dict)]
+        if isinstance(result, dict):
+            return [result]
+    return []
+
+
+_MAX_BROWSE = 5  # hard cap on how many top results to surface (avoid "clicking too many")
+
+
+async def open_top_organic_result(
+    browser: Any,
+    *,
+    query: str,
+    max_candidates: int = 6,
+    want: int = 1,
+) -> dict[str, Any] | None:
+    """Deterministically open the first non-ad organic result and navigate to it.
+
+    Probes the current search-results page for ranked organic candidates (ads /
+    nav / sidebars / same-engine internal links already excluded in-page), then
+    walks them in order: navigate to each candidate and run a landing-page second
+    pass (:func:`is_ad_redirect_url` + same-search-host check). The first
+    candidate that resolves to a real, non-ad destination wins; the rest are
+    recorded as ``skipped``. Returns a result dict (``url`` empty + ``failed``
+    True when every candidate was an ad / dead end), or ``None`` when the page
+    had no organic candidates at all. ``want`` (capped at ``_MAX_BROWSE``)
+    also surfaces the top-N clean results in ``results`` for browsing without
+    extra navigation. ``browser`` is duck-typed
+    (``_ensure_active_page`` / ``current_url`` / ``page.goto`` /
+    ``_wait_for_page_stable``) so this stays unit-testable with stub frames.
+    """
+    q = (query or "").strip()
+    candidates = await _probe_organic_results(browser, q, limit=max_candidates)
+    if not candidates:
+        return None
+    want = max(1, min(int(want or 1), _MAX_BROWSE))
+    results: list[dict[str, Any]] = []
+    for _cand in candidates:
+        _href = str(_cand.get("href") or "").strip()
+        if not _href or is_ad_redirect_url(_href):
+            continue
+        results.append({
+            "rank": len(results) + 1,
+            "title": str(_cand.get("text") or "").strip(),
+            "url": _href,
+        })
+        if len(results) >= want:
+            break
+    page = await browser._ensure_active_page(reason="open top organic result")
+    if not page:
+        return None
+    search_host = _host(str(getattr(browser, "current_url", "") or ""))
+    tried: list[dict[str, Any]] = []
+    for cand in candidates:
+        href = str(cand.get("href") or "").strip()
+        title = str(cand.get("text") or "").strip()
+        if not href:
+            continue
+        if is_ad_redirect_url(href):
+            tried.append({"href": href, "title": title, "skipped": "ad_redirect_href"})
+            continue
+        try:
+            await page.goto(href, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await browser._wait_for_page_stable()
+            except Exception:
+                pass
+        except Exception as exc:
+            tried.append({"href": href, "title": title, "skipped": f"nav_error:{exc}"[:120]})
+            continue
+        landing = str(getattr(browser, "current_url", "") or "").strip() or href
+        landing_host = _host(landing)
+        if (
+            is_ad_redirect_url(landing)
+            or not landing_host
+            or (search_host and landing_host == search_host)
+        ):
+            tried.append(
+                {"href": href, "title": title, "landing": landing, "skipped": "ad_or_search_host"}
+            )
+            continue
+        logger.info(
+            "[SEARCH NAV] opened first clean organic result: %s (%s) after %d skip(s)",
+            landing, title[:60], len(tried),
+        )
+        return {
+            "url": landing,
+            "href": href,
+            "title": title,
+            "query": q,
+            "candidates": len(candidates),
+            "skipped": tried,
+            "results": results,
+        }
+    logger.info("[SEARCH NAV] all %d organic candidates were ads / dead ends", len(candidates))
+    return {
+        "url": "",
+        "href": "",
+        "title": "",
+        "query": q,
+        "candidates": len(candidates),
+        "skipped": tried,
+        "results": results,
+        "failed": True,
+    }
 
 
 async def apply_search_result_open_guard(

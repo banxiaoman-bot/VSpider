@@ -1219,11 +1219,39 @@ RESUME_RUN_SKILL = """
 """.strip()
 
 
+SEARCH_NAV_SKILL = """
+## Skill: 搜索结果页 → 确定性打开首个非广告结果（open_top_search_result）
+适用：
+- goal 没给网址、系统已自动落到搜索引擎结果页（Bing / Google / 百度 等）；
+- 或 goal 明说"搜索 X 后打开第一个 / 最相关的结果"。
+
+🎯 标准动作：当你处在搜索结果页（URL 含 ?q= / ?wd= / /search 等），**不要**用视觉去猜哪个链接是结果，直接调用：
+{"action":"open_top_search_result","target_id":<想浏览的结果条数:0/1=直接进首个,2~5=多挑几个>,"type_value":"<搜索关键词，可留空让系统从 URL ?q= 读取>","memory_key":"search_top_result", ...}
+
+📌 灵活条数（target_id 当条数用，硬上限 5）：
+- target_id 留 0 或 1 → 只进第一个干净结果（1 次导航）。
+- target_id = 2~5 → 额外把前 N 条干净有机结果（rank/title/url）写进 memory.search_top_result.results 供挑选；仍只导航第 1 条（不会点很多）。要读多条正文请用 fetch_links_batch 后台批量拉，**不要**逐个 click 进去。
+
+系统会确定性地：
+1. 按 DOM 结构 + 关键词相关性挑出有机结果（已排除：广告 / 赞助 / 推广 / sponsored 角标、nav/footer/侧栏、搜索引擎自身的 /search·/images·/aclick 内链）；
+2. 导航到首个候选，并做**落地二次校验**：若落地 URL 命中广告跳转域（doubleclick / googleadservices 等）/ 付费点击参数（gclid / msclkid / utm_medium=cpc）/ aclk·aclick·pagead 路径 → 自动跳过，轮替下一个候选；
+3. 落地到真实结果后写回 memory（url / title / query / ads_skipped）。
+
+🚫 反模式：
+- ❌ 在搜索结果页用 click / click_point 盲点第一个高亮链接（常点到广告位 / 竞价排名）
+- ❌ 把"搜索结果列表 / 相关推荐"当成目标内容直接 extract
+- ❌ 关键词留空但当前又不是带 ?q= 的搜索页（系统取不到关键词会报错）
+
+✅ 成功判据：动作后 URL 跳到一个**非搜索引擎、非广告跳转**的真实站点；memory.search_top_result.url 非空。
+""".strip()
+
+
 SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
     "vscroll_capture": VSCROLL_CAPTURE_SKILL,
     "snapshot": SNAPSHOT_SKILL,
+    "search_nav": SEARCH_NAV_SKILL,
     "resume_run": RESUME_RUN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,

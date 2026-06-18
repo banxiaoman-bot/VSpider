@@ -117,6 +117,8 @@ def build_system_prompt(
         skills.append("vscroll_capture")
     if _text_has_any(haystack, _SNAPSHOT_TRIGGERS):
         skills.append("snapshot")
+    if _text_has_any(haystack, _SEARCH_NAV_TRIGGERS):
+        skills.append("search_nav")
     if _text_has_any(haystack, _RESUME_RUN_TRIGGERS):
         skills.append("resume_run")
     if _text_has_any(haystack, ("示例", "范例", "few-shot", "few shot")):

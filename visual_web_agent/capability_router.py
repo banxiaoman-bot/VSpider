@@ -61,6 +61,13 @@ _CHALLENGE_RE = re.compile(
     re.I,
 )
 
+_SEARCH_NAV_RE = re.compile(
+    r"\b(search\s+and\s+open|open\s+(the\s+)?(first|top)\s+result|search\s+results?|serp)\b"
+    r"|搜索并打开|搜索后打开|先搜索|打开第一个结果|打开搜索结果|第一个结果|首个结果|最相关的结果|用搜索引擎",
+    re.I,
+)
+
+
 _TASK_TEMPLATE_REGISTRY = TaskTemplateRegistry()
 
 
@@ -521,6 +528,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     browser_interaction = bool(_BROWSER_RE.search(text) or form or chat or file_io)
     auth = bool(_AUTH_RE.search(text))
     bot_challenge = bool(_CHALLENGE_RE.search(text))
+    search_nav = bool(_SEARCH_NAV_RE.search(text))
     output_contract = strategy_context.get("output_contract") or infer_goal_output_contract(text)
     return {
         "structured": structured,
@@ -539,6 +547,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "browser_interaction": browser_interaction,
         "auth_or_captcha": auth,
         "bot_challenge": bot_challenge,
+        "search_nav_preferred": search_nav,
         "visual_required": browser_interaction and not (api or crawl),
         "domain": parsed.netloc.split('@')[-1].split(':', 1)[0] if parsed.netloc else "",
         "output_mode": strategy_context.get("output_mode") or output_contract.get("mode") or "default",
@@ -568,6 +577,8 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "vscroll_capture", "extraction", "VSCROLL-ACTION", ["ActionRegistry: vscroll_capture"], "Deterministically harvest every row of a virtualised / infinite-scroll list (main document first, then same-origin child iframes) in one mid-run call - alternate row snapshots with container nudges and dedup recycled rows - instead of one VLM round per viewport.", "deterministic_router")
     if signals.get("snapshot_preferred"):
         _add(plan, "page_snapshot", "artifact", "S4", ["ActionRegistry: html_snapshot", "ActionRegistry: screenshot"], "Persist the page HTML and/or a screenshot as run artifacts recorded in manifest.json (kind=html_snapshot / screenshot) when the deliverable is a snapshot, instead of leaving debug screenshots outside the manifest.", "deterministic_router")
+    if signals.get("search_nav_preferred"):
+        _add(plan, "open_top_search_result", "navigation", "SEARCH-NAV", ["ActionRegistry: open_top_search_result"], "When the goal carried no URL and the agent lands on a search-results page, deterministically open the first non-ad organic result (ads / sponsored / paid-click redirects / same-engine internal links excluded, with a landing-page second pass + candidate rotation) instead of letting the VLM guess a link.", "deterministic_router")
     if signals.get("resume_preferred"):
         _add(plan, "resume_run", "resume", "RUN-RESUME1", ["ActionRegistry: resume_run"], "Read the prior run checkpoint / resume state and continue from where the previous run left off (dedup already-captured rows, skip already-completed sub-goals) instead of restarting from scratch.", "deterministic_router")
     if signals.get("crawl") or (signals.get("structured") and signals.get("artifact_required")):
