@@ -3942,3 +3942,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useBrowserRuntimeStatus.test.js 6 例（默认空对象+route-only/unknown；status→class+中文标签 6 例；health/cache 标签变体；fetch happy 存 runtime+toggle loading；re-entrancy guard 不发网络；error 经 appendLog 告警且 status 不变）；vitest 98 passed（11 文件）；npm run build 绿（1693 模块，index js 190.32kB）。
 - App.vue 行数: 1644 → **1602 行**（-42）。本会话累计 ~4150 → 1602。
 - 风险: 低（纯 computed + 单 fetch action 平移，依赖经注入，guard/happy/error 三路 + 标签映射穷举覆盖；build+vitest+lint 三绿）。
+
+## Slice D-UI-12 (M4 简便): capability-trace 导出/摘要/复制三件套抽离 useCapabilityTraceExport (done, P2)
+
+- 能力名: capability_trace_export_extraction（exportCapabilityTraceAsJsonl / buildCapabilityTraceSummaryText / copyCapabilityTraceSummary 三个动作整体抽成 composable）。
+- 影响层: 新增 composables/useCapabilityTraceExport.js（`useCapabilityTraceExport({ trace, writeToClipboard })` 返回 export/copy 两动作 + 内部 buildSummaryText）。
+- 依赖注入: trace（整个 useCapabilityTrace(phaseEvents) 返回对象，composable 内 destructure 出 22 个所需 computed —— 保持函数体逐字不变）；writeToClipboard（wrapper arrow `(text) => _writeToClipboard(text)`，_writeToClipboard 定义晚于接线点，延迟查找）；ElMessage 由 composable 直接 import。
+- 抽离方法: App.vue 把 `const { … } = useCapabilityTrace(phaseEvents)` 改为先 `const capabilityTrace = useCapabilityTrace(phaseEvents)` 捕获整袋、再 `} = capabilityTrace` 解构（原有名字零改）；3 个函数逐字平移（`_writeToClipboard` → `writeToClipboard`）；App.vue 仅 destructure 2 个对外动作（buildSummaryText 仅 composable 内部用，不再 destructure 避免未用变量）。调用点（keyboardActions.exportCapability / 模板 @export-jsonl / CapabilityReplayPane copySummary）零改动。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useCapabilityTraceExport.test.js 8 例（空 trace 双 guard / buildSummaryText header+health+intent+alignment / 可选 crawl+runtime 段 / off-plan "not in plan" / copy happy 写剪贴板+toast / copy 失败不 toast / export DOM-stub 验证 _ts 剥离+文件名 capability_trace_<stamp>.jsonl+导出计数 toast）；vitest 106 passed（12 文件）；npm run build 绿（1694 模块）。
+- App.vue 行数: 1602 → **1440 行**（-162）。本会话累计 ~4150 → 1440（约 -65%）。
+- 风险: 低-中（buildSummaryText ~120 行多分支逐字平移，靠整袋注入零转写；guard/happy/可选段 + DOM-stub export 覆盖，build+vitest+lint 三绿）。
