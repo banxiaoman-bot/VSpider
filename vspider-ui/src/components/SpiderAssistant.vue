@@ -158,13 +158,16 @@ function onDragEnd() {
     <transition name="sp-drawer">
       <div v-if="panelOpen" class="sp-drawer">
         <div class="sp-drawer-header">
-          <h2>AI 助手</h2>
+          <div class="sp-drawer-titles">
+            <span class="sp-kicker">VSPIDER</span>
+            <h2>实时画面</h2>
+          </div>
           <button class="sp-drawer-close" @click="panelOpen = false">&times;</button>
         </div>
         <div class="sp-drawer-body">
           <div class="sp-status" :class="running ? 'running' : 'idle'">
             <span class="sp-status-dot" />
-            <span>{{ running ? '运行中' : '空闲' }}</span>
+            <span>{{ running ? '运行中 · 实时画面' : '空闲 · 等待任务' }}</span>
           </div>
           <slot />
         </div>
@@ -233,11 +236,11 @@ function onDragEnd() {
 .sp-drawer {
   position: fixed;
   top: 0; right: 0; bottom: 0;
-  width: 400px;
-  max-width: 90vw;
-  background: #fff;
+  width: 420px;
+  max-width: 92vw;
+  background: var(--vsp-surface);
   z-index: 1001;
-  box-shadow: -6px 0 24px rgba(0,0,0,0.07);
+  box-shadow: -8px 0 30px rgb(var(--rgb-teal-deep) / 0.14);
   display: flex;
   flex-direction: column;
 }
@@ -246,29 +249,47 @@ function onDragEnd() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 16px 20px;
-  border-bottom: 1px solid #ebedf0;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--vsp-border);
+  /* faint brand wash + a 56x2 emerald→cyan hairline pinned bottom-left */
+  background:
+    linear-gradient(90deg, var(--vsp-accent), var(--vsp-cyan-bright)) 0 100% / 56px 2px no-repeat,
+    linear-gradient(90deg, rgb(var(--rgb-accent) / 0.06), transparent 55%);
+}
+
+.sp-drawer-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.sp-kicker {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--vsp-cyan-700);
 }
 
 .sp-drawer-header h2 {
-  font-size: 15px;
-  font-weight: 600;
-  color: #1a1a2e;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--vsp-teal-deep);
 }
 
 .sp-drawer-close {
   width: 30px; height: 30px;
-  border: none; background: #f3f4f6;
-  border-radius: 6px;
+  border: none; background: var(--vsp-surface-sunken);
+  border-radius: 8px;
   font-size: 16px;
   cursor: pointer;
-  color: #6b7280;
+  color: var(--vsp-text-muted);
   display: grid;
   place-items: center;
   transition: all 0.15s;
 }
 
-.sp-drawer-close:hover { background: #e5e7eb; color: #1a1a2e; }
+.sp-drawer-close:hover { background: var(--vsp-surface-mint); color: var(--vsp-accent); }
 
 .sp-drawer-body {
   flex: 1;
@@ -286,27 +307,33 @@ function onDragEnd() {
   margin-bottom: 14px;
 }
 
+.sp-status {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
 .sp-status.idle {
-  background: #f8f9fa;
-  border: 1px solid #e5e7eb;
-  color: #6b7280;
+  background: var(--vsp-bg-deep);
+  border: 1px solid var(--vsp-border);
+  color: var(--vsp-text-muted);
 }
 
 .sp-status.running {
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  color: #166534;
+  background: var(--vsp-surface-mint);
+  border: 1px solid rgb(var(--rgb-accent) / 0.35);
+  color: var(--vsp-cyan-700);
 }
 
 .sp-status-dot {
-  width: 7px; height: 7px;
+  width: 8px; height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
 }
 
-.sp-status.idle .sp-status-dot { background: #9ca3af; }
+.sp-status.idle .sp-status-dot { background: var(--vsp-text-faint); }
 .sp-status.running .sp-status-dot {
-  background: #10b981;
+  background: var(--vsp-accent);
+  box-shadow: 0 0 0 3px rgb(var(--rgb-accent) / 0.18);
   animation: sp-dot-pulse 1.5s ease-in-out infinite;
 }
 

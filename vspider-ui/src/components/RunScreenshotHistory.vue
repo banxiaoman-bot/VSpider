@@ -205,7 +205,15 @@ onBeforeUnmount(() => {
       </div>
     </template>
 
-    <div v-else class="rsh-empty">启动任务后显示实时画面</div>
+    <div v-else class="rsh-empty">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4.5" width="18" height="12" rx="2" />
+        <path d="M8 20h8M12 16.5V20" />
+        <circle cx="9.5" cy="10.5" r="1.3" />
+        <circle cx="14.5" cy="10.5" r="1.3" />
+      </svg>
+      <span>启动任务后，这里实时显示<br />小蜘蛛的操作画面</span>
+    </div>
 
     <Teleport to="body">
       <transition name="rsh-fade">
@@ -304,21 +312,21 @@ onBeforeUnmount(() => {
   transition: all 0.15s;
 }
 
-.rsh-btn:hover:not(:disabled) { border-color: #10b981; color: #10b981; }
+.rsh-btn:hover:not(:disabled) { border-color: var(--vsp-accent); color: var(--vsp-accent); }
 .rsh-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.rsh-play { background: #10b981; border-color: #10b981; color: #fff; }
+.rsh-play { background: var(--vsp-accent); border-color: var(--vsp-accent); color: #fff; }
 .rsh-play:hover:not(:disabled) { background: #0ea372; color: #fff; }
 
 .rsh-latest {
   width: auto;
   font-size: 12px;
-  color: #10b981;
+  color: var(--vsp-accent);
   border-color: #bbf7d0;
   background: #f0fdf4;
 }
 
-.rsh-range { flex: 1; accent-color: #10b981; cursor: pointer; }
+.rsh-range { flex: 1; accent-color: var(--vsp-accent); cursor: pointer; }
 
 .rsh-count {
   font-size: 12px;
@@ -351,7 +359,7 @@ onBeforeUnmount(() => {
 
 .rsh-thumb img { width: 100%; height: 100%; object-fit: cover; }
 .rsh-thumb:hover { transform: translateY(-1px); }
-.rsh-thumb.active { border-color: #10b981; }
+.rsh-thumb.active { border-color: var(--vsp-accent); }
 
 .rsh-thumb-idx {
   position: absolute;
@@ -365,10 +373,23 @@ onBeforeUnmount(() => {
 }
 
 .rsh-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
   text-align: center;
   color: var(--vsp-text-faint, #9ca3af);
   font-size: 13px;
-  padding: 32px 0;
+  line-height: 1.6;
+  padding: 56px 0;
+}
+
+.rsh-empty svg {
+  width: 46px;
+  height: 46px;
+  color: var(--vsp-cyan-600, #0e9488);
+  opacity: 0.5;
 }
 
 .rsh-lightbox {
@@ -472,7 +493,7 @@ onBeforeUnmount(() => {
 }
 
 .rsh-lb-speed button.on {
-  background: #10b981;
+  background: var(--vsp-accent);
   color: #fff;
 }
 
