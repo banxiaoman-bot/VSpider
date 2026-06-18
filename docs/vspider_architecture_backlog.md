@@ -3700,6 +3700,37 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: `tests/test_extract_runtime.py` 追加 10 例（stub-frame：list/table 读取 / signature 显式 scope / autopager 翻页 / scroll-drain / canvas found+not-found），合计 14✓；6 个源码扫描测试（`test_autopager_shadow` / `test_extract_canvas_fallback` / `test_extract_shadow_list` / `test_extract_shadow_table` / `test_extract_table_iframe` / `test_table_autopager_frames`）改为同时 `inspect.getsource(run_agent)+ExtractRuntime`（JS 标记随闭包迁移）；`py_compile` 通过；`validate_y S1b` 全绿（target 14 / build / core 112 / 全量 pytest 3889 passed / 2 skipped / 0 failed）。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1b）。
 
+## Slice S1c (M5 拆分): 抽取候选仲裁 + 字段归一闭包 → ExtractRuntime 方法 (done, P1)
+
+- 能力名: extract_runtime_arbiter_normalizer（14 个仲裁/归一/字段工具闭包从 `run_agent` 平移进 `ExtractRuntime`，run 级句柄经 `ExtractDeps` 注入，模块助手直接 import）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。
+- 前置: S1b 已完成。
+- 改动:
+  - 平移 14 闭包为方法：`sanitize_extraction_candidate` / `expected_rows_from_data_shape` / `candidate_min_expected_rows` / `is_under_yield_viewport_candidate` / `choose_best_extraction_candidate` / `commit_extraction_candidate` / `record_extract_progress` / `field_aliases` / `requested_field_coverage` / `project_row_to_requested_fields` / `normalize_extracted_row_fields` / `first_int_value` / `classify_url_role` / `is_probable_url`。
+  - `ExtractDeps` 增 4 个 run 级句柄（`goal` / `goal_output_mode` / `requested_output_fields` / `data_controller`）；移除 S1b 的 `normalize_extracted_row_fields` 回调（normalize 升为方法，S1b reader 改调 `self.normalize_extracted_row_fields`）。
+  - `runtime.py` 直接 import 模块助手：`_parse_goal_target_count` / `_goal_is_tooltip_extract` / `_normalize_output_field_key`（`phases.goal_parser`）、`sanitize_extracted_rows` / `extract_tooltip_primary_key`（`data_sanitizer`）。
+  - `main.py` 14 闭包改薄委托包装（签名不变，所有调用点零改动）；闭包体移出后净减约 410 行。字节级 patch（CRLF，`_patch_s1c_*.py` 即用即删）；纯平移零行为改动。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 追加 13 例，合计 27✓；`py_compile` 通过；全量 pytest **S1c 新增 0 失败**（3880 passed，+13 S1c 新测全过；当时另有并发 UI agent 的 App.vue 重构失败，与本切片无关）。
+- 提交: `3109036`（仅 Python；当时 `backlog.md` 被并发 UI agent 占用，本条目延后补录）。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1c）。
+
+## Slice S1d (M5 拆分): 抽取快路径 + 文本/收尾相邻闭包 → ExtractRuntime 方法 (done, P1)
+
+- 能力名: extract_runtime_fastpath_text（11 个快路径/文本抽取闭包 + 2 个传递链接助手从 `run_agent` 平移进 `ExtractRuntime`；3 个 nonlocal 收尾闭包按设计留 `main.py`）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。
+- 前置: S1c 已完成。
+- 改动:
+  - 平移 13 方法：`capture_body_text_excerpt` / `save_extraction_snapshot` / `try_dom_api_fast_path` / `xhr_saved_row_count` / `xhr_target_reached` / `enrich_rows_with_dom_links` / `extract_compact_list_text_via_dom` / `extract_full_page_text_for_data` / `extract_body_text_for_semantic_cards` / `inspect_click_target_for_extract_nav_guard` / `nudge_scroll_after_duplicate_extract` / `compact_link_match_text` / `row_primary_link_text`。
+  - 留在 `main.py` 的 3 个 nonlocal finalizer：`_finish_if_xhr_target_reached` / `_finish_if_file_download_completed` / `_try_pre_extract_fast_path`（写 run 控制流标志，属 run 生命周期；调用图确认 finalizer→可搬方法为单向依赖，留 3 搬 13 安全）。
+  - `ExtractDeps` 增 6 个 run 级句柄（`event_stream` / `run_ts` / `snapshot_goal` / `goal_output_contract` / `vlm_output` / `enable_xhr`，均带默认值，兼容既有测试构造）；`runtime.py` import `maybe_save_snapshot` / `save_run_dataset` / `resolve_artifact_path` / `nudge_virtual_scroll` / `_goal_is_bulk_extraction`。
+  - 2 个带 `step` 的闭包（snapshot / dom_api_fast_path）：`step` 经 `main.py` wrapper 转发为方法参数（行为不变）。
+  - `main.py` 13 闭包改薄委托包装；闭包体移出后净减约 600 行。字节级 patch（CRLF，`_patch_s1d_*.py` 即用即删）；纯平移零行为改动。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 38✓（+11 S1d）；`tests/test_virtual_scroll_nudge.py::TestMainWiring::test_dedup_nudge_falls_back_to_virtual_scroll` 因 nudge 搬家改读 `run_agent`+`ExtractRuntime` 源，44✓；抽取子集 67✓；全量 pytest **S1d 新增 0 失败**（30 个失败全是并发 UI/api 重构，与本切片无关）。
+- 提交: `6c5cfbb`（仅 Python；本条目延后补录）。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（S1d）。
+
 ## Slice C4 (M5 契约): input_contract 落地 (done, P1)
 
 - 能力名: input_contract_enforcement（每个 run 产出 input_contract.json）。
