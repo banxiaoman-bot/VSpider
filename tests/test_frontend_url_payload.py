@@ -15,7 +15,11 @@ UI_ROOT = ROOT / "vspider-ui"
 
 
 def test_app_submits_merged_authoritative_urls_payload() -> None:
-    src = APP_VUE.read_text(encoding="utf-8")
+    src = (
+        APP_VUE.read_text(encoding="utf-8")
+        + "\n"
+        + (ROOT / "vspider-ui" / "src" / "composables" / "useTaskForm.js").read_text(encoding="utf-8")
+    )
 
     assert "buildAuthoritativeUrlsPayload," in src
     assert "const normalizedTargetUrl = url.value.trim()" in src

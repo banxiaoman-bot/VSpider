@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   Close,
   Refresh,
@@ -49,38 +49,18 @@ import { useAuthProfiles } from './composables/useAuthProfiles.js'
 import { useFinalAnswer } from './composables/useFinalAnswer.js'
 import { useBottomTabs } from './composables/useBottomTabs.js'
 import { useRunEventRouter } from './composables/useRunEventRouter.js'
-import {
-  ATTACHMENT_INTENT_AUTO,
-  ATTACHMENT_INTENT_OPTIONS,
-  appendAttachmentIntentToFormData,
-} from './composables/useAttachmentIntent.js'
+import { ATTACHMENT_INTENT_OPTIONS } from './composables/useAttachmentIntent.js'
 import {
   ATTACHMENT_ACCEPT,
-  appendConstraintsToFormData,
   authProfileOptionLabel,
-  buildAuthoritativeUrlsPayload,
-  buildTaskConstraints,
-  validateTaskInput,
   fetchOutputContractPreview,
 } from './composables/useTaskSubmit'
+import { useTaskForm } from './composables/useTaskForm.js'
 import { API_BASE, apiFetch } from './api/client.js'
 
-const url = ref('')
-const urlFieldExpanded = ref(false)
-const prompt = ref('')
 const outputContractPreview = ref(null)
 const outputContractPreviewLoading = ref(false)
 let outputContractPreviewTimer = null
-const extraUrls = ref('')
-const proxyServer = ref('')
-const proxyUsername = ref('')
-const proxyPassword = ref('')
-const batchMaxRuns = ref(0)
-const resumeEnabled = ref(false)
-const selectedFile = ref(null)
-// 优化 E: 附件 intent 用户覆盖（auto = 交给后端推断）
-const attachmentIntent = ref(ATTACHMENT_INTENT_AUTO)
-const isRunning = ref(false)
 // 优化 D: batched log buffer — one reactive update + one scroll per frame
 // instead of per WS line; ring-trims to LOG_LIMIT (backend event_stream
 // keeps the full log). scrollToBottom is defined below; the arrow defers
@@ -148,9 +128,6 @@ const {
 } = useBottomTabs({
   resolveExternalBadges: () => ({ hasNewArtifacts, hasNewFinalAnswer, timelinePanelRef }),
 })
-// C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
-const settingsDrawerOpen = ref(false)
-const settingsActivePanels = ref(['models', 'identity', 'constraints', 'file'])
 const {
   currentImageBase64,
   screenshotHistory,
@@ -260,6 +237,61 @@ const cmdPaletteRef = ref(null)
 const finalAnswerCopyState = ref('idle') // 'idle' | 'ok' | 'err'
 let finalAnswerCopyTimer = null // F1: reset-to-idle debounce; cleared on unmount
 
+const {
+  url,
+  urlFieldExpanded,
+  prompt,
+  extraUrls,
+  proxyServer,
+  proxyUsername,
+  proxyPassword,
+  batchMaxRuns,
+  resumeEnabled,
+  selectedFile,
+  attachmentIntent,
+  isRunning,
+  settingsDrawerOpen,
+  settingsActivePanels,
+  handleUploadChange,
+  handleUploadRemove,
+  onPromptInput,
+  onPromptKeydown,
+  handleCmdSelect,
+  trySlashBeforeSubmit,
+  submitTask,
+  forceStop,
+} = useTaskForm({
+  appendLog,
+  clearTerminalLogs,
+  clearScreenshotStream,
+  markArtifactsBaseline,
+  fetchBrowserRuntimeStatus,
+  resetForNewRun,
+  finalAnswerCopyState,
+  phaseEvents,
+  hasNewPhase,
+  hasNewCapability,
+  timelineAutoScroll,
+  replayMode,
+  replaySourceName,
+  selectedAuthProfiles,
+  selectedModel,
+  selectedSemanticModel,
+  selectedModelType,
+  modelTemperature,
+  modelMaxTokens,
+  modelBaseUrl,
+  modelApiKey,
+  semanticBaseUrl,
+  semanticApiKey,
+  updateCmdSuggestions,
+  cmdPaletteVisible,
+  cmdPaletteRef,
+  dismissCmdPalette,
+  promptInputRef,
+  tryExecuteCmd,
+})
+
 // appendLog now comes from createTerminalLogBuffer (see top of setup):
 // synchronous push into a plain buffer, batched flush per frame.
 
@@ -311,25 +343,6 @@ const {
   onClose: () => appendLog('[SYSTEM] WebSocket disconnected'),
   onError: () => appendLog('[ERROR] WebSocket error'),
 })
-
-const handleUploadChange = (uploadFile, uploadFiles) => {
-  if (!uploadFile || !uploadFile.raw) {
-    selectedFile.value = null
-    attachmentIntent.value = ATTACHMENT_INTENT_AUTO
-    return
-  }
-
-  selectedFile.value = uploadFile.raw
-  attachmentIntent.value = ATTACHMENT_INTENT_AUTO
-  if (uploadFiles.length > 1) {
-    uploadFiles.splice(0, uploadFiles.length - 1)
-  }
-}
-
-const handleUploadRemove = () => {
-  selectedFile.value = null
-  attachmentIntent.value = ATTACHMENT_INTENT_AUTO
-}
 
 const capabilityTrace = useCapabilityTrace(phaseEvents)
 const {
@@ -509,151 +522,6 @@ watch(prompt, () => {
     refreshOutputContractPreview()
   }, 450)
 })
-
-// ── Slash command input handlers ──
-const onPromptInput = (val) => {
-  const firstLine = (typeof val === 'string' ? val : prompt.value).split('\n')[0]
-  updateCmdSuggestions(firstLine)
-}
-const onPromptKeydown = (e) => {
-  if (cmdPaletteVisible.value) {
-    cmdPaletteRef.value?.onKeydown(e)
-  }
-}
-const handleCmdSelect = (cmd) => {
-  prompt.value = '/' + cmd.name + (cmd.args ? ' ' : '')
-  dismissCmdPalette()
-  nextTick(() => {
-    promptInputRef.value?.focus()
-  })
-}
-const trySlashBeforeSubmit = () => {
-  const firstLine = prompt.value.trim().split('\n')[0]
-  if (firstLine.startsWith('/')) {
-    const executed = tryExecuteCmd(firstLine)
-    if (executed) {
-      prompt.value = ''
-      return true
-    }
-  }
-  return false
-}
-
-const submitTask = async () => {
-  if (trySlashBeforeSubmit()) return
-  const validation = validateTaskInput({ prompt: prompt.value })
-  if (!validation.ok) {
-    ElMessage.warning(validation.message)
-    return
-  }
-
-  isRunning.value = true
-  clearTerminalLogs()
-  clearScreenshotStream()
-  // M: clear timeline buffer at the start of every new run so phases
-  // from old runs don't bleed into the new timeline view.
-  phaseEvents.value = []
-  hasNewPhase.value = false
-  hasNewCapability.value = false
-  // W: starting a fresh run implicitly exits replay mode — otherwise
-  // the WS phase events for the new run would be silently dropped by
-  // the gate in the WS handler.
-  if (replayMode.value) {
-    replayMode.value = false
-    replaySourceName.value = ''
-  }
-  // P: re-pin the tail since the panel is empty again
-  timelineAutoScroll.value = true
-
-  // ── Final Answer：进入"执行中/等待"状态 ──
-  resetForNewRun()
-  finalAnswerCopyState.value = 'idle' // F1: 复位 copy 反馈
-  markArtifactsBaseline()
-  fetchBrowserRuntimeStatus()
-
-  const formData = new FormData()
-  const normalizedTargetUrl = url.value.trim()
-  const normalizedExtraUrls = extraUrls.value.trim()
-  formData.append('target_url', normalizedTargetUrl)
-  formData.append('goal', prompt.value.trim())
-  const authoritativeUrls = buildAuthoritativeUrlsPayload(normalizedTargetUrl, normalizedExtraUrls)
-  if (normalizedExtraUrls || (!normalizedTargetUrl && authoritativeUrls.length)) {
-    formData.append('urls', JSON.stringify(authoritativeUrls))
-  }
-  const constraints = buildTaskConstraints({
-    proxyServer: proxyServer.value,
-    proxyUsername: proxyUsername.value,
-    proxyPassword: proxyPassword.value,
-    maxRuns: batchMaxRuns.value,
-    resume: resumeEnabled.value,
-  })
-  appendConstraintsToFormData(formData, constraints)
-  if (selectedModel.value !== 'backend-default') {
-    formData.append('vlm_model', selectedModel.value)
-  }
-  if (selectedSemanticModel.value !== 'backend-default') {
-    formData.append('semantic_model', selectedSemanticModel.value)
-  }
-  formData.append('vlm_model_type', selectedModelType.value)
-  formData.append('vlm_temperature', String(modelTemperature.value))
-  formData.append('vlm_max_tokens', String(modelMaxTokens.value))
-  if (modelBaseUrl.value.trim()) {
-    formData.append('vlm_base_url', modelBaseUrl.value.trim())
-  }
-  if (modelApiKey.value.trim()) {
-    formData.append('vlm_api_key', modelApiKey.value.trim())
-  }
-  if (semanticBaseUrl.value.trim()) {
-    formData.append('semantic_base_url', semanticBaseUrl.value.trim())
-  }
-  if (semanticApiKey.value.trim()) {
-    formData.append('semantic_api_key', semanticApiKey.value.trim())
-  }
-  if (selectedAuthProfiles.value.length) {
-    formData.append('auth_profiles', selectedAuthProfiles.value.join(','))
-  }
-  if (selectedFile.value) {
-    formData.append('file', selectedFile.value)
-    appendAttachmentIntentToFormData(formData, attachmentIntent.value)
-  }
-
-  try {
-    const response = await apiFetch('/api/start_batch', {
-      method: 'POST',
-      body: formData,
-    })
-
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '任务启动失败')
-    }
-
-    await appendLog('[SYSTEM] 任务已提交，等待后端执行...')
-    ElMessage.success('任务已在后台启动')
-  } catch (err) {
-    isRunning.value = false
-    ElMessage.error(`提交失败: ${String(err)}`)
-    await appendLog(`[ERROR] 提交失败: ${String(err)}`)
-  }
-}
-
-const forceStop = async () => {
-  try {
-    const response = await apiFetch('/api/stop_batch', {
-      method: 'POST',
-    })
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '停止请求失败')
-    }
-    isRunning.value = false
-    ElMessage.warning('正在强制终止后台任务...')
-    await appendLog('[WARN] 已发送强制终止请求')
-  } catch (err) {
-    ElMessage.error(`强制终止失败: ${String(err)}`)
-    await appendLog(`[ERROR] 强制终止失败: ${String(err)}`)
-  }
-}
 
 onMounted(() => {
   loadModelSettings()

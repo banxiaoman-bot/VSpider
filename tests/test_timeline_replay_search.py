@@ -36,6 +36,7 @@ CAPABILITY_SHARED_CSS = Path(__file__).resolve().parent.parent / "vspider-ui" / 
 USE_PHASE_TRACE = _UI_SRC / "composables" / "usePhaseTrace.js"
 USE_TIMELINE_REPLAY = _UI_SRC / "composables" / "useTimelineReplay.js"
 USE_RUN_EVENT_ROUTER = _UI_SRC / "composables" / "useRunEventRouter.js"
+USE_TASK_FORM = _UI_SRC / "composables" / "useTaskForm.js"
 USE_CAPABILITY_TRACE = _UI_SRC / "composables" / "useCapabilityTrace.js"
 USE_CAPABILITY_TRACE_EXPORT = _UI_SRC / "composables" / "useCapabilityTraceExport.js"
 USE_CAPABILITY_FIXTURE_REPLAY = _UI_SRC / "composables" / "useCapabilityFixtureReplay.js"
@@ -163,9 +164,10 @@ class TestWReplayMode:
         overview_src = overview.read_text(encoding="utf-8") if overview.exists() else ""
         replay = USE_TIMELINE_REPLAY.read_text(encoding="utf-8") if USE_TIMELINE_REPLAY.exists() else ""
         router = USE_RUN_EVENT_ROUTER.read_text(encoding="utf-8") if USE_RUN_EVENT_ROUTER.exists() else ""
+        task_form = USE_TASK_FORM.read_text(encoding="utf-8") if USE_TASK_FORM.exists() else ""
         return (
             app + "\n" + timeline + "\n" + timeline_css + "\n" + app_css
-            + "\n" + hero_src + "\n" + overview_src + "\n" + replay + "\n" + router
+            + "\n" + hero_src + "\n" + overview_src + "\n" + replay + "\n" + router + "\n" + task_form
         )
 
     def test_replay_state_refs_exist(self, combined_src: str) -> None:
