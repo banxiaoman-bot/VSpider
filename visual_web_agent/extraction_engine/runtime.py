@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 try:  # pragma: no cover - import shim mirrors main.py
-    from ..data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows
+    from ..data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows, TOOLTIP_UNIQUE_KEY
     from ..phases.goal_parser import (
         _goal_is_tooltip_extract,
         _normalize_output_field_key,
@@ -33,7 +33,7 @@ try:  # pragma: no cover - import shim mirrors main.py
     from ..artifact_manager import resolve_artifact_path
     from ..virtual_scroll import nudge_virtual_scroll
 except ImportError:  # pragma: no cover
-    from data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows
+    from data_sanitizer import extract_tooltip_primary_key, sanitize_extracted_rows, TOOLTIP_UNIQUE_KEY
     from phases.goal_parser import (
         _goal_is_tooltip_extract,
         _normalize_output_field_key,
@@ -130,6 +130,21 @@ class ExtractCommit:
     source_text_for_validation: str
     log_extract_text_source: str
     current_extract_page_key: str
+
+
+@dataclass
+class ExtractPersist:
+    """Result of persisting a successful extraction batch (save + snapshot +
+    progress). Mirrors the locals the explicit-extract persist block produced;
+    the caller writes ``decision['extracted_data']`` / ``decision['snapshot_path']``
+    and resets ``_duplicate_zero_extract_streak`` from these.
+    """
+
+    extracted: list
+    saved_path: str
+    snapshot_path: str
+    progress_new_rows: int
+    progress_total_rows: int
 
 
 class ExtractRuntime:
@@ -938,6 +953,112 @@ class ExtractRuntime:
             source_text_for_validation=source_text_for_validation,
             log_extract_text_source=log_extract_text_source,
             current_extract_page_key=current_extract_page_key,
+        )
+
+    async def persist_extracted_batch(
+        self,
+        *,
+        extracted: list,
+        new_rows: int,
+        dup_rows: int,
+        rejected_rows: int,
+        log_extract_text_source: str,
+        source_text_for_validation: str,
+        candidates: list,
+        data_shape: dict,
+        current_url: str,
+        current_extract_page_key: str,
+        step: int,
+    ) -> ExtractPersist:
+        """Enrich, save, snapshot and count a successful explicit-extract batch.
+        Verbatim relocation of run_agent's explicit persist block (formerly
+        main.py ~6436-6515). Writes the shared ``_xs`` counters; returns the
+        final rows + saved/snapshot paths + progress for the caller to write
+        back into ``decision`` and reset the dedup streak. The auto-extract
+        persist block has diverged (different locals / produced_by / no decision
+        writes) and is left in place.
+        """
+        if dup_rows or rejected_rows:
+            self.deps.logger.info(
+                "[EXTRACT DEDUP] filtered %s duplicate rows, "
+                "rejected %s unsupported rows, saving %s new rows",
+                dup_rows,
+                rejected_rows,
+                new_rows,
+            )
+
+        # 统计本次新增行数。tooltip 任务按 trigger 主键统计，避免
+        # 中间半成品被 UPSERT 覆盖后仍显示累计过高。
+        extracted = await self.enrich_rows_with_dom_links(extracted)
+        progress_new_rows, progress_total_rows = self.record_extract_progress(
+            extracted,
+            new_rows,
+        )
+        self.deps.logger.info(
+            f"[EXTRACT] 本次提取 {new_rows} 条，"
+            f"累计已提取 {progress_total_rows} 条"
+        )
+        saved_path = ""
+        if self.deps.goal_output_mode == "answer":
+            self.deps.logger.info(
+                "[ANSWER OUTPUT] answer-only result; not saving Excel artifact"
+            )
+        else:
+            saved_path = save_run_dataset(
+                extracted,
+                run_id=self.deps.run_ts,
+                output_contract=self.deps.goal_output_contract,
+                produced_by="vlm_extract",
+                step_id=str(step),
+                filename_hint=self.deps.vlm_output,
+                unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(self.deps.goal) else None,
+            )
+        api_fast = await self.try_dom_api_fast_path(
+            extracted,
+            source=log_extract_text_source or "VLM_EXTRACT_OUTPUT",
+        )
+        if api_fast.get("applied"):
+            extracted = api_fast.get("fast_path", {}).get("rows") or extracted
+            progress_total_rows = self.state.total_extracted_rows
+        snapshot_path = await self.save_extraction_snapshot(
+            source=log_extract_text_source or "VLM_EXTRACT_OUTPUT",
+            rows=extracted,
+            output_file=str(saved_path or ""),
+            accepted_rows=new_rows,
+            duplicate_rows=dup_rows,
+            rejected_rows=rejected_rows,
+            candidates=candidates,
+            data_shape=data_shape,
+            source_text=source_text_for_validation,
+            metadata={
+                "mode": "explicit_extract",
+                "progress_new_rows": progress_new_rows,
+                "progress_total_rows": progress_total_rows,
+            },
+        )
+        if saved_path:
+            self.deps.logger.info(f"[EXTRACT] Saved to: {saved_path}")
+        if _goal_is_tooltip_extract(self.deps.goal):
+            print(
+                f"\033[1;32m✅ [EXTRACT]\033[0m "
+                f"成功合并 \033[36m{new_rows}\033[0m 条候选。"
+                f"当前唯一提示项: \033[36m{progress_total_rows}\033[0m 条"
+            )
+        else:
+            print(
+                f"\033[1;32m✅ [EXTRACT]\033[0m "
+                f"成功追加 \033[36m{new_rows}\033[0m 条数据。"
+                f"当前总计: \033[36m{progress_total_rows}\033[0m 条"
+            )
+        self.state.extract_count += 1
+        self.state.extracted_page_urls.add(current_url)
+        self.state.extracted_page_keys.add(current_extract_page_key)
+        return ExtractPersist(
+            extracted=extracted,
+            saved_path=str(saved_path or ""),
+            snapshot_path=str(snapshot_path or ""),
+            progress_new_rows=progress_new_rows,
+            progress_total_rows=progress_total_rows,
         )
 
     async def arm_pagination_after_extract(

@@ -964,8 +964,9 @@ async def run_agent(
     action_registry.bind("cascader_pick", _replay_rpa)
     action_registry.bind("hover_and_click", _browser_action_tool)
     action_registry.bind("next_page", _browser_action_tool)
+    action_registry.bind("dismiss_consent", _browser_action_tool)
     action_registry.bind("targeted_probe", _targeted_probe_tool)
-    _registry_dispatch_actions = {"hover_and_click", "next_page", "targeted_probe"}
+    _registry_dispatch_actions = {"hover_and_click", "next_page", "dismiss_consent", "targeted_probe"}
     _run_succeeded = False
     _run_ckpt = None  # RUN-RESUME1 step2b: run checkpointer (set before the step loop)
     _selected_tools: list[dict] = []
@@ -6433,86 +6434,27 @@ async def run_agent(
                                 )
                                 break
 
-                            if _dup_rows or _rejected_rows:
-                                logger.info(
-                                    "[EXTRACT DEDUP] filtered %s duplicate rows, "
-                                    "rejected %s unsupported rows, saving %s new rows",
-                                    _dup_rows,
-                                    _rejected_rows,
-                                    _new_rows,
-                                )
-
-                            # 统计本次新增行数。tooltip 任务按 trigger 主键统计，避免
-                            # 中间半成品被 UPSERT 覆盖后仍显示累计过高。
-                            extracted = await _enrich_rows_with_dom_links(extracted)
-                            decision["extracted_data"] = extracted
-                            _progress_new_rows, _progress_total_rows = _record_extract_progress(
-                                extracted,
-                                _new_rows,
-                            )
-                            _duplicate_zero_extract_streak = 0
-                            logger.info(
-                                f"[EXTRACT] 本次提取 {_new_rows} 条，"
-                                f"累计已提取 {_progress_total_rows} 条"
-                            )
-                            saved_path = ""
-                            if _goal_output_mode == "answer":
-                                logger.info(
-                                    "[ANSWER OUTPUT] answer-only result; not saving Excel artifact"
-                                )
-                            else:
-                                saved_path = save_run_dataset(
-                                    extracted,
-                                    run_id=_run_ts,
-                                    output_contract=_goal_output_contract,
-                                    produced_by="vlm_extract",
-                                    step_id=str(step),
-                                    filename_hint=_vlm_output,
-                                    unique_key=TOOLTIP_UNIQUE_KEY if _goal_is_tooltip_extract(goal) else None,
-                                )
-                            _api_fast = await _try_dom_api_fast_path(
-                                extracted,
-                                source=_log_extract_text_source or "VLM_EXTRACT_OUTPUT",
-                            )
-                            if _api_fast.get("applied"):
-                                extracted = _api_fast.get("fast_path", {}).get("rows") or extracted
-                                decision["extracted_data"] = extracted
-                                _progress_total_rows = _xs.total_extracted_rows
-                            _extract_snapshot_path = await _save_extraction_snapshot(
-                                source=_log_extract_text_source or "VLM_EXTRACT_OUTPUT",
-                                rows=extracted,
-                                output_file=str(saved_path or ""),
-                                accepted_rows=_new_rows,
-                                duplicate_rows=_dup_rows,
+                            _persist = await _extract_rt.persist_extracted_batch(
+                                extracted=extracted,
+                                new_rows=_new_rows,
+                                dup_rows=_dup_rows,
                                 rejected_rows=_rejected_rows,
+                                log_extract_text_source=_log_extract_text_source,
+                                source_text_for_validation=_source_text_for_validation,
                                 candidates=_candidates,
                                 data_shape=_data_shape,
-                                source_text=_source_text_for_validation,
-                                metadata={
-                                    "mode": "explicit_extract",
-                                    "progress_new_rows": _progress_new_rows,
-                                    "progress_total_rows": _progress_total_rows,
-                                },
+                                current_url=_current_url,
+                                current_extract_page_key=_current_extract_page_key,
+                                step=step,
                             )
-                            if _extract_snapshot_path:
-                                decision["snapshot_path"] = _extract_snapshot_path
-                            if saved_path:
-                                logger.info(f"[EXTRACT] Saved to: {saved_path}")
-                            if _goal_is_tooltip_extract(goal):
-                                print(
-                                    f"\033[1;32m✅ [EXTRACT]\033[0m "
-                                    f"成功合并 \033[36m{_new_rows}\033[0m 条候选。"
-                                    f"当前唯一提示项: \033[36m{_progress_total_rows}\033[0m 条"
-                                )
-                            else:
-                                print(
-                                    f"\033[1;32m✅ [EXTRACT]\033[0m "
-                                    f"成功追加 \033[36m{_new_rows}\033[0m 条数据。"
-                                    f"当前总计: \033[36m{_progress_total_rows}\033[0m 条"
-                                )
-                            _xs.extract_count += 1
-                            _xs.extracted_page_urls.add(_current_url)
-                            _xs.extracted_page_keys.add(_current_extract_page_key)
+                            extracted = _persist.extracted
+                            decision["extracted_data"] = extracted
+                            if _persist.snapshot_path:
+                                decision["snapshot_path"] = _persist.snapshot_path
+                            saved_path = _persist.saved_path
+                            _progress_new_rows = _persist.progress_new_rows
+                            _progress_total_rows = _persist.progress_total_rows
+                            _duplicate_zero_extract_streak = 0
                             if _goal_output_mode == "answer":
                                 logger.info(
                                     "[ANSWER OUTPUT] completed after targeted extract; "

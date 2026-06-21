@@ -1003,3 +1003,108 @@ def test_select_and_commit_no_candidate_returns_priors():
     assert res.source_text_for_validation == "prior_src"
     assert res.log_extract_text_source == "PRIOR_SRC"
     assert res.current_extract_page_key == "PRIOR"
+
+
+# ── R2-3e: persist_extracted_batch (explicit-path enrich/save/snapshot/count) ─
+
+
+def _mk_persist_runtime(monkeypatch, *, goal_output_mode="dataset", api_applied=False, state=None):
+    from visual_web_agent.extraction_engine import runtime as _rt_mod
+
+    monkeypatch.setattr(_rt_mod, "save_run_dataset", lambda *a, **k: "out.xlsx")
+    rt = _mk_runtime(
+        goal="抓取数据", goal_output_mode=goal_output_mode, state=state or ExtractState()
+    )
+
+    async def _enrich(rows):
+        return rows
+
+    rt.enrich_rows_with_dom_links = _enrich
+
+    def _progress(rows, accepted):
+        rt.state.total_extracted_rows += accepted
+        return accepted, rt.state.total_extracted_rows
+
+    rt.record_extract_progress = _progress
+
+    async def _api(rows, *, source):
+        if api_applied:
+            return {"applied": True, "fast_path": {"rows": [{"api": 1}]}}
+        return {"applied": False}
+
+    rt.try_dom_api_fast_path = _api
+
+    async def _snap(**kw):
+        return "snap/path"
+
+    rt.save_extraction_snapshot = _snap
+    return rt
+
+
+def test_persist_basic_dataset(monkeypatch):
+    rt = _mk_persist_runtime(monkeypatch)
+    res = asyncio.run(
+        rt.persist_extracted_batch(
+            extracted=[{"a": 1}, {"a": 2}],
+            new_rows=2,
+            dup_rows=0,
+            rejected_rows=0,
+            log_extract_text_source="DOM_LIST",
+            source_text_for_validation="src",
+            candidates=[],
+            data_shape={},
+            current_url="http://x",
+            current_extract_page_key="http://x#k",
+            step=1,
+        )
+    )
+    assert res.extracted == [{"a": 1}, {"a": 2}]
+    assert res.saved_path == "out.xlsx"
+    assert res.snapshot_path == "snap/path"
+    assert res.progress_new_rows == 2
+    assert res.progress_total_rows == 2
+    assert rt.state.extract_count == 1
+    assert "http://x" in rt.state.extracted_page_urls
+    assert "http://x#k" in rt.state.extracted_page_keys
+
+
+def test_persist_answer_mode_skips_save(monkeypatch):
+    rt = _mk_persist_runtime(monkeypatch, goal_output_mode="answer")
+    res = asyncio.run(
+        rt.persist_extracted_batch(
+            extracted=[{"a": 1}],
+            new_rows=1,
+            dup_rows=0,
+            rejected_rows=0,
+            log_extract_text_source="DOM_LIST",
+            source_text_for_validation="",
+            candidates=[],
+            data_shape={},
+            current_url="http://x",
+            current_extract_page_key="http://x#k",
+            step=1,
+        )
+    )
+    assert res.saved_path == ""  # answer mode does not write a dataset artifact
+
+
+def test_persist_api_fast_path_replaces_rows(monkeypatch):
+    state = ExtractState(total_extracted_rows=7)
+    rt = _mk_persist_runtime(monkeypatch, api_applied=True, state=state)
+    res = asyncio.run(
+        rt.persist_extracted_batch(
+            extracted=[{"a": 1}],
+            new_rows=1,
+            dup_rows=0,
+            rejected_rows=0,
+            log_extract_text_source="DOM_LIST",
+            source_text_for_validation="",
+            candidates=[],
+            data_shape={},
+            current_url="http://x",
+            current_extract_page_key="http://x#k",
+            step=1,
+        )
+    )
+    assert res.extracted == [{"api": 1}]
+    assert res.progress_total_rows == 8
