@@ -4139,3 +4139,26 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: tests/test_dismiss_consent.py 15 例（schema/注册/no-op/无活动页/known-CMP 命中+校验/accept-text 兜底/排除词 no-op/iframe 兜底/点击后仍可见=未关/ActionTool evidence/路由 consent 信号+backend_plan 命中/skill 内容+字典登记）；tests/agent_cases/cases.json 注册 1 条 live 基准用例（按需跑，非 CI）。
 - 验证: py_compile 7 文件绿；pytest tests/test_dismiss_consent.py 15 passed；按字节 patch 保持各文件原 newline。
 - 风险: 低（默认不自动触发，纯新增动作；L2 容器作用域+整词+排除词三重防误点；提交只 add 本切片文件，未碰并发 R2/BBR/UI 改动）。
+
+## Slice D-UI-22 (M4 简便): 任务表单 + 提交链路从 App.vue 抽离 useTaskForm (done, P2)
+
+- 能力名: task_form_extraction（任务输入态 + settings drawer 开关 + 上传处理 + slash 输入胶水 + submitTask + forceStop 抽成 composables/useTaskForm.js）。
+- 影响层: vspider-ui（App.vue → composables/useTaskForm.js）+ 2 个结构化 pytest 同步折入。
+- 设计: 29 依赖注入；destructure 置于 finalAnswerCopyState 之后、useCapabilityFixtureReplay(消费 url/prompt) 之前满足 init-order；output-contract preview + 其 timer 留 App.vue（保 test_app_vue_timer_cleanup 的 outputContractPreviewTimer 断言）；清理 6 个随 submitTask 迁走的 useTaskSubmit/useAttachmentIntent import + nextTick。
+- 测试同步: test_frontend_url_payload.py 的 src 折入 useTaskForm.js；test_timeline_replay_search.py TestWReplayMode.combined_src 折入 useTaskForm.js（submitTask replay-exit 串）。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useTaskForm.test.js 11 例（upload change/remove、slash onPromptInput/trySlashBeforeSubmit、submitTask 校验早退/happy 全复位+POST start_batch/error 复位、forceStop happy/error）。
+- 验证: vitest 20 文件 / 172 passed（+11）；npm run build 绿；ReadLints clean；结构化 pytest 57 passed；App.vue 1144→1012 行（-132），仍纯 CRLF。
+- commit: 37b6203（backlog 条目因并发 DC-1 占用同文件，待其提交后补录）。
+- 风险: 中-高（最大耦合函数 submitTask，29 注入；vitest 全分支 + 结构化 pytest 双绿守回归）。
+
+## Slice D-UI-23 (M1 准确 + M4 简便): D-UI-17~22 抽离后 App.vue 死代码清理 (done, P3)
+
+- 能力名: appvue_dead_sweep_d22（沿 D-UI-14/16 方法：解析顶层 const/let + destructure 本地名 + 命名 import，对去注释 script+template 整词计数 count==1 判死，即用即删脚本）。
+- 影响层: 仅 App.vue。
+- 结果: 删 3 个死符号——taskResult / trySlashBeforeSubmit（D-UI-19/22 抽离后 App.vue 不再直接引用的死 destructure）+ apiFetch（submitTask/forceStop 迁走后唯一用户消失的 import，保留仍被模板用的 API_BASE）。删后重扫 0 死候选（声明名 204→201）。
+- 新增 contract 字段: 无。
+- Tests: 无新增（纯删除，零行为改动）；vitest 172 passed 不变；npm run build 绿；ReadLints clean；结构化 pytest 57 passed。
+- App.vue 行数: 1012 → 1010 行（-2）。本轮 D-UI-17~23 累计 1353 → 1010（约 -25%）。
+- commit: 85cd3da。
+- 风险: 低（仅删 count<=1 死符号，脚本迭代确认 0 残留 + 三绿）。
