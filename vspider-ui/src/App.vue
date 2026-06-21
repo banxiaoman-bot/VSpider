@@ -56,7 +56,7 @@ import {
   fetchOutputContractPreview,
 } from './composables/useTaskSubmit'
 import { useTaskForm } from './composables/useTaskForm.js'
-import { API_BASE, apiFetch } from './api/client.js'
+import { API_BASE } from './api/client.js'
 
 const outputContractPreview = ref(null)
 const outputContractPreviewLoading = ref(false)
@@ -213,7 +213,6 @@ const failedRunsPaneRef = ref(null)
 //                                 Final Answer 面板显示兜底文案
 // finalAnswerStatus: 'idle' | 'pending' | 'text' | 'file'，驱动面板的 3 种 UI 状态
 const {
-  taskResult,
   finalAnswerStatus,
   finalAnswerText,
   finalAnswerDomain,
@@ -257,7 +256,6 @@ const {
   onPromptInput,
   onPromptKeydown,
   handleCmdSelect,
-  trySlashBeforeSubmit,
   submitTask,
   forceStop,
 } = useTaskForm({
