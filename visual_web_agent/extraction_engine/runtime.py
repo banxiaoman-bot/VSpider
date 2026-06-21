@@ -109,6 +109,7 @@ class ExtractDeps:
     vlm_output: str = ""
     enable_xhr: bool = False
     broadcast_log_safe: Callable[..., Any] = lambda *_a, **_k: None
+    vlm: Any = None
 
 
 class ExtractRuntime:
@@ -1021,6 +1022,114 @@ class ExtractRuntime:
                     self.state.total_extracted_rows,
                     _rearm_target,
                 )
+
+    async def handle_zero_new_rows_feedback(
+        self,
+        *,
+        duplicate_zero_extract_streak: int,
+        dup_rows: int,
+        rejected_rows: int,
+        current_url: str,
+        data_shape: dict,
+    ) -> int:
+        """Inject dedup/no-new-rows VLM feedback for the explicit-extract path
+        when row-level filtering yielded 0 new rows. Verbatim relocation of the
+        block from run_agent's explicit path (formerly main.py 6435-6519);
+        writes pagination flags to ``self.state`` and returns the updated
+        ``duplicate_zero_extract_streak``. The caller keeps the
+        ``if _new_rows == 0`` guard, the ``_dedup_tripped_last_step = True``
+        flag, and the trailing ``break``. The auto-extract path's zero-row block
+        is structurally different (no target/streak/drain branches, ends in
+        ``continue``) and is intentionally left in place.
+        """
+        self.deps.logger.warning(
+            "[EXTRACT DEDUP] no new rows after row-level filtering "
+            "(duplicates=%s, rejected=%s, url=%s)",
+            dup_rows,
+            rejected_rows,
+            current_url,
+        )
+        _target_count_pre = _parse_goal_target_count(self.deps.goal)
+        _pre_reached = (
+            _target_count_pre is not None
+            and self.state.total_extracted_rows >= _target_count_pre
+        )
+        if _pre_reached:
+            self.deps.vlm.inject_error_feedback(
+                f"✅ 你已累计提取 {self.state.total_extracted_rows} 条数据，"
+                f"已达成用户要求的 {_target_count_pre} 条。"
+                "请立即输出 action=done 结束任务，不要再 extract。"
+            )
+        else:
+            _has_prior_extract_page = bool(
+                self.state.extracted_page_urls or self.state.extracted_page_keys
+            )
+            if _target_count_pre is not None and _has_prior_extract_page:
+                duplicate_zero_extract_streak += 1
+                _scroll_drain = await self.probe_scroll_drain_state(
+                    "duplicate extract drain probe"
+                )
+                _physically_drained = bool(_scroll_drain.get("at_bottom"))
+                _probe_failed = bool(_scroll_drain.get("probe_failed"))
+                if _physically_drained or (_probe_failed and duplicate_zero_extract_streak >= 3):
+                    self.state.first_flip_pending = True
+                    _drain_reason = (
+                        "物理触底"
+                        if _physically_drained
+                        else "触底探测失败且连续多次无新增"
+                    )
+                    self.deps.vlm.inject_error_feedback(
+                        f"⚠️ 系统 extract 净新增为 0，且已确认{_drain_reason}。\n"
+                        f"当前累计 {self.state.total_extracted_rows}/{_target_count_pre} 条，"
+                        "说明当前页/当前滚动区域已基本榨干但目标尚未达成。\n"
+                        "下一步必须执行 next_page（target_id=0, type_value=\"\"），"
+                        "让底层优先尝试 URL 变异/分页器/页码；不要继续 smooth_scroll "
+                        "或重复 extract 当前页。"
+                    )
+                else:
+                    _remaining_hint = (
+                        f"window_remaining={_scroll_drain.get('window_remaining')}, "
+                        f"container_remaining={_scroll_drain.get('container_remaining')}"
+                    )
+                    self.deps.vlm.inject_error_feedback(
+                        "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
+                        f"当前累计 {self.state.total_extracted_rows}/{_target_count_pre} 条，"
+                        "这只能证明当前视口没有新行，尚不能证明整页已榨干。\n"
+                        f"物理滚动探测显示仍有下滑空间（{_remaining_hint}）。"
+                        "下一步先 smooth_scroll down 暴露同页下方隐藏数据；"
+                        "只有净新增为 0 且物理触底后，系统才会强制 next_page。"
+                    )
+                    await self.nudge_scroll_after_duplicate_extract(
+                        "first duplicate extract before pagination"
+                    )
+            else:
+                duplicate_zero_extract_streak += 1
+                _expected_dense_rows = self.expected_rows_from_data_shape(
+                    data_shape
+                )
+                if _expected_dense_rows >= 10:
+                    self.state.block_next_page_until_drained = True
+                    self.state.block_next_page_reason = (
+                        f"dense page exposes about {_expected_dense_rows} rows, "
+                        "but viewport/full extraction under-yielded"
+                    )
+                    self.deps.vlm.inject_error_feedback(
+                        "⚠️ 系统探头发现当前页存在密集列表/表格，"
+                        f"大约 {_expected_dense_rows} 个结构化条目；"
+                        "但本次 extract 没有得到足够新增行。\n"
+                        "这说明当前页尚未被可靠提取，下一步先 smooth_scroll down "
+                        "或重新 extract 当前页，禁止直接 next_page。"
+                    )
+                else:
+                    self.deps.vlm.inject_error_feedback(
+                        "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
+                        "请不要重复提取当前列表。下一步优先 next_page；"
+                        "若 next_page 报错，再考虑 smooth_scroll 加载更多。"
+                    )
+                await self.nudge_scroll_after_duplicate_extract(
+                    "explicit extract duplicate rows"
+                )
+        return duplicate_zero_extract_streak
 
     async def detect_canvas_grid(self, reason: str) -> dict:
         """Detect a dominant canvas/svg-rendered grid (EXTRACT-CANVAS-1).

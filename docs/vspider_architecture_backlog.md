@@ -4039,6 +4039,20 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 验证: 全量 pytest **32 failed / 3946 passed / 2 skipped**——32 失败全是并发 UI agent 的 App.vue source-wiring/keyboard/timeline 断言（较 R2-2 的 36 少 4，因 UI agent 同期修了 timer_cleanup/browser_pool），与本切片零关联；**本切片 0 新增失败**（域回归 262✓ 佐证）。
 - 计划: `docs/superpowers/plans/2026-06-21-extract-tail-decomposition-design.md`（策略 A 第一刀；下刀候选：R2-3a 零新增反馈块 6432-6518 → `handle_zero_new_rows_feedback`）。
 
+## Slice R2-3a (M5 拆分): extract 显式路径零新增去重反馈块 → ExtractRuntime (done, P1)
+
+- 能力名: extract_zero_rows_feedback（显式 extract 路径「净新增 0 行」的去重反馈块——目标已达提示 / 有前页+触底探测+first_flip / dense 页 block_next_page / 通用 nudge——收敛为 `ExtractRuntime.handle_zero_new_rows_feedback(*, duplicate_zero_extract_streak, dup_rows, rejected_rows, current_url, data_shape) -> int`）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。R2「安全增量」第四刀：写 `_xs.*` 分页旗标 + 回传 streak；`if _new_rows==0` 守卫 / `_dedup_tripped_last_step=True` / `break` 留主循环。
+- 前置: R2-3b 已完成；设计稿同 R2-3b（策略 A 第二刀）。
+- 关键发现: auto-extract 路径零行块（5196-5229，~33 行，`continue` 收尾，仅 dense/通用两分支）与 explicit（~86 行，`break` 收尾，含目标已达/有前页触底/first_flip/dense 多分支）**结构性漂移**，**不能合并**；本刀只搬显式块（单点），auto 块原地不动。
+- 改动:
+  - 新增方法 `handle_zero_new_rows_feedback`：逐字平移 explicit 块；`_parse_goal_target_count` 经 import，`probe_scroll_drain_state`/`expected_rows_from_data_shape`/`nudge_scroll_after_duplicate_extract` 经 self；新增 `ExtractDeps.vlm`（main 注入 `vlm`）。
+  - `main.py` 字节级 patch（`_patch_r2_3a.py` 即用即删）：85 行块 → 7 行委托；移除 7 个块内局部（`_target_count_pre`/`_pre_reached`/`_has_prior_extract_page`/`_physically_drained`/`_drain_reason`/`_remaining_hint`/`_expected_dense_rows`，grep 确认 0 残留）。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 追加 4 例（目标已达提 done / 有前页触底武装 first_flip / 有前页未触底 nudge / dense 页 block_next_page），mock probe/nudge 隔离浏览器，先验红（AttributeError）后转绿，合计 54✓；extraction+pagination 17 文件域回归 266✓；`py_compile` 通过，CLEAN_CRLF；main.py 9435→9358 行（<9700）。
+- 验证: 全量 pytest 后台核验（App.vue UI 失败均为并发 agent 在制品，与本切片零关联）；域回归 266✓ + 悬挂引用 0 残留，**本切片 0 新增失败**。
+- 计划: `docs/superpowers/plans/2026-06-21-extract-tail-decomposition-design.md`（策略 A 第二刀；下刀候选：R2-3c 批后翻页引导块 → `inject_post_extract_pagination_guidance`）。
+
 ## Slice BBR-1 (M3 通用): 三后端任务分流路由骨架纳管 BrowserBackendRouter (done, P2)
 
 - 能力名: browser_backend_routing（在 `build_default_browser_backend` 扁平 env/kind 开关之上，按任务类型在 chromium / lightpanda / cloakbrowser 三 persona 间确定性分流；契约 `browser_backend_route.v1`）。

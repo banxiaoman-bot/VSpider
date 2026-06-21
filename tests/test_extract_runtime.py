@@ -113,6 +113,7 @@ def _mk_runtime(
     goal_output_contract=None,
     vlm_output="",
     enable_xhr=False,
+    vlm=None,
 ):
     deps = ExtractDeps(
         browser=browser if browser is not None else _StubBrowser(_StubFrame()),
@@ -128,6 +129,7 @@ def _mk_runtime(
         goal_output_contract=goal_output_contract,
         vlm_output=vlm_output,
         enable_xhr=enable_xhr,
+        vlm=vlm,
     )
     return ExtractRuntime(deps, state if state is not None else ExtractState())
 
@@ -760,3 +762,113 @@ def test_arm_pagination_rearm_when_paginator_known_and_target_unmet():
         )
     )
     assert state.force_next_page_pending is True
+
+
+# ── R2-3a: handle_zero_new_rows_feedback (explicit-path no-new-rows dedup) ────
+
+
+class _RecVlm:
+    """VLM stub recording inject_error_feedback messages."""
+
+    def __init__(self):
+        self.feedback = []
+
+    def inject_error_feedback(self, msg):
+        self.feedback.append(str(msg))
+
+
+def _mk_zero_rows_runtime(vlm, state, *, goal="抓取50条数据", drain=None):
+    rt = _mk_runtime(goal=goal, state=state, vlm=vlm)
+    # isolate the feedback branching from the real browser scroll machinery
+    _drain = drain or {"at_bottom": False, "window_remaining": 500, "container_remaining": 0}
+
+    async def _fake_drain(_reason):
+        return _drain
+
+    rt.probe_scroll_drain_state = _fake_drain
+    calls = {"nudge": 0}
+
+    async def _fake_nudge(_reason, scroll_amount=2000):
+        calls["nudge"] += 1
+        return True
+
+    rt.nudge_scroll_after_duplicate_extract = _fake_nudge
+    return rt, calls
+
+
+def test_zero_rows_target_already_reached_tells_done():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=50)
+    rt, _calls = _mk_zero_rows_runtime(vlm, state, goal="抓取50条数据")
+    streak = asyncio.run(
+        rt.handle_zero_new_rows_feedback(
+            duplicate_zero_extract_streak=0,
+            dup_rows=2,
+            rejected_rows=0,
+            current_url="http://x",
+            data_shape={},
+        )
+    )
+    assert streak == 0  # pre_reached branch does not bump the streak
+    assert any("已达成" in m for m in vlm.feedback)
+
+
+def test_zero_rows_prior_page_drained_arms_first_flip():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=10, extracted_page_urls={"http://x"})
+    rt, _calls = _mk_zero_rows_runtime(
+        vlm, state, goal="抓取50条数据", drain={"at_bottom": True}
+    )
+    streak = asyncio.run(
+        rt.handle_zero_new_rows_feedback(
+            duplicate_zero_extract_streak=0,
+            dup_rows=0,
+            rejected_rows=0,
+            current_url="http://x",
+            data_shape={},
+        )
+    )
+    assert streak == 1
+    assert state.first_flip_pending is True
+    assert any("物理触底" in m for m in vlm.feedback)
+
+
+def test_zero_rows_prior_page_not_drained_nudges():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=10, extracted_page_keys={"k"})
+    rt, calls = _mk_zero_rows_runtime(
+        vlm,
+        state,
+        goal="抓取50条数据",
+        drain={"at_bottom": False, "window_remaining": 800, "container_remaining": 0},
+    )
+    streak = asyncio.run(
+        rt.handle_zero_new_rows_feedback(
+            duplicate_zero_extract_streak=0,
+            dup_rows=0,
+            rejected_rows=0,
+            current_url="http://x",
+            data_shape={},
+        )
+    )
+    assert streak == 1
+    assert calls["nudge"] == 1
+    assert state.first_flip_pending is False
+
+
+def test_zero_rows_dense_page_blocks_next_page():
+    vlm = _RecVlm()
+    state = ExtractState()  # no prior page, no row-count target met
+    rt, calls = _mk_zero_rows_runtime(vlm, state, goal="抓取所有数据")
+    streak = asyncio.run(
+        rt.handle_zero_new_rows_feedback(
+            duplicate_zero_extract_streak=0,
+            dup_rows=0,
+            rejected_rows=0,
+            current_url="http://x",
+            data_shape={"table_rows": 25, "table_cells": 3},
+        )
+    )
+    assert streak == 1
+    assert state.block_next_page_until_drained is True
+    assert calls["nudge"] == 1

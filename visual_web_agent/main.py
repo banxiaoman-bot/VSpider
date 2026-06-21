@@ -2245,6 +2245,7 @@ async def run_agent(
             vlm_output=_vlm_output,
             enable_xhr=enable_xhr,
             broadcast_log_safe=_broadcast_log_safe,
+            vlm=vlm,
         )
         _extract_rt = _ExtractRuntime(_extract_deps, _xs)
 
@@ -6432,91 +6433,13 @@ async def run_agent(
                             decision["extracted_data"] = extracted
                             if _new_rows == 0:
                                 _dedup_tripped_last_step = True
-                                logger.warning(
-                                    "[EXTRACT DEDUP] no new rows after row-level filtering "
-                                    "(duplicates=%s, rejected=%s, url=%s)",
-                                    _dup_rows,
-                                    _rejected_rows,
-                                    _current_url,
+                                _duplicate_zero_extract_streak = await _extract_rt.handle_zero_new_rows_feedback(
+                                    duplicate_zero_extract_streak=_duplicate_zero_extract_streak,
+                                    dup_rows=_dup_rows,
+                                    rejected_rows=_rejected_rows,
+                                    current_url=_current_url,
+                                    data_shape=_data_shape,
                                 )
-                                _target_count_pre = _parse_goal_target_count(goal)
-                                _pre_reached = (
-                                    _target_count_pre is not None
-                                    and _xs.total_extracted_rows >= _target_count_pre
-                                )
-                                if _pre_reached:
-                                    vlm.inject_error_feedback(
-                                        f"✅ 你已累计提取 {_xs.total_extracted_rows} 条数据，"
-                                        f"已达成用户要求的 {_target_count_pre} 条。"
-                                        "请立即输出 action=done 结束任务，不要再 extract。"
-                                    )
-                                else:
-                                    _has_prior_extract_page = bool(_xs.extracted_page_urls or _xs.extracted_page_keys)
-                                    if _target_count_pre is not None and _has_prior_extract_page:
-                                        _duplicate_zero_extract_streak += 1
-                                        _scroll_drain = await _probe_scroll_drain_state(
-                                            "duplicate extract drain probe"
-                                        )
-                                        _physically_drained = bool(_scroll_drain.get("at_bottom"))
-                                        _probe_failed = bool(_scroll_drain.get("probe_failed"))
-                                        if _physically_drained or (_probe_failed and _duplicate_zero_extract_streak >= 3):
-                                            _xs.first_flip_pending = True
-                                            _drain_reason = (
-                                                "物理触底"
-                                                if _physically_drained
-                                                else "触底探测失败且连续多次无新增"
-                                            )
-                                            vlm.inject_error_feedback(
-                                                f"⚠️ 系统 extract 净新增为 0，且已确认{_drain_reason}。\n"
-                                                f"当前累计 {_xs.total_extracted_rows}/{_target_count_pre} 条，"
-                                                "说明当前页/当前滚动区域已基本榨干但目标尚未达成。\n"
-                                                "下一步必须执行 next_page（target_id=0, type_value=\"\"），"
-                                                "让底层优先尝试 URL 变异/分页器/页码；不要继续 smooth_scroll "
-                                                "或重复 extract 当前页。"
-                                            )
-                                        else:
-                                            _remaining_hint = (
-                                                f"window_remaining={_scroll_drain.get('window_remaining')}, "
-                                                f"container_remaining={_scroll_drain.get('container_remaining')}"
-                                            )
-                                            vlm.inject_error_feedback(
-                                                "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
-                                                f"当前累计 {_xs.total_extracted_rows}/{_target_count_pre} 条，"
-                                                "这只能证明当前视口没有新行，尚不能证明整页已榨干。\n"
-                                                f"物理滚动探测显示仍有下滑空间（{_remaining_hint}）。"
-                                                "下一步先 smooth_scroll down 暴露同页下方隐藏数据；"
-                                                "只有净新增为 0 且物理触底后，系统才会强制 next_page。"
-                                            )
-                                            await _nudge_scroll_after_duplicate_extract(
-                                                "first duplicate extract before pagination"
-                                            )
-                                    else:
-                                        _duplicate_zero_extract_streak += 1
-                                        _expected_dense_rows = _expected_rows_from_data_shape(
-                                            _data_shape
-                                        )
-                                        if _expected_dense_rows >= 10:
-                                            _xs.block_next_page_until_drained = True
-                                            _xs.block_next_page_reason = (
-                                                f"dense page exposes about {_expected_dense_rows} rows, "
-                                                "but viewport/full extraction under-yielded"
-                                            )
-                                            vlm.inject_error_feedback(
-                                                "⚠️ 系统探头发现当前页存在密集列表/表格，"
-                                                f"大约 {_expected_dense_rows} 个结构化条目；"
-                                                "但本次 extract 没有得到足够新增行。\n"
-                                                "这说明当前页尚未被可靠提取，下一步先 smooth_scroll down "
-                                                "或重新 extract 当前页，禁止直接 next_page。"
-                                            )
-                                        else:
-                                            vlm.inject_error_feedback(
-                                                "⚠️ 系统执行了 extract，但行级去重发现没有新增数据。\n"
-                                                "请不要重复提取当前列表。下一步优先 next_page；"
-                                                "若 next_page 报错，再考虑 smooth_scroll 加载更多。"
-                                            )
-                                        await _nudge_scroll_after_duplicate_extract(
-                                            "explicit extract duplicate rows"
-                                        )
                                 break
 
                             if _dup_rows or _rejected_rows:
