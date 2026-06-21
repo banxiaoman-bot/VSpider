@@ -5122,56 +5122,15 @@ async def run_agent(
                                 "auto extract visible list rows"
                             )
                         )
-                        if _dom_list_rows:
-                            _dom_card_source_text = "\n\n".join(
-                                text for text in (_ax_text, _dom_list_text) if text
-                            )
-                            _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
-                                _dom_list_rows,
-                                source_text=_dom_card_source_text,
-                                requested_fields=_requested_output_fields,
-                                goal=goal,
-                            )
-                            if not _dom_card_rows:
-                                _dom_card_body_text = await _extract_body_text_for_semantic_cards(
-                                    "auto extract semantic card body text"
-                                )
-                                if _dom_card_body_text:
-                                    _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
-                                        _dom_list_rows,
-                                        source_text="\n\n".join(
-                                            text
-                                            for text in (
-                                                _dom_card_body_text,
-                                                _dom_card_source_text,
-                                            )
-                                            if text
-                                        ),
-                                        requested_fields=_requested_output_fields,
-                                        goal=goal,
-                                    )
-                            if _dom_card_rows:
-                                logger.info(
-                                    "[EXTRACT DOM] semantic cards rows=%s source_chars=%s",
-                                    len(_dom_card_rows),
-                                    len(_dom_card_text or _dom_list_text or ""),
-                                )
-                                _auto_candidates.append(
-                                    _sanitize_extraction_candidate(
-                                        name="DOM_CARDS",
-                                        data=_dom_card_rows,
-                                        source_text=_dom_card_text or _dom_list_text or _ax_text,
-                                        data_shape=_data_shape,
-                                    )
-                                )
-                            _auto_candidates.append(
-                                _sanitize_extraction_candidate(
-                                    name="DOM_LIST",
-                                    data=_dom_list_rows,
-                                    source_text=_dom_list_text or _ax_text,
-                                    data_shape=_data_shape,
-                                )
-                            )
+                        await _extract_rt.gather_dom_list_card_candidates(
+                            _auto_candidates,
+                            dom_list_rows=_dom_list_rows,
+                            dom_list_text=_dom_list_text,
+                            data_shape=_data_shape,
+                            card_base_texts=(_ax_text,),
+                            fallback_source_text=_ax_text,
+                            body_text_reason="auto extract semantic card body text",
+                        )
 
                         _dom_auto_rows = (
                             []
@@ -6385,66 +6344,15 @@ async def run_agent(
                                     "extract visible list rows"
                                 )
                             )
-                            if _dom_list_rows:
-                                _dom_card_source_text = "\n\n".join(
-                                    text
-                                    for text in (
-                                        _full_page_text,
-                                        _source_text_for_validation,
-                                        _dom_list_text,
-                                    )
-                                    if text
-                                )
-                                _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
-                                    _dom_list_rows,
-                                    source_text=_dom_card_source_text,
-                                    requested_fields=_requested_output_fields,
-                                    goal=goal,
-                                )
-                                if not _dom_card_rows:
-                                    _dom_card_body_text = await _extract_body_text_for_semantic_cards(
-                                        "extract semantic card body text"
-                                    )
-                                    if _dom_card_body_text:
-                                        _dom_card_rows, _dom_card_text = extract_semantic_card_rows(
-                                            _dom_list_rows,
-                                            source_text="\n\n".join(
-                                                text
-                                                for text in (
-                                                    _dom_card_body_text,
-                                                    _dom_card_source_text,
-                                                )
-                                                if text
-                                            ),
-                                            requested_fields=_requested_output_fields,
-                                            goal=goal,
-                                        )
-                                if _dom_card_rows:
-                                    logger.info(
-                                        "[EXTRACT DOM] semantic cards rows=%s source_chars=%s",
-                                        len(_dom_card_rows),
-                                        len(_dom_card_text or _dom_list_text or ""),
-                                    )
-                                    _candidates.append(
-                                        _sanitize_extraction_candidate(
-                                            name="DOM_CARDS",
-                                            data=_dom_card_rows,
-                                            source_text=(
-                                                _dom_card_text
-                                                or _dom_list_text
-                                                or _source_text_for_validation
-                                            ),
-                                            data_shape=_data_shape,
-                                        )
-                                    )
-                                _candidates.append(
-                                    _sanitize_extraction_candidate(
-                                        name="DOM_LIST",
-                                        data=_dom_list_rows,
-                                        source_text=_dom_list_text or _source_text_for_validation,
-                                        data_shape=_data_shape,
-                                    )
-                                )
+                            await _extract_rt.gather_dom_list_card_candidates(
+                                _candidates,
+                                dom_list_rows=_dom_list_rows,
+                                dom_list_text=_dom_list_text,
+                                data_shape=_data_shape,
+                                card_base_texts=(_full_page_text, _source_text_for_validation),
+                                fallback_source_text=_source_text_for_validation,
+                                body_text_reason="extract semantic card body text",
+                            )
 
                             _dom_table_rows = (
                                 []

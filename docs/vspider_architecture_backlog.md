@@ -4012,6 +4012,19 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 验证: 全量 pytest **36 failed / 3893 passed / 2 skipped**——36 失败全是并发 UI agent 的 App.vue source-wiring/keyboard/timeline/timer 断言（已 `git stash` 证实 HEAD 无本切片改动时同样失败），与本切片零关联；**本切片 0 新增失败**。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（R2 安全增量首刀；下刀候选：candidate 采集段 6344-6517 → `gather_candidates`）。
 
+## Slice R2-2 (M5 拆分): extract DOM list/card 候选采集去重 → ExtractRuntime (done, P1)
+
+- 能力名: extract_dom_list_card_dedup（auto/explicit 两处 extract 路径重复的「DOM_CARDS 语义卡 + DOM_LIST 列表候选采集」整块收敛为 `ExtractRuntime.gather_dom_list_card_candidates(candidates, *, ...)`）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。R2「安全增量」第二刀：真·无控制流子段（仅 append 到调用方 candidates 列表），控制流尾段仍留主循环。
+- 前置: R2-1 已完成（`compute_data_shape_with_drain` 就位）。
+- 改动:
+  - 新增方法 `ExtractRuntime.gather_dom_list_card_candidates(candidates, *, dom_list_rows, dom_list_text, data_shape, card_base_texts, fallback_source_text, body_text_reason) -> None`：`extract_semantic_card_rows` → 空则 body_text 二次兜底 → append `DOM_CARDS`（若有）+ `DOM_LIST`。三处 per-call 差异（card 前置文本 / source_text 兜底串 / body 探针 reason）参数化；原地 mutate 调用方 candidates 列表，不碰其它 caller 局部。逐字平移零行为改动。
+  - `main.py` 两处约 50 行内联块（auto extract ~5122 / explicit extract ~6344）改为单次 `await _extract_rt.gather_dom_list_card_candidates(...)` 委托；净减约 92 行；移除 `_dom_card_source_text`/`_dom_card_rows`/`_dom_card_text`/`_dom_card_body_text` 四个局部经全量引用核验安全（grep main.py 0 残留下游引用）。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 追加 5 例（空 rows noop / 无卡仅 DOM_LIST / 有卡 DOM_CARDS+DOM_LIST 顺序 / body_text 二次兜底命中 / DOM_LIST source_text 回退 fallback），monkeypatch `extract_semantic_card_rows` + passthrough sanitize 隔离重逻辑，断分支不断 sanitize 内部；合计 46✓；`py_compile` 通过，三文件 CLEAN_CRLF 无混行；main.py 9658→9566 行（<9700 基线仍绿）。
+- 验证: 全量 pytest **36 failed / 3938 passed / 2 skipped**——36 失败全是并发 UI agent 的 App.vue source-wiring/keyboard/timeline/timer 断言（已 `git stash` 仅本切片 3 文件后重跑同样 36 failed/110 passed，证实 HEAD 无本切片改动时同样失败），与本切片零关联；**本切片 0 新增失败**。
+- 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（R2 安全增量第二刀；下刀候选：candidate 采集段控制流尾段——需 `ExtractOutcome` 返回指令协议，风险高）。
+
 ## Slice BBR-1 (M3 通用): 三后端任务分流路由骨架纳管 BrowserBackendRouter (done, P2)
 
 - 能力名: browser_backend_routing（在 `build_default_browser_backend` 扁平 env/kind 开关之上，按任务类型在 chromium / lightpanda / cloakbrowser 三 persona 间确定性分流；契约 `browser_backend_route.v1`）。

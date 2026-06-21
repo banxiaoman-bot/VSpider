@@ -513,3 +513,146 @@ def test_compute_data_shape_with_drain_probe_failure_returns_empty():
     rt = _mk_runtime(browser=_Br())
     shape = asyncio.run(rt.compute_data_shape_with_drain("r"))
     assert shape == {}
+
+
+# ── R2-2: gather_dom_list_card_candidates (dedup of auto/explicit extract) ───
+
+
+def _passthrough_sanitize(rt):
+    """Replace sanitize_extraction_candidate with a thin recorder so the
+    gather tests assert on branching (which candidates, order, source_text),
+    not on the heavy sanitize internals (data_controller/fingerprints)."""
+    rt.sanitize_extraction_candidate = lambda **kw: {
+        "name": kw["name"],
+        "data": kw["data"],
+        "source_text": kw.get("source_text", ""),
+        "data_shape": kw.get("data_shape"),
+    }
+
+
+async def _async_empty_body(_reason):
+    return ""
+
+
+def test_gather_dom_list_card_candidates_empty_rows_noop():
+    rt = _mk_runtime()
+    candidates: list = []
+    asyncio.run(
+        rt.gather_dom_list_card_candidates(
+            candidates,
+            dom_list_rows=[],
+            dom_list_text="",
+            data_shape={},
+            card_base_texts=("base",),
+            fallback_source_text="fb",
+            body_text_reason="r",
+        )
+    )
+    assert candidates == []
+
+
+def test_gather_dom_list_card_candidates_list_only_when_no_cards(monkeypatch):
+    from visual_web_agent.extraction_engine import runtime as _rt_mod
+
+    monkeypatch.setattr(_rt_mod, "extract_semantic_card_rows", lambda *a, **k: ([], ""))
+    rt = _mk_runtime()
+    _passthrough_sanitize(rt)
+    rt.extract_body_text_for_semantic_cards = _async_empty_body
+    candidates: list = []
+    asyncio.run(
+        rt.gather_dom_list_card_candidates(
+            candidates,
+            dom_list_rows=[{"a": 1}],
+            dom_list_text="list-text",
+            data_shape={},
+            card_base_texts=("base",),
+            fallback_source_text="fb",
+            body_text_reason="r",
+        )
+    )
+    assert [c["name"] for c in candidates] == ["DOM_LIST"]
+    assert candidates[0]["source_text"] == "list-text"
+
+
+def test_gather_dom_list_card_candidates_cards_then_list(monkeypatch):
+    from visual_web_agent.extraction_engine import runtime as _rt_mod
+
+    monkeypatch.setattr(
+        _rt_mod, "extract_semantic_card_rows", lambda *a, **k: ([{"c": 1}], "card-text")
+    )
+    rt = _mk_runtime()
+    _passthrough_sanitize(rt)
+    candidates: list = []
+    asyncio.run(
+        rt.gather_dom_list_card_candidates(
+            candidates,
+            dom_list_rows=[{"a": 1}],
+            dom_list_text="list-text",
+            data_shape={},
+            card_base_texts=("base",),
+            fallback_source_text="fb",
+            body_text_reason="r",
+        )
+    )
+    assert [c["name"] for c in candidates] == ["DOM_CARDS", "DOM_LIST"]
+    assert candidates[0]["source_text"] == "card-text"
+    assert candidates[1]["source_text"] == "list-text"
+
+
+def test_gather_dom_list_card_candidates_body_text_fallback(monkeypatch):
+    calls = {"n": 0}
+
+    def _fake_cards(_rows, *, source_text, requested_fields, goal):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ([], "")
+        return ([{"c": 1}], "card-after-body")
+
+    from visual_web_agent.extraction_engine import runtime as _rt_mod
+
+    monkeypatch.setattr(_rt_mod, "extract_semantic_card_rows", _fake_cards)
+    rt = _mk_runtime()
+    _passthrough_sanitize(rt)
+
+    async def _body(_reason):
+        return "body-text"
+
+    rt.extract_body_text_for_semantic_cards = _body
+    candidates: list = []
+    asyncio.run(
+        rt.gather_dom_list_card_candidates(
+            candidates,
+            dom_list_rows=[{"a": 1}],
+            dom_list_text="list-text",
+            data_shape={},
+            card_base_texts=("base",),
+            fallback_source_text="fb",
+            body_text_reason="r",
+        )
+    )
+    assert calls["n"] == 2
+    assert [c["name"] for c in candidates] == ["DOM_CARDS", "DOM_LIST"]
+    assert candidates[0]["source_text"] == "card-after-body"
+
+
+def test_gather_dom_list_card_candidates_list_source_falls_back(monkeypatch):
+    from visual_web_agent.extraction_engine import runtime as _rt_mod
+
+    monkeypatch.setattr(_rt_mod, "extract_semantic_card_rows", lambda *a, **k: ([], ""))
+    rt = _mk_runtime()
+    _passthrough_sanitize(rt)
+    rt.extract_body_text_for_semantic_cards = _async_empty_body
+    candidates: list = []
+    asyncio.run(
+        rt.gather_dom_list_card_candidates(
+            candidates,
+            dom_list_rows=[{"a": 1}],
+            dom_list_text="",
+            data_shape={},
+            card_base_texts=("base",),
+            fallback_source_text="fb-source",
+            body_text_reason="r",
+        )
+    )
+    assert candidates[0]["name"] == "DOM_LIST"
+    assert candidates[0]["source_text"] == "fb-source"

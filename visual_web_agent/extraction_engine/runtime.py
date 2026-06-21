@@ -23,6 +23,7 @@ try:  # pragma: no cover - import shim mirrors main.py
     )
     from ..phases.decision_helpers import _goal_is_bulk_extraction
     from .snapshots import maybe_save_snapshot
+    from .cards import extract_semantic_card_rows
     from ..data_writers import save_run_dataset
     from ..artifact_manager import resolve_artifact_path
     from ..virtual_scroll import nudge_virtual_scroll
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover
     )
     from phases.decision_helpers import _goal_is_bulk_extraction
     from extraction_engine.snapshots import maybe_save_snapshot
+    from extraction_engine.cards import extract_semantic_card_rows
     from data_writers import save_run_dataset
     from artifact_manager import resolve_artifact_path
     from virtual_scroll import nudge_virtual_scroll
@@ -784,6 +786,76 @@ class ExtractRuntime:
         except Exception as shape_err:
             self.deps.logger.debug("[DATA SHAPE] skipped: %s", shape_err)
         return data_shape
+
+    async def gather_dom_list_card_candidates(
+        self,
+        candidates: list,
+        *,
+        dom_list_rows,
+        dom_list_text,
+        data_shape,
+        card_base_texts,
+        fallback_source_text,
+        body_text_reason,
+    ) -> None:
+        """Append DOM_CARDS (when semantic cards extract) + DOM_LIST candidates.
+
+        Verbatim relocation of the block duplicated across run_agent's auto-
+        and explicit-extract paths. The three per-call differences are passed
+        in: ``card_base_texts`` (texts prepended to the card source ahead of
+        the list text), ``fallback_source_text`` (used when ``dom_list_text``
+        is empty) and ``body_text_reason`` (the semantic-card body-text probe
+        reason). Mutates the caller-owned ``candidates`` list in place; no other
+        caller local is touched.
+        """
+        if not dom_list_rows:
+            return
+        card_source_text = "\n\n".join(
+            text for text in (*card_base_texts, dom_list_text) if text
+        )
+        dom_card_rows, dom_card_text = extract_semantic_card_rows(
+            dom_list_rows,
+            source_text=card_source_text,
+            requested_fields=self.deps.requested_output_fields,
+            goal=self.deps.goal,
+        )
+        if not dom_card_rows:
+            dom_card_body_text = await self.extract_body_text_for_semantic_cards(
+                body_text_reason
+            )
+            if dom_card_body_text:
+                dom_card_rows, dom_card_text = extract_semantic_card_rows(
+                    dom_list_rows,
+                    source_text="\n\n".join(
+                        text
+                        for text in (dom_card_body_text, card_source_text)
+                        if text
+                    ),
+                    requested_fields=self.deps.requested_output_fields,
+                    goal=self.deps.goal,
+                )
+        if dom_card_rows:
+            self.deps.logger.info(
+                "[EXTRACT DOM] semantic cards rows=%s source_chars=%s",
+                len(dom_card_rows),
+                len(dom_card_text or dom_list_text or ""),
+            )
+            candidates.append(
+                self.sanitize_extraction_candidate(
+                    name="DOM_CARDS",
+                    data=dom_card_rows,
+                    source_text=dom_card_text or dom_list_text or fallback_source_text,
+                    data_shape=data_shape,
+                )
+            )
+        candidates.append(
+            self.sanitize_extraction_candidate(
+                name="DOM_LIST",
+                data=dom_list_rows,
+                source_text=dom_list_text or fallback_source_text,
+                data_shape=data_shape,
+            )
+        )
 
     async def detect_canvas_grid(self, reason: str) -> dict:
         """Detect a dominant canvas/svg-rendered grid (EXTRACT-CANVAS-1).
