@@ -1590,3 +1590,206 @@ class HoverAndClickHandler(ActionHandler):
             raise ActionExecutionError(f"hover_and_click 执行失败: {e}")
 
 
+
+
+@ActionRegistry.register("dismiss_consent")
+class DismissConsentHandler(ActionHandler):
+    """Deterministically dismiss cookie/consent walls (CMP) by clicking the
+    'Accept all' control so downstream interaction/extraction is unblocked.
+
+    Layered like next_page: L1 known-CMP selectors -> L2 scoped multilingual
+    affirmative text (reject/manage excluded) -> child-iframe fallback ->
+    verify the overlay disappeared. Idempotent no-op when no wall is present,
+    so the future auto-guard slice can call it cheaply.
+    """
+
+    _KNOWN_CMP_SELECTORS: ClassVar[list[str]] = [
+        "#onetrust-accept-btn-handler",
+        "#accept-recommended-btn-handler",
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#CybotCookiebotDialogBodyButtonAccept",
+        "#truste-consent-button",
+        ".qc-cmp2-summary-buttons button[mode='primary']",
+        "#didomi-notice-agree-button",
+        "[data-testid='uc-accept-all-button']",
+        "button#uc-btn-accept-banner",
+        ".osano-cm-accept-all",
+        ".cky-btn-accept",
+        ".cmplz-accept",
+        ".cc-allow",
+        ".cm-btn-success",
+        ".cm-btn-accept-all",
+        "[data-tid='banner-accept']",
+        "#BorlabsCookieBoxSaveButton",
+        "a[data-cookie-accept-all]",
+        ".sp_choice_type_11",
+        "#wt-cli-accept-all-btn",
+        ".wt-cli-accept-all-btn",
+    ]
+    _ACCEPT_TEXTS: ClassVar[list[str]] = [
+        "accept all", "accept all cookies", "i accept", "i agree", "agree",
+        "allow all", "got it", "accept", "ok",
+        "接受全部", "全部接受", "同意", "同意全部", "允许全部", "我知道了", "同意并继续",
+        "alle akzeptieren", "akzeptieren", "tout accepter", "accepter",
+        "aceptar todo", "同意する", "すべて同意", "모두 동의",
+    ]
+    _REJECT_TEXTS: ClassVar[list[str]] = [
+        "reject", "decline", "manage", "settings", "preferences", "customize",
+        "only necessary", "拒绝", "管理", "设置", "仅必要", "自定义",
+    ]
+    _CONTAINER_SELECTORS: ClassVar[str] = (
+        "[role='dialog'],[aria-modal='true'],"
+        "[class*='cookie'],[class*='consent'],[class*='cmp'],"
+        "[class*='gdpr'],[class*='privacy'],[id*='cookie'],[id*='consent']"
+    )
+    _MARK: ClassVar[str] = "data-vspider-consent-accept"
+
+    _JS_MARK_CONSENT: ClassVar[str] = r"""
+([known, accept, reject, container, MARK]) => {
+  document.querySelectorAll(`[${MARK}]`).forEach(el => el.removeAttribute(MARK));
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return false;
+    const st = window.getComputedStyle(el);
+    return st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) > 0.01;
+  };
+  const enabled = (el) => !(el.disabled || el.getAttribute('aria-disabled') === 'true');
+  const mark = (el, extra) => {
+    el.setAttribute(MARK, '1');
+    try { el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'}); } catch (e) {}
+    return Object.assign({found: true}, extra);
+  };
+  for (const sel of known) {
+    let el = null;
+    try { el = document.querySelector(sel); } catch (e) { continue; }
+    if (el && visible(el) && enabled(el)) {
+      return mark(el, {strategy: 'known_cmp', cmp: 'cmp', selector: sel});
+    }
+  }
+  let roots = [];
+  try { roots = Array.from(document.querySelectorAll(container)).filter(visible); } catch (e) { roots = []; }
+  const textOf = (el) => norm([el.innerText, el.textContent, el.getAttribute('aria-label'), el.value].filter(Boolean).join(' '));
+  for (const root of roots) {
+    const nodes = Array.from(root.querySelectorAll("a,button,[role='button'],input[type='button'],input[type='submit']")).filter(visible).filter(enabled);
+    for (const el of nodes) {
+      const t = textOf(el);
+      if (!t || t.length > 40) continue;
+      if (reject.some(w => t.includes(w))) continue;
+      if (accept.some(w => t === w)) {
+        return mark(el, {strategy: 'accept_text', cmp: 'text', label: t});
+      }
+    }
+  }
+  return {found: false, reason: 'no-consent-control'};
+}
+"""
+
+    _JS_CONSENT_STILL_VISIBLE: ClassVar[str] = r"""
+([known, accept, reject, container, MARK]) => {
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return false;
+    const st = window.getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || 1) <= 0.01) return false;
+    return true;
+  };
+  for (const sel of known) {
+    let el = null;
+    try { el = document.querySelector(sel); } catch (e) { continue; }
+    if (el && visible(el)) return true;
+  }
+  let roots = [];
+  try { roots = Array.from(document.querySelectorAll(container)); } catch (e) { roots = []; }
+  for (const root of roots) {
+    if (!visible(root)) continue;
+    const st = window.getComputedStyle(root);
+    if (st.position === 'fixed' || st.position === 'sticky' || Number(st.zIndex || 0) >= 1000) return true;
+  }
+  return false;
+}
+"""
+
+    def _iter_scopes(self, page):
+        scopes = [(page, getattr(page, "url", "") or "")]
+        main_frame = getattr(page, "main_frame", None)
+        for frame in list(getattr(page, "frames", None) or []):
+            if frame is main_frame:
+                continue
+            is_detached = getattr(frame, "is_detached", None)
+            if callable(is_detached) and is_detached():
+                continue
+            scopes.append((frame, str(getattr(frame, "url", "") or "")))
+        return scopes
+
+    async def _verify_gone(self, scope, payload):
+        try:
+            still = await scope.evaluate(self._JS_CONSENT_STILL_VISIBLE, payload)
+        except Exception:
+            return False
+        return not bool(still)
+
+    async def execute(self, ctx: "ActionContext") -> "Optional[Page]":
+        browser = ctx.browser
+        page = ctx.page
+        if not page:
+            raise ActionExecutionError("dismiss_consent: 无活动页面。")
+
+        result = {
+            "action": "dismiss_consent", "cmp": "none", "strategy": "noop",
+            "selector": "", "frame_url": "", "dismissed": False, "scanned_frames": 0,
+        }
+        payload = [
+            self._KNOWN_CMP_SELECTORS, self._ACCEPT_TEXTS,
+            self._REJECT_TEXTS, self._CONTAINER_SELECTORS, self._MARK,
+        ]
+
+        for scope, frame_url in self._iter_scopes(page):
+            result["scanned_frames"] += 1
+            try:
+                probe = await scope.evaluate(self._JS_MARK_CONSENT, payload)
+            except Exception as probe_err:
+                logger.debug("[DISMISS_CONSENT] probe failed (%s): %s", frame_url, probe_err)
+                continue
+            if not isinstance(probe, dict) or not probe.get("found"):
+                continue
+            marker = "[" + self._MARK + '="1"]'
+            loc = scope.locator(marker).first
+            label = (
+                "dismiss_consent " + str(probe.get("strategy"))
+                + " " + repr(probe.get("selector") or probe.get("label"))
+            )
+            try:
+                await _click_locator_with_js_fallback(loc, label, timeout=3000)
+            except Exception as click_err:
+                logger.debug("[DISMISS_CONSENT] click failed for %s: %s", label, click_err)
+                continue
+            dismissed = await self._verify_gone(scope, payload)
+            if not dismissed:
+                try:
+                    probe2 = await scope.evaluate(self._JS_MARK_CONSENT, payload)
+                    if isinstance(probe2, dict) and probe2.get("found"):
+                        loc2 = scope.locator(marker).first
+                        await _click_locator_with_js_fallback(loc2, label + " retry", timeout=3000)
+                        dismissed = await self._verify_gone(scope, payload)
+                except Exception:
+                    pass
+            result.update(
+                cmp=probe.get("cmp") or probe.get("strategy") or "text",
+                strategy=probe.get("strategy") or "accept_text",
+                selector=probe.get("selector") or "",
+                frame_url=frame_url,
+                dismissed=bool(dismissed),
+            )
+            if dismissed:
+                break
+
+        logger.info(
+            "[DISMISS_CONSENT] strategy=%s cmp=%s dismissed=%s frames=%s",
+            result["strategy"], result["cmp"], result["dismissed"], result["scanned_frames"],
+        )
+        browser.rpa_trail.append(ctx.with_rpa_meta(dict(result)))
+        await browser._wait_after_action()
+        return None

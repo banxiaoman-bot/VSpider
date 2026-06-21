@@ -37,6 +37,7 @@ from .keys_select_drag import (
 )
 from .page_ops import (
     ClickPointHandler, NextPageHandler,
+    DismissConsentHandler,
     ClickTextHandler, HoverAndClickHandler,
 )
 from .row_and_tree import (
@@ -86,6 +87,7 @@ __all__ = [
     "PressKeyHandler", "SelectHandler",
     "DragAndDropHandler", "RemoveElementHandler",
     "ClickPointHandler", "NextPageHandler",
+    "DismissConsentHandler",
     "ClickTextHandler", "HoverAndClickHandler",
     "RowActionHandler", "ExtractRowHandler", "TreeCheckHandler",
     "SetPromptResponseHandler", "SwitchTabHandler",
