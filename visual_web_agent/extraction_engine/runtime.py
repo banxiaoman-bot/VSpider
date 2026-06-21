@@ -1131,6 +1131,87 @@ class ExtractRuntime:
                 )
         return duplicate_zero_extract_streak
 
+    def inject_post_extract_pagination_guidance(self) -> None:
+        """Inject smart pagination/done VLM guidance after a successful explicit
+        extract, based on pages extracted so far vs the row-count target.
+        Verbatim relocation of the block from run_agent's explicit path
+        (formerly main.py ~6622-6690): pure read of ``self.state`` + browser,
+        no control flow, no state writes. The auto-extract path keeps its own
+        divergent block (``_auto_pages`` = urls only, final ``else`` instead of
+        ``elif extract_count > 0``, different message text), so they are not
+        merged.
+        """
+        _n_pages = max(
+            len(self.state.extracted_page_urls), len(self.state.extracted_page_keys)
+        )
+        _target_count_b = _parse_goal_target_count(self.deps.goal)
+        _reached_target_b = (
+            _target_count_b is not None
+            and self.state.total_extracted_rows >= _target_count_b
+        )
+        if _reached_target_b:
+            self.deps.vlm.inject_error_feedback(
+                f"✅ 你已成功提取 {_n_pages} 个不同页面的数据"
+                f"（累计 {self.state.total_extracted_rows} 条）。\n"
+                f"用户要求获取 {_target_count_b} 条数据，"
+                f"当前已达到目标！请立即输出 done 结束任务。"
+            )
+        elif _n_pages >= 2 and _target_count_b is not None:
+            _pag_links_c = self.deps.browser.find_pagination_links()
+            if _pag_links_c:
+                _pag_hint_c = "\n".join(
+                    f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                    for p in _pag_links_c
+                )
+                self.deps.vlm.inject_error_feedback(
+                    f"✅ 你已成功提取 {_n_pages} 个页面"
+                    f"（累计 {self.state.total_extracted_rows} 条），"
+                    f"但用户要求 {_target_count_b} 条，"
+                    f"还差 {_target_count_b - self.state.total_extracted_rows} 条。\n"
+                    f"系统发现了翻页链接：\n{_pag_hint_c}\n"
+                    f"【立即操作】请继续翻页，例如："
+                    f"click(target_id={_pag_links_c[0]['id']})"
+                )
+            else:
+                self.deps.vlm.inject_error_feedback(
+                    f"✅ 你已成功提取 {_n_pages} 个页面"
+                    f"（累计 {self.state.total_extracted_rows} 条），"
+                    f"但用户要求 {_target_count_b} 条，"
+                    f"还差 {_target_count_b - self.state.total_extracted_rows} 条。\n"
+                    "请向下滚动查找翻页按钮后继续翻页提取。"
+                )
+        elif _n_pages >= 2:
+            self.deps.vlm.inject_error_feedback(
+                f"✅ 你已成功提取 {_n_pages} 个不同页面的数据"
+                f"（累计 {self.state.total_extracted_rows} 条）。\n"
+                "请仔细回顾用户的原始任务要求，"
+                "判断是否需要继续翻页提取更多数据。\n"
+                "如果已满足用户需求，请输出 done 结束任务。"
+            )
+        elif self.state.extract_count > 0:
+            _pag_links_b = self.deps.browser.find_pagination_links()
+            if _pag_links_b:
+                _pag_hint_b = "\n".join(
+                    f"  → [ID: {p['id']}] {p['role']}: \"{p['name']}\""
+                    for p in _pag_links_b
+                )
+                self.deps.vlm.inject_error_feedback(
+                    f"✅ 你已成功提取当前页数据"
+                    f"（第 {_n_pages} 个页面，累计 {self.state.total_extracted_rows} 条）。\n"
+                    f"系统在当前页面发现了以下翻页链接：\n{_pag_hint_b}\n"
+                    f"【立即操作】请点击翻页链接加载下一页，例如："
+                    f"click(target_id={_pag_links_b[0]['id']})\n"
+                    f"⚠️ 必须使用上述精确的 ID，不要猜测其他 ID！"
+                )
+            else:
+                self.deps.vlm.inject_error_feedback(
+                    f"✅ 你已成功提取当前页数据"
+                    f"（第 {_n_pages} 个页面，累计 {self.state.total_extracted_rows} 条）。\n"
+                    "当前页面未发现翻页链接，可能已是最后一页。\n"
+                    "如果任务还需要更多数据，请尝试向下滚动查找翻页按钮。\n"
+                    "如果已完成所有页的提取，请直接输出 done 结束任务。"
+                )
+
     async def detect_canvas_grid(self, reason: str) -> dict:
         """Detect a dominant canvas/svg-rendered grid (EXTRACT-CANVAS-1).
 

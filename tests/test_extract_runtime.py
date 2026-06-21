@@ -872,3 +872,61 @@ def test_zero_rows_dense_page_blocks_next_page():
     assert streak == 1
     assert state.block_next_page_until_drained is True
     assert calls["nudge"] == 1
+
+
+# ── R2-3c: inject_post_extract_pagination_guidance (explicit-path) ───────────
+
+
+class _PagLinksBrowser:
+    """Browser stub exposing a canned (sync) find_pagination_links."""
+
+    def __init__(self, links=None):
+        self._links = links or []
+
+    def find_pagination_links(self):
+        return self._links
+
+
+def test_post_extract_guidance_target_reached_says_done():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=50, extracted_page_urls={"a", "b"})
+    rt = _mk_runtime(goal="抓取50条数据", state=state, vlm=vlm, browser=_PagLinksBrowser())
+    rt.inject_post_extract_pagination_guidance()
+    assert any("已达到目标" in m for m in vlm.feedback)
+
+
+def test_post_extract_guidance_multi_page_target_with_links():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=10, extracted_page_urls={"a", "b"})
+    rt = _mk_runtime(
+        goal="抓取50条数据",
+        state=state,
+        vlm=vlm,
+        browser=_PagLinksBrowser([{"id": 7, "role": "link", "name": "Next"}]),
+    )
+    rt.inject_post_extract_pagination_guidance()
+    assert any("target_id=7" in m for m in vlm.feedback)
+
+
+def test_post_extract_guidance_multi_page_no_target_asks_review():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=5, extracted_page_urls={"a", "b"})
+    rt = _mk_runtime(goal="抓取所有数据", state=state, vlm=vlm, browser=_PagLinksBrowser())
+    rt.inject_post_extract_pagination_guidance()
+    assert any("判断是否需要继续翻页" in m for m in vlm.feedback)
+
+
+def test_post_extract_guidance_single_page_no_links_suggests_done():
+    vlm = _RecVlm()
+    state = ExtractState(total_extracted_rows=3, extract_count=1)
+    rt = _mk_runtime(goal="抓取所有数据", state=state, vlm=vlm, browser=_PagLinksBrowser([]))
+    rt.inject_post_extract_pagination_guidance()
+    assert any("可能已是最后一页" in m for m in vlm.feedback)
+
+
+def test_post_extract_guidance_noop_when_nothing_extracted():
+    vlm = _RecVlm()
+    state = ExtractState()  # n_pages=0 and extract_count=0 -> no branch fires
+    rt = _mk_runtime(goal="抓取所有数据", state=state, vlm=vlm, browser=_PagLinksBrowser())
+    rt.inject_post_extract_pagination_guidance()
+    assert vlm.feedback == []

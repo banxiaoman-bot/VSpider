@@ -4053,6 +4053,20 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 验证: 全量 pytest 后台核验（App.vue UI 失败均为并发 agent 在制品，与本切片零关联）；域回归 266✓ + 悬挂引用 0 残留，**本切片 0 新增失败**。
 - 计划: `docs/superpowers/plans/2026-06-21-extract-tail-decomposition-design.md`（策略 A 第二刀；下刀候选：R2-3c 批后翻页引导块 → `inject_post_extract_pagination_guidance`）。
 
+## Slice R2-3c (M5 拆分): extract 显式路径批后翻页引导块 → ExtractRuntime (done, P1)
+
+- 能力名: extract_pagination_guidance（显式 extract 路径「智能翻页/结束引导」vlm 反馈树——达标提 done / 多页+目标+链接提翻页 / 多页无目标让 VLM 判断 / 单页 extract_count>0 提链接或最后一页——收敛为同步方法 `ExtractRuntime.inject_post_extract_pagination_guidance()`）。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。R2「安全增量」第五刀（策略 A 收官）：纯读 `_xs.*` + `browser.find_pagination_links`，纯调 `vlm.inject_error_feedback`，零状态写、零控制流（同步方法，无 await）。
+- 前置: R2-3a 已完成；设计稿同前（策略 A 第三刀）。
+- 关键发现: auto-extract 路径引导块与 explicit **结构性漂移**（`_auto_pages=len(urls)` vs `_n_pages=max(urls,keys)`；末分支 `else` vs `elif extract_count>0`；消息文案前缀不同），**不能合并**；本刀只搬显式块（单点），auto 块原地不动。
+- 改动:
+  - 新增同步方法 `inject_post_extract_pagination_guidance`：逐字平移 explicit 块；`_parse_goal_target_count` 经 import，`browser.find_pagination_links` / `vlm.inject_error_feedback` 经 self.deps。
+  - `main.py` 字节级 patch（`_patch_r2_3c.py` 即用即删）：70 行块 → 单行委托；移除 7 个块内局部（`_n_pages`/`_target_count_b`/`_reached_target_b`/`_pag_links_c`/`_pag_hint_c`/`_pag_links_b`/`_pag_hint_b`，grep 确认 0 残留）。
+- 新增 contract 字段: 无。
+- Tests: `tests/test_extract_runtime.py` 追加 5 例（达标 done / 多页目标有链接 target_id / 多页无目标让 VLM 判断 / 单页无链接提最后一页 / 无提取 noop），先验红（AttributeError）后转绿，合计 59✓；extraction+pagination 17 文件域回归 271✓；`py_compile` 通过，CLEAN_CRLF；main.py 9358→9291 行（<9700）。
+- 验证: 全量 pytest 后台核验（App.vue UI 失败均为并发 agent 在制品，与本切片零关联）；域回归 271✓ + 悬挂引用 0 残留，**本切片 0 新增失败**。
+- 计划: 策略 A（R2-3a/3b/3c）收官；extract 分支剩不可约控制流骨架 = 策略 B（设计稿 §6 备查，高风险默认缓做）。main.py R2 累计 9658→9291（减 367 行）。
+
 ## Slice BBR-1 (M3 通用): 三后端任务分流路由骨架纳管 BrowserBackendRouter (done, P2)
 
 - 能力名: browser_backend_routing（在 `build_default_browser_backend` 扁平 env/kind 开关之上，按任务类型在 chromium / lightpanda / cloakbrowser 三 persona 间确定性分流；契约 `browser_backend_route.v1`）。
