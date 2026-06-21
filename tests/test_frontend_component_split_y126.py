@@ -19,6 +19,8 @@ RUN_REGISTRY_PANEL = ROOT / "vspider-ui" / "src" / "components" / "RunRegistryPa
 CAPABILITY_OVERVIEW_PANE = ROOT / "vspider-ui" / "src" / "components" / "CapabilityOverviewPane.vue"
 CAPABILITY_HERO_SECTION = ROOT / "vspider-ui" / "src" / "components" / "CapabilityHeroSection.vue"
 CAPABILITY_EXEC_TELEMETRY = ROOT / "vspider-ui" / "src" / "components" / "CapabilityExecutionTelemetry.vue"
+USE_CAPABILITY_TRACE = ROOT / "vspider-ui" / "src" / "composables" / "useCapabilityTrace.js"
+USE_CAPABILITY_FIXTURE_REPLAY = ROOT / "vspider-ui" / "src" / "composables" / "useCapabilityFixtureReplay.js"
 
 
 @pytest.fixture(scope="module")
@@ -33,6 +35,16 @@ def app_src() -> str:
 @pytest.fixture(scope="module")
 def trace_utils_src() -> str:
     return CAPABILITY_TRACE_UTILS.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def capability_trace_src() -> str:
+    return USE_CAPABILITY_TRACE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def capability_replay_src() -> str:
+    return USE_CAPABILITY_FIXTURE_REPLAY.read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -65,8 +77,14 @@ def run_registry_panel_src() -> str:
     return RUN_REGISTRY_PANEL.read_text(encoding="utf-8")
 
 
-def test_capability_trace_helpers_are_extracted(app_src: str, trace_utils_src: str) -> None:
-    assert "from './components/capabilityTraceUtils'" in app_src
+def test_capability_trace_helpers_are_extracted(
+    app_src: str, trace_utils_src: str, capability_trace_src: str
+) -> None:
+    # D-UI-12/14 moved the capability-event helper destructure out of App.vue and
+    # into the useCapabilityTrace composable. The helpers stay the single source
+    # of truth in capabilityTraceUtils.js (exported there + imported by the
+    # composable) and must not be re-inlined back into App.vue.
+    assert "from '../components/capabilityTraceUtils'" in capability_trace_src
     for name in [
         "capabilityEventActionTrace",
         "capabilityEventActionIssueSummary",
@@ -78,11 +96,9 @@ def test_capability_trace_helpers_are_extracted(app_src: str, trace_utils_src: s
         "capabilityCrawlEfficiencyEvidence",
         "capabilityItemName",
         "capabilityAttemptClass",
+        "capabilityItemMeta",
+        "capabilityItemDetail",
     ]:
-        assert f"  {name}," in app_src
-        assert f"export const {name}" in trace_utils_src
-        assert f"const {name}" not in app_src
-    for name in ["capabilityItemMeta", "capabilityItemDetail"]:
         assert f"export const {name}" in trace_utils_src
         assert f"const {name}" not in app_src
 
@@ -154,9 +170,19 @@ def test_run_registry_panel_component_is_used(app_src: str, run_registry_panel_s
     assert "contracts.value.manifest" in run_registry_panel_src
 
 
-def test_app_keeps_capability_state_and_api_flow(app_src: str) -> None:
-    assert "const capabilityTraceEvents = computed(" in app_src
-    assert "phaseEvents.value.filter((evt)" in app_src
-    assert "const capabilityTraceRows = computed(" in app_src
-    assert "const fetchCapabilityEfficiencyFeedbackReplays = async (silent = false) =>" in app_src
-    assert "const replayCapabilityEfficiencyFeedback = async () =>" in app_src
+def test_app_keeps_capability_state_and_api_flow(
+    app_src: str, capability_trace_src: str, capability_replay_src: str
+) -> None:
+    # Capability-trace state moved into the useCapabilityTrace composable and the
+    # efficiency-feedback fetch/replay API flow into useCapabilityFixtureReplay
+    # (D-UI-12+). App.vue wires the trace composable; the implementations live in
+    # the composables.
+    assert "useCapabilityTrace(phaseEvents)" in app_src
+    assert "const capabilityTraceEvents = computed(" in capability_trace_src
+    assert "phaseEvents.value.filter((evt)" in capability_trace_src
+    assert "const capabilityTraceRows = computed(" in capability_trace_src
+    assert (
+        "const fetchCapabilityEfficiencyFeedbackReplays = async (silent = false) =>"
+        in capability_replay_src
+    )
+    assert "const replayCapabilityEfficiencyFeedback = async () =>" in capability_replay_src

@@ -31,11 +31,25 @@ CAPABILITY_ALIGNMENT_CARD = Path(__file__).resolve().parent.parent / "vspider-ui
 CAPABILITY_EFFICIENCY_PANEL = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityEfficiencyPanel.vue"
 CAPABILITY_REPLAY_PANE = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityReplayPane.vue"
 CAPABILITY_SHARED_CSS = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "styles" / "capability-shared.css"
+# Frontend decomposition (D-UI-*) moved much of the timeline/replay/capability
+# logic out of App.vue into composables; the source-pin fixtures fold these in.
+USE_PHASE_TRACE = _UI_SRC / "composables" / "usePhaseTrace.js"
+USE_TIMELINE_REPLAY = _UI_SRC / "composables" / "useTimelineReplay.js"
+USE_CAPABILITY_TRACE = _UI_SRC / "composables" / "useCapabilityTrace.js"
+USE_CAPABILITY_TRACE_EXPORT = _UI_SRC / "composables" / "useCapabilityTraceExport.js"
+USE_CAPABILITY_FIXTURE_REPLAY = _UI_SRC / "composables" / "useCapabilityFixtureReplay.js"
+KEYBOARD_CMD = _UI_SRC / "composables" / "useKeyboardCommand.js"
+APP_CSS = _UI_SRC / "styles" / "app.css"
 
 
 @pytest.fixture(scope="module")
 def src() -> str:
     return APP_VUE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def kbd_src() -> str:
+    return KEYBOARD_CMD.read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -76,24 +90,27 @@ def capability_shared_css_src() -> str:
 class TestVPhaseStats:
     @pytest.fixture(scope="class")
     def combined_src(self) -> str:
-        """Phase stats were extracted into TimelinePanel.vue; read both."""
+        """Phase stats state/computeds moved into the usePhaseTrace composable;
+        the panel template + CSS stayed in TimelinePanel.vue. Read all three."""
         app = APP_VUE.read_text(encoding="utf-8")
         timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
         timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
         timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
-        return app + "\n" + timeline + "\n" + timeline_css
+        phase_trace = USE_PHASE_TRACE.read_text(encoding="utf-8") if USE_PHASE_TRACE.exists() else ""
+        return app + "\n" + timeline + "\n" + timeline_css + "\n" + phase_trace
 
     def test_stats_state_refs_exist(self, combined_src: str) -> None:
         assert "const phaseStatsExpanded = ref(false)" in combined_src
         assert "const phaseStatsSortBy = ref('count')" in combined_src
 
     def test_phase_filter_options_carry_stats(self, combined_src: str) -> None:
-        body = re.search(r"const phaseFilterOptions = computed\(\(\) => \{([\s\S]*?)\n\}\)", combined_src)
-        assert body, "phaseFilterOptions computed must exist"
-        text = body.group(1)
+        # phaseFilterOptions moved into usePhaseTrace as an indented composable
+        # computed, so pin its presence + the stat fields it builds directly
+        # (the old top-level "\n})" body-capture no longer matches).
+        assert "const phaseFilterOptions = computed(() => {" in combined_src
         for token in ["mean:", "p50:", "p95:", "max:", "sevCounts:", "durations:"]:
-            assert token in text
-        assert "pickPercentile(sorted, 0.95)" in text
+            assert token in combined_src
+        assert "pickPercentile(sorted, 0.95)" in combined_src
 
     def test_stats_sorted_computed_exists(self, combined_src: str) -> None:
         assert "const phaseStatsSorted = computed" in combined_src
@@ -101,7 +118,8 @@ class TestVPhaseStats:
         assert "return bv - av" in combined_src
 
     def test_sparkline_helper_exists(self, combined_src: str) -> None:
-        assert "const phaseSparklinePath = (durations) =>" in combined_src
+        # The sparkline helper is now an exported function in usePhaseTrace.js.
+        assert "export function phaseSparklinePath (durations) {" in combined_src
         assert "viewBox=\"0 0 100 24\"" in combined_src
         assert ":d=\"phaseSparklinePath(row.durations)\"" in combined_src
 
@@ -130,16 +148,23 @@ class TestVPhaseStats:
 class TestWReplayMode:
     @pytest.fixture(scope="class")
     def combined_src(self) -> str:
-        """Replay UI was partially extracted to TimelinePanel.vue + CapabilityHeroSection.vue."""
+        """Replay state/parser/import moved into the useTimelineReplay composable;
+        banners/inputs stayed in TimelinePanel.vue + CapabilityHeroSection.vue and
+        the banner CSS lives across timeline-panel.css + app.css. Read them all."""
         app = APP_VUE.read_text(encoding="utf-8")
         timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
         timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
         timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
+        app_css = APP_CSS.read_text(encoding="utf-8") if APP_CSS.exists() else ""
         hero = _UI_SRC / "components" / "CapabilityHeroSection.vue"
         hero_src = hero.read_text(encoding="utf-8") if hero.exists() else ""
         overview = _UI_SRC / "components" / "CapabilityOverviewPane.vue"
         overview_src = overview.read_text(encoding="utf-8") if overview.exists() else ""
-        return app + "\n" + timeline + "\n" + timeline_css + "\n" + hero_src + "\n" + overview_src
+        replay = USE_TIMELINE_REPLAY.read_text(encoding="utf-8") if USE_TIMELINE_REPLAY.exists() else ""
+        return (
+            app + "\n" + timeline + "\n" + timeline_css + "\n" + app_css
+            + "\n" + hero_src + "\n" + overview_src + "\n" + replay
+        )
 
     def test_replay_state_refs_exist(self, combined_src: str) -> None:
         assert "const replayMode = ref(false)" in combined_src
@@ -164,7 +189,9 @@ class TestWReplayMode:
         assert m
 
     def test_replay_parser_tolerates_bad_lines(self, combined_src: str) -> None:
-        assert "const _parseJsonlText = (text) =>" in combined_src
+        # The JSONL parser was extracted into useTimelineReplay.js and renamed
+        # parsePhaseReplayJsonl (the artifact helper kept its name).
+        assert "export const parsePhaseReplayJsonl = (text) =>" in combined_src
         assert "const _capabilityExecuteArtifactPhaseEvent = (doc) =>" in combined_src
         assert "String(doc.type || '') !== 'capability_execute_trace'" in combined_src
         assert "phase: 'capability_execute'" in combined_src
@@ -184,7 +211,11 @@ class TestWReplayMode:
         assert "const handleReplayFileChange = async (event) =>" in combined_src
         assert "phaseEvents.value = events" in combined_src
         assert "replayMode.value = true" in combined_src
-        assert "replaySourceName.value = file.name || 'imported.jsonl'" in combined_src
+        # useTimelineReplay sets replaySourceName from the filename arg; the
+        # file.name || 'imported.jsonl' default now lives in TimelinePanel's
+        # handleReplayFileChange before it emits import-replay.
+        assert "replaySourceName.value = filename" in combined_src
+        assert "file.name || 'imported.jsonl'" in combined_src
         assert "setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')" in combined_src
 
     def test_replay_ui_wired(self, combined_src: str) -> None:
@@ -243,17 +274,22 @@ class TestXTerminalSearch:
         assert "terminalSearchVisible.value = true" in combined_src
         assert "terminalSearchVisible.value = false" in combined_src
 
-    def test_search_keyboard_shortcuts_wired(self, src: str) -> None:
+    def test_search_keyboard_shortcuts_wired(self, src: str, kbd_src: str) -> None:
+        # Dispatch moved to composables/useKeyboardCommand.js: the resolver maps
+        # keys to action names; App.vue's keyboardActions wire them to the
+        # TerminalLogPane search methods.
         ctrl_f = re.search(
-            r"activeBottomTab\.value === 'terminal'[\s\S]*?event\.key === 'f'[\s\S]*?openTerminalSearch\(\)",
-            src,
+            r"activeTab === 'terminal'[\s\S]*?\bkey === 'f' \|\| key === 'F'[\s\S]*?action: 'terminalSearchOpen'",
+            kbd_src,
         )
-        assert ctrl_f, "Ctrl+F on terminal tab must open terminal search"
-        assert "closeTerminalSearch()" in src
-        assert "terminalSearchPrev()" in src
-        assert "terminalSearchNext()" in src
-        assert "event.key === 'Escape'" in src
-        assert "event.key === 'Enter' && event.shiftKey" in src
+        assert ctrl_f, "Ctrl+F on terminal tab must resolve to terminalSearchOpen"
+        assert "if (key === 'Escape') return { action: 'terminalSearchClose' }" in kbd_src
+        assert "if (key === 'Enter' && event.shiftKey) return { action: 'terminalSearchPrev' }" in kbd_src
+        assert "if (key === 'Enter') return { action: 'terminalSearchNext' }" in kbd_src
+        assert "terminalSearchOpen: () => terminalLogPaneRef.value?.openTerminalSearch()" in src
+        assert "terminalSearchClose: () => terminalLogPaneRef.value?.closeTerminalSearch()" in src
+        assert "terminalSearchPrev: () => terminalLogPaneRef.value?.terminalSearchPrev()" in src
+        assert "terminalSearchNext: () => terminalLogPaneRef.value?.terminalSearchNext()" in src
 
     def test_search_template_wired(self, combined_src: str) -> None:
         assert "v-if=\"terminalSearchVisible\"" in combined_src
@@ -277,9 +313,9 @@ class TestXTerminalSearch:
 class TestY33CapabilityTracePanel:
     @pytest.fixture(scope="class")
     def src(self) -> str:
-        """Capability UI was partially extracted to sub-components."""
-        app = APP_VUE.read_text(encoding="utf-8")
-        extras = []
+        """Capability UI/state was extracted into sub-components + composables
+        (useCapabilityTrace / useCapabilityTraceExport / useCapabilityFixtureReplay)."""
+        parts = [APP_VUE.read_text(encoding="utf-8")]
         for name in (
             "CapabilityOverviewPane.vue",
             "CapabilityHeroSection.vue",
@@ -287,8 +323,19 @@ class TestY33CapabilityTracePanel:
         ):
             p = _UI_SRC / "components" / name
             if p.exists():
-                extras.append(p.read_text(encoding="utf-8"))
-        return app + "\n" + "\n".join(extras)
+                parts.append(p.read_text(encoding="utf-8"))
+        for comp in (
+            "useCapabilityTrace.js",
+            "useCapabilityTraceExport.js",
+            "useCapabilityFixtureReplay.js",
+            "useTimelineReplay.js",
+        ):
+            p = _UI_SRC / "composables" / comp
+            if p.exists():
+                parts.append(p.read_text(encoding="utf-8"))
+        if APP_CSS.exists():
+            parts.append(APP_CSS.read_text(encoding="utf-8"))
+        return "\n".join(parts)
 
     def test_capability_state_and_computeds_exist(self, src: str, capability_trace_utils_src: str) -> None:
         for token in [
@@ -315,15 +362,15 @@ class TestY33CapabilityTracePanel:
             "const latestCapabilityRoute = computed",
             "const latestCapabilityExecute = computed",
             "const capabilityTraceEvents = computed",
-            "from './components/capabilityTraceUtils'",
+            "from '../components/capabilityTraceUtils'",
             "import CapabilityTraceList from './components/CapabilityTraceList.vue'",
             "const capabilityBackendPlan = computed",
             "const capabilityRouteCrawlEfficiencyPlan = computed",
             "const capabilityFallbackChain = computed",
             "const capabilityModelRoles = computed",
             "const capabilityTraceJson = computed",
-            "const capabilityExecutionAttempts = computed",
-            "const capabilityExecutionChecks = computed",
+            "const attempts = computed",
+            "const checks = computed",
             "const capabilityExecuteJson = computed",
             "const capabilityTraceRows = computed",
             "const capabilityTraceSummary = computed",
@@ -338,17 +385,17 @@ class TestY33CapabilityTracePanel:
             "const capabilityExecutionActionIssueActions = computed",
             "const capabilityExecutionActionFailureSummary = computed",
             "const capabilityExecutionActionRecoveryActions = computed",
-            "const capabilityEfficiencyCorrelationStatusClass = computed",
+            "const correlationStatusClass = computed",
             "const capabilityExecutionFailureBundle = computed",
             "const capabilityExecutionCrawlEfficiencyPlan = computed",
             "const capabilityActiveCrawlEfficiencyPlan = computed",
             "const capabilityExecutionCrawlEfficiencyCandidates = computed",
             "const capabilityExecutionCrawlEfficiencyAvailablePaths = computed",
-            "const capabilityExecutionCrawlEfficiencySummary = computed",
+            "const crawlSummary = computed",
             "const capabilityExecutionEfficiencyCorrelationReport = computed",
             "const capabilityExecutionEfficiencyCorrelationAlignment = computed",
             "const capabilityExecutionEfficiencyCorrelationRootCauses = computed",
-            "const capabilityExecutionEfficiencyCorrelationPlannerHints = computed",
+            "const correlationPlannerHints = computed",
             "const capabilityExecutionEfficiencyCorrelationActions = computed",
             "const capabilityEfficiencyFeedbackReplayChecks = computed",
             "const capabilityEfficiencyFeedbackReplayFailedChecks = computed",
@@ -426,7 +473,7 @@ class TestY33CapabilityTracePanel:
             "searchText: actionSearchText",
             "const q = String(capabilityTraceSearchQuery.value || '').trim().toLowerCase()",
             "String(row.searchText || row.detail || '').toLowerCase().includes(q)",
-            "import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'",
+            "import { buildFailureFixtureBatchReplaySummaryText } from './failureFixtureSummary'",
             "const buildCapabilityTraceSummaryText = () =>",
             "const copyCapabilityTraceSummary = async () =>",
             "const buildCapabilityFailureFixtureBatchReplaySummaryText = () =>",

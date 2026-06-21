@@ -26,6 +26,10 @@ APP_VUE = (
     Path(__file__).resolve().parent.parent
     / "vspider-ui" / "src" / "App.vue"
 )
+KEYBOARD_CMD = (
+    Path(__file__).resolve().parent.parent
+    / "vspider-ui" / "src" / "composables" / "useKeyboardCommand.js"
+)
 
 
 @pytest.fixture(scope="module")
@@ -33,74 +37,89 @@ def src() -> str:
     return APP_VUE.read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def kbd_src() -> str:
+    """Pure keyboard dispatcher (resolveKeyboardAction + useKeyboardCommand),
+    extracted out of App.vue into the composable."""
+    return KEYBOARD_CMD.read_text(encoding="utf-8")
+
+
 # ── Dispatcher lifecycle ──────────────────────────────────────────────
 
 
 class TestDispatcherLifecycle:
-    def test_handler_function_defined(self, src: str) -> None:
-        assert "const handleGlobalKeydown = (event) =>" in src
+    # The dispatcher was extracted into composables/useKeyboardCommand.js
+    # (resolveKeyboardAction + useKeyboardCommand); App.vue only wires the
+    # actions map + context. Lifecycle/shape assertions now read the composable.
+    def test_handler_function_defined(self, kbd_src: str) -> None:
+        assert "const handleGlobalKeydown = (event) =>" in kbd_src
 
-    def test_listener_added_on_mount(self, src: str) -> None:
-        assert "window.addEventListener('keydown', handleGlobalKeydown)" in src
+    def test_listener_added_on_mount(self, kbd_src: str) -> None:
+        assert "window.addEventListener('keydown', handleGlobalKeydown)" in kbd_src
 
-    def test_listener_removed_on_unmount(self, src: str) -> None:
-        assert "window.removeEventListener('keydown', handleGlobalKeydown)" in src
+    def test_listener_removed_on_unmount(self, kbd_src: str) -> None:
+        assert "window.removeEventListener('keydown', handleGlobalKeydown)" in kbd_src
 
-    def test_uses_ctrl_or_meta_modifier(self, src: str) -> None:
+    def test_uses_ctrl_or_meta_modifier(self, kbd_src: str) -> None:
         """macOS Cmd key + Windows/Linux Ctrl key must both trigger primary
         shortcuts. If someone drops the metaKey OR, macOS users silently
         lose all bindings."""
-        assert "event.ctrlKey || event.metaKey" in src
+        assert "event.ctrlKey || event.metaKey" in kbd_src
 
-    def test_typing_target_guard_present(self, src: str) -> None:
-        """Global shortcuts (except Ctrl+Enter) must be suppressed when
+    def test_typing_target_guard_present(self, kbd_src: str) -> None:
+        """Global shortcuts (except Ctrl+Enter / Ctrl+F) must be suppressed when
         focus is inside an input/textarea/contenteditable element."""
-        assert "_isTypingTarget" in src
-        assert re.search(r"if\s*\(\s*typing\s*\)\s*return", src)
+        assert "isTypingTarget" in kbd_src
+        assert re.search(r"if\s*\(\s*typing\s*\)\s*return", kbd_src)
 
 
 # ── Individual shortcut wiring ────────────────────────────────────────
 
 
 class TestGlobalShortcuts:
-    def test_ctrl_enter_calls_submit(self, src: str) -> None:
-        # Anchor on the Enter-key branch and confirm it calls submitTask.
-        m = re.search(
-            r"event\.key\s*===\s*'Enter'.*?submitTask\(\)",
-            src, flags=re.S,
-        )
-        assert m, "Ctrl+Enter must dispatch to submitTask()"
+    # Two layers: resolveKeyboardAction (kbd_src) maps a key combo to an action
+    # NAME; App.vue's keyboardActions map (src) wires that name to the real fn.
+    def test_ctrl_enter_calls_submit(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"\bkey\s*===\s*'Enter'.*?action:\s*'submitIfIdle'", kbd_src, flags=re.S
+        ), "Ctrl+Enter must resolve to the submitIfIdle action"
+        assert re.search(
+            r"submitIfIdle:.*?submitTask\(\)", src, flags=re.S
+        ), "submitIfIdle action must dispatch to submitTask()"
 
     def test_ctrl_enter_respects_isrunning(self, src: str) -> None:
         """Spam-pressing Ctrl+Enter during a run must not re-submit. The
         guard is the same one the UI button uses."""
-        m = re.search(
-            r"event\.key\s*===\s*'Enter'.*?!\s*isRunning\.value.*?submitTask",
-            src, flags=re.S,
-        )
-        assert m, "Ctrl+Enter must check !isRunning.value before submitting"
+        assert re.search(
+            r"submitIfIdle:.*?!\s*isRunning\.value.*?submitTask", src, flags=re.S
+        ), "submitIfIdle action must check !isRunning.value before submitting"
 
-    def test_ctrl_k_focuses_prompt(self, src: str) -> None:
-        m = re.search(
-            r"event\.key\s*===\s*'k'\s*\|\|\s*event\.key\s*===\s*'K'.*?focusPromptInput\(\)",
-            src, flags=re.S,
-        )
-        assert m, "Ctrl+K must call focusPromptInput()"
+    def test_ctrl_k_focuses_prompt(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"\bkey\s*===\s*'k'\s*\|\|\s*key\s*===\s*'K'.*?action:\s*'focusPrompt'",
+            kbd_src, flags=re.S,
+        ), "Ctrl+K must resolve to the focusPrompt action"
+        assert re.search(
+            r"focusPrompt:.*?focusPromptInput\(\)", src, flags=re.S
+        ), "focusPrompt action must call focusPromptInput()"
 
-    def test_ctrl_slash_toggles_help(self, src: str) -> None:
-        m = re.search(
-            r"event\.key\s*===\s*'/'.*?helpDialogVisible\.value\s*=\s*!helpDialogVisible\.value",
+    def test_ctrl_slash_toggles_help(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"\bkey\s*===\s*'/'.*?action:\s*'toggleHelp'", kbd_src, flags=re.S
+        ), "Ctrl+/ must resolve to the toggleHelp action"
+        assert re.search(
+            r"toggleHelp:.*?helpDialogVisible\.value\s*=\s*!helpDialogVisible\.value",
             src, flags=re.S,
-        )
-        assert m, "Ctrl+/ must toggle helpDialogVisible"
+        ), "toggleHelp action must toggle helpDialogVisible"
 
-    def test_ctrl_digits_switch_tabs(self, src: str) -> None:
-        m = re.search(
-            r"event\.key\s*>=\s*'1'\s*&&\s*event\.key\s*<=\s*'9'.*?"
-            r"setActiveBottomTab\(TAB_ORDER\[i\]\)",
-            src, flags=re.S,
-        )
-        assert m, "Ctrl+1..9 must dispatch to setActiveBottomTab(TAB_ORDER[i])"
+    def test_ctrl_digits_switch_tabs(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"\bkey\s*>=\s*'1'\s*&&\s*key\s*<=\s*'9'.*?action:\s*'selectTab'",
+            kbd_src, flags=re.S,
+        ), "Ctrl+1..9 must resolve to the selectTab action"
+        assert re.search(
+            r"selectTab:\s*\(i\)\s*=>\s*setActiveBottomTab\(TAB_ORDER\[i\]\)", src
+        ), "selectTab action must call setActiveBottomTab(TAB_ORDER[i])"
 
 
 class TestTabOrderInvariants:
@@ -124,39 +143,43 @@ class TestTabOrderInvariants:
 
 
 class TestTimelineShortcuts:
-    def test_ctrl_e_exports_jsonl(self, src: str) -> None:
-        m = re.search(
-            r"activeBottomTab\.value\s*===\s*'timeline'.*?"
-            r"event\.key\s*===\s*'e'\s*\|\|\s*event\.key\s*===\s*'E'.*?"
-            r"exportPhaseEventsAsJsonl\(\)",
-            src, flags=re.S,
-        )
-        assert m, "Ctrl+E (in Timeline) must call exportPhaseEventsAsJsonl()"
+    def test_ctrl_e_exports_jsonl(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"activeTab\s*===\s*'timeline'.*?"
+            r"\bkey\s*===\s*'e'\s*\|\|\s*key\s*===\s*'E'.*?action:\s*'exportTimeline'",
+            kbd_src, flags=re.S,
+        ), "Ctrl+E (in Timeline) must resolve to the exportTimeline action"
+        assert re.search(
+            r"exportTimeline:.*?exportPhaseEventsAsJsonl\(\)", src, flags=re.S
+        ), "exportTimeline action must call exportPhaseEventsAsJsonl()"
 
-    def test_end_scrolls_to_bottom(self, src: str) -> None:
-        m = re.search(
-            r"event\.key\s*===\s*'End'.*?scroll(?:TimelineTo|To)Bottom\(\)",
-            src, flags=re.S,
+    def test_end_scrolls_to_bottom(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"\bkey\s*===\s*'End'.*?action:\s*'timelineBottom'", kbd_src, flags=re.S
+        ), "End must resolve to the timelineBottom action"
+        assert re.search(
+            r"timelineBottom:.*?scroll(?:TimelineTo|To)Bottom\(\)", src, flags=re.S
         )
-        assert m
 
-    def test_home_scrolls_to_top(self, src: str) -> None:
-        m = re.search(
-            r"event\.key\s*===\s*'Home'.*?scroll(?:TimelineTo|To)Top\(\)",
-            src, flags=re.S,
+    def test_home_scrolls_to_top(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"\bkey\s*===\s*'Home'.*?action:\s*'timelineTop'", kbd_src, flags=re.S
+        ), "Home must resolve to the timelineTop action"
+        assert re.search(
+            r"timelineTop:.*?scroll(?:TimelineTo|To)Top\(\)", src, flags=re.S
         )
-        assert m
 
 
 class TestCapabilityShortcuts:
-    def test_ctrl_e_exports_capability_trace_jsonl(self, src: str) -> None:
-        m = re.search(
-            r"activeBottomTab\.value\s*===\s*'capability'.*?"
-            r"event\.key\s*===\s*'e'\s*\|\|\s*event\.key\s*===\s*'E'.*?"
-            r"exportCapabilityTraceAsJsonl\(\)",
-            src, flags=re.S,
-        )
-        assert m, "Ctrl+E (in Capability) must call exportCapabilityTraceAsJsonl()"
+    def test_ctrl_e_exports_capability_trace_jsonl(self, src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"activeTab\s*===\s*'capability'.*?"
+            r"\bkey\s*===\s*'e'\s*\|\|\s*key\s*===\s*'E'.*?action:\s*'exportCapability'",
+            kbd_src, flags=re.S,
+        ), "Ctrl+E (in Capability) must resolve to the exportCapability action"
+        assert re.search(
+            r"exportCapability:.*?exportCapabilityTraceAsJsonl\(\)", src, flags=re.S
+        ), "exportCapability action must call exportCapabilityTraceAsJsonl()"
 
 
 class TestDialogNavigation:
@@ -168,21 +191,25 @@ class TestDialogNavigation:
         ).read_text(encoding="utf-8")
         return app + "\n" + timeline
 
-    def test_arrow_left_calls_prev(self, combined_src: str) -> None:
-        m = re.search(
-            r"phaseDialogVisible.*?"
-            r"event\.key\s*===\s*'ArrowLeft'.*?goToPrevPhaseEvent\(\)",
-            combined_src, flags=re.S,
-        )
-        assert m
+    def test_arrow_left_calls_prev(self, combined_src: str, kbd_src: str) -> None:
+        # Resolver maps ← (while phase dialog open) -> 'phasePrev'; App.vue's
+        # action wires that to timelinePanelRef goToPrevPhaseEvent().
+        assert re.search(
+            r"phaseDialogOpen.*?\bkey\s*===\s*'ArrowLeft'.*?action:\s*'phasePrev'",
+            kbd_src, flags=re.S,
+        ), "← must resolve to the phasePrev action when phase dialog is open"
+        assert re.search(
+            r"phasePrev:.*?goToPrevPhaseEvent\(\)", combined_src, flags=re.S
+        ), "phasePrev action must call goToPrevPhaseEvent()"
 
-    def test_arrow_right_calls_next(self, combined_src: str) -> None:
-        m = re.search(
-            r"phaseDialogVisible.*?"
-            r"event\.key\s*===\s*'ArrowRight'.*?goToNextPhaseEvent\(\)",
-            combined_src, flags=re.S,
-        )
-        assert m
+    def test_arrow_right_calls_next(self, combined_src: str, kbd_src: str) -> None:
+        assert re.search(
+            r"phaseDialogOpen.*?\bkey\s*===\s*'ArrowRight'.*?action:\s*'phaseNext'",
+            kbd_src, flags=re.S,
+        ), "→ must resolve to the phaseNext action when phase dialog is open"
+        assert re.search(
+            r"phaseNext:.*?goToNextPhaseEvent\(\)", combined_src, flags=re.S
+        ), "phaseNext action must call goToNextPhaseEvent()"
 
     def test_prev_next_use_filtered_list(self, combined_src: str) -> None:
         """←/→ should respect the user's phase/severity filter (O) —

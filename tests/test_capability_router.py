@@ -2066,6 +2066,17 @@ def test_capability_router_source_wiring() -> None:
         _sub_path = root / "vspider-ui" / "src" / "components" / _sub_name
         if _sub_path.exists():
             _sub_parts.append(_sub_path.read_text(encoding="utf-8"))
+    # The capability-trace state/computeds were extracted out of App.vue into
+    # composables (D-UI-12/14); fold them into app_src so the source-wiring
+    # assertions below still find the implementation wherever it now lives.
+    for _comp_name in (
+        "useCapabilityTrace.js",
+        "useCapabilityTraceExport.js",
+        "useBrowserRuntimeStatus.js",
+    ):
+        _comp_path = root / "vspider-ui" / "src" / "composables" / _comp_name
+        if _comp_path.exists():
+            _sub_parts.append(_comp_path.read_text(encoding="utf-8"))
     app_src = _app_raw + "\n" + "\n".join(_sub_parts)
     capability_trace_list_src = (root / "vspider-ui" / "src" / "components" / "CapabilityTraceList.vue").read_text(encoding="utf-8")
     capability_runtime_panel_src = (root / "vspider-ui" / "src" / "components" / "CapabilityRuntimePanel.vue").read_text(encoding="utf-8")
@@ -2450,7 +2461,10 @@ def test_capability_router_source_wiring() -> None:
     assert "const capabilityExecutionPlanSteps = computed(" in app_src
     assert "const capabilityRuntimePreflight = computed(" in app_src
     assert "const capabilityRuntimePreflightLabel = computed(" in app_src
-    assert "const capabilityExecutionRuntimeSummary = computed(" in app_src
+    # capabilityExecutionRuntimeSummary was consolidated into
+    # components/CapabilityExecutionTelemetry.vue, which reads exe.runtime_summary
+    # directly (runtimeAfter) instead of via a dedicated App.vue computed.
+    assert "exe.value.runtime_summary" in app_src
     assert "const capabilityExecutionRuntimeDrift = computed(" in app_src
     assert "const capabilityExecutionRuntimeIssueSummary = computed(" in app_src
     assert "const capabilityExecutionRuntimeIssues = computed(" in app_src
@@ -2460,10 +2474,13 @@ def test_capability_router_source_wiring() -> None:
     assert "const capabilityExecutionActionIssues = computed(" in app_src
     assert "const capabilityExecutionActionIssueActions = computed(" in app_src
     assert "const capabilityTraceSearchQuery = ref('')" in app_src
-    assert "const capabilityExecutionRuntimeLabel = computed(" in app_src
-    assert "const capabilityExecutionDriftLabel = computed(" in app_src
-    assert "const capabilityExecutionIssueLabel = computed(" in app_src
-    assert "const capabilityExecutionActionIssueLabel = computed(" in app_src
+    # The per-status *Label computeds were consolidated into a single
+    # statusLabel(kind, statusMap) helper (runtime / drift / issue maps) inside
+    # components/CapabilityExecutionTelemetry.vue.
+    assert "function statusLabel(kind, statusMap)" in app_src
+    assert "runtime: { pass: 'runtime ok'" in app_src
+    assert "drift: { stable: 'drift stable'" in app_src
+    assert "issue: { ok: 'runtime ok'" in app_src
     assert "const hasRouteRuntimePreflightIssue = phase === 'capability_route'" in app_src
     assert "runtimePreflightStatus === 'warn'" in app_src
     assert "runtimePreflightWarningCount > 0" in app_src

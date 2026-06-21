@@ -32,6 +32,7 @@ import pytest
 _UI_SRC = Path(__file__).resolve().parent.parent / "vspider-ui" / "src"
 APP_VUE = _UI_SRC / "App.vue"
 FAILED_RUNS_PANE = _UI_SRC / "components" / "FailedRunsPane.vue"
+KEYBOARD_CMD = _UI_SRC / "composables" / "useKeyboardCommand.js"
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +43,11 @@ def src() -> str:
 @pytest.fixture(scope="module")
 def app_src() -> str:
     return APP_VUE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def kbd_src() -> str:
+    return KEYBOARD_CMD.read_text(encoding="utf-8")
 
 
 # ── Reactive state ────────────────────────────────────────────────────
@@ -157,20 +163,35 @@ class TestDialogNavigation:
         assert m, "goToNextFailedRun must wrap idx>=length-1 to 0"
 
     def test_keyboard_dispatcher_routes_arrows_when_dialog_open(
-        self, app_src: str,
+        self, app_src: str, kbd_src: str,
     ) -> None:
+        # The dispatcher was extracted to composables/useKeyboardCommand.js: the
+        # pure resolver maps ←/→ to action names while the failed-run dialog is
+        # open; App.vue's keyboardActions map wires those names to the nav helpers
+        # and getKeyboardContext feeds failedDialogOpen from failedRunDialogVisible.
         m_left = re.search(
-            r"failedRun(?:sPaneRef\.value\?\.failedRun)?DialogVisible.*?"
-            r"event\.key\s*===\s*'ArrowLeft'.*?goToPrevFailedRun\(\)",
-            app_src, flags=re.S,
+            r"failedDialogOpen.*?\bkey\s*===\s*'ArrowLeft'.*?action:\s*'failedPrev'",
+            kbd_src, flags=re.S,
         )
         m_right = re.search(
-            r"failedRun(?:sPaneRef\.value\?\.failedRun)?DialogVisible.*?"
-            r"event\.key\s*===\s*'ArrowRight'.*?goToNextFailedRun\(\)",
-            app_src, flags=re.S,
+            r"failedDialogOpen.*?\bkey\s*===\s*'ArrowRight'.*?action:\s*'failedNext'",
+            kbd_src, flags=re.S,
         )
-        assert m_left, "← must call goToPrevFailedRun when dialog is open"
-        assert m_right, "→ must call goToNextFailedRun when dialog is open"
+        assert m_left, "← must resolve to the failedPrev action when dialog is open"
+        assert m_right, "→ must resolve to the failedNext action when dialog is open"
+        # App.vue wires the action names to the real nav helpers + the context flag.
+        assert re.search(
+            r"failedPrev:\s*\(\)\s*=>\s*failedRunsPaneRef\.value\?\.goToPrevFailedRun\(\)",
+            app_src,
+        ), "keyboardActions.failedPrev must call goToPrevFailedRun"
+        assert re.search(
+            r"failedNext:\s*\(\)\s*=>\s*failedRunsPaneRef\.value\?\.goToNextFailedRun\(\)",
+            app_src,
+        ), "keyboardActions.failedNext must call goToNextFailedRun"
+        assert (
+            "failedDialogOpen: !!failedRunsPaneRef.value?.failedRunDialogVisible"
+            in app_src
+        ), "getKeyboardContext must feed failedDialogOpen from failedRunDialogVisible"
 
 
 # ── Template wiring ───────────────────────────────────────────────────

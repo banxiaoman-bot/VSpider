@@ -367,6 +367,7 @@ def test_browser_pool_source_wiring() -> None:
     _overview_pane = root / "vspider-ui" / "src" / "components" / "CapabilityOverviewPane.vue"
     app_src = _app_raw + ("\n" + _overview_pane.read_text(encoding="utf-8") if _overview_pane.exists() else "")
     runtime_panel_src = (root / "vspider-ui" / "src" / "components" / "CapabilityRuntimePanel.vue").read_text(encoding="utf-8")
+    browser_runtime_src = (root / "vspider-ui" / "src" / "composables" / "useBrowserRuntimeStatus.js").read_text(encoding="utf-8")
 
     assert "from .browser_pool import acquire_browser, release_browser" in main_src
     assert "browser_lease = acquire_browser(run_id=_run_ts)" in main_src
@@ -394,12 +395,16 @@ def test_browser_pool_source_wiring() -> None:
     assert "backend_unhealthy" in pool_src
     assert "VSPIDER_BROWSER_MAX_CONTEXTS" in pool_src
     assert "VSPIDER_EXPERIMENTAL_PARALLEL_RUNS" in pool_src
-    assert "const browserRuntimeStatus = ref(null)" in app_src
-    assert "const fetchBrowserRuntimeStatus = async () => {" in app_src
-    assert "/api/browser_pool" in app_src
-    assert "const browserRuntimeStatusClass = computed(" in app_src
-    assert "const browserRuntimeHealthLabel = computed(" in app_src
-    assert "const browserRuntimeHealthCacheLabel = computed(" in app_src
+    # Browser-runtime state/fetch/computeds were extracted into
+    # composables/useBrowserRuntimeStatus.js (D-UI-11); App.vue now consumes the
+    # composable. Pin the implementation in the composable + the App.vue wiring.
+    assert "useBrowserRuntimeStatus({ appendLog })" in app_src
+    assert "const browserRuntimeStatus = ref(null)" in browser_runtime_src
+    assert "const fetchBrowserRuntimeStatus = async () => {" in browser_runtime_src
+    assert "/api/browser_pool" in browser_runtime_src
+    assert "const browserRuntimeStatusClass = computed(" in browser_runtime_src
+    assert "const browserRuntimeHealthLabel = computed(" in browser_runtime_src
+    assert "const browserRuntimeHealthCacheLabel = computed(" in browser_runtime_src
     assert "import CapabilityRuntimePanel from './components/CapabilityRuntimePanel.vue'" in app_src
     assert "<CapabilityRuntimePanel" in app_src
     assert "Browser Runtime" in runtime_panel_src
