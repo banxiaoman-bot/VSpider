@@ -4067,3 +4067,13 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useAuthProfiles.test.js 6 例（loadAuthProfiles happy/非success warn / loadCaptchaSolverStatus happy/非success早退/error吞掉 console.warn / useAuthProfile 去重+忽略空）。
 - 验证: vitest 16 文件 / 132 passed（+6）；npm run build 绿（index js 192.14kB）；ReadLints clean；App.vue 1332→1305 行（-27），仍纯 CRLF。
 - 风险: 低（自包含 API 子系统，行为逐字平移）。
+
+## Slice D-UI-19 (M4 简便): Final Answer 面板状态从 App.vue 抽离 useFinalAnswer (done, P2)
+
+- 能力名: final_answer_extraction（taskResult/finalAnswer* 状态 + finalAnswerHtml computed + 自动切 Tab watch + done 答案类型解析 applyDoneAnswer + 新任务复位 resetForNewRun 抽成 composables/useFinalAnswer.js）。
+- 影响层: 仅 vspider-ui（App.vue → composables/useFinalAnswer.js）；activeBottomTab + artifactsGrewSinceSubmit 注入；renderMarkdown import 随 finalAnswerHtml 迁入 composable（App.vue 去掉 markdownRender + computed import）。
+- 关键决策: finalAnswerCopyState/finalAnswerCopyTimer（vestigial copy 反馈）保留在 App.vue（与 onUnmounted 清理同处），不入本 composable —— 保住 test_app_vue_timer_cleanup.py 对 onUnmounted 内 finalAnswerCopyTimer 的结构断言；finalAnswerExpanded 仅 resetForNewRun 写、App.vue 无读，内置不外暴露。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useFinalAnswer.test.js 9 例（applyDoneAnswer 显式file/启发式file-text/去重早退/domain白名单(text)/finalAnswerHtml渲染 + resetForNewRun + watch 切final/切artifacts/同type不抢Tab）。
+- 验证: vitest 17 文件 / 141 passed（+9）；npm run build 绿（index js 192.54kB）；ReadLints clean；test_app_vue_timer_cleanup.py 3 passed（onUnmounted pin 完好）；App.vue 1305→1252 行（-53），仍纯 CRLF。
+- 风险: 中-低（done 解析 + watch 行为逐字平移 + stub 测试守回归；onUnmounted 结构断言已验证）。

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   Close,
   Refresh,
@@ -34,7 +34,6 @@ import {
   useSlashCommand,
 } from './composables/useSlashCommand.js'
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
-import { renderMarkdown } from './composables/markdownRender.js'
 import { useModelSettings } from './composables/useModelSettings.js'
 import { useWebSocket } from './composables/useWebSocket.js'
 import { useKeyboardCommand } from './composables/useKeyboardCommand.js'
@@ -47,6 +46,7 @@ import { useHitlForm } from './composables/useHitlForm.js'
 import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
 import { writeToClipboard } from './composables/useClipboard.js'
 import { useAuthProfiles } from './composables/useAuthProfiles.js'
+import { useFinalAnswer } from './composables/useFinalAnswer.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -228,11 +228,16 @@ const timelineAutoScroll = ref(true)
 //   - { type: 'file', answer? }：结构化导出，自动切到 Artifacts Tab；
 //                                 Final Answer 面板显示兜底文案
 // finalAnswerStatus: 'idle' | 'pending' | 'text' | 'file'，驱动面板的 3 种 UI 状态
-const taskResult = ref(null)
-const finalAnswerStatus = ref('idle')
-const finalAnswerText = ref('')
-const finalAnswerDomain = ref('') // F3: 'weather'|'stock'|'recipe'|'flight'|'' (空=无卡片)
-const hasNewFinalAnswer = ref(false)
+const {
+  taskResult,
+  finalAnswerStatus,
+  finalAnswerText,
+  finalAnswerDomain,
+  hasNewFinalAnswer,
+  finalAnswerHtml,
+  applyDoneAnswer,
+  resetForNewRun,
+} = useFinalAnswer({ activeBottomTab, artifactsGrewSinceSubmit })
 
 // ── Slash command system ──
 const slashRegistry = createSlashCommandRegistry()
@@ -245,26 +250,6 @@ const {
 } = useSlashCommand(slashRegistry)
 const cmdPaletteRef = ref(null)
 
-// ── 自动切换 Tab：仅在 taskResult.type 真正发生变化时触发，避免无限循环 ──
-//   - 只读 taskResult，只写 activeBottomTab / hasNewFinalAnswer
-//   - 不会回写 taskResult，所以这个 watch 不会自激
-//   - 重复的 done 事件（同 type）也不会再次抢用户已切走的 Tab
-watch(taskResult, (val, oldVal) => {
-  if (!val) return
-  if (oldVal && oldVal.type === val.type) return
-  if (val.type === 'text') {
-    if (activeBottomTab.value !== 'final') {
-      hasNewFinalAnswer.value = true
-    }
-    activeBottomTab.value = 'final'
-  } else if (val.type === 'file') {
-    activeBottomTab.value = 'artifacts'
-  }
-})
-
-const finalAnswerHtml = computed(() => renderMarkdown(finalAnswerText.value))
-
-const finalAnswerExpanded = ref(false)
 const finalAnswerCopyState = ref('idle') // 'idle' | 'ok' | 'err'
 let finalAnswerCopyTimer = null // F1: reset-to-idle debounce; cleared on unmount
 
@@ -318,40 +303,7 @@ const handleSocketMessage = async (event) => {
           }
         }
 
-        // ── Final Answer：解析后端结果类型 ──
-        // 优先用后端显式字段 (payload.answer_type / payload.answer)；
-        // 若缺失则使用兜底启发式：本次运行有新 artifact 产生 → 视为 'file'，
-        // 否则视为 'text'，并把 message 当成纯文本答案展示。
-        let answerType =
-          typeof payload.answer_type === 'string' && payload.answer_type
-            ? payload.answer_type
-            : null
-        const answerText =
-          typeof payload.answer === 'string' ? payload.answer : ''
-        const hasExplicitAnswerType =
-          typeof payload.answer_type === 'string' && payload.answer_type
-        const hasExplicitAnswer = answerText.trim().length > 0
-        const hasExistingTextAnswer =
-          taskResult.value &&
-          taskResult.value.type === 'text' &&
-          typeof finalAnswerText.value === 'string' &&
-          finalAnswerText.value.trim().length > 0
-        if (!hasExplicitAnswerType && !hasExplicitAnswer && hasExistingTextAnswer) {
-          return
-        }
-        if (!answerType) {
-          answerType = artifactsGrewSinceSubmit() ? 'file' : 'text'
-        }
-        const fallbackText = answerText || (answerType === 'text' ? text : '')
-        finalAnswerText.value = fallbackText
-        finalAnswerStatus.value = answerType === 'file' ? 'file' : 'text'
-        // F3: domain hint from backend (only meaningful when answerType==='text')
-        const rawDomain =
-          typeof payload.answer_domain === 'string' ? payload.answer_domain : ''
-        const ALLOWED_DOMAINS = ['weather', 'stock', 'recipe', 'flight']
-        finalAnswerDomain.value =
-          answerType === 'text' && ALLOWED_DOMAINS.includes(rawDomain) ? rawDomain : ''
-        taskResult.value = { type: answerType, answer: fallbackText }
+        applyDoneAnswer(payload, text)
         return
       }
 
@@ -722,13 +674,8 @@ const submitTask = async () => {
   timelineAutoScroll.value = true
 
   // ── Final Answer：进入"执行中/等待"状态 ──
-  taskResult.value = null
-  finalAnswerText.value = ''
-  finalAnswerStatus.value = 'pending'
-  hasNewFinalAnswer.value = false
-  finalAnswerExpanded.value = false  // F2: 新任务默认折叠
+  resetForNewRun()
   finalAnswerCopyState.value = 'idle' // F1: 复位 copy 反馈
-  finalAnswerDomain.value = ''       // F3: 清除上轮的域卡片
   markArtifactsBaseline()
   fetchBrowserRuntimeStatus()
 
