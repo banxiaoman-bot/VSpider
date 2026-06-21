@@ -656,3 +656,107 @@ def test_gather_dom_list_card_candidates_list_source_falls_back(monkeypatch):
     )
     assert candidates[0]["name"] == "DOM_LIST"
     assert candidates[0]["source_text"] == "fb-source"
+
+
+# ── R2-3b: arm_pagination_after_extract (explicit-path pagination probe/arm) ──
+
+
+class _ProbeBrowser:
+    """Browser stub for arm_pagination_after_extract: canned probe_pagination
+    result + a drain frame for the low-yield probe_scroll_drain_state call."""
+
+    def __init__(self, probe_result, *, drain_at_bottom=True):
+        self._probe_result = probe_result
+        self._drain = {"at_bottom": drain_at_bottom}
+
+    async def probe_pagination(self):
+        return self._probe_result
+
+    async def _ensure_active_page(self, reason=""):
+        return _StubFrame(eval_result=self._drain)
+
+
+def test_arm_pagination_first_flip_sets_pending_for_page_goal():
+    from visual_web_agent.phases.pagination_helpers import (
+        _should_force_first_flip_after_successful_extract,
+    )
+
+    goal = "抓取前3页数据"
+    # premise: this goal must trigger the first-flip hard constraint
+    assert _should_force_first_flip_after_successful_extract(goal) is True
+    # pagination_probed=True + extract_count=0 isolates the first-flip branch
+    state = ExtractState(pagination_probed=True, extract_count=0)
+    rt = _mk_runtime(
+        goal=goal,
+        state=state,
+        browser=_ProbeBrowser({"has_paginator": False, "kind": "", "candidates": []}),
+    )
+    asyncio.run(
+        rt.arm_pagination_after_extract(
+            new_rows=5, log_extract_text_source="DOM_LIST", data_shape={}
+        )
+    )
+    assert state.first_extract_ever_done is True
+    assert state.first_flip_pending is True
+
+
+def test_arm_pagination_probe_has_paginator_arms_next_page():
+    state = ExtractState(extract_count=1, total_extracted_rows=15)
+    rt = _mk_runtime(
+        goal="抓取50条数据",
+        state=state,
+        browser=_ProbeBrowser(
+            {
+                "has_paginator": True,
+                "kind": "numeric",
+                "candidates": [{"ref": "r1", "name": "2"}],
+            }
+        ),
+    )
+    asyncio.run(
+        rt.arm_pagination_after_extract(
+            new_rows=15, log_extract_text_source="DOM_LIST", data_shape={}
+        )
+    )
+    assert state.pagination_probed is True
+    assert state.pagination_kind == "numeric"
+    assert state.force_next_page_pending is True
+    assert "分页器" in state.pagination_hint_msg
+
+
+def test_arm_pagination_no_paginator_marks_infinite_scroll():
+    state = ExtractState(extract_count=1, total_extracted_rows=5)
+    rt = _mk_runtime(
+        goal="抓取50条数据",
+        state=state,
+        browser=_ProbeBrowser({"has_paginator": False, "kind": "", "candidates": []}),
+    )
+    asyncio.run(
+        rt.arm_pagination_after_extract(
+            new_rows=3, log_extract_text_source="DOM_LIST", data_shape={}
+        )
+    )
+    assert state.page_is_infinite_scroll is True
+
+
+def test_arm_pagination_rearm_when_paginator_known_and_target_unmet():
+    # probe skipped (extract_count != 1); the re-arm branch fires.
+    state = ExtractState(
+        pagination_probed=True,
+        pagination_kind="numeric",
+        page_is_infinite_scroll=False,
+        force_next_page_pending=False,
+        extract_count=2,
+        total_extracted_rows=5,
+    )
+    rt = _mk_runtime(
+        goal="抓取50条数据",
+        state=state,
+        browser=_ProbeBrowser({"has_paginator": True, "kind": "numeric", "candidates": []}),
+    )
+    asyncio.run(
+        rt.arm_pagination_after_extract(
+            new_rows=5, log_extract_text_source="DOM_LIST", data_shape={}
+        )
+    )
+    assert state.force_next_page_pending is True

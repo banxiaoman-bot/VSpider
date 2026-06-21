@@ -2244,6 +2244,7 @@ async def run_agent(
             goal_output_contract=_goal_output_contract,
             vlm_output=_vlm_output,
             enable_xhr=enable_xhr,
+            broadcast_log_safe=_broadcast_log_safe,
         )
         _extract_rt = _ExtractRuntime(_extract_deps, _xs)
 
@@ -6634,143 +6635,11 @@ async def run_agent(
                                 _task_completed = True
                                 _run_succeeded = True
                                 break
-                            # ── 首翻引擎硬约束：首次 extract 后强制下一步 next_page ──
-                            # Bug 修复：用任务级永久锁，避免翻页后 _xs.extract_count 重置反复触发
-                            if (
-                                not _xs.first_extract_ever_done
-                                and _should_force_first_flip_after_successful_extract(goal)
-                            ):
-                                _xs.first_extract_ever_done = True
-                                _xs.first_flip_pending = True
-                            # ── Improvement 1：首次 extract 后探测分页器（显式 extract 路径） ──
-                            if (
-                                _goal_needs_pagination_probe(goal)
-                                and not _xs.pagination_probed
-                                and _xs.extract_count == 1
-                            ):
-                                _xs.pagination_probed = True
-                                try:
-                                    _probe = await browser.probe_pagination()
-                                    _xs.pagination_kind = _probe.get("kind", "")
-                                    _cands = _probe.get("candidates", [])
-                                    if _probe.get("has_paginator"):
-                                        _names = ", ".join(
-                                            f"{c['ref']}={c['name']!r}" for c in _cands[:6]
-                                        )
-                                        _should_force_probe_next, _force_probe_reason = (
-                                            _should_schedule_next_page_after_extract(
-                                                goal,
-                                                new_rows=_new_rows,
-                                                total_rows=_xs.total_extracted_rows,
-                                                extract_source=_log_extract_text_source,
-                                                pagination_kind=_xs.pagination_kind,
-                                                expected_rows=_expected_rows_from_data_shape(_data_shape),
-                                                physically_drained=bool(_data_shape.get("physically_drained")),
-                                            )
-                                        )
-                                        if _should_force_probe_next:
-                                            _xs.force_next_page_pending = True
-                                            _xs.first_flip_pending = False
-                                            _xs.block_next_page_until_drained = False
-                                            _xs.block_next_page_reason = ""
-                                            logger.info(
-                                                "[PROBE PAGE] armed next_page after extract: %s",
-                                                _force_probe_reason,
-                                            )
-                                            _broadcast_log_safe(
-                                                f"[PROBE PAGE] 已发现分页器，下一轮直接 next_page：{_force_probe_reason}",
-                                                level="info",
-                                            )
-                                            _xs.pagination_hint_msg = (
-                                                f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
-                                                f"已确认页面底部存在翻页控件：{_names}。\n"
-                                                f"当前页已提取到足够完整的一批数据（{_force_probe_reason}）。"
-                                                f"下一步**必须**用 next_page（首选 URL Mutation）翻页，"
-                                                f"**禁止** smooth_scroll 当无限滚动处理。"
-                                            )
-                                        else:
-                                            _drain_state = await _probe_scroll_drain_state(
-                                                "pagination probe low-yield explicit extract"
-                                            )
-                                            if not bool(_drain_state.get("at_bottom")):
-                                                _xs.block_next_page_until_drained = True
-                                                _xs.block_next_page_reason = _force_probe_reason
-                                            else:
-                                                _xs.force_next_page_pending = True
-                                                _xs.first_flip_pending = False
-                                                _xs.block_next_page_until_drained = False
-                                                _xs.block_next_page_reason = ""
-                                                _force_probe_reason = (
-                                                    f"{_force_probe_reason}; physical bottom reached"
-                                                )
-                                            _xs.pagination_hint_msg = (
-                                                f"📍【系统探测：本页**带分页器**（{_xs.pagination_kind}）】\n"
-                                                f"已确认页面存在翻页控件：{_names}。\n"
-                                                f"但本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
-                                                "不足以证明当前页已提取完。\n"
-                                                "下一步请先 smooth_scroll 向下并继续 extract 当前页；"
-                                                "只有当前页物理触底或无新增后，才使用 next_page。"
-                                            )
-                                    else:
-                                        # No paginator detected — mark as infinite scroll
-                                        _xs.page_is_infinite_scroll = True
-                                        _should_force_probe_next, _force_probe_reason = (
-                                            _should_schedule_next_page_after_extract(
-                                                goal,
-                                                new_rows=_new_rows,
-                                                total_rows=_xs.total_extracted_rows,
-                                                extract_source=_log_extract_text_source,
-                                                pagination_kind=_xs.pagination_kind,
-                                                expected_rows=_expected_rows_from_data_shape(_data_shape),
-                                                physically_drained=bool(_data_shape.get("physically_drained")),
-                                            )
-                                        )
-                                        if _should_force_probe_next:
-                                            _xs.force_next_page_pending = True
-                                            _xs.first_flip_pending = False
-                                            _xs.block_next_page_until_drained = False
-                                            _xs.block_next_page_reason = ""
-                                            logger.info(
-                                                "[PROBE PAGE] armed universal next_page after extract: %s",
-                                                _force_probe_reason,
-                                            )
-                                            _broadcast_log_safe(
-                                                f"[PROBE PAGE] 大批量提取未达量，下一轮交给 next_page 宏动作：{_force_probe_reason}",
-                                                level="info",
-                                            )
-                                            _xs.pagination_hint_msg = (
-                                                "📍【系统探测：本页**无分页器**（infinite 模式）】\n"
-                                                "当前提取批次已足够大但目标未达成。"
-                                                "下一步使用 next_page 宏动作；如果确实没有分页器，"
-                                                "底层会自动走 L4 滚动兜底加载新数据。"
-                                            )
-                                        else:
-                                            _xs.pagination_hint_msg = (
-                                                "📍【系统探测：本页**无分页器**】\n"
-                                                f"本次仅新增 {_new_rows} 条（{_force_probe_reason}），"
-                                                "请继续 smooth_scroll / extract 当前列表；"
-                                                "如果滚动触底且仍未达量，引擎会再调度 next_page 宏动作。"
-                                            )
-                                    logger.info(f"[PROBE PAGE] kind={_xs.pagination_kind} cands={len(_cands)}")
-                                except Exception as _probe_err:
-                                    logger.warning(f"[PROBE PAGE] 失败忽略：{_probe_err}")
-                            # ── Re-arm：已知分页器 + 目标未达 → 每次 extract 后强制 next_page ──
-                            if (
-                                _xs.pagination_probed
-                                and _xs.pagination_kind not in ("", "infinite")
-                                and not _xs.page_is_infinite_scroll
-                                and not _xs.force_next_page_pending
-                            ):
-                                _rearm_target = _parse_goal_target_count(goal)
-                                if _rearm_target is not None and _xs.total_extracted_rows < _rearm_target:
-                                    _xs.force_next_page_pending = True
-                                    logger.info(
-                                        "[REARM NEXT_PAGE] paginator known (%s), target not met "
-                                        "(%s/%s); re-armed for next step",
-                                        _xs.pagination_kind,
-                                        _xs.total_extracted_rows,
-                                        _rearm_target,
-                                    )
+                            await _extract_rt.arm_pagination_after_extract(
+                                new_rows=_new_rows,
+                                log_extract_text_source=_log_extract_text_source,
+                                data_shape=_data_shape,
+                            )
                             # ── Path C：Hard Kill 引擎层强杀（同上）──
                             _hk_target = _parse_goal_target_count(goal)
                             if _hk_target is not None and _xs.total_extracted_rows >= _hk_target:
