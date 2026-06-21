@@ -4127,3 +4127,15 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useRunEventRouter.test.js 13 例（log/image、done happy+success=false+already-on-runs、phase append+badge+replay drop+PHASE_LIMIT 环裁、status 四子态、坏 JSON [WARN]）。
 - 验证: vitest 19 文件 / 161 passed（+13）；npm run build 绿；ReadLints clean；结构化 pytest 55 passed；App.vue 1239→1144 行（-95），仍纯 CRLF。
 - 风险: 中（最大单刀，26 注入；vitest 全分支 + 结构化 pytest 双绿守回归）。
+
+## Slice DC-1 (M1 准确 + M3 通用): Cookie/同意墙确定性关闭 dismiss_consent (done, P1)
+
+- 能力名: dismiss_consent（DOM/JS 命中主流 CMP「接受全部」+ 容器内多语肯定文本兜底 + iframe + 校验弹层消失；契约 consent_dismissed.v1）。替代既有「VLM 视觉提示先 Escape/click 关闭」(prompt_skills:255)，直击铁律#1 准确。
+- 影响层: model_plane(vlm_models 动作枚举) + operations_plane(action_registry ActionTool / capability_router 路由) + execution_kernel(actions/page_ops DismissConsentHandler + main.py bind/_registry_dispatch_actions) + prompts(prompt_skills DISMISS_CONSENT_SKILL + :255 升级)。
+- 触发模型: c-分两刀，DC-1 仅显式动作（VLM/路由触发）；DC-2 自动前置守卫后续单独切片（幂等 no-op 已就位可复用）。
+- 设计/计划: docs/superpowers/specs/2026-06-21-dismiss-consent-design.md / docs/superpowers/plans/2026-06-21-dismiss-consent-dc1.md。
+- 新增 contract 字段: consent_dismissed.v1（cmp/strategy/selector/frame_url/dismissed/scanned_frames），rpa_trail 留痕；只加不删。
+- known-CMP 选择器表 21 条（OneTrust/Cookiebot/TrustArc/Quantcast/Didomi/Usercentrics/Osano/CookieYes/Complianz/Klaro/Termly/Borlabs/Sourcepoint/WP-GDPR…）+ 多语 accept/reject 词表。
+- Tests: tests/test_dismiss_consent.py 15 例（schema/注册/no-op/无活动页/known-CMP 命中+校验/accept-text 兜底/排除词 no-op/iframe 兜底/点击后仍可见=未关/ActionTool evidence/路由 consent 信号+backend_plan 命中/skill 内容+字典登记）；tests/agent_cases/cases.json 注册 1 条 live 基准用例（按需跑，非 CI）。
+- 验证: py_compile 7 文件绿；pytest tests/test_dismiss_consent.py 15 passed；按字节 patch 保持各文件原 newline。
+- 风险: 低（默认不自动触发，纯新增动作；L2 容器作用域+整词+排除词三重防误点；提交只 add 本切片文件，未碰并发 R2/BBR/UI 改动）。
