@@ -4105,3 +4105,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useFinalAnswer.test.js 9 例（applyDoneAnswer 显式file/启发式file-text/去重早退/domain白名单(text)/finalAnswerHtml渲染 + resetForNewRun + watch 切final/切artifacts/同type不抢Tab）。
 - 验证: vitest 17 文件 / 141 passed（+9）；npm run build 绿（index js 192.54kB）；ReadLints clean；test_app_vue_timer_cleanup.py 3 passed（onUnmounted pin 完好）；App.vue 1305→1252 行（-53），仍纯 CRLF。
 - 风险: 中-低（done 解析 + watch 行为逐字平移 + stub 测试守回归；onUnmounted 结构断言已验证）。
+
+## Slice D-UI-20 (M4 简便): 底部 Tab 状态 + setActiveBottomTab 从 App.vue 抽离 useBottomTabs (done, P2)
+
+- 能力名: bottom_tabs_extraction（activeBottomTab/runsSubView/hasNewRuns/hasNewPhase/hasNewCapability/timelineAutoScroll/runHistoryRefreshToken + TAB_ORDER + setActiveBottomTab 抽成 composables/useBottomTabs.js）。
+- 影响层: vspider-ui（App.vue → composables/useBottomTabs.js）+ 2 个结构化 pytest 同步 repoint。
+- 关键设计: 破 init-order 环——activeBottomTab 需早于 useScreenshotArtifacts/useFinalAnswer，但 setActiveBottomTab 要清它们的红点（hasNewArtifacts/hasNewFinalAnswer）+ TimelinePanel 滚动；用 resolveExternalBadges() getter 延迟解析注入（与 createTerminalLogBuffer 引用 scrollToBottom 同前向引用模式，setActiveBottomTab 仅 setup 后调用故安全）。
+- 测试同步（eb13fc7 同款 pattern）: test_keyboard_shortcuts.py 加 bottom_tabs_src fixture、test_tab_order_has_six_tabs repoint 到 useBottomTabs.js；test_timeline_replay_search.py 把 useBottomTabs.js 折进 TestY33CapabilityTracePanel.src bundle（修 test_capability_state_and_computeds_exist + test_capability_ws_badge_wired 的 setActiveBottomTab capability 清红点断言）。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useBottomTabs.test.js 7 例（非法名早退/各 Tab 清对应红点含外部 artifacts·final/timeline 滚动开关）。
+- 验证: vitest 18 文件 / 148 passed（+7）；npm run build 绿；ReadLints clean；结构化 pytest 55 passed（keyboard/timeline_replay/timer_cleanup）；App.vue 1252→1239 行（-13），仍纯 CRLF。
+- 风险: 中（init-order getter 注入 + 跨 composable 红点；vitest + 结构化 pytest 双绿守回归）。

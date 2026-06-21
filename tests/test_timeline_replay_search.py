@@ -329,6 +329,7 @@ class TestY33CapabilityTracePanel:
             "useCapabilityTraceExport.js",
             "useCapabilityFixtureReplay.js",
             "useTimelineReplay.js",
+            "useBottomTabs.js",
         ):
             p = _UI_SRC / "composables" / comp
             if p.exists():

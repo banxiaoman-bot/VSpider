@@ -30,6 +30,10 @@ KEYBOARD_CMD = (
     Path(__file__).resolve().parent.parent
     / "vspider-ui" / "src" / "composables" / "useKeyboardCommand.js"
 )
+BOTTOM_TABS = (
+    Path(__file__).resolve().parent.parent
+    / "vspider-ui" / "src" / "composables" / "useBottomTabs.js"
+)
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +46,12 @@ def kbd_src() -> str:
     """Pure keyboard dispatcher (resolveKeyboardAction + useKeyboardCommand),
     extracted out of App.vue into the composable."""
     return KEYBOARD_CMD.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def bottom_tabs_src() -> str:
+    """TAB_ORDER + setActiveBottomTab were extracted into useBottomTabs.js (D-UI-20)."""
+    return BOTTOM_TABS.read_text(encoding="utf-8")
 
 
 # ── Dispatcher lifecycle ──────────────────────────────────────────────
@@ -123,13 +133,13 @@ class TestGlobalShortcuts:
 
 
 class TestTabOrderInvariants:
-    def test_tab_order_has_six_tabs(self, src: str) -> None:
+    def test_tab_order_has_six_tabs(self, bottom_tabs_src: str) -> None:
         """TAB_ORDER must list the 6 tabs the UI has today, in the same
         order they appear in the DOM. If a future tab is added (or one
         removed), this test forces a deliberate update."""
         m = re.search(
             r"const TAB_ORDER\s*=\s*\[(.*?)\]",
-            src, flags=re.S,
+            bottom_tabs_src, flags=re.S,
         )
         assert m, "TAB_ORDER constant must exist"
         items = [

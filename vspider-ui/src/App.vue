@@ -47,6 +47,7 @@ import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
 import { writeToClipboard } from './composables/useClipboard.js'
 import { useAuthProfiles } from './composables/useAuthProfiles.js'
 import { useFinalAnswer } from './composables/useFinalAnswer.js'
+import { useBottomTabs } from './composables/useBottomTabs.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -133,8 +134,19 @@ const {
   submitHitlForm,
   skipHitlForm,
 } = useHitlForm({ appendLog })
-const activeBottomTab = ref('terminal')
-const runsSubView = ref('all')
+const {
+  activeBottomTab,
+  runsSubView,
+  hasNewRuns,
+  hasNewPhase,
+  hasNewCapability,
+  timelineAutoScroll,
+  runHistoryRefreshToken,
+  TAB_ORDER,
+  setActiveBottomTab,
+} = useBottomTabs({
+  resolveExternalBadges: () => ({ hasNewArtifacts, hasNewFinalAnswer, timelinePanelRef }),
+})
 // C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
 const settingsDrawerOpen = ref(false)
 const settingsActivePanels = ref(['models', 'identity', 'constraints', 'file'])
@@ -152,8 +164,6 @@ const {
   appendLog,
   isArtifactsTabActive: () => activeBottomTab.value === 'artifacts',
 })
-const runHistoryRefreshToken = ref(0)
-const hasNewRuns = ref(false)
 const {
   fetchBrowserRuntimeStatus,
   browserRuntime,
@@ -179,8 +189,6 @@ const {
 // hasNewPhase: pulse the tab badge when an event lands while the user is
 // on a different tab.
 const phaseEvents = ref([])
-const hasNewPhase = ref(false)
-const hasNewCapability = ref(false)
 const PHASE_LIMIT = 500
 
 // ── N: Phase event detail dialog ──
@@ -220,7 +228,6 @@ const failedRunsPaneRef = ref(null)
 // the user's expectation of the browser's native page-search.
 
 
-const timelineAutoScroll = ref(true)
 // ── Final Answer 面板状态 ──
 // taskResult: 后端最终结果，结构 { type: 'text' | 'file', answer: string }
 //   - null：未开始 / 已重置
@@ -523,26 +530,6 @@ const {
 //     have native browser meanings. We unconditionally preventDefault on
 //     a hit so the browser doesn't open the address bar or jump to the
 //     wrong window tab. The user's mental model in an SPA expects this.
-
-// Tab name lookup for Ctrl+1..6 — kept here so the help dialog can use
-// it as a single source of truth.
-const TAB_ORDER = ['terminal', 'timeline', 'capability', 'final', 'artifacts', 'runs']
-
-// Switch active tab + apply the same badge-clearing side effects the
-// el-tabs @tab-change handler does, since direct assignment to the model
-// doesn't fire the event.
-const setActiveBottomTab = (name) => {
-  if (!TAB_ORDER.includes(name)) return
-  activeBottomTab.value = name
-  if (name === 'artifacts') hasNewArtifacts.value = false
-  if (name === 'runs') hasNewRuns.value = false
-  if (name === 'final') hasNewFinalAnswer.value = false
-  if (name === 'timeline') {
-    hasNewPhase.value = false
-    if (timelineAutoScroll.value) timelinePanelRef.value?.scrollToBottom()
-  }
-  if (name === 'capability') hasNewCapability.value = false
-}
 
 // Focus the Prompt textarea programmatically. Element Plus el-input
 // exposes a ``.focus()`` method on its component instance (NOT the
