@@ -4035,3 +4035,12 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 验证: `python -m pytest tests/test_browser_backend_router.py` → **35 passed, exit 0**。
 - 风险: 极低（新模块未被任何生产代码引用，grep 全仓 0 外部 import；纯确定性数据驱动路由，不触碰既有 browser 调用方）。
 - 后续（未做，独立切片）: 接线 = browser_pool/browser_control 建后端时改走 `router.route()`→`build()`；lightpanda CDP endpoint 实测；cloakbrowser slot 实装。
+
+## Slice D-UI-17 (M4 简便): 剪贴板写入工具从 App.vue 抽离 useClipboard (done, P3)
+
+- 能力名: clipboard_write_extraction（App.vue 内联 `_writeToClipboard` 抽成 `composables/useClipboard.js::writeToClipboard`：navigator.clipboard 优先 + textarea/execCommand 回退 + ElMessage 错误反馈）。
+- 影响层: 仅 vspider-ui（App.vue → composables/useClipboard.js）；两处注入点（useCapabilityFixtureReplay / useCapabilityTraceExport）由 `(text) => _writeToClipboard(text)` 改为同名 shorthand `writeToClipboard`。
+- 新增 contract 字段: 无。
+- Tests: 新增 `tests/useClipboard.test.js` 4 例（空串→false / navigator.clipboard 路径 / textarea+execCommand 回退 / 异常→ElMessage.error+false），vi.stubGlobal 注入 navigator/document；先验红（模块缺失）后转绿。
+- 验证: vitest 15 文件 / 126 passed（+4）；npm run build 绿（index js 191.70kB）；ReadLints clean；App.vue 1353→1332 行（-21），仍纯 CRLF。
+- 风险: 低（叶子工具，行为逐字平移；无结构化 pytest 断言 _writeToClipboard）。

@@ -45,6 +45,7 @@ import { useBrowserRuntimeStatus } from './composables/useBrowserRuntimeStatus.j
 import { useCapabilityTraceExport } from './composables/useCapabilityTraceExport.js'
 import { useHitlForm } from './composables/useHitlForm.js'
 import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
+import { writeToClipboard } from './composables/useClipboard.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -538,7 +539,7 @@ const {
   url,
   prompt,
   fetchArtifacts: () => fetchArtifacts(),
-  writeToClipboard: (text) => _writeToClipboard(text),
+  writeToClipboard,
   latestCapabilityExecute,
   capabilityExecutionFailureBundle,
   capabilityExecutionEfficiencyCorrelationReport,
@@ -560,7 +561,7 @@ const {
   copyCapabilityTraceSummary,
 } = useCapabilityTraceExport({
   trace: capabilityTrace,
-  writeToClipboard: (text) => _writeToClipboard(text),
+  writeToClipboard,
 })
 
 // ── W: Offline replay — import a phase_<id>.jsonl ─────────────────────
@@ -577,28 +578,6 @@ const {
 // We DON'T cap by PHASE_LIMIT here — a user importing a giant file
 // presumably wants to see all of it. The Timeline render already
 // virtualizes per-step so it handles ~10k events fine.
-
-// Same clipboard fallback chain as copyPhaseJson + finalAnswerText copy.
-const _writeToClipboard = async (text) => {
-  if (!text) return false
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(text)
-    } else {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    return true
-  } catch (err) {
-    ElMessage.error(`复制失败: ${String(err)}`)
-    return false
-  }
-}
-
 
 // ── T: Keyboard shortcuts dispatcher ──────────────────────────────────
 // A single window-level keydown listener routes to handlers based on the
