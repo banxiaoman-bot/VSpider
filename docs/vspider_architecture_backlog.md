@@ -4116,3 +4116,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useBottomTabs.test.js 7 例（非法名早退/各 Tab 清对应红点含外部 artifacts·final/timeline 滚动开关）。
 - 验证: vitest 18 文件 / 148 passed（+7）；npm run build 绿；ReadLints clean；结构化 pytest 55 passed（keyboard/timeline_replay/timer_cleanup）；App.vue 1252→1239 行（-13），仍纯 CRLF。
 - 风险: 中（init-order getter 注入 + 跨 composable 红点；vitest + 结构化 pytest 双绿守回归）。
+
+## Slice D-UI-21 (M4 简便 + M2 高效): WS 运行事件分发器从 App.vue 抽离 useRunEventRouter (done, P2)
+
+- 能力名: run_event_router_extraction（handleSocketMessage——log/image/done/phase/status 全类型 WS 路由——抽成 composables/useRunEventRouter.js；PHASE_LIMIT 一并迁入并 export 供测试）。
+- 影响层: vspider-ui（App.vue → composables/useRunEventRouter.js）+ test_timeline_replay_search.py 同步折入 bundle。
+- 设计: 纯编排、不持状态——26 个依赖（appendLog/截图/HITL/browser-runtime/底部 Tab 红点/applyDoneAnswer/replayMode/phaseEvents/artifacts/模板 ref）全注入；handleSocketMessage 逐字平移。App.vue onMessage 接 destructure 出的 handleSocketMessage。
+- 测试同步: useRunEventRouter.js 折进 TestY33CapabilityTracePanel.src（capability badge 串）+ TestWReplayMode.combined_src（WS phase replay-gate 串）两个 bundle。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useRunEventRouter.test.js 13 例（log/image、done happy+success=false+already-on-runs、phase append+badge+replay drop+PHASE_LIMIT 环裁、status 四子态、坏 JSON [WARN]）。
+- 验证: vitest 19 文件 / 161 passed（+13）；npm run build 绿；ReadLints clean；结构化 pytest 55 passed；App.vue 1239→1144 行（-95），仍纯 CRLF。
+- 风险: 中（最大单刀，26 注入；vitest 全分支 + 结构化 pytest 双绿守回归）。
