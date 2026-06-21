@@ -974,5 +974,21 @@ def build_default_action_registry() -> ActionRegistry:
         deterministic=True,
         risk="low",
     ))
+    register(ActionTool(
+        name="dismiss_consent",
+        capability="browser_actions",
+        description="Deterministically dismiss cookie/consent walls (CMP) by clicking 'Accept all', verified by overlay disappearance; idempotent no-op when absent.",
+        actions=("dismiss_consent",),
+        aliases=(
+            "cookie", "cookies", "consent", "accept all", "accept cookies",
+            "gdpr", "cookie banner", "同意", "接受全部", "全部接受",
+            "我知道了", "cookie 横幅", "隐私弹窗", "同意墙",
+        ),
+        tags=("overlay", "consent", "cookie", "unblock"),
+        evidence=("consent_dismissed.v1",),
+        deterministic=True,
+        changes_state=True,
+        risk="low",
+    ))
 
     return registry
