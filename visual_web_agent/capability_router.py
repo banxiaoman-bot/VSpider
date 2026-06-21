@@ -55,6 +55,11 @@ _QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|met
 _RESUME_RE = re.compile(r"\bresume\b|\bcontinue\s+(the\s+)?(last|previous|prior)\b|continue\s+where|left\s+off|pick\s+up\s+where|断点续跑|断点续传|接着上次|继续上次|上次没做完|上次没完成|接着之前|继续之前", re.I)
 _BROWSER_RE = re.compile(r"\b(click|scroll|hover|tab|cookie|storage|console|screenshot|browser|locator|selector|similar)\b|点击|滚动|悬停|标签页|浏览器|选择器|相似元素", re.I)
 _AUTH_RE = re.compile(r"\b(login|signin|auth|captcha|2fa|otp)\b|登录|认证|验证码|短信", re.I)
+_CONSENT_RE = re.compile(
+    r"\b(cookie\s*(banner|consent|notice|wall)?|consent|gdpr|ccpa|onetrust|cookiebot|trustarc|didomi|usercentrics|quantcast)\b"
+    r"|cookie\s*弹窗|同意墙|隐私弹窗|接受全部\s*cookie|关闭\s*cookie|cookie\s*横幅|同意\s*cookie",
+    re.I,
+)
 _CHALLENGE_RE = re.compile(
     r"\b(cloudflare|turnstile|recaptcha|hcaptcha|datadome|perimeterx|akamai|anti[- ]?bot|bot[- ]?detection|bot[- ]?challenge|waf)\b"
     r"|人机验证|滑块|拼图|点选验证|反爬|风控|五秒盾|防护盾",
@@ -527,6 +532,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     resume = bool(_RESUME_RE.search(text))
     browser_interaction = bool(_BROWSER_RE.search(text) or form or chat or file_io)
     auth = bool(_AUTH_RE.search(text))
+    consent = bool(_CONSENT_RE.search(text))
     bot_challenge = bool(_CHALLENGE_RE.search(text))
     search_nav = bool(_SEARCH_NAV_RE.search(text))
     output_contract = strategy_context.get("output_contract") or infer_goal_output_contract(text)
@@ -546,6 +552,7 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "resume_preferred": resume,
         "browser_interaction": browser_interaction,
         "auth_or_captcha": auth,
+        "consent_preferred": consent,
         "bot_challenge": bot_challenge,
         "search_nav_preferred": search_nav,
         "visual_required": browser_interaction and not (api or crawl),
@@ -577,6 +584,8 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "vscroll_capture", "extraction", "VSCROLL-ACTION", ["ActionRegistry: vscroll_capture"], "Deterministically harvest every row of a virtualised / infinite-scroll list (main document first, then same-origin child iframes) in one mid-run call - alternate row snapshots with container nudges and dedup recycled rows - instead of one VLM round per viewport.", "deterministic_router")
     if signals.get("snapshot_preferred"):
         _add(plan, "page_snapshot", "artifact", "S4", ["ActionRegistry: html_snapshot", "ActionRegistry: screenshot"], "Persist the page HTML and/or a screenshot as run artifacts recorded in manifest.json (kind=html_snapshot / screenshot) when the deliverable is a snapshot, instead of leaving debug screenshots outside the manifest.", "deterministic_router")
+    if signals.get("consent_preferred"):
+        _add(plan, "dismiss_consent", "browser_actions", "DC-1", ["ActionRegistry: dismiss_consent"], "When a cookie/GDPR consent wall blocks the page, deterministically click the CMP 'Accept all' control (OneTrust/Cookiebot/TrustArc/... + scoped multilingual accept text, reject excluded, iframe fallback, verified by overlay disappearance) before any extraction, instead of asking the VLM to visually find and click it.", "deterministic_router")
     if signals.get("search_nav_preferred"):
         _add(plan, "open_top_search_result", "navigation", "SEARCH-NAV", ["ActionRegistry: open_top_search_result"], "When the goal carried no URL and the agent lands on a search-results page, deterministically open the first non-ad organic result (ads / sponsored / paid-click redirects / same-engine internal links excluded, with a landing-page second pass + candidate rotation) instead of letting the VLM guess a link.", "deterministic_router")
     if signals.get("resume_preferred"):
