@@ -44,6 +44,7 @@ import { useCapabilityFixtureReplay } from './composables/useCapabilityFixtureRe
 import { useBrowserRuntimeStatus } from './composables/useBrowserRuntimeStatus.js'
 import { useCapabilityTraceExport } from './composables/useCapabilityTraceExport.js'
 import { useHitlForm } from './composables/useHitlForm.js'
+import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -91,9 +92,6 @@ const {
   appendLog,
   clear: clearTerminalLogs,
 } = createTerminalLogBuffer({ onFlush: () => { scrollToBottom() } })
-const currentImageBase64 = ref('')
-const screenshotHistory = ref([])
-const SCREENSHOT_HISTORY_MAX = 60
 const terminalLogPaneRef = ref(null)
 
 const authDialogOpen = ref(false)
@@ -135,8 +133,20 @@ const runsSubView = ref('all')
 // C2: 高级配置抽屉 — 左栏只留任务输入，配置项收进抽屉
 const settingsDrawerOpen = ref(false)
 const settingsActivePanels = ref(['models', 'identity', 'constraints', 'file'])
-const artifactList = ref([])
-const hasNewArtifacts = ref(false)
+const {
+  currentImageBase64,
+  screenshotHistory,
+  pushScreenshotFrame,
+  clearScreenshotStream,
+  artifactList,
+  hasNewArtifacts,
+  fetchArtifacts,
+  markArtifactsBaseline,
+  artifactsGrewSinceSubmit,
+} = useScreenshotArtifacts({
+  appendLog,
+  isArtifactsTabActive: () => activeBottomTab.value === 'artifacts',
+})
 const runHistoryRefreshToken = ref(0)
 const hasNewRuns = ref(false)
 const {
@@ -218,8 +228,6 @@ const finalAnswerStatus = ref('idle')
 const finalAnswerText = ref('')
 const finalAnswerDomain = ref('') // F3: 'weather'|'stock'|'recipe'|'flight'|'' (空=无卡片)
 const hasNewFinalAnswer = ref(false)
-// 启动任务时记录 artifact 数，作为兜底的 type 推断依据（后端未显式标记时使用）
-let artifactsCountAtSubmit = 0
 
 // ── Slash command system ──
 const slashRegistry = createSlashCommandRegistry()
@@ -279,13 +287,7 @@ const handleSocketMessage = async (event) => {
       }
 
       if (payload.type === 'image' || payload.type === 'screenshot') {
-        currentImageBase64.value = payload.data || ''
-        if (payload.data) {
-          screenshotHistory.value.push({ src: payload.data, ts: Date.now() })
-          if (screenshotHistory.value.length > SCREENSHOT_HISTORY_MAX) {
-            screenshotHistory.value.shift()
-          }
-        }
+        pushScreenshotFrame(payload.data)
         return
       }
 
@@ -333,9 +335,7 @@ const handleSocketMessage = async (event) => {
           return
         }
         if (!answerType) {
-          const artifactsGrew =
-            artifactList.value.length > artifactsCountAtSubmit
-          answerType = artifactsGrew ? 'file' : 'text'
+          answerType = artifactsGrewSinceSubmit() ? 'file' : 'text'
         }
         const fallbackText = answerText || (answerType === 'text' ? text : '')
         finalAnswerText.value = fallbackText
@@ -485,22 +485,6 @@ const loadCaptchaSolverStatus = async () => {
   } catch (err) {
     // non-critical
     console.warn('[captcha_solver] status fetch failed:', err)
-  }
-}
-
-const fetchArtifacts = async () => {
-  try {
-    const response = await apiFetch('/api/artifacts')
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '加载产出文件失败')
-    }
-    artifactList.value = result.files || []
-    if (activeBottomTab.value === 'artifacts') {
-      hasNewArtifacts.value = false
-    }
-  } catch (err) {
-    await appendLog(`[WARN] 加载产出文件失败: ${String(err)}`)
   }
 }
 
@@ -771,8 +755,7 @@ const submitTask = async () => {
 
   isRunning.value = true
   clearTerminalLogs()
-  currentImageBase64.value = ''
-  screenshotHistory.value = []
+  clearScreenshotStream()
   // M: clear timeline buffer at the start of every new run so phases
   // from old runs don't bleed into the new timeline view.
   phaseEvents.value = []
@@ -796,7 +779,7 @@ const submitTask = async () => {
   finalAnswerExpanded.value = false  // F2: 新任务默认折叠
   finalAnswerCopyState.value = 'idle' // F1: 复位 copy 反馈
   finalAnswerDomain.value = ''       // F3: 清除上轮的域卡片
-  artifactsCountAtSubmit = artifactList.value.length
+  markArtifactsBaseline()
   fetchBrowserRuntimeStatus()
 
   const formData = new FormData()
