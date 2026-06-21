@@ -4011,3 +4011,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: `tests/test_extract_runtime.py` 追加 3 例（sparse 不附 override / dense 附 drain_state / probe 异常返回 {}），先验红（AttributeError）后转绿，合计 41✓；`py_compile` 通过，CLEAN_CRLF 无混行；main.py 9669→9658 行（<9700 基线仍绿）。
 - 验证: 全量 pytest **36 failed / 3893 passed / 2 skipped**——36 失败全是并发 UI agent 的 App.vue source-wiring/keyboard/timeline/timer 断言（已 `git stash` 证实 HEAD 无本切片改动时同样失败），与本切片零关联；**本切片 0 新增失败**。
 - 计划: `docs/superpowers/plans/2026-06-18-main-py-decomposition.md`（R2 安全增量首刀；下刀候选：candidate 采集段 6344-6517 → `gather_candidates`）。
+
+## Slice BBR-1 (M3 通用): 三后端任务分流路由骨架纳管 BrowserBackendRouter (done, P2)
+
+- 能力名: browser_backend_routing（在 `build_default_browser_backend` 扁平 env/kind 开关之上，按任务类型在 chromium / lightpanda / cloakbrowser 三 persona 间确定性分流；契约 `browser_backend_route.v1`）。
+- 影响层: browser_substrate（新增 `visual_web_agent/browser_backend_router.py`，仅 import 既有 `browser_backend.BrowserBackend` / `build_default_browser_backend`，**无运行时接线**——本切片只纳管骨架+回归，不改 browser_pool/control 调用方）。
+- 设计: 两段式路由——① 意图排序（纯任务类型打分，availability 无关，top=preferred）；② 可用性闸门（preferred 顺序里首个 available=selected，余者 fallback_chain）。硬规则: vision/screenshot 永不路由 lightpanda（无渲染）；高 anti-bot 偏好 cloakbrowser，不可用降级 chromium stealth；bulk 无像素采集偏好 lightpanda 吞吐；`explicit_backend` / env `VSPIDER_BROWSER_BACKEND` 覆盖。persona→slot: chromium→playwright_chromium / lightpanda→remote_playwright / cloakbrowser→stealth_browser（保留位，`build_backend_for` 对 cloak 显式 NotImplementedError）。
+- 新增 contract 字段: `browser_backend_route.v1`（preferred / selected / backend_slot / preference_order / fallback_chain / task_profile / candidates / reasons）。
+- Tests: 新增 `tests/test_browser_backend_router.py`（5 类 35 例: alias 归一 / 路由决策 8 场景含 vision 排除 lightpanda + bulk 降级 + 高 anti-bot 降级 + explicit 覆盖 + render 安全压过 explicit / 默认 persona env 闸门 / `build_backend_for` persona→kind 映射 + cloak NotImplementedError + unknown ValueError）；注入固定 persona 与 monkeypatch 工厂，环境无关、不构造真实浏览器。
+- 验证: `python -m pytest tests/test_browser_backend_router.py` → **35 passed, exit 0**。
+- 风险: 极低（新模块未被任何生产代码引用，grep 全仓 0 外部 import；纯确定性数据驱动路由，不触碰既有 browser 调用方）。
+- 后续（未做，独立切片）: 接线 = browser_pool/browser_control 建后端时改走 `router.route()`→`build()`；lightpanda CDP endpoint 实测；cloakbrowser slot 实装。
