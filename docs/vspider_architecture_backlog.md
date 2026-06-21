@@ -4067,6 +4067,30 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 验证: 全量 pytest 后台核验（App.vue UI 失败均为并发 agent 在制品，与本切片零关联）；域回归 271✓ + 悬挂引用 0 残留，**本切片 0 新增失败**。
 - 计划: 策略 A（R2-3a/3b/3c）收官；extract 分支剩不可约控制流骨架 = 策略 B（设计稿 §6 备查，高风险默认缓做）。main.py R2 累计 9658→9291（减 367 行）。
 
+## Slice R2-3d (M5 拆分): extract 显式路径 choose/commit 选取块 → ExtractRuntime (done, P1)
+
+- 能力名: extract_select_commit（显式 extract 路径 choose_best + commit + DOM_TABLE page_key 块收敛为 `ExtractRuntime.select_and_commit_extraction(...) -> ExtractCommit`（7 字段 dataclass））。
+- 影响层: data_plane（`extraction_engine/runtime.py` + `main.py::run_agent`）。R2 策略 A++ 首刀：无控制流；无候选时 prior source_text/log_source/page_key 原样回传（保真原 else）。
+- 关键发现: auto 路径 choose/commit 已漂移（_auto_extracted/_chosen_source_text/_auto_extract_text_source，无 DOM_TABLE key）→ 单点搬，auto 不动。
+- 改动: 新增 `select_and_commit_extraction` + `ExtractCommit` dataclass + `import hashlib`；main.py 字节级 patch 23 行块 → 14 行委托；移除 _chosen_candidate/_dom_sig（显式路径 0 残留）。期间 main.py 改动曾被并发 agent git 操作冲掉，已重新接线 + 立即提交。
+- 新增 contract 字段: 无。
+- Tests: test_extract_runtime.py +3 例（非表格保 prior key / DOM_TABLE 设 key / 无候选返 prior），红→绿，合计 62✓；域回归 274✓；CLEAN_CRLF；main.py 9291→9283。
+- 验证: 全量 pytest 0 新增失败（App.vue UI 失败为并发 agent churn）。
+- commit: 54f5f4c。
+- 计划: `docs/superpowers/plans/2026-06-21-extract-tail-strategy-b-plan.md`（A++ 首刀；下刀 R2-3e persist）。
+
+## Slice R2-3e (M5 拆分): extract 显式路径 persist 落盘块 → ExtractRuntime (done, P1)
+
+- 能力名: extract_persist_batch（显式 extract persist 块——enrich/record_progress/save_run_dataset/dom_api_fast_path/snapshot/print/_xs 计数——收敛为 `ExtractRuntime.persist_extracted_batch(...) -> ExtractPersist`（5 字段 dataclass））。
+- 影响层: data_plane（同上）。R2 策略 A++ 第二刀（收官）：写共享 _xs 计数；返回 extracted/saved_path/snapshot_path/progress，caller 写 decision + 重置 streak；无控制流。
+- 关键发现: auto persist 已漂移（produced_by="auto_extract"，不同局部，无 decision 写）→ 单点搬。
+- 改动: 新增 `persist_extracted_batch` + `ExtractPersist` dataclass + `import TOOLTIP_UNIQUE_KEY`；main.py 字节级 patch 80 行块 → 21 行委托；移除 _api_fast/_extract_snapshot_path（显式路径 0 残留）。
+- 新增 contract 字段: 无。
+- Tests: test_extract_runtime.py +3 例（基础 dataset / answer 跳过 save / api-fast 替换行），红→绿，合计 65✓；域回归 277✓；CLEAN_CRLF；main.py 9283→9224（R2 累计 9658→9224，-434）。
+- 验证: 全量 pytest 0 新增失败（App.vue UI 失败为并发 churn）。
+- commit: 582be62。
+- 计划: 策略 A++（R2-3d+3e）收官；explicit extract 分支 = choose/commit + persist 委托 + ~50 行控制流骨架。策略 B（R2-4）缓做。
+
 ## Slice BBR-1 (M3 通用): 三后端任务分流路由骨架纳管 BrowserBackendRouter (done, P2)
 
 - 能力名: browser_backend_routing（在 `build_default_browser_backend` 扁平 env/kind 开关之上，按任务类型在 chromium / lightpanda / cloakbrowser 三 persona 间确定性分流；契约 `browser_backend_route.v1`）。
