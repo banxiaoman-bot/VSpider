@@ -252,7 +252,7 @@ EXTRACT_SKILL = """
 1. AX Tree 是文本数据第一来源；截图用于确认布局、顺序和遮挡。
 2. 按真实视觉顺序读取：从上到下、从左到右；列表/表格只提取当前屏幕可见且未重复的数据。
 3. 过滤条件必须严格执行，例如时间、价格、地区、状态、部门、关键词。
-4. extract 前若有广告、cookie 横幅、登录弹窗等遮挡，先 Escape/click 关闭或 remove_element。
+4. extract 前若有 cookie 同意墙优先用 `dismiss_consent`（确定性）；其它广告 / 登录弹窗遮挡再用 Escape/click 关闭或 remove_element。
 5. 红框编号不是数据。排名、热度、价格、日期等必须来自页面真实文本。
 6. 导航纪律：提取任务的默认工作区是当前 URL 的主体数据区。除非用户明确要求切换栏目/示例/分类，
    绝对不要点击左侧、顶部、底部导航菜单、示例链接、文档目录或站点全局入口。当前页短暂没看到数据时，
@@ -1246,12 +1246,33 @@ SEARCH_NAV_SKILL = """
 """.strip()
 
 
+DISMISS_CONSENT_SKILL = """
+## Skill: Cookie / 同意墙确定性关闭（dismiss_consent）
+🍪 适用：页面出现 cookie 横幅 / 隐私同意墙 / "Accept all cookies" / "我们重视您的隐私" 等遮挡。
+
+🎯 标准动作：**优先输出确定性动作** `dismiss_consent`（target_id=0, type_value=""），不要用 click_point / click 视觉点击去找"接受"按钮。
+{"action":"dismiss_consent","target_id":0,"type_value":"","memory_key":""}
+
+系统会确定性地：
+1. 命中主流 CMP（OneTrust / Cookiebot / TrustArc / Quantcast / Didomi / Usercentrics / Osano / Klaro / Sourcepoint …）的「接受全部」按钮；
+2. 未知 CMP 时在同意容器内按多语肯定文本（Accept all / I agree / 接受全部 / 同意 / 我知道了 …）兜底，**绝不点"拒绝 / 管理 / 设置 / 仅必要"**；
+3. 子 iframe 兜底；点完校验弹层消失才算成功。
+
+📌 默认**接受全部**（爬取要的是解锁内容）。无同意墙时是干净 no-op，不会报错。
+
+🚫 反模式：
+- ❌ 用 click_point 视觉猜"接受"按钮坐标（违反确定性铁律）。
+- ❌ 同意墙挡住列表/表单还硬 extract——先 dismiss_consent，再继续原任务。
+""".strip()
+
+
 SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
     "vscroll_capture": VSCROLL_CAPTURE_SKILL,
     "snapshot": SNAPSHOT_SKILL,
     "search_nav": SEARCH_NAV_SKILL,
+    "dismiss_consent": DISMISS_CONSENT_SKILL,
     "resume_run": RESUME_RUN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,
