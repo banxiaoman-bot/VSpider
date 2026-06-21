@@ -52,14 +52,12 @@ import {
 } from './composables/useAttachmentIntent.js'
 import {
   ATTACHMENT_ACCEPT,
-  ATTACHMENT_HINT,
   appendConstraintsToFormData,
   authProfileOptionLabel,
   buildAuthoritativeUrlsPayload,
   buildTaskConstraints,
   validateTaskInput,
   fetchOutputContractPreview,
-  formatOutputContractPreview,
 } from './composables/useTaskSubmit'
 import { API_BASE, apiFetch } from './api/client.js'
 
