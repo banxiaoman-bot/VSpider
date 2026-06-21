@@ -930,3 +930,76 @@ def test_post_extract_guidance_noop_when_nothing_extracted():
     rt = _mk_runtime(goal="抓取所有数据", state=state, vlm=vlm, browser=_PagLinksBrowser())
     rt.inject_post_extract_pagination_guidance()
     assert vlm.feedback == []
+
+
+# ── R2-3d: select_and_commit_extraction (explicit-path choose + commit) ───────
+
+
+def _commit_candidate(name, rows, *, source_text="src"):
+    return {
+        "name": name,
+        "rows": rows,
+        "accepted": len(rows),
+        "duplicates": 0,
+        "rejected": 0,
+        "source_text": source_text,
+        "fingerprints": set(),
+        "score": 50.0,
+        "data_shape": {},
+    }
+
+
+def test_select_and_commit_chosen_non_table_keeps_prior_page_key():
+    rt = _mk_runtime()
+    cand = _commit_candidate("DOM_LIST", [{"a": 1}, {"a": 2}])
+    res = asyncio.run(
+        rt.select_and_commit_extraction(
+            candidates=[cand],
+            current_url="http://x",
+            current_extract_page_key="PRIOR",
+            source_text_for_validation="prior_src",
+            log_extract_text_source="PRIOR_SRC",
+        )
+    )
+    assert res.extracted == [{"a": 1}, {"a": 2}]
+    assert res.new_rows == 2
+    assert res.source_text_for_validation == "src"
+    assert res.log_extract_text_source == "DOM_LIST"
+    assert res.current_extract_page_key == "PRIOR"  # non-table leaves prior key
+
+
+def test_select_and_commit_dom_table_sets_page_key():
+    rt = _mk_runtime(browser=_StubBrowser(_StubFrame(eval_result="r1|r2|r3")))
+    cand = _commit_candidate("DOM_TABLE", [{"c": 1}, {"c": 2}])
+    res = asyncio.run(
+        rt.select_and_commit_extraction(
+            candidates=[cand],
+            current_url="http://x",
+            current_extract_page_key="PRIOR",
+            source_text_for_validation="",
+            log_extract_text_source="",
+        )
+    )
+    assert res.log_extract_text_source == "DOM_TABLE"
+    assert res.current_extract_page_key.startswith("http://x#table:")
+    assert res.current_extract_page_key != "PRIOR"
+
+
+def test_select_and_commit_no_candidate_returns_priors():
+    rt = _mk_runtime()
+    res = asyncio.run(
+        rt.select_and_commit_extraction(
+            candidates=[],
+            current_url="http://x",
+            current_extract_page_key="PRIOR",
+            source_text_for_validation="prior_src",
+            log_extract_text_source="PRIOR_SRC",
+        )
+    )
+    assert res.extracted == []
+    assert res.new_rows == 0
+    assert res.dup_rows == 0
+    assert res.rejected_rows == 0
+    assert res.source_text_for_validation == "prior_src"
+    assert res.log_extract_text_source == "PRIOR_SRC"
+    assert res.current_extract_page_key == "PRIOR"

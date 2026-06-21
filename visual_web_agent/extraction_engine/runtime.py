@@ -50,6 +50,7 @@ except ImportError:  # pragma: no cover
     from data_writers import save_run_dataset
     from artifact_manager import resolve_artifact_path
     from virtual_scroll import nudge_virtual_scroll
+import hashlib
 import re
 
 
@@ -110,6 +111,25 @@ class ExtractDeps:
     enable_xhr: bool = False
     broadcast_log_safe: Callable[..., Any] = lambda *_a, **_k: None
     vlm: Any = None
+
+
+@dataclass
+class ExtractCommit:
+    """Result of choosing + committing the best extraction candidate.
+
+    Mirrors the seven run_agent locals the explicit-extract choose/commit block
+    used to assign in place. When no candidate is chosen, the prior
+    ``source_text_for_validation`` / ``log_extract_text_source`` /
+    ``current_extract_page_key`` are echoed back unchanged.
+    """
+
+    extracted: list
+    new_rows: int
+    dup_rows: int
+    rejected_rows: int
+    source_text_for_validation: str
+    log_extract_text_source: str
+    current_extract_page_key: str
 
 
 class ExtractRuntime:
@@ -867,6 +887,57 @@ class ExtractRuntime:
                 source_text=dom_list_text or fallback_source_text,
                 data_shape=data_shape,
             )
+        )
+
+    async def select_and_commit_extraction(
+        self,
+        *,
+        candidates: list,
+        current_url: str,
+        current_extract_page_key: str,
+        source_text_for_validation: str,
+        log_extract_text_source: str,
+    ) -> ExtractCommit:
+        """Choose the best candidate, commit it, and derive the DOM_TABLE page
+        key. Verbatim relocation of run_agent's explicit-extract choose/commit
+        block (formerly main.py 6410-6432, minus the trailing
+        ``decision['extracted_data']`` write the caller keeps). When no
+        candidate is chosen, the prior source_text / log_source / page_key are
+        echoed back unchanged (the original ``else`` left them untouched). The
+        auto-extract path's choose/commit block has diverged (different locals,
+        no DOM_TABLE key) and is left in place.
+        """
+        chosen = self.choose_best_extraction_candidate(candidates)
+        if chosen:
+            (
+                extracted,
+                new_rows,
+                dup_rows,
+                rejected_rows,
+                source_text_for_validation,
+            ) = self.commit_extraction_candidate(chosen)
+            log_extract_text_source = str(
+                chosen.get("name") or "VLM_EXTRACT_OUTPUT"
+            )
+            if log_extract_text_source == "DOM_TABLE":
+                dom_sig = await self.visible_table_signature(
+                    "extract DOM page signature"
+                )
+                if dom_sig:
+                    current_extract_page_key = (
+                        f"{current_url}#table:"
+                        f"{hashlib.md5(dom_sig.encode('utf-8', errors='ignore')).hexdigest()}"
+                    )
+        else:
+            extracted, new_rows, dup_rows, rejected_rows = [], 0, 0, 0
+        return ExtractCommit(
+            extracted=extracted,
+            new_rows=new_rows,
+            dup_rows=dup_rows,
+            rejected_rows=rejected_rows,
+            source_text_for_validation=source_text_for_validation,
+            log_extract_text_source=log_extract_text_source,
+            current_extract_page_key=current_extract_page_key,
         )
 
     async def arm_pagination_after_extract(

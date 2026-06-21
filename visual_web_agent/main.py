@@ -6407,29 +6407,20 @@ async def run_agent(
                             except Exception as _recovery_err:
                                 logger.debug("[EXTRACT RECOVERY] skipped: %s", _recovery_err)
 
-                            _chosen_candidate = _choose_best_extraction_candidate(_candidates)
-                            if _chosen_candidate:
-                                (
-                                    extracted,
-                                    _new_rows,
-                                    _dup_rows,
-                                    _rejected_rows,
-                                    _source_text_for_validation,
-                                ) = _commit_extraction_candidate(_chosen_candidate)
-                                _log_extract_text_source = str(
-                                    _chosen_candidate.get("name") or "VLM_EXTRACT_OUTPUT"
-                                )
-                                if _log_extract_text_source == "DOM_TABLE":
-                                    _dom_sig = await _visible_table_signature(
-                                        "extract DOM page signature"
-                                    )
-                                    if _dom_sig:
-                                        _current_extract_page_key = (
-                                            f"{_current_url}#table:"
-                                            f"{hashlib.md5(_dom_sig.encode('utf-8', errors='ignore')).hexdigest()}"
-                                        )
-                            else:
-                                extracted, _new_rows, _dup_rows, _rejected_rows = [], 0, 0, 0
+                            _commit = await _extract_rt.select_and_commit_extraction(
+                                candidates=_candidates,
+                                current_url=_current_url,
+                                current_extract_page_key=_current_extract_page_key,
+                                source_text_for_validation=_source_text_for_validation,
+                                log_extract_text_source=_log_extract_text_source,
+                            )
+                            extracted = _commit.extracted
+                            _new_rows = _commit.new_rows
+                            _dup_rows = _commit.dup_rows
+                            _rejected_rows = _commit.rejected_rows
+                            _source_text_for_validation = _commit.source_text_for_validation
+                            _log_extract_text_source = _commit.log_extract_text_source
+                            _current_extract_page_key = _commit.current_extract_page_key
                             decision["extracted_data"] = extracted
                             if _new_rows == 0:
                                 _dedup_tripped_last_step = True
