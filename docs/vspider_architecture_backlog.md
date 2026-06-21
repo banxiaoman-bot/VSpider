@@ -4058,3 +4058,12 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 `tests/useClipboard.test.js` 4 例（空串→false / navigator.clipboard 路径 / textarea+execCommand 回退 / 异常→ElMessage.error+false），vi.stubGlobal 注入 navigator/document；先验红（模块缺失）后转绿。
 - 验证: vitest 15 文件 / 126 passed（+4）；npm run build 绿（index js 191.70kB）；ReadLints clean；App.vue 1353→1332 行（-21），仍纯 CRLF。
 - 风险: 低（叶子工具，行为逐字平移；无结构化 pytest 断言 _writeToClipboard）。
+
+## Slice D-UI-18 (M4 简便): Auth Profile + Captcha Solver 状态从 App.vue 抽离 useAuthProfiles (done, P3)
+
+- 能力名: auth_profiles_extraction（App.vue 内联的 auth profile 选择 + captcha solver 状态抽成 composables/useAuthProfiles.js）。
+- 影响层: 仅 vspider-ui（App.vue → composables/useAuthProfiles.js）；5 个 ref（authDialogOpen/authProfileOptions/selectedAuthProfiles/captchaSolverEnabled/captchaSolverProvider）+ 3 函数（loadAuthProfiles/loadCaptchaSolverStatus/useAuthProfile）迁入，App.vue 同名 destructure 接线；模板 8 处 + onMounted 2 处 + submitTask 1 处 + slash 1 处调用点逐字不变。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useAuthProfiles.test.js 6 例（loadAuthProfiles happy/非success warn / loadCaptchaSolverStatus happy/非success早退/error吞掉 console.warn / useAuthProfile 去重+忽略空）。
+- 验证: vitest 16 文件 / 132 passed（+6）；npm run build 绿（index js 192.14kB）；ReadLints clean；App.vue 1332→1305 行（-27），仍纯 CRLF。
+- 风险: 低（自包含 API 子系统，行为逐字平移）。

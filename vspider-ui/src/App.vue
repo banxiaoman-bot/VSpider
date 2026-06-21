@@ -46,6 +46,7 @@ import { useCapabilityTraceExport } from './composables/useCapabilityTraceExport
 import { useHitlForm } from './composables/useHitlForm.js'
 import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
 import { writeToClipboard } from './composables/useClipboard.js'
+import { useAuthProfiles } from './composables/useAuthProfiles.js'
 import {
   ATTACHMENT_INTENT_AUTO,
   ATTACHMENT_INTENT_OPTIONS,
@@ -74,9 +75,6 @@ const proxyUsername = ref('')
 const proxyPassword = ref('')
 const batchMaxRuns = ref(0)
 const resumeEnabled = ref(false)
-const captchaSolverEnabled = ref(false)
-const captchaSolverProvider = ref('')
-const selectedAuthProfiles = ref([])
 const selectedFile = ref(null)
 // 优化 E: 附件 intent 用户覆盖（auto = 交给后端推断）
 const attachmentIntent = ref(ATTACHMENT_INTENT_AUTO)
@@ -93,8 +91,16 @@ const {
 } = createTerminalLogBuffer({ onFlush: () => { scrollToBottom() } })
 const terminalLogPaneRef = ref(null)
 
-const authDialogOpen = ref(false)
-const authProfileOptions = ref([])
+const {
+  authDialogOpen,
+  authProfileOptions,
+  selectedAuthProfiles,
+  captchaSolverEnabled,
+  captchaSolverProvider,
+  loadAuthProfiles,
+  loadCaptchaSolverStatus,
+  useAuthProfile,
+} = useAuthProfiles({ appendLog })
 const {
   selectedModel,
   selectedSemanticModel,
@@ -459,39 +465,6 @@ const handleUploadChange = (uploadFile, uploadFiles) => {
 const handleUploadRemove = () => {
   selectedFile.value = null
   attachmentIntent.value = ATTACHMENT_INTENT_AUTO
-}
-
-const loadAuthProfiles = async () => {
-  try {
-    const response = await apiFetch('/api/auth/profiles')
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') {
-      throw new Error(result.message || '加载 Auth Profiles 失败')
-    }
-    authProfileOptions.value = result.profiles || []
-  } catch (err) {
-    await appendLog(`[WARN] 加载 Auth Profiles 失败: ${String(err)}`)
-  }
-}
-
-const loadCaptchaSolverStatus = async () => {
-  try {
-    const response = await apiFetch('/api/runtime/captcha_solver')
-    const result = await response.json()
-    if (!response.ok || result.status !== 'success') return
-    captchaSolverEnabled.value = Boolean(result.enabled)
-    captchaSolverProvider.value = String(result.provider || '')
-  } catch (err) {
-    // non-critical
-    console.warn('[captcha_solver] status fetch failed:', err)
-  }
-}
-
-const useAuthProfile = (name) => {
-  if (!name) return
-  if (!selectedAuthProfiles.value.includes(name)) {
-    selectedAuthProfiles.value = [...selectedAuthProfiles.value, name]
-  }
 }
 
 const capabilityTrace = useCapabilityTrace(phaseEvents)
