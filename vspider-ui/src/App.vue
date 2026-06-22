@@ -35,7 +35,7 @@ import {
 } from './composables/useSlashCommand.js'
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import { useModelSettings } from './composables/useModelSettings.js'
-import { useWebSocket } from './composables/useWebSocket.js'
+import { useRunStream } from './composables/useRunStream.js'
 import { useAppKeyboard } from './composables/useAppKeyboard.js'
 import { useCapabilityTracePanel } from './composables/useCapabilityTracePanel.js'
 import { useTimelineReplay } from './composables/useTimelineReplay.js'
@@ -45,7 +45,6 @@ import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
 import { useAuthProfiles } from './composables/useAuthProfiles.js'
 import { useFinalAnswer } from './composables/useFinalAnswer.js'
 import { useBottomTabs } from './composables/useBottomTabs.js'
-import { useRunEventRouter } from './composables/useRunEventRouter.js'
 import { ATTACHMENT_INTENT_OPTIONS } from './composables/useAttachmentIntent.js'
 import {
   ATTACHMENT_ACCEPT,
@@ -293,45 +292,22 @@ const { outputContractPreview, outputContractPreviewLoading } = useOutputContrac
 // tags ("[PHASE]", "[PHASE/WARN]", "[PHASE/ERR]").
 
 
-const scrollToBottom = () => terminalLogPaneRef.value?.scrollToBottom()
-
-const { handleSocketMessage } = useRunEventRouter({
-  appendLog,
-  pushScreenshotFrame,
-  isRunning,
-  isHumanInterventionRequired,
-  humanInterventionReason,
-  hitlScreenshot,
-  hitlFormFields,
-  hitlFormReason,
-  hitlFormScreenshot,
-  hitlFormLoading,
-  hitlFormVisible,
-  fetchBrowserRuntimeStatus,
-  runHistoryRefreshToken,
-  activeBottomTab,
-  hasNewRuns,
-  hasNewCapability,
-  hasNewPhase,
-  timelineAutoScroll,
-  failedRunsPaneRef,
-  applyDoneAnswer,
-  replayMode,
-  phaseEvents,
-  fetchArtifacts,
-  hasNewArtifacts,
-  currentImageBase64,
-  timelinePanelRef,
-})
 const {
-  status: wsStatus,
-  connect: connectWebSocket,
-  disconnect: disconnectWebSocket,
-} = useWebSocket({
-  onOpen: () => appendLog('[SYSTEM] WebSocket connected'),
-  onMessage: handleSocketMessage,
-  onClose: () => appendLog('[SYSTEM] WebSocket disconnected'),
-  onError: () => appendLog('[ERROR] WebSocket error'),
+  wsStatus,
+  connectWebSocket,
+  disconnectWebSocket,
+  scrollToBottom,
+} = useRunStream({
+  appendLog, terminalLogPaneRef,
+  pushScreenshotFrame, isRunning,
+  isHumanInterventionRequired, humanInterventionReason,
+  hitlScreenshot, hitlFormFields, hitlFormReason,
+  hitlFormScreenshot, hitlFormLoading, hitlFormVisible,
+  fetchBrowserRuntimeStatus, runHistoryRefreshToken,
+  activeBottomTab, hasNewRuns, hasNewCapability, hasNewPhase,
+  timelineAutoScroll, failedRunsPaneRef, applyDoneAnswer,
+  replayMode, phaseEvents, fetchArtifacts, hasNewArtifacts,
+  currentImageBase64, timelinePanelRef,
 })
 
 const {
