@@ -36,7 +36,7 @@ import {
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import { useModelSettings } from './composables/useModelSettings.js'
 import { useWebSocket } from './composables/useWebSocket.js'
-import { useKeyboardCommand } from './composables/useKeyboardCommand.js'
+import { useAppKeyboard } from './composables/useAppKeyboard.js'
 import { useCapabilityTrace } from './composables/useCapabilityTrace.js'
 import { useTimelineReplay } from './composables/useTimelineReplay.js'
 import { useCapabilityFixtureReplay } from './composables/useCapabilityFixtureReplay.js'
@@ -169,11 +169,7 @@ const phaseEvents = ref([])
 // Click a timeline chip → open a dialog with the full event payload
 // (pretty-printed JSON + key fields summary).
 
-// ── T: Keyboard shortcuts ─────────────────────────────────────────
-// helpDialogVisible: toggled by Ctrl+/ — shows a cheat-sheet table.
-// promptInputRef: bound to the prompt el-input via :ref so Ctrl+K can
-//   programmatically focus the textarea even when it isn't visible yet.
-const helpDialogVisible = ref(false)
+// ── T: Keyboard shortcuts → useAppKeyboard ───────────────────────
 const promptInputRef = ref(null)
 
 const {
@@ -426,74 +422,12 @@ const {
 // presumably wants to see all of it. The Timeline render already
 // virtualizes per-step so it handles ~10k events fine.
 
-// ── T: Keyboard shortcuts dispatcher ──────────────────────────────────
-// A single window-level keydown listener routes to handlers based on the
-// current UI context (which tab / dialog is active). Design notes:
-//
-//   • Modifier portability: Ctrl on Windows/Linux, Cmd on macOS. We treat
-//     ``event.ctrlKey || event.metaKey`` as the "primary" modifier so the
-//     same bindings feel native everywhere.
-//   • Input-typing guard: when focus is in <input>/<textarea>/contenteditable,
-//     we skip MOST global shortcuts (otherwise Ctrl+K would steal focus
-//     mid-edit). The Ctrl+Enter SUBMIT shortcut intentionally bypasses
-//     this guard — submitting from inside the prompt textarea is exactly
-//     the workflow we want.
-//   • Dialog-active guard: when phaseDialogVisible is true, ←/→ navigate
-//     between events; other shortcuts (Ctrl+Enter, tab switches, etc.)
-//     still work — they're independent of the dialog state.
-//   • Browser-default conflict: Ctrl+1..6 / Ctrl+K / Ctrl+/ / Ctrl+E all
-//     have native browser meanings. We unconditionally preventDefault on
-//     a hit so the browser doesn't open the address bar or jump to the
-//     wrong window tab. The user's mental model in an SPA expects this.
-
-// Focus the Prompt textarea programmatically. Element Plus el-input
-// exposes a ``.focus()`` method on its component instance (NOT the
-// DOM element). The :ref bound to el-input gives us that instance.
-const focusPromptInput = () => {
-  const inp = promptInputRef.value
-  if (!inp) return
-  try {
-    if (typeof inp.focus === 'function') {
-      inp.focus()
-    } else if (inp.$el && inp.$el.querySelector) {
-      // Fallback: dig into the rendered DOM for the textarea node
-      const ta = inp.$el.querySelector('textarea, input')
-      if (ta && typeof ta.focus === 'function') ta.focus()
-    }
-  } catch (err) {
-    // Quiet — focus failures are non-fatal and almost always mean the
-    // input was unmounted between scheduling and dispatch.
-  }
-}
-
-const keyboardActions = {
-  submitIfIdle: () => { if (!isRunning.value) submitTask() },
-  terminalSearchOpen: () => terminalLogPaneRef.value?.openTerminalSearch(),
-  toggleHelp: () => { helpDialogVisible.value = !helpDialogVisible.value },
-  focusPrompt: () => focusPromptInput(),
-  selectTab: (i) => setActiveBottomTab(TAB_ORDER[i]),
-  phasePrev: () => timelinePanelRef.value?.goToPrevPhaseEvent(),
-  phaseNext: () => timelinePanelRef.value?.goToNextPhaseEvent(),
-  failedPrev: () => failedRunsPaneRef.value?.goToPrevFailedRun(),
-  failedNext: () => failedRunsPaneRef.value?.goToNextFailedRun(),
-  terminalSearchClose: () => terminalLogPaneRef.value?.closeTerminalSearch(),
-  terminalSearchPrev: () => terminalLogPaneRef.value?.terminalSearchPrev(),
-  terminalSearchNext: () => terminalLogPaneRef.value?.terminalSearchNext(),
-  exportTimeline: () => timelinePanelRef.value?.exportPhaseEventsAsJsonl(),
-  timelineBottom: () => timelinePanelRef.value?.scrollToBottom(),
-  timelineTop: () => timelinePanelRef.value?.scrollToTop(),
-  exportCapability: () => exportCapabilityTraceAsJsonl(),
-}
-
-const getKeyboardContext = () => ({
-  activeTab: activeBottomTab.value,
-  tabCount: TAB_ORDER.length,
-  phaseDialogOpen: !!timelinePanelRef.value?.phaseDialogVisible,
-  failedDialogOpen: !!failedRunsPaneRef.value?.failedRunDialogVisible,
-  terminalSearchVisible: !!terminalLogPaneRef.value?.searchVisible,
+const { helpDialogVisible, focusPromptInput } = useAppKeyboard({
+  isRunning, submitTask,
+  terminalLogPaneRef, setActiveBottomTab, TAB_ORDER,
+  activeBottomTab, timelinePanelRef, failedRunsPaneRef,
+  exportCapabilityTraceAsJsonl, promptInputRef,
 })
-
-useKeyboardCommand({ getContext: getKeyboardContext, actions: keyboardActions })
 
 onMounted(() => {
   loadModelSettings()
