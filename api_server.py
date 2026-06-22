@@ -940,6 +940,10 @@ from api_routes.extractor_api import register_extractor_routes as _register_extr
 _register_extractor_routes(app, extractor_engine=_extractor_engine)
 
 
+from api_routes.model_config_api import register_model_config_routes as _register_model_config_routes  # noqa: E402
+_register_model_config_routes(app)
+
+
 @app.post("/api/start_batch", summary="启动批处理任务（后台执行）")
 async def start_batch(
     background_tasks: BackgroundTasks,
@@ -1161,6 +1165,8 @@ async def start_batch(
         except ValueError:
             return {"status": "error", "message": "Invalid vlm_max_tokens"}
     vlm_options = {k: v for k, v in vlm_options.items() if v not in ("", None)}
+    from model_config_store import resolve_vlm_options as _resolve_vlm_options
+    vlm_options = _resolve_vlm_options(vlm_options)
 
     run_constraints: dict[str, Any] = {}
     constraints_raw = (constraints or "").strip()
