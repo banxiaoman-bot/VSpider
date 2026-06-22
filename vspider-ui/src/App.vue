@@ -37,14 +37,11 @@ import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import { useModelSettings } from './composables/useModelSettings.js'
 import { useWebSocket } from './composables/useWebSocket.js'
 import { useAppKeyboard } from './composables/useAppKeyboard.js'
-import { useCapabilityTrace } from './composables/useCapabilityTrace.js'
+import { useCapabilityTracePanel } from './composables/useCapabilityTracePanel.js'
 import { useTimelineReplay } from './composables/useTimelineReplay.js'
-import { useCapabilityFixtureReplay } from './composables/useCapabilityFixtureReplay.js'
 import { useBrowserRuntimeStatus } from './composables/useBrowserRuntimeStatus.js'
-import { useCapabilityTraceExport } from './composables/useCapabilityTraceExport.js'
 import { useHitlForm } from './composables/useHitlForm.js'
 import { useScreenshotArtifacts } from './composables/useScreenshotArtifacts.js'
-import { writeToClipboard } from './composables/useClipboard.js'
 import { useAuthProfiles } from './composables/useAuthProfiles.js'
 import { useFinalAnswer } from './composables/useFinalAnswer.js'
 import { useBottomTabs } from './composables/useBottomTabs.js'
@@ -337,7 +334,6 @@ const {
   onError: () => appendLog('[ERROR] WebSocket error'),
 })
 
-const capabilityTrace = useCapabilityTrace(phaseEvents)
 const {
   latestCapabilityRoute,
   latestCapabilityExecute,
@@ -367,8 +363,6 @@ const {
   capabilityRoleRows,
   capabilityTraceFilter,
   capabilityTraceSearchQuery,
-} = capabilityTrace
-const {
   capabilityReplayPaneProps,
   copyCapabilityFailureFixtureBatchReplaySummary,
   generateCapabilityFailureFixture,
@@ -378,33 +372,13 @@ const {
   fetchCapabilityFailureFixtures,
   fetchCapabilityFailureFixtureBatchHistory,
   batchReplayCapabilityFailureFixtures,
-} = useCapabilityFixtureReplay({
-  url,
-  prompt,
-  fetchArtifacts: () => fetchArtifacts(),
-  writeToClipboard,
-  latestCapabilityExecute,
-  capabilityExecutionFailureBundle,
-  capabilityExecutionEfficiencyCorrelationReport,
-})
-const clearPhaseEvents = () => {
-  phaseEvents.value = []
-  hasNewPhase.value = false
-  hasNewCapability.value = false
-  // P: After a clear, there's nothing to scroll past — re-pin to bottom.
-  timelineAutoScroll.value = true
-}
-
-// ── Q: capability trace 导出/摘要/复制（→ useCapabilityTraceExport）─────
-// Honors the active filter (severity/phase exclude) so the user gets
-// exactly what they see. Strip the synthetic _ts field (added by M for
-// internal use) so the file contains only over-the-wire payloads.
-const {
+  clearPhaseEvents,
   exportCapabilityTraceAsJsonl,
   copyCapabilityTraceSummary,
-} = useCapabilityTraceExport({
-  trace: capabilityTrace,
-  writeToClipboard,
+  handleCapabilityMoreAction,
+} = useCapabilityTracePanel({
+  phaseEvents, hasNewPhase, hasNewCapability, timelineAutoScroll,
+  url, prompt, fetchArtifacts, triggerReplayImport,
 })
 
 // ── W: Offline replay — import a phase_<id>.jsonl ─────────────────────
@@ -473,21 +447,6 @@ onUnmounted(() => {
     finalAnswerCopyTimer = null
   }
 })
-// B: 按钮墙收纳进下拉后的 command 分发（指向原有 handler，不改行为）
-const handleCapabilityMoreAction = (command) => {
-  const handlers = {
-    copySummary: copyCapabilityTraceSummary,
-    generateFixture: generateCapabilityFailureFixture,
-    replayFixture: replayCapabilityFailureFixture,
-    refreshFixtures: fetchCapabilityFailureFixtures,
-    refreshBatchHistory: fetchCapabilityFailureFixtureBatchHistory,
-    batchReplay: batchReplayCapabilityFailureFixtures,
-    replayEfficiency: replayCapabilityEfficiencyFeedback,
-    refreshEfficiencyReplays: fetchCapabilityEfficiencyFeedbackReplays,
-    importReplay: () => triggerReplayImport('capability'),
-  }
-  handlers[command]?.()
-}
 
 </script>
 
