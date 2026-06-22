@@ -4186,3 +4186,14 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - App.vue 行数: 1012 → 1010 行（-2）。本轮 D-UI-17~23 累计 1353 → 1010（约 -25%）。
 - commit: 85cd3da。
 - 风险: 低（仅删 count<=1 死符号，脚本迭代确认 0 残留 + 三绿）。
+
+## Slice D-UI-25 (M4 简便): output_contract 实时预览从 App.vue 抽离 useOutputContractPreview (done, P2)
+
+- 能力名: output_contract_preview_extraction（outputContractPreview/Loading + refreshOutputContractPreview + watch(prompt) 450ms 去抖 + onUnmounted timer 清理抽成 composables/useOutputContractPreview.js；导出常量 OUTPUT_CONTRACT_PREVIEW_DEBOUNCE_MS=450）。
+- 影响层: vspider-ui（App.vue → composables/useOutputContractPreview.js）+ 1 个结构化 pytest co-evolve（test_app_vue_timer_cleanup）。
+- 设计: 1 依赖注入（prompt，来自 useTaskForm）；destructure 置于 useTaskForm 之后（消费其 prompt）；onUnmounted 用 getCurrentInstance() 守卫以便 node 测试环境直调零警告（沿用 useKeyboardCommand 抽纯逻辑做法）；连带移除 App.vue 失效的 watch import 与 fetchOutputContractPreview import。
+- 测试 co-evolve: test_app_vue_timer_cleanup.py 的 outputContractPreviewTimer 断言从「App.vue onUnmounted 内」改为「App.vue 接线 useOutputContractPreview + 该 composable 自有 onUnmounted 清 timer」（与 useWebSocket/TimelinePanel 既有委托同构）。
+- 新增 contract 字段: 无。
+- Tests: 新增 tests/useOutputContractPreview.test.js 6 例（空 prompt 不触网清空 / success 取 formatted / 非 success 置 null / fetch 抛错 finally 复位 loading / watch 450ms 去抖单发 / 窗口内连改折叠为一发尾触发）。
+- 验证: vitest 21 文件 / 178 passed（+6）；npm run build 绿；ReadLints clean；App.vue 结构化 pytest 148 passed（含 co-evolve 后 test_app_vue_timer_cleanup 3 绿）+ core pytest 112 passed；App.vue 1010→977 行（-33），仍纯 CRLF。
+- 风险: 低（纯自包含叶子；TDD 红→绿 + 结构化 pytest co-evolve 守回归；只 add 本切片文件，未碰并发 consent_guard/page_ops/config/perception 改动）。

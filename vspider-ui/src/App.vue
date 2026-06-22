@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import {
   Close,
   Refresh,
@@ -53,14 +53,11 @@ import { ATTACHMENT_INTENT_OPTIONS } from './composables/useAttachmentIntent.js'
 import {
   ATTACHMENT_ACCEPT,
   authProfileOptionLabel,
-  fetchOutputContractPreview,
 } from './composables/useTaskSubmit'
 import { useTaskForm } from './composables/useTaskForm.js'
+import { useOutputContractPreview } from './composables/useOutputContractPreview.js'
 import { API_BASE } from './api/client.js'
 
-const outputContractPreview = ref(null)
-const outputContractPreviewLoading = ref(false)
-let outputContractPreviewTimer = null
 // 优化 D: batched log buffer — one reactive update + one scroll per frame
 // instead of per WS line; ring-trims to LOG_LIMIT (backend event_stream
 // keeps the full log). scrollToBottom is defined below; the arrow defers
@@ -290,6 +287,8 @@ const {
   tryExecuteCmd,
 })
 
+const { outputContractPreview, outputContractPreviewLoading } = useOutputContractPreview({ prompt })
+
 // appendLog now comes from createTerminalLogBuffer (see top of setup):
 // synchronous push into a plain buffer, batched flush per frame.
 
@@ -496,31 +495,6 @@ const getKeyboardContext = () => ({
 
 useKeyboardCommand({ getContext: getKeyboardContext, actions: keyboardActions })
 
-const refreshOutputContractPreview = async () => {
-  const text = String(prompt.value || '').trim()
-  if (!text) {
-    outputContractPreview.value = null
-    outputContractPreviewLoading.value = false
-    return
-  }
-  outputContractPreviewLoading.value = true
-  try {
-    const result = await fetchOutputContractPreview(text)
-    outputContractPreview.value = result.status === 'success' ? result.formatted : null
-  } catch {
-    outputContractPreview.value = null
-  } finally {
-    outputContractPreviewLoading.value = false
-  }
-}
-
-watch(prompt, () => {
-  if (outputContractPreviewTimer) clearTimeout(outputContractPreviewTimer)
-  outputContractPreviewTimer = setTimeout(() => {
-    refreshOutputContractPreview()
-  }, 450)
-})
-
 onMounted(() => {
   loadModelSettings()
   registerBuiltinCommands(slashRegistry, {
@@ -558,13 +532,6 @@ onUnmounted(() => {
   // S: cancel any pending Timeline chip single-click dialog-open so the
   // callback doesn't fire after the component is gone (would touch
   // selectedPhaseEvent/phaseDialogVisible refs and crash on detached state).
-  // U: cancel the pending output-contract preview debounce so its callback
-  // can't fire after unmount (it issues a fetch and writes refs on a now
-  // detached component).
-  if (outputContractPreviewTimer) {
-    clearTimeout(outputContractPreviewTimer)
-    outputContractPreviewTimer = null
-  }
   // F1: cancel the pending copy-feedback reset so it can't write
   // finalAnswerCopyState on a detached component after unmount.
   if (finalAnswerCopyTimer) {

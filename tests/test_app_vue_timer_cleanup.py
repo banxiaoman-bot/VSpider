@@ -1,12 +1,13 @@
-"""ASYNC-LEAK-1 regression: App.vue onUnmounted must clear every pending timer.
+"""ASYNC-LEAK-1 regression: every pending timer must be torn down on unmount.
 
-The component schedules an ``outputContractPreviewTimer`` debounce (it is only
-``clearTimeout``-ed inside the debounce itself before rescheduling). On unmount
-the last scheduled timer stays pending, so its callback fires after the
-component is gone -- issuing a fetch and writing refs on a detached component.
+The output-contract debounce (``outputContractPreviewTimer``) was extracted into
+``composables/useOutputContractPreview.js`` (D-UI-25); the composable now owns its
+own ``onUnmounted`` teardown so the last scheduled timer can't fire after the host
+component is gone (it would issue a fetch + write refs on a detached component).
+App.vue delegates by wiring ``useOutputContractPreview``.
 
-``reconnectTimer`` and ``_chipClickTimer`` are already torn down in
-``onUnmounted``; this pins that ``outputContractPreviewTimer`` joins them.
+``reconnectTimer`` (useWebSocket.js), ``_chipClickTimer`` (TimelinePanel.vue) and
+``finalAnswerCopyTimer`` (App.vue onUnmounted) are torn down the same way.
 Structural test (matches tests/test_frontend_component_split_y126.py style):
 no JS runner, just assert the source teardown is present.
 """
@@ -22,6 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_VUE = ROOT / "vspider-ui" / "src" / "App.vue"
 TIMELINE_PANEL = ROOT / "vspider-ui" / "src" / "components" / "TimelinePanel.vue"
 USE_WEBSOCKET = ROOT / "vspider-ui" / "src" / "composables" / "useWebSocket.js"
+USE_OUTPUT_CONTRACT_PREVIEW = (
+    ROOT / "vspider-ui" / "src" / "composables" / "useOutputContractPreview.js"
+)
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +43,11 @@ def ws_src() -> str:
     return USE_WEBSOCKET.read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def output_contract_preview_src() -> str:
+    return USE_OUTPUT_CONTRACT_PREVIEW.read_text(encoding="utf-8")
+
+
 def _onunmounted_block(src: str) -> str:
     start = src.find("onUnmounted(() => {")
     assert start != -1, "onUnmounted handler not found"
@@ -51,11 +60,20 @@ def _onunmounted_block(src: str) -> str:
     return src[start:end]
 
 
-def test_onunmounted_clears_output_contract_preview_timer(app_src: str) -> None:
-    block = _onunmounted_block(app_src)
-    assert "outputContractPreviewTimer" in block, (
-        "onUnmounted must clear the pending outputContractPreviewTimer debounce "
-        "so its callback can't fire (fetch + ref writes) after unmount"
+def test_onunmounted_clears_output_contract_preview_timer(
+    app_src: str, output_contract_preview_src: str
+) -> None:
+    # D-UI-25: the output-contract preview debounce + its teardown moved into
+    # composables/useOutputContractPreview.js. App.vue now delegates by wiring the
+    # composable, which owns its own onUnmounted cleanup.
+    assert "useOutputContractPreview(" in app_src, (
+        "App.vue must wire useOutputContractPreview so the preview debounce is "
+        "owned (and torn down) by the composable"
+    )
+    assert "onUnmounted(" in output_contract_preview_src
+    assert "outputContractPreviewTimer" in output_contract_preview_src, (
+        "useOutputContractPreview must clear its pending outputContractPreviewTimer "
+        "on unmount so its callback can't fire (fetch + ref writes) after unmount"
     )
 
 
