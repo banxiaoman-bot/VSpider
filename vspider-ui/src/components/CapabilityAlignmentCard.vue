@@ -43,7 +43,7 @@ const props = defineProps({
 <style scoped>
 .capability-section h4 {
   margin: 0 0 8px;
-  color: #f1f5f9;
+  color: var(--vsp-text-strong);
   font-size: 13px;
 }
 
@@ -52,7 +52,7 @@ const props = defineProps({
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  color: #cbd5e1;
+  color: var(--vsp-text-2);
   font-size: 12px;
 }
 
@@ -66,13 +66,13 @@ const props = defineProps({
 }
 
 .capability-alignment-status.is-complete {
-  color: #86efac;
+  color: var(--vsp-success);
   background: rgba(34, 197, 94, 0.12);
   border-color: rgba(34, 197, 94, 0.35);
 }
 
 .capability-alignment-status.is-fallback {
-  color: #fde68a;
+  color: var(--vsp-warn);
   background: rgba(251, 191, 36, 0.12);
   border-color: rgba(251, 191, 36, 0.35);
 }

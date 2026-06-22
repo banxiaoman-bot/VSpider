@@ -4,7 +4,7 @@
 
 .capability-export-btn {
   border-color: rgb(var(--rgb-cyan) / 0.45);
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
 }
 
 .capability-section h4 {
@@ -38,7 +38,7 @@
 .capability-audit-item {
   padding: 9px 10px;
   border-radius: 8px;
-  background: rgb(var(--rgb-ink) / 0.72);
+  background: var(--vsp-surface);
   border: 1px solid rgb(var(--rgb-slate) / 0.16);
 }
 
@@ -52,7 +52,7 @@
 .capability-card-head strong,
 .capability-role-card strong,
 .capability-audit-item strong {
-  color: var(--vsp-cyan-300);
+  color: var(--vsp-cyan-700);
   font-size: 13px;
 }
 
@@ -97,7 +97,7 @@
   padding: 8px 10px;
   border-radius: 8px;
   color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.72);
+  background: var(--vsp-surface);
   border: 1px solid rgb(var(--rgb-slate) / 0.16);
   font-size: 12px;
 }
@@ -112,21 +112,21 @@
 .capability-health-status.is-healthy,
 .capability-health-status.is-executed,
 .capability-health-status.is-ok {
-  color: var(--vsp-success-soft);
+  color: var(--vsp-success);
   background: rgb(var(--rgb-success) / 0.12);
   border-color: rgb(var(--rgb-success) / 0.35);
 }
 
 .capability-health-status.is-route-only,
 .capability-health-status.is-fallback {
-  color: var(--vsp-warn-soft);
+  color: var(--vsp-warn);
   background: rgb(var(--rgb-warn) / 0.12);
   border-color: rgb(var(--rgb-warn) / 0.35);
 }
 
 .capability-health-status.is-issue,
 .capability-health-status.is-error {
-  color: var(--vsp-danger-soft);
+  color: var(--vsp-danger);
   background: rgb(var(--rgb-danger) / 0.14);
   border-color: rgb(var(--rgb-danger) / 0.4);
 }
@@ -136,7 +136,7 @@
   padding: 10px 12px;
   border-radius: 10px;
   color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.74);
+  background: var(--vsp-surface);
   border: 1px solid rgb(var(--rgb-cyan) / 0.24);
 }
 
@@ -152,7 +152,7 @@
 }
 
 .capability-fixture-replay-grid strong {
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
 }
 
 .capability-fixture-replay-artifact,
@@ -166,7 +166,7 @@
 }
 
 .capability-fixture-replay-artifact a {
-  color: var(--vsp-cyan-300);
+  color: var(--vsp-cyan-700);
   text-decoration: none;
 }
 
@@ -191,13 +191,13 @@
 }
 
 .capability-fixture-replay-check-list li.is-ok {
-  color: var(--vsp-success-soft);
+  color: var(--vsp-success);
   border-color: rgb(var(--rgb-success) / 0.35);
   background: rgb(var(--rgb-success) / 0.12);
 }
 
 .capability-fixture-replay-check-list li.is-error {
-  color: var(--vsp-danger-soft);
+  color: var(--vsp-danger);
   border-color: rgb(var(--rgb-danger) / 0.4);
   background: rgb(var(--rgb-danger) / 0.14);
 }
@@ -207,7 +207,7 @@
   padding: 10px 12px;
   border-radius: 10px;
   color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.62);
+  background: var(--vsp-surface);
   border: 1px solid rgb(var(--rgb-slate) / 0.18);
 }
 
@@ -215,7 +215,7 @@
   padding: 10px 12px;
   border-radius: 10px;
   color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink) / 0.58);
+  background: var(--vsp-surface);
   border: 1px solid rgb(var(--rgb-cyan) / 0.18);
 }
 
@@ -236,7 +236,7 @@
   padding: 7px 9px;
   border-radius: 8px;
   color: var(--vsp-text-2);
-  background: rgb(var(--rgb-ink-deep) / 0.32);
+  background: var(--vsp-bg-deep);
   border: 1px solid rgb(var(--rgb-slate) / 0.16);
   font-size: 12px;
 }
@@ -273,7 +273,7 @@
   gap: 3px;
   padding: 7px 9px;
   border-radius: 8px;
-  background: rgb(var(--rgb-ink-deep) / 0.32);
+  background: var(--vsp-bg-deep);
   border: 1px solid rgb(var(--rgb-slate) / 0.16);
   font-size: 12px;
 }
@@ -282,7 +282,7 @@
 .capability-efficiency-feedback-library-item strong,
 .capability-fixture-history-item strong,
 .capability-fixture-batch-item strong {
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
 }
 
 .capability-fixture-library-item span,
@@ -297,12 +297,12 @@
 
 .capability-fixture-library-item a,
 .capability-efficiency-feedback-library-item a {
-  color: var(--vsp-cyan-300);
+  color: var(--vsp-cyan-700);
   text-decoration: none;
 }
 
 .capability-fixture-history-item a {
-  color: var(--vsp-cyan-300);
+  color: var(--vsp-cyan-700);
   text-decoration: none;
 }
 
@@ -314,12 +314,12 @@
   margin-top: 8px;
   padding: 8px;
   border-radius: 8px;
-  background: rgb(var(--rgb-ink-deep) / 0.28);
+  background: var(--vsp-bg-deep);
   border: 1px solid rgb(var(--rgb-cyan) / 0.18);
 }
 
 .capability-fixture-triage-focus {
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
   font-size: 12px;
   margin-bottom: 6px;
 }
@@ -343,7 +343,7 @@
 }
 
 .capability-fixture-triage-grid strong {
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
   font-size: 12px;
 }
 
@@ -409,7 +409,7 @@
 }
 
 .capability-attempt strong {
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
 }
 
 .capability-attempt p {
@@ -421,7 +421,7 @@
 .capability-exec-status.is-complete,
 .capability-attempt.is-complete,
 .capability-check.is-complete {
-  color: var(--vsp-success-soft);
+  color: var(--vsp-success);
   background: rgb(var(--rgb-success) / 0.12);
   border-color: rgb(var(--rgb-success) / 0.35);
 }
@@ -430,14 +430,14 @@
 .capability-attempt.is-skip,
 .capability-check.is-warning,
 .capability-check.is-skip {
-  color: var(--vsp-warn-soft);
+  color: var(--vsp-warn);
   background: rgb(var(--rgb-warn) / 0.12);
   border-color: rgb(var(--rgb-warn) / 0.35);
 }
 
 .capability-attempt.is-error,
 .capability-check.is-error {
-  color: var(--vsp-danger-soft);
+  color: var(--vsp-danger);
   background: rgb(var(--rgb-danger) / 0.14);
   border-color: rgb(var(--rgb-danger) / 0.4);
 }
@@ -448,7 +448,7 @@
   display: inline-flex;
   padding: 3px 8px;
   border-radius: 999px;
-  color: var(--vsp-cyan-200);
+  color: var(--vsp-cyan-700);
   background: rgb(var(--rgb-cyan) / 0.16);
   border: 1px solid rgb(var(--rgb-cyan) / 0.32);
   font-size: 11.5px;
@@ -473,7 +473,7 @@
   padding: 10px 12px;
   border-radius: 8px;
   color: var(--vsp-text-2);
-  background: var(--vsp-slate-950);
+  background: var(--vsp-bg-deep);
   border: 1px solid rgb(var(--rgb-slate) / 0.16);
   font-family: Consolas, 'JetBrains Mono', monospace;
   font-size: 11.5px;

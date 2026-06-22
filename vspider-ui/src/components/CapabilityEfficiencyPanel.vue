@@ -148,7 +148,7 @@ const props = defineProps({
   gap: 8px;
   padding: 9px 10px;
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.72);
+  background: var(--vsp-surface);
   border: 1px solid rgba(129, 140, 248, 0.24);
 }
 
@@ -159,13 +159,13 @@ const props = defineProps({
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  color: #cbd5e1;
+  color: var(--vsp-text-2);
   font-size: 12px;
 }
 
 .capability-efficiency-correlation-head strong,
 .capability-crawl-efficiency-head strong {
-  color: #c7d2fe;
+  color: var(--vsp-indigo-500);
 }
 
 .capability-efficiency-hints,
@@ -178,8 +178,8 @@ const props = defineProps({
 .capability-crawl-efficiency-candidate {
   padding: 8px 9px;
   border-radius: 8px;
-  background: rgba(2, 6, 23, 0.42);
-  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: var(--vsp-bg-deep);
+  border: 1px solid var(--vsp-border);
 }
 
 .capability-crawl-efficiency-candidate.is-available {
@@ -197,20 +197,20 @@ const props = defineProps({
 }
 
 .capability-card-head strong {
-  color: #93c5fd;
+  color: var(--vsp-blue-500);
   font-size: 13px;
 }
 
 .capability-meta,
 .capability-detail {
   margin: 5px 0 0;
-  color: #94a3b8;
+  color: var(--vsp-text-muted);
   font-size: 12px;
   line-height: 1.45;
 }
 
 .capability-detail {
-  color: #cbd5e1;
+  color: var(--vsp-text-2);
 }
 
 .capability-check-list {
@@ -229,20 +229,20 @@ const props = defineProps({
 }
 
 .capability-check.is-complete {
-  color: #86efac;
+  color: var(--vsp-success);
   background: rgba(34, 197, 94, 0.12);
   border-color: rgba(34, 197, 94, 0.35);
 }
 
 .capability-check.is-warning,
 .capability-check.is-skip {
-  color: #fde68a;
+  color: var(--vsp-warn);
   background: rgba(251, 191, 36, 0.12);
   border-color: rgba(251, 191, 36, 0.35);
 }
 
 .capability-check.is-error {
-  color: #fecaca;
+  color: var(--vsp-danger);
   background: rgba(239, 68, 68, 0.14);
   border-color: rgba(239, 68, 68, 0.4);
 }
