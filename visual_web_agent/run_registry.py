@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -259,3 +260,57 @@ def list_runs(
         items.append(rec)
     items.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
     return items[:n]
+
+
+def delete_run(run_id: str, *, base_dir: str | Path | None = None) -> bool:
+    """Delete a run's registry record + ``runs/<id>/`` dir + ``logs/*_<id>.*``.
+
+    Pure file removal — NO status guard (callers enforce active-run protection).
+    Returns True iff the registry record existed. Raises ValueError on bad id.
+    """
+    rid = _safe_run_id(run_id)
+    reg = registry_root(base_dir)          # .../runs/registry
+    runs_root = reg.parent                  # .../runs
+    proj = runs_root.parent                 # project root (or tmp in tests)
+    reg_path = reg / f"{rid}.json"
+    existed = reg_path.exists()
+    reg_path.unlink(missing_ok=True)
+    run_dir = runs_root / rid
+    if run_dir.is_dir():
+        shutil.rmtree(run_dir, ignore_errors=True)
+    for rel in (f"run_log_{rid}.html", f"phase_{rid}.jsonl", f"event_stream_{rid}.jsonl"):
+        try:
+            (proj / "logs" / rel).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return existed
+
+
+def prune_runs(*, keep: int = 100, base_dir: str | Path | None = None) -> list[str]:
+    """Keep newest *keep* runs by created_at; delete older **terminal** ones.
+
+    Never deletes non-terminal (running/queued/paused) runs even if old.
+    Returns deleted run_ids.
+    """
+    try:
+        k = max(0, int(keep))
+    except (TypeError, ValueError):
+        k = 100
+    recs: list[dict[str, Any]] = []
+    for path in registry_root(base_dir).glob("*.json"):
+        if not path.is_file():
+            continue
+        rec = load_run(path.stem, base_dir)
+        if rec:
+            recs.append(rec)
+    recs.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
+    deleted: list[str] = []
+    for rec in recs[k:]:
+        if rec.get("status") in _TERMINAL_STATUS:
+            rid = str(rec.get("run_id") or rec.get("task_id") or "")
+            try:
+                if rid and delete_run(rid, base_dir=base_dir):
+                    deleted.append(rid)
+            except ValueError:
+                continue
+    return deleted
