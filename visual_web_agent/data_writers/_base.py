@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -44,6 +44,16 @@ from visual_web_agent.io_contract import (
 
 _SAFE_NAME_RE = re.compile(r"[^0-9A-Za-z._-]+")
 
+# Extensions a ``filename_hint`` may legitimately carry. When the caller asks
+# for a different ``suffix`` (the writer's container extension) we strip one of
+# these off the stem first so the on-disk name reflects the contract container
+# rather than a stale hint (mission §一-A: never bury the real container under a
+# leftover ``.xlsx``).
+_KNOWN_ARTIFACT_EXTS = frozenset({
+    "xlsx", "xls", "xlsm", "csv", "tsv", "json", "jsonl",
+    "md", "markdown", "html", "htm", "txt", "parquet",
+})
+
 
 def safe_filename(stem: str, *, suffix: str = "", default: str = "artifact") -> str:
     """Return a filesystem-safe filename composed of ``stem`` + ``suffix``.
@@ -51,12 +61,18 @@ def safe_filename(stem: str, *, suffix: str = "", default: str = "artifact") -> 
     - Strips disallowed characters
     - Falls back to ``default`` when stem becomes empty
     - Always preserves the leading dot of ``suffix`` if provided
+    - When ``suffix`` is given and the stem already ends with a known artifact
+      extension, that extension is replaced (not doubled): ``safe_filename(
+      "output_1.xlsx", suffix=".csv") -> "output_1.csv"``.
     """
     base = _SAFE_NAME_RE.sub("_", str(stem or "").strip("._- ")) or default
     base = base.strip("._-") or default
     if suffix:
         if not suffix.startswith("."):
             suffix = "." + suffix
+        head, _dot, tail = base.rpartition(".")
+        if head and tail.lower() in _KNOWN_ARTIFACT_EXTS:
+            base = head
         return base + suffix
     return base
 
@@ -68,7 +84,7 @@ def default_filename(*, produced_by: str, suffix: str) -> str:
     in the same run are still distinguishable inside the artifacts folder.
     """
     stem = (produced_by or "artifact").strip() or "artifact"
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    stamp = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S_%f")
     return safe_filename(f"{stem}_{stamp}", suffix=suffix)
 
 
@@ -85,6 +101,55 @@ def compute_sha256_size(data: bytes) -> tuple[str, int]:
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError(f"compute_sha256_size expects bytes, got {type(data).__name__}")
     return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def _field_names(rows: Iterable[Any]) -> list[str]:
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            sk = str(key)
+            if sk not in seen_set:
+                seen.append(sk)
+                seen_set.add(sk)
+    return seen
+
+
+def dataset_extra(
+    extra: dict[str, Any] | None,
+    *,
+    output_kind: str,
+    rows: Iterable[Any] | None = None,
+    row_count: int | None = None,
+    fields: Iterable[Any] | None = None,
+) -> dict[str, Any]:
+    """Merge dataset evidence into manifest ``extra`` without overwriting caller data."""
+    merged = dict(extra or {})
+    if output_kind not in {"dataset_rows", "dataset_records"}:
+        return merged
+
+    materialized_rows: list[Any] | None = None
+    if rows is not None:
+        materialized_rows = list(rows)
+
+    if row_count is None and materialized_rows is not None:
+        row_count = len(materialized_rows)
+    if row_count is not None:
+        try:
+            merged.setdefault("row_count", int(row_count))
+        except (TypeError, ValueError):
+            pass
+
+    field_names: list[str] = []
+    if fields is not None:
+        field_names = [str(f) for f in fields if str(f)]
+    if not field_names and materialized_rows is not None:
+        field_names = _field_names(materialized_rows)
+    if field_names:
+        merged.setdefault("fields", field_names)
+    return merged
 
 
 def finalize_file_artifact(

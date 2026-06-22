@@ -95,18 +95,15 @@ def test_multi_tab_skill_calls_out_clf_anti_bot_fallback() -> None:
 
 
 def test_legacy_prompts_module_action_enum_in_sync() -> None:
-    """prompts.py has a parallel JSON schema string; keep it consistent so
-    legacy code paths that use it also surface the action."""
-    from visual_web_agent import prompts as _prompts
-    # The schema string is part of build_user_message construction; sample
-    # the module text for a sanity check.
+    """prompt_templates.py has the SYSTEM_PROMPT with action enum; keep consistent."""
+    from visual_web_agent import prompt_templates as _templates
     import inspect
-    src = inspect.getsource(_prompts)
+    src = inspect.getsource(_templates)
     assert "fetch_link_content" in src, (
-        "prompts.py must also list fetch_link_content in its action enum"
+        "prompt_templates.py must list fetch_link_content in its action enum"
     )
     assert "fetch_links_batch" in src, (
-        "prompts.py must also list fetch_links_batch in its action enum"
+        "prompt_templates.py must list fetch_links_batch in its action enum"
     )
 
 

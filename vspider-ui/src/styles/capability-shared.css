@@ -1,0 +1,481 @@
+/* Capability 面板共享样式：由 App.vue scoped 样式抽出，
+   供 App.vue 概览页 + CapabilityPlanPane / ReplayPane / DiagnosticsPane 公用。
+   选择器均以 .capability- 前缀命名空间隔离。 */
+
+.capability-export-btn {
+  border-color: rgb(var(--rgb-cyan) / 0.45);
+  color: var(--vsp-cyan-700);
+}
+
+.capability-section h4 {
+  margin: 0 0 8px;
+  color: var(--vsp-text-strong);
+  font-size: 13px;
+}
+
+.capability-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 8px;
+}
+
+.capability-section-head h4 {
+  margin: 0;
+}
+
+.capability-chain,
+.capability-role-grid,
+.capability-audit-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.capability-card,
+.capability-role-card,
+.capability-audit-item {
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: var(--vsp-surface);
+  border: 1px solid rgb(var(--rgb-slate) / 0.16);
+}
+
+.capability-card-head,
+.capability-role-card header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.capability-card-head strong,
+.capability-role-card strong,
+.capability-audit-item strong {
+  color: var(--vsp-cyan-700);
+  font-size: 13px;
+}
+
+.capability-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--vsp-slate-900);
+  background: var(--vsp-cyan-300);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.capability-meta,
+.capability-detail,
+.capability-audit-item p,
+.capability-avoid {
+  margin: 5px 0 0;
+  color: var(--vsp-text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.capability-detail {
+  color: var(--vsp-text-2);
+}
+
+.capability-fallback {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.capability-health-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--vsp-text-2);
+  background: var(--vsp-surface);
+  border: 1px solid rgb(var(--rgb-slate) / 0.16);
+  font-size: 12px;
+}
+
+.capability-health-status {
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--rgb-slate) / 0.22);
+  font-weight: 700;
+}
+
+.capability-health-status.is-healthy,
+.capability-health-status.is-executed,
+.capability-health-status.is-ok {
+  color: var(--vsp-success);
+  background: rgb(var(--rgb-success) / 0.12);
+  border-color: rgb(var(--rgb-success) / 0.35);
+}
+
+.capability-health-status.is-route-only,
+.capability-health-status.is-fallback {
+  color: var(--vsp-warn);
+  background: rgb(var(--rgb-warn) / 0.12);
+  border-color: rgb(var(--rgb-warn) / 0.35);
+}
+
+.capability-health-status.is-issue,
+.capability-health-status.is-error {
+  color: var(--vsp-danger);
+  background: rgb(var(--rgb-danger) / 0.14);
+  border-color: rgb(var(--rgb-danger) / 0.4);
+}
+
+.capability-fixture-replay-card,
+.capability-efficiency-feedback-replay-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--vsp-text-2);
+  background: var(--vsp-surface);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.24);
+}
+
+.capability-fixture-replay-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 6px 10px;
+  font-size: 12px;
+}
+
+.capability-fixture-replay-grid span {
+  color: var(--vsp-text-muted);
+}
+
+.capability-fixture-replay-grid strong {
+  color: var(--vsp-cyan-700);
+}
+
+.capability-fixture-replay-artifact,
+.capability-fixture-replay-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--vsp-text-muted);
+  font-size: 12px;
+}
+
+.capability-fixture-replay-artifact a {
+  color: var(--vsp-cyan-700);
+  text-decoration: none;
+}
+
+.capability-fixture-replay-check-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.capability-fixture-replay-check-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--rgb-slate) / 0.22);
+  background: rgb(var(--rgb-slate) / 0.08);
+  font-size: 11.5px;
+}
+
+.capability-fixture-replay-check-list li.is-ok {
+  color: var(--vsp-success);
+  border-color: rgb(var(--rgb-success) / 0.35);
+  background: rgb(var(--rgb-success) / 0.12);
+}
+
+.capability-fixture-replay-check-list li.is-error {
+  color: var(--vsp-danger);
+  border-color: rgb(var(--rgb-danger) / 0.4);
+  background: rgb(var(--rgb-danger) / 0.14);
+}
+
+.capability-fixture-library-card,
+.capability-efficiency-feedback-library-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--vsp-text-2);
+  background: var(--vsp-surface);
+  border: 1px solid rgb(var(--rgb-slate) / 0.18);
+}
+
+.capability-fixture-history-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--vsp-text-2);
+  background: var(--vsp-surface);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.18);
+}
+
+.capability-fixture-library-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--vsp-text-muted);
+  font-size: 12px;
+}
+
+.capability-fixture-history-trend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  color: var(--vsp-text-2);
+  background: var(--vsp-bg-deep);
+  border: 1px solid rgb(var(--rgb-slate) / 0.16);
+  font-size: 12px;
+}
+
+.capability-fixture-history-trend.is-improved {
+  border-color: rgb(var(--rgb-success) / 0.3);
+}
+
+.capability-fixture-history-trend.is-regressed {
+  border-color: rgb(var(--rgb-danger) / 0.36);
+}
+
+.capability-fixture-history-trend.is-stable,
+.capability-fixture-history-trend.is-baseline {
+  border-color: rgb(var(--rgb-cyan) / 0.26);
+}
+
+.capability-fixture-library-list,
+.capability-efficiency-feedback-library-list,
+.capability-fixture-history-list,
+.capability-fixture-batch-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.capability-fixture-library-item,
+.capability-efficiency-feedback-library-item,
+.capability-fixture-history-item,
+.capability-fixture-batch-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--vsp-bg-deep);
+  border: 1px solid rgb(var(--rgb-slate) / 0.16);
+  font-size: 12px;
+}
+
+.capability-fixture-library-item strong,
+.capability-efficiency-feedback-library-item strong,
+.capability-fixture-history-item strong,
+.capability-fixture-batch-item strong {
+  color: var(--vsp-cyan-700);
+}
+
+.capability-fixture-library-item span,
+.capability-efficiency-feedback-library-item span,
+.capability-fixture-history-item span,
+.capability-fixture-history-item small,
+.capability-fixture-batch-item small,
+.capability-fixture-library-empty {
+  color: var(--vsp-text-muted);
+  font-size: 12px;
+}
+
+.capability-fixture-library-item a,
+.capability-efficiency-feedback-library-item a {
+  color: var(--vsp-cyan-700);
+  text-decoration: none;
+}
+
+.capability-fixture-history-item a {
+  color: var(--vsp-cyan-700);
+  text-decoration: none;
+}
+
+.capability-fixture-library-empty {
+  margin-top: 8px;
+}
+
+.capability-fixture-triage {
+  margin-top: 8px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--vsp-bg-deep);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.18);
+}
+
+.capability-fixture-triage-focus {
+  color: var(--vsp-cyan-700);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.capability-fixture-triage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 6px;
+}
+
+.capability-fixture-triage-grid div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.capability-fixture-triage-grid span,
+.capability-fixture-triage-grid small {
+  color: var(--vsp-text-muted);
+  font-size: 11px;
+}
+
+.capability-fixture-triage-grid strong {
+  color: var(--vsp-cyan-700);
+  font-size: 12px;
+}
+
+.capability-fixture-batch-head-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.capability-fixture-batch-item.is-ok {
+  border-color: rgb(var(--rgb-success) / 0.28);
+}
+
+.capability-fixture-history-item.is-ok {
+  border-color: rgb(var(--rgb-success) / 0.24);
+}
+
+.capability-fixture-batch-item.is-error {
+  border-color: rgb(var(--rgb-danger) / 0.36);
+}
+
+.capability-fixture-history-item.is-error {
+  border-color: rgb(var(--rgb-danger) / 0.3);
+}
+
+.capability-exec-summary,
+.capability-attempt-list,
+.capability-check-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.capability-exec-summary {
+  align-items: center;
+  color: var(--vsp-text-2);
+  font-size: 12px;
+}
+
+.capability-exec-status,
+.capability-attempt,
+.capability-check {
+  border-radius: 999px;
+  border: 1px solid rgb(var(--rgb-slate) / 0.22);
+  background: rgb(var(--rgb-slate) / 0.08);
+}
+
+.capability-exec-status,
+.capability-check {
+  padding: 3px 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.capability-attempt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  color: var(--vsp-text-2);
+  font-size: 11.5px;
+}
+
+.capability-attempt strong {
+  color: var(--vsp-cyan-700);
+}
+
+.capability-attempt p {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--vsp-text-muted);
+}
+
+.capability-exec-status.is-complete,
+.capability-attempt.is-complete,
+.capability-check.is-complete {
+  color: var(--vsp-success);
+  background: rgb(var(--rgb-success) / 0.12);
+  border-color: rgb(var(--rgb-success) / 0.35);
+}
+
+.capability-exec-status.is-fallback,
+.capability-attempt.is-skip,
+.capability-check.is-warning,
+.capability-check.is-skip {
+  color: var(--vsp-warn);
+  background: rgb(var(--rgb-warn) / 0.12);
+  border-color: rgb(var(--rgb-warn) / 0.35);
+}
+
+.capability-attempt.is-error,
+.capability-check.is-error {
+  color: var(--vsp-danger);
+  background: rgb(var(--rgb-danger) / 0.14);
+  border-color: rgb(var(--rgb-danger) / 0.4);
+}
+
+.capability-fallback-pill,
+.capability-role-card header span,
+.capability-audit-item span {
+  display: inline-flex;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: var(--vsp-cyan-700);
+  background: rgb(var(--rgb-cyan) / 0.16);
+  border: 1px solid rgb(var(--rgb-cyan) / 0.32);
+  font-size: 11.5px;
+}
+
+.capability-role-card ul {
+  margin: 7px 0 0;
+  padding-left: 18px;
+  color: var(--vsp-text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.capability-avoid {
+  color: var(--vsp-warn);
+}
+
+.capability-json {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--vsp-text-2);
+  background: var(--vsp-bg-deep);
+  border: 1px solid rgb(var(--rgb-slate) / 0.16);
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+}

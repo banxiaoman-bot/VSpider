@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,7 @@ logger = logging.getLogger("vspider.events")
 
 
 def _utc_now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
 
 
 class EventStream:
@@ -72,6 +72,7 @@ class EventStream:
         screenshot_path: str = "",
         ax_lines: int = 0,
         browser_state: BrowserStateSnapshot | dict[str, Any] | None = None,
+        perception_reused: bool = False,
         metadata: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(browser_state, BrowserStateSnapshot):
@@ -87,6 +88,7 @@ class EventStream:
             screenshot_path=screenshot_path,
             ax_lines=ax_lines,
             browser_state=state_payload,
+            perception_reused=bool(perception_reused),
             metadata=dict(metadata or {}),
         )
 

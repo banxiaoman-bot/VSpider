@@ -14,6 +14,7 @@ effects. Persistence helpers that touch disk live alongside
 """
 
 from .input_contract import (
+    ATTACHMENT_INTENTS,
     InputContract,
     UrlSpec,
     AttachmentSpec,
@@ -33,6 +34,9 @@ from .output_contract import (
     CONTAINERS,
     infer_output_contract,
     default_container_for_kind,
+    normalize_output_fields,
+    output_contract_fields,
+    normalize_output_contract_dict,
 )
 from .manifest import (
     Manifest,
@@ -46,6 +50,7 @@ from .clarification import (
     detect_input_clarifications,
 )
 from .preflight import Preflight, build_preflight
+from .entry_llm import make_entry_llm, entry_llm_from_config
 from .protocol import RunOutputProtocol
 from .runtime import (
     clear_current_run,
@@ -77,6 +82,7 @@ from .persistence import (
 
 
 __all__ = [
+    "ATTACHMENT_INTENTS",
     "InputContract",
     "UrlSpec",
     "AttachmentSpec",
@@ -94,6 +100,9 @@ __all__ = [
     "CONTAINERS",
     "infer_output_contract",
     "default_container_for_kind",
+    "normalize_output_fields",
+    "output_contract_fields",
+    "normalize_output_contract_dict",
     "Manifest",
     "ManifestItem",
     "new_manifest",
@@ -103,6 +112,8 @@ __all__ = [
     "detect_input_clarifications",
     "Preflight",
     "build_preflight",
+    "make_entry_llm",
+    "entry_llm_from_config",
     "RunOutputProtocol",
     "INPUT_CONTRACT_FILENAME",
     "OUTPUT_CONTRACT_FILENAME",

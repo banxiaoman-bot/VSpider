@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ._base import (
+    dataset_extra,
     default_filename,
     finalize_file_artifact,
     run_artifacts_dir,
@@ -73,15 +74,16 @@ def write_xlsx(
     )
     target = artifacts / filename
     df.to_excel(target, index=False, engine="openpyxl")
+    kind = output_kind or "dataset_rows"
 
     return finalize_file_artifact(
         run_id=run_id,
         path=target,
-        kind=output_kind or "dataset_rows",
+        kind=kind,
         mime=_XLSX_MIME,
         produced_by=produced_by,
         step_id=step_id,
         source_url=source_url,
-        extra=extra,
+        extra=dataset_extra(extra, output_kind=kind, rows=rows),
         base_dir=base_dir,
     )

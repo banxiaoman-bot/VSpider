@@ -95,7 +95,7 @@ const openRow = (row) => {
 <style scoped>
 .capability-section h4 {
   margin: 0 0 8px;
-  color: #f1f5f9;
+  color: var(--vsp-text-strong);
   font-size: 13px;
 }
 
@@ -129,22 +129,22 @@ const openRow = (row) => {
 }
 
 .capability-trace-search-count {
-  color: #94a3b8;
+  color: var(--vsp-text-muted);
   font-size: 11px;
 }
 
 .capability-trace-filter {
   padding: 3px 8px;
   border-radius: 999px;
-  color: #94a3b8;
-  background: rgba(15, 23, 42, 0.72);
-  border: 1px solid rgba(148, 163, 184, 0.2);
+  color: var(--vsp-text-muted);
+  background: var(--vsp-surface);
+  border: 1px solid var(--vsp-border);
   font-size: 11px;
   cursor: pointer;
 }
 
 .capability-trace-filter.is-active {
-  color: #c7d2fe;
+  color: var(--vsp-indigo-500);
   background: rgba(99, 102, 241, 0.18);
   border-color: rgba(129, 140, 248, 0.42);
 }
@@ -157,16 +157,16 @@ const openRow = (row) => {
   width: 100%;
   padding: 7px 9px;
   border-radius: 8px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  color: #cbd5e1;
-  background: rgba(15, 23, 42, 0.66);
+  border: 1px solid var(--vsp-border);
+  color: var(--vsp-text-2);
+  background: var(--vsp-surface);
   text-align: left;
   cursor: pointer;
 }
 
 .capability-trace-row:hover {
   border-color: rgba(147, 197, 253, 0.42);
-  background: rgba(30, 41, 59, 0.82);
+  background: var(--vsp-surface-mint);
 }
 
 .capability-trace-row.sev-warn {
@@ -183,20 +183,20 @@ const openRow = (row) => {
 
 .capability-trace-index,
 .capability-trace-time {
-  color: #94a3b8;
+  color: var(--vsp-text-muted);
   font-family: Consolas, 'JetBrains Mono', monospace;
   font-size: 11.5px;
 }
 
 .capability-trace-phase {
-  color: #93c5fd;
+  color: var(--vsp-blue-500);
   font-weight: 700;
   font-size: 12px;
 }
 
 .capability-trace-detail {
   overflow: hidden;
-  color: #cbd5e1;
+  color: var(--vsp-text-2);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -204,7 +204,7 @@ const openRow = (row) => {
 
 .capability-trace-empty {
   margin: 2px 0 0;
-  color: #94a3b8;
+  color: var(--vsp-text-muted);
   font-size: 12px;
 }
 </style>

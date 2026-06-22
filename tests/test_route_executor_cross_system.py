@@ -25,10 +25,12 @@ import pytest
 
 from visual_web_agent.extraction_engine import generic
 from visual_web_agent.route_executor import (
+    _build_session_plan,
     _normalise_per_step_systems,
     _stamp_system_metadata,
     execute_route,
 )
+from visual_web_agent.session_router import SessionRouter, SystemAuthPlan
 
 
 _SELECTOR_SOURCE = """
@@ -145,6 +147,61 @@ class TestStampSystemMetadata:
 
 
 # ---------------------------------------------------------------------------
+# _stamp_system_metadata with a SessionRouter (E1c-2)
+# ---------------------------------------------------------------------------
+
+
+def _router(systems: list[dict]) -> SessionRouter:
+    return SessionRouter(run_id="route_executor", plan=SystemAuthPlan(systems=systems))
+
+
+class TestStampSystemMetadataWithRouter:
+    def test_plan_auth_profile_used_when_per_step_auto(self) -> None:
+        attempts = [{"capability": "extractor_select", "status": "attempted"}]
+        mapping = {"extractor_select": {"system_id": "system_2", "auth_profile": "auto"}}
+        router = _router([{"id": "system_2", "domain": "beta.com", "auth_profile": "beta_login"}])
+        _stamp_system_metadata(attempts, mapping, router)
+        assert attempts[0]["auth_profile"] == "beta_login"
+
+    def test_per_step_explicit_overrides_plan(self) -> None:
+        attempts = [{"capability": "extractor_select", "status": "attempted"}]
+        mapping = {"extractor_select": {"system_id": "system_2", "auth_profile": "explicit_login"}}
+        router = _router([{"id": "system_2", "domain": "beta.com", "auth_profile": "beta_login"}])
+        _stamp_system_metadata(attempts, mapping, router)
+        assert attempts[0]["auth_profile"] == "explicit_login"
+
+    def test_no_stamp_when_neither_per_step_nor_plan_declares(self) -> None:
+        attempts = [{"capability": "extractor_select", "status": "attempted"}]
+        mapping = {"extractor_select": {"system_id": "system_2", "auth_profile": "auto"}}
+        router = _router([{"id": "system_2", "domain": "beta.com", "auth_profile": "auto"}])
+        _stamp_system_metadata(attempts, mapping, router)
+        assert "auth_profile" not in attempts[0]
+
+
+# ---------------------------------------------------------------------------
+# _build_session_plan (E1c-2)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSessionPlan:
+    def test_resolves_profile_and_domain_per_system(self) -> None:
+        router = _router([
+            {"id": "system_1", "domain": "alpha.com", "auth_profile": "alpha_login"},
+            {"id": "system_2", "domain": "beta.com", "auth_profile": "auto"},
+        ])
+        plan = _build_session_plan(["system_1", "system_2"], router)
+        assert plan == [
+            {"system_id": "system_1", "auth_profile": "alpha_login", "domain": "alpha.com"},
+            {"system_id": "system_2", "auth_profile": "auto", "domain": "beta.com"},
+        ]
+
+    def test_unknown_system_defaults_auto_blank_domain(self) -> None:
+        router = _router([])
+        plan = _build_session_plan(["system_1"], router)
+        assert plan == [{"system_id": "system_1", "auth_profile": "auto", "domain": ""}]
+
+
+# ---------------------------------------------------------------------------
 # execute_route end-to-end
 # ---------------------------------------------------------------------------
 
@@ -228,3 +285,32 @@ class TestExecuteRouteCrossSystem:
         })
         assert result["status"] == "completed"
         assert result["systems_involved"] == ["system_1"]
+
+    def test_execute_route_includes_session_plan(self, _artifact_tmp) -> None:
+        """E1c-2: every result exposes a session_plan aligned with
+        systems_involved, each entry carrying system_id / auth_profile /
+        domain so a downstream executor can pre-resolve sessions."""
+        result = execute_route({
+            "goal": "提取前 2 条 quote 文本",
+            "source": _SELECTOR_SOURCE,
+            "selector": ".quote .text::text",
+            "export": True,
+            "run_id": "xsys_session_plan",
+        })
+        assert "session_plan" in result
+        sp_ids = [entry["system_id"] for entry in result["session_plan"]]
+        assert sp_ids == result["systems_involved"]
+        assert all(
+            {"system_id", "auth_profile", "domain"} <= set(entry)
+            for entry in result["session_plan"]
+        )
+
+    def test_fallback_path_includes_session_plan(self) -> None:
+        result = execute_route({
+            "goal": "爬取列表数据并导出",
+            "url": "https://example.com/",
+            "extract": {"selector": ".quote .text::text"},
+        })
+        assert "session_plan" in result
+        sp_ids = [entry["system_id"] for entry in result["session_plan"]]
+        assert sp_ids == result["systems_involved"]

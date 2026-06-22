@@ -143,13 +143,204 @@ def _manifest_satisfies_contract(
     return len(items) > 0
 
 
+def _manifest_dataset_row_count(manifest_items: list[dict[str, Any]] | None) -> int:
+    rows = 0
+    for item in (manifest_items or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") not in {"dataset_rows", "dataset_records"}:
+            continue
+        extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+        for value in (item.get("row_count"), extra.get("row_count"), extra.get("rows")):
+            try:
+                count = int(value or 0)
+            except Exception:
+                count = 0
+            rows = max(rows, count)
+    return rows
+
+
+def structured_extraction_requirement_unmet(
+    output_contract: dict[str, Any] | None,
+    *,
+    total_extracted_rows: int = 0,
+    manifest_items: list[dict[str, Any]] | None = None,
+    pagination_exhausted: bool = False,
+    no_progress_streak: int = 0,
+) -> bool:
+    """Return True when a structured-extraction contract still owes rows.
+
+    A ``dataset_rows`` / ``dataset_records`` task must not be accepted as ``done``
+    while it has produced zero rows and an empty manifest — that is the
+    "empty-extraction premature completion" failure. The guard releases (returns
+    False) once any data is present, or once the source is genuinely exhausted
+    (pagination exhausted / repeated no-progress) so truly empty pages can still
+    finish instead of looping forever.
+    """
+    contract = _as_dict(output_contract)
+    kind = str(contract.get("output_kind") or "")
+    if kind not in {"dataset_rows", "dataset_records"}:
+        return False
+    if not bool(contract.get("artifact_required", True)):
+        return False
+    if bool(contract.get("answer_required", False)):
+        return False
+    data_present = (
+        int(total_extracted_rows or 0) > 0
+        or _manifest_dataset_row_count(manifest_items) > 0
+        or _manifest_satisfies_contract(manifest_items, contract)
+    )
+    if data_present:
+        return False
+    if pagination_exhausted or int(no_progress_streak or 0) >= 3:
+        return False
+    return True
+
+
+def has_recorded_dataset_rows(
+    output_contract: dict[str, Any] | None,
+    *,
+    total_extracted_rows: int = 0,
+    manifest_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True when a structured-extraction contract already has recorded rows.
+
+    Deterministic row evidence (extracted rows / manifest row_count) is stronger
+    than a vision-only judge counting items visible in a viewport screenshot, so
+    callers use this to let the manifest override the visual judge for
+    ``dataset_rows`` / ``dataset_records`` tasks.
+    """
+    contract = _as_dict(output_contract)
+    kind = str(contract.get("output_kind") or "")
+    if kind not in {"dataset_rows", "dataset_records"}:
+        return False
+    return (
+        int(total_extracted_rows or 0) > 0
+        or _manifest_dataset_row_count(manifest_items) > 0
+    )
+
+
+def _normalize_field(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower().replace("-", "_")
+    text = re.sub(r"[^0-9a-z_\u4e00-\u9fff]+", "_", text).strip("_")
+    return text
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        raw = [value]
+    out: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _required_dataset_fields(
+    output_contract: dict[str, Any],
+    capability_route: dict[str, Any] | None = None,
+) -> list[str]:
+    try:
+        from visual_web_agent.io_contract.output_contract import (
+            normalize_output_fields,
+            output_contract_fields,
+        )
+    except Exception:
+        normalize_output_fields = None
+        output_contract_fields = None
+
+    values: list[str] = []
+    if output_contract_fields is not None:
+        values.extend(output_contract_fields(output_contract))
+    else:
+        for key in ("required_fields", "fields", "requested_fields"):
+            values.extend(_as_string_list(output_contract.get(key)))
+    route = _as_dict(capability_route)
+    for source in (
+        route.get("output_contract"),
+        _as_dict(route.get("strategy_context")).get("output_contract"),
+    ):
+        if not isinstance(source, dict):
+            continue
+        if output_contract_fields is not None:
+            values.extend(output_contract_fields(source))
+        else:
+            for key in ("required_fields", "fields", "requested_fields"):
+                values.extend(_as_string_list(source.get(key)))
+
+    strategy = _as_dict(route.get("strategy_context"))
+    values.extend(_as_string_list(strategy.get("requested_fields")))
+    values.extend(_as_string_list(strategy.get("required_fields")))
+
+    if normalize_output_fields is not None:
+        return normalize_output_fields(values)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = _normalize_field(value)
+        if normalized and normalized not in seen:
+            out.append(value)
+            seen.add(normalized)
+    return out
+
+
+def _manifest_dataset_fields(manifest_items: list[dict[str, Any]] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in (manifest_items or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") not in {"dataset_rows", "dataset_records"}:
+            continue
+        extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+        sources = (
+            item.get("fields"),
+            extra.get("fields"),
+            extra.get("columns"),
+            extra.get("field_names"),
+        )
+        for source in sources:
+            for value in _as_string_list(source):
+                normalized = _normalize_field(value)
+                if normalized and normalized not in seen:
+                    out.append(value)
+                    seen.add(normalized)
+    return out
+
+
+def _dataset_fields_check(
+    manifest_items: list[dict[str, Any]] | None,
+    required_fields: list[str],
+) -> dict[str, Any]:
+    observed_fields = _manifest_dataset_fields(manifest_items)
+    observed_normalized = {_normalize_field(field) for field in observed_fields}
+    missing = [
+        field for field in required_fields
+        if _normalize_field(field) not in observed_normalized
+    ]
+    return {
+        "required": list(required_fields),
+        "observed": observed_fields,
+        "missing": missing,
+        "passed": not missing,
+    }
+
+
 def evaluate_completion(
     *,
     goal: str = "",
     output_contract: dict[str, Any] | None = None,
     output_mode: str = "",
     total_extracted_rows: int = 0,
+    total_pages: int = 0,
     goal_target_count: int | None = None,
+    goal_target_pages: int | None = None,
     pagination_exhausted: bool = False,
     manifest_items: list[dict[str, Any]] | None = None,
     workflow_memory: dict[str, Any] | None = None,
@@ -167,6 +358,7 @@ def evaluate_completion(
     checks: list[dict[str, Any]] = []
     evidence: list[str] = []
     target = goal_target_count
+    page_target = goal_target_pages
     tolerance = _extract_tolerance(target)
 
     extract_complete = False
@@ -187,6 +379,19 @@ def evaluate_completion(
         if extract_complete:
             evidence.append(f"extract_rows:{total_extracted_rows}/{target}")
 
+    page_complete = False
+    if page_target is not None and page_target > 0:
+        page_complete = total_pages >= page_target
+        checks.append(_check(
+            "extract_page_target",
+            page_complete,
+            f"pages={total_pages} target={page_target}",
+            observed=total_pages,
+            target=page_target,
+        ))
+        if page_complete:
+            evidence.append(f"extract_pages:{total_pages}/{page_target}")
+
     answer_text = _answer_text_from_memory(workflow_memory)
     answer_complete = mode == "answer" and bool(answer_text)
     if mode == "answer":
@@ -199,15 +404,53 @@ def evaluate_completion(
             evidence.append("answer:workflow_memory")
 
     manifest_ok = _manifest_satisfies_contract(manifest_items, contract)
+    manifest_dataset_rows = _manifest_dataset_row_count(manifest_items)
+    required_dataset_fields = (
+        _required_dataset_fields(contract, capability_route)
+        if output_kind in {"dataset_rows", "dataset_records"}
+        else []
+    )
+    dataset_fields = _dataset_fields_check(manifest_items, required_dataset_fields)
+    dataset_field_gate = (
+        output_kind not in {"dataset_rows", "dataset_records"}
+        or not required_dataset_fields
+        or bool(dataset_fields["passed"])
+    )
+    dataset_manifest_complete = False
+    if manifest_ok and output_kind in {"dataset_rows", "dataset_records"}:
+        if not dataset_field_gate:
+            dataset_manifest_complete = False
+        elif target is not None and target > 0:
+            dataset_manifest_complete = (
+                max(total_extracted_rows, manifest_dataset_rows) >= target
+            )
+        elif page_target is not None and page_target > 0:
+            dataset_manifest_complete = total_pages >= page_target
+        else:
+            dataset_manifest_complete = True
     if output_kind:
         checks.append(_check(
             "manifest_contract",
             manifest_ok,
             "manifest satisfies output_contract" if manifest_ok else "manifest missing expected artifact",
             output_kind=output_kind,
+            dataset_rows=manifest_dataset_rows,
         ))
+        if output_kind in {"dataset_rows", "dataset_records"} and required_dataset_fields:
+            checks.append(_check(
+                "manifest_dataset_fields",
+                bool(dataset_fields["passed"]),
+                "manifest dataset fields satisfy output_contract" if dataset_fields["passed"] else "manifest dataset fields missing",
+                required=dataset_fields["required"],
+                observed=dataset_fields["observed"],
+                missing=dataset_fields["missing"],
+            ))
         if manifest_ok:
             evidence.append(f"manifest:{output_kind}")
+        if required_dataset_fields and dataset_fields["passed"]:
+            evidence.append("manifest_fields:" + ",".join(required_dataset_fields))
+        if dataset_manifest_complete:
+            evidence.append(f"dataset_manifest:{output_kind}")
 
     route_complete = False
     route = _as_dict(capability_route)
@@ -249,6 +492,7 @@ def evaluate_completion(
     exit_eval = evaluate_exit_criteria(
         exit_criteria,
         total_extracted_rows=total_extracted_rows,
+        total_pages=total_pages,
         current_url=current_url,
         workflow_memory=workflow_memory,
         last_action=last_action,
@@ -265,20 +509,41 @@ def evaluate_completion(
         if subgoal_exit_complete:
             evidence.append("subgoal_exit:" + ",".join(exit_eval.get("matched") or []))
 
+    structured_unmet = structured_extraction_requirement_unmet(
+        contract,
+        total_extracted_rows=total_extracted_rows,
+        manifest_items=manifest_items,
+        pagination_exhausted=pagination_exhausted,
+        no_progress_streak=no_progress_streak,
+    )
+    subgoal_exit_complete_for_status = subgoal_exit_complete and not structured_unmet
+    if subgoal_exit_complete and structured_unmet:
+        checks.append(_check(
+            "structured_extraction_guard",
+            False,
+            "subgoal exit met but dataset manifest empty; blocking premature done",
+            output_kind=output_kind,
+            extracted_rows=total_extracted_rows,
+        ))
+
+    extract_complete_for_status = (extract_complete or page_complete) and dataset_field_gate
+    no_progress_complete_for_status = no_progress_complete and dataset_field_gate
+
     complete = any([
-        extract_complete,
+        extract_complete_for_status,
         answer_complete,
         manifest_ok and output_kind.startswith("media_"),
         manifest_ok and output_kind in {"file_generic", "screenshot"},
-        route_complete and extract_complete,
-        no_progress_complete,
-        subgoal_exit_complete,
+        dataset_manifest_complete,
+        route_complete and extract_complete_for_status,
+        no_progress_complete_for_status,
+        subgoal_exit_complete_for_status,
     ])
 
     if complete:
         status = "complete"
         recommended = "done"
-        confidence = 0.95 if extract_complete or answer_complete else 0.85
+        confidence = 0.95 if extract_complete_for_status or answer_complete else 0.85
     elif no_progress_streak >= 3 and total_extracted_rows > 0:
         status = "blocked"
         recommended = "recovery"
@@ -289,15 +554,19 @@ def evaluate_completion(
         confidence = 0.5
 
     reasons: list[str] = []
-    if extract_complete:
+    if extract_complete and dataset_field_gate:
         reasons.append("extract_target_met")
+    if page_complete and dataset_field_gate:
+        reasons.append("extract_page_target_met")
     if answer_complete:
         reasons.append("answer_ready")
     if manifest_ok:
         reasons.append("manifest_ready")
-    if subgoal_exit_complete:
+    if dataset_manifest_complete:
+        reasons.append("dataset_manifest_ready")
+    if subgoal_exit_complete_for_status:
         reasons.append("subgoal_exit_met")
-    if no_progress_complete:
+    if no_progress_complete_for_status:
         reasons.append("pagination_stalled_with_enough_rows")
 
     return {
@@ -322,7 +591,9 @@ def maybe_short_circuit_decision(
     output_contract: dict[str, Any] | None = None,
     output_mode: str = "",
     total_extracted_rows: int = 0,
+    total_pages: int = 0,
     goal_target_count: int | None = None,
+    goal_target_pages: int | None = None,
     pagination_exhausted: bool = False,
     manifest_items: list[dict[str, Any]] | None = None,
     workflow_memory: dict[str, Any] | None = None,
@@ -343,7 +614,9 @@ def maybe_short_circuit_decision(
         output_contract=output_contract,
         output_mode=output_mode,
         total_extracted_rows=total_extracted_rows,
+        total_pages=total_pages,
         goal_target_count=goal_target_count,
+        goal_target_pages=goal_target_pages,
         pagination_exhausted=pagination_exhausted,
         manifest_items=manifest_items,
         workflow_memory=workflow_memory,
@@ -374,15 +647,30 @@ def maybe_short_circuit_decision(
     return {"short_circuit": True, "decision": rewritten, "evaluation": evaluation}
 
 
-def load_manifest_items_for_run(run_id: str) -> list[dict[str, Any]]:
+def load_manifest_items_for_run(
+    run_id: str,
+    *,
+    base_dir: str | None = None,
+) -> list[dict[str, Any]]:
     rid = str(run_id or "").strip()
     if not rid:
         return []
     try:
         from visual_web_agent.io_contract.persistence import read_manifest
 
-        payload = read_manifest(rid)
-        items = payload.get("items") if isinstance(payload, dict) else None
-        return [dict(item) for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        payload = read_manifest(rid, base_dir=base_dir)
+        if isinstance(payload, dict):
+            items = payload.get("items")
+        else:
+            items = getattr(payload, "items", None)
+        out: list[dict[str, Any]] = []
+        for item in items or []:
+            if isinstance(item, dict):
+                out.append(dict(item))
+            elif hasattr(item, "to_dict"):
+                item_payload = item.to_dict()
+                if isinstance(item_payload, dict):
+                    out.append(item_payload)
+        return out
     except Exception:
         return []

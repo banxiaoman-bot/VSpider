@@ -18,6 +18,7 @@ export function buildTaskConstraints({
   proxyUsername = '',
   proxyPassword = '',
   maxRuns = 0,
+  resume = false,
 } = {}) {
   const constraints = {}
   const server = String(proxyServer || '').trim()
@@ -32,7 +33,44 @@ export function buildTaskConstraints({
   if (Number.isFinite(runs) && runs > 0) {
     constraints.max_runs = runs
   }
+  if (resume) {
+    constraints.resume = true
+  }
   return Object.keys(constraints).length ? constraints : null
+}
+
+export function parseUrlList(value = '') {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean)
+  }
+  const text = String(value || '').trim()
+  if (!text) return []
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) return parseUrlList(parsed)
+    } catch {
+      // Fall back to delimiter parsing for user-entered text.
+    }
+  }
+  return text
+    .split(/[\n,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+export function buildAuthoritativeUrlsPayload(targetUrl = '', extraUrls = '') {
+  const urls = []
+  const seen = new Set()
+  for (const item of [targetUrl, ...parseUrlList(extraUrls)]) {
+    const value = String(item || '').trim()
+    if (!value) continue
+    const key = value.replace(/\/+$/, '')
+    if (seen.has(key)) continue
+    seen.add(key)
+    urls.push(value)
+  }
+  return urls
 }
 
 export function authProfileOptionLabel(profile) {

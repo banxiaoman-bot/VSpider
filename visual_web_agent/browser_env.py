@@ -34,19 +34,50 @@ from playwright_stealth import Stealth
 try:
     from . import config
     from .auth_manager import apply_storage_state_to_context, load_auth_profiles
-    from .artifact_manager import artifact_root, register_artifact
+    from .artifact_manager import artifact_root, register_download_artifact
     from .action_result import ActionResult
+    from .browser_profile import resolve_user_data_dir
+    from .stealth_profile import build_profile
     from .data_manager import save_intercepted_data
     from .network_intelligence import record_candidate as _record_network_candidate
     from .vlm_client import VSpiderAction
 except ImportError:
     import config
     from auth_manager import apply_storage_state_to_context, load_auth_profiles
-    from artifact_manager import artifact_root, register_artifact
+    from artifact_manager import artifact_root, register_download_artifact
     from action_result import ActionResult
+    from browser_profile import resolve_user_data_dir
+    from stealth_profile import build_profile
     from data_manager import save_intercepted_data
     from network_intelligence import record_candidate as _record_network_candidate
     from vlm_client import VSpiderAction
+
+try:
+    from .browser_intercept_helpers import (
+        _format_som_element as format_som_element,
+        screenshot_looks_visually_blank,
+        extract_data_list,
+        score_intercept_candidate,
+        stable_json_hash,
+        schema_fingerprint,
+        row_dedup_key,
+        dedupe_intercept_rows,
+        flatten_ax_tree_for_extract,
+        flatten_ax_tree,
+    )
+except ImportError:
+    from browser_intercept_helpers import (
+        _format_som_element as format_som_element,
+        screenshot_looks_visually_blank,
+        extract_data_list,
+        score_intercept_candidate,
+        stable_json_hash,
+        schema_fingerprint,
+        row_dedup_key,
+        dedupe_intercept_rows,
+        flatten_ax_tree_for_extract,
+        flatten_ax_tree,
+    )
 
 # ── 网络资源拦截配置 ────────────────────────────────────────────────────────
 # 策略：拦截媒体流和字体（体积大、对 SoM 截图无意义），保留 image（视觉模式需要）。
@@ -192,7 +223,18 @@ class ActionTarget:
     selector: str
 
 
-class BrowserEnv:
+try:
+    from .browser_ax import BrowserAXMixin as _BrowserAXMixin
+except ImportError:
+    from browser_ax import BrowserAXMixin as _BrowserAXMixin  # type: ignore[no-redef]
+
+try:
+    from .browser_som import BrowserSoMMixin as _BrowserSoMMixin
+except ImportError:
+    from browser_som import BrowserSoMMixin as _BrowserSoMMixin  # type: ignore[no-redef]
+
+
+class BrowserEnv(_BrowserSoMMixin, _BrowserAXMixin):
     """
     Playwright 浏览器环境封装。
 
@@ -232,6 +274,9 @@ class BrowserEnv:
         self._playwright = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        # PROXY-4: rotatable proxy chain. Built once (start / _ensure_proxy_chain)
+        # and preserved across restart() so rotation state survives a reroute.
+        self._proxy_chain = None
         self._closed: bool = False
         self._som_js: str = ""
         self._screenshot_dir: Path = Path(config.SCREENSHOT_DIR)
@@ -240,8 +285,13 @@ class BrowserEnv:
         self._intercept_enabled: bool = False  # 默认关闭，由 configure_interceptor() 或 --xhr 参数开启
         self._intercept_count: int = 0
         self._intercept_unique_key: str | list[str] | None = None
-        self._intercept_filename: str = "output.xlsx"
+        self._intercept_filename: str = "output"
+        # output_contract.v1 of the current run; decides the intercept
+        # dataset container (xlsx/csv/jsonl) instead of a blind xlsx default.
+        self._intercept_output_contract: dict | None = None
         self._registered_pages: set[int] = set()
+        # STEALTH-3: identity bundle (UA + CH + ua metadata), set in start() so every page CDP session can replay setUserAgentOverride.
+        self._stealth_profile = None
         self._background_tasks: set[asyncio.Task] = set()
         self._intercept_min_list_size: int = 5  # 启发式探测阈值
         # ── 核心 API 精准截胡 ──────────────────────────────────────────
@@ -278,6 +328,7 @@ class BrowserEnv:
         # even though it had become a "rules / terms" page).
         self._page_titles: dict[int, str] = {}
         self._last_som_elements: list[dict] = []  # 最近一轮 SoM 标记的元素列表
+        self._last_som_scope: str = "full"  # E2：最近一轮 SoM 选区（viewport/full/selector）
         self._visual_blank_reloaded_urls: set[str] = set()
         self._auth_matrix_note: str = ""
         self.auth_matrix_loaded: bool = False
@@ -623,171 +674,8 @@ class BrowserEnv:
             return ""
 
     # ── CDP AX Tree（替代 Playwright 1.58 已移除的 page.accessibility）──────
-    async def _get_ax_tree_via_cdp(
-        self, page: Page, interesting_only: bool = True
-    ) -> dict | None:
-        """
-        通过 Chrome DevTools Protocol 获取完整 Accessibility Tree。
-
-        Playwright ≥ 1.58 移除了 ``page.accessibility.snapshot()``，
-        此方法使用 ``Accessibility.getFullAXTree`` CDP 命令替代，
-        并将 CDP 扁平节点列表重建为与旧 API 兼容的树形 dict。
-
-        Args:
-            page: 当前活动页。
-            interesting_only: True 时过滤掉 ignored / generic / none 等
-                              装饰性容器节点（仅保留有语义价值的节点）。
-
-        Returns:
-            与旧 ``page.accessibility.snapshot()`` 格式兼容的树形 dict，
-            失败时返回 None。
-        """
-        cdp = None
-        try:
-            cdp = await page.context.new_cdp_session(page)
-            result = await cdp.send("Accessibility.getFullAXTree")
-            nodes = result.get("nodes", [])
-            if not nodes:
-                return None
-
-            # ── 1. 将 CDP 扁平节点转为简洁 dict ──
-            by_id: dict[str, dict] = {}
-            for raw in nodes:
-                nid = raw.get("nodeId")
-                if nid is None:
-                    continue
-                role_val = (raw.get("role") or {}).get("value", "")
-                name_val = (raw.get("name") or {}).get("value", "")
-                val_obj = raw.get("value") or {}
-                entry: dict = {"role": role_val, "name": name_val}
-                if val_obj.get("value") is not None:
-                    entry["value"] = str(val_obj["value"])
-                for prop in raw.get("properties", []):
-                    pname = prop.get("name", "")
-                    pval = (prop.get("value") or {}).get("value")
-                    if pname and pval is not None:
-                        entry[pname] = pval
-                entry["_cids"] = raw.get("childIds", [])
-                entry["_ign"] = raw.get("ignored", False)
-                by_id[nid] = entry
-
-            # ── 2. 递归重建树 ──
-            SKIP_ROLES = frozenset(
-                {"none", "presentation", "generic", "InlineTextBox", "LineBreak"}
-            )
-
-            def _to_tree(nid: str) -> dict | list | None:
-                node = by_id.get(nid)
-                if node is None:
-                    return None
-                children: list[dict] = []
-                for cid in node["_cids"]:
-                    child = _to_tree(cid)
-                    if child is None:
-                        continue
-                    if isinstance(child, list):
-                        children.extend(child)
-                    else:
-                        children.append(child)
-                # interesting_only 模式下跳过被忽略/装饰性节点，
-                # 但保留其子节点向上传递
-                if interesting_only and (
-                    node["_ign"] or node["role"] in SKIP_ROLES
-                ):
-                    return children or None
-                out = {k: v for k, v in node.items() if not k.startswith("_")}
-                if children:
-                    out["children"] = children
-                return out
-
-            root = _to_tree(nodes[0]["nodeId"])
-            if isinstance(root, list):
-                return {"role": "RootWebArea", "name": "", "children": root}
-            return root
-
-        except Exception as e:
-            logger.warning(f"[AX CDP] 通过 CDP 获取 AX Tree 失败: {e}")
-            return None
-        finally:
-            if cdp:
-                try:
-                    await cdp.detach()
-                except Exception:
-                    pass
-
-    async def _get_accessibility_signature(self, page: Page, handle) -> tuple[str, str]:
-        """提取元素的语义角色与可访问名称，优先走轻量 JS 提取。"""
-        _AX_JS = r"""
-        (el) => {
-            const clean = (value) => (value || '')
-                .toString()
-                .replace(/\s+/g, ' ')
-                .trim()
-                .slice(0, 120);
-
-            const implicitRole = (node) => {
-                if (!node || !node.tagName) return '';
-                const tag = node.tagName.toLowerCase();
-                const type = (node.getAttribute && (node.getAttribute('type') || '') || '').toLowerCase();
-                const role = clean(node.getAttribute && node.getAttribute('role'));
-                if (role) return role.toLowerCase();
-                if (tag === 'a' && node.hasAttribute && node.hasAttribute('href')) return 'link';
-                if (tag === 'button') return 'button';
-                if (tag === 'summary') return 'button';
-                if (tag === 'textarea') return 'textbox';
-                if (tag === 'select') return 'combobox';
-                if (tag === 'input') {
-                    if (['button', 'submit', 'reset'].includes(type)) return 'button';
-                    if (type === 'checkbox') return 'checkbox';
-                    if (type === 'radio') return 'radio';
-                    if (type === 'search') return 'searchbox';
-                    if (type === 'range') return 'slider';
-                    return 'textbox';
-                }
-                if (node.isContentEditable) return 'textbox';
-                if (tag === 'img') return 'img';
-                if (tag === 'option') return 'option';
-                return tag;
-            };
-
-            const accessibleName = (node) => {
-                if (!node || !node.getAttribute) return '';
-                const labelledBy = clean(node.getAttribute('aria-labelledby'));
-                if (labelledBy) {
-                    const parts = labelledBy.split(/\s+/)
-                        .map((id) => document.getElementById(id))
-                        .filter(Boolean)
-                        .map((n) => clean(n.textContent));
-                    const joined = clean(parts.join(' '));
-                    if (joined) return joined;
-                }
-                const ariaLabel = clean(node.getAttribute('aria-label'));
-                if (ariaLabel) return ariaLabel;
-                const title = clean(node.getAttribute('title'));
-                if (title) return title;
-                const placeholder = clean(node.getAttribute('placeholder'));
-                if (placeholder) return placeholder;
-                const alt = clean(node.getAttribute('alt'));
-                if (alt) return alt;
-                const text = clean(node.textContent);
-                if (text) return text;
-                return '';
-            };
-
-            return { role: implicitRole(el), name: accessibleName(el) };
-        }
-        """
-        role = ""
-        name = ""
-        try:
-            raw = await handle.evaluate(_AX_JS)
-            if isinstance(raw, dict):
-                role = str(raw.get("role") or "").strip().lower()
-                name = str(raw.get("name") or "").strip()
-        except Exception as _xe:
-            logger.debug(f"[RPA] AX JS signature extraction failed (non-fatal): {_xe}")
-
-        return role, name
+    # _get_ax_tree_via_cdp → browser_ax.BrowserAXMixin
+    # _get_accessibility_signature → browser_ax.BrowserAXMixin
 
     def _track_background_task(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -1120,6 +1008,29 @@ class BrowserEnv:
         except Exception:
             pass
 
+    async def _apply_cdp_ua_override(self, page: Page) -> None:
+        """STEALTH-3: drive CDP Emulation.setUserAgentOverride so the JS-side
+        navigator.userAgentData (and workers / cross-origin iframes) advertise
+        the same identity as the header-level UA + Client Hints. Header
+        injection alone never populates navigator.userAgentData, so a spoofed
+        UA with empty/!mismatched high-entropy hints is itself a bot tell.
+        Best-effort: never breaks page registration."""
+        profile = getattr(self, "_stealth_profile", None)
+        if profile is None:
+            return
+        try:
+            from .stealth_profile import build_cdp_ua_override
+        except ImportError:  # pragma: no cover - script/relative import shim
+            from stealth_profile import build_cdp_ua_override  # type: ignore[no-redef]
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send(
+                "Emulation.setUserAgentOverride",
+                build_cdp_ua_override(profile),
+            )
+        except Exception as _ua_err:
+            logger.debug("[STEALTH-3] setUserAgentOverride skipped: %s", _ua_err)
+
     async def _register_page(
         self, page: Page, reason: str = "", activate: bool = True
     ) -> None:
@@ -1129,6 +1040,7 @@ class BrowserEnv:
         page_key = id(page)
         if page_key not in self._registered_pages:
             self._registered_pages.add(page_key)
+            await self._apply_cdp_ua_override(page)
             page.on("response", self._handle_xhr_response)
             page.on("download", self._handle_download)
             page.on(
@@ -1481,9 +1393,15 @@ class BrowserEnv:
                     f"{_sample[:10]}...(共 {len(_sample)} 个)"
                     if len(_sample) > 10 else str(_sample)
                 )
+                _scope_note = (
+                    "（本轮为视口局部 SoM，目标可能在视口外——"
+                    "先用 smooth_scroll 把它移入视口再操作）"
+                    if getattr(self, "_last_som_scope", "full") == "viewport"
+                    else ""
+                )
                 self._last_action_error = ValueError(
                     f"target_id={target_id} 不在本轮 SoM 标记中，疑似幻觉 ID。"
-                    f"有效 ID：{_hint}。"
+                    f"有效 ID：{_hint}。{_scope_note}"
                     "请从截图红框或 @eN 快照中选一个真实存在的编号，"
                     "若页面无合适目标改用 smooth_scroll / press_key / wait。"
                 )
@@ -1688,7 +1606,7 @@ class BrowserEnv:
             selector=synthetic_selector,
         )
 
-    async def start(self, url: str) -> None:
+    async def start(self, url: str, *, user_data_dir_override: str | None = None) -> None:
         """
         启动持久化浏览器上下文并导航到指定 URL。
 
@@ -1697,6 +1615,9 @@ class BrowserEnv:
 
         Args:
             url: 初始页面 URL
+            user_data_dir_override: 跨系统会话隔离用——为目标 system 指定独立
+                Chromium profile 目录，避开 launch_persistent_context 的单实例
+                锁；None 时沿用全局 config.BROWSER_USER_DATA_DIR（默认行为）。
         """
         # 加载 SoM 注入脚本
         self._closed = False
@@ -1707,32 +1628,42 @@ class BrowserEnv:
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
-        # 解析 user_data_dir 路径
-        user_data_path = Path(config.BROWSER_USER_DATA_DIR or (Path(__file__).parent / "browser_data"))
+        # 解析 user_data_dir 路径（cross-system 切换可经 override 给每个 system
+        # 独立 profile，避开 launch_persistent_context 的单实例锁）
+        user_data_path = resolve_user_data_dir(
+            user_data_dir_override,
+            default_base=config.BROWSER_USER_DATA_DIR,
+            packaged_fallback=Path(__file__).parent / "browser_data",
+        )
         user_data_path.mkdir(parents=True, exist_ok=True)
 
         # 启动 Playwright + 持久化 Chromium 上下文
         self._playwright = await async_playwright().start()
 
-        # 伪造真实 Windows Chrome UA，避免 Headless 特征泄露
-        _STEALTH_UA = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
+        # 伪造真实 Windows Chrome UA，避免 Headless 特征泄露。
+        # STEALTH-1: 用真实 Chromium 主版本拼 UA，并让 Sec-CH-UA Client Hints
+        # 与之对齐，避免 UA 谎报版本/平台被 Cloudflare 当作风控信号。
+        try:
+            _chromium_exe = self._playwright.chromium.executable_path
+        except Exception:
+            _chromium_exe = None
+        _stealth_profile = build_profile(_chromium_exe, platform="Windows")
+        _STEALTH_UA = _stealth_profile.user_agent
+        self._stealth_profile = _stealth_profile
 
         logger.info(f"Launching persistent context: {user_data_path.resolve()}")
-        _proxy_cfg = None
-        _proxy_server = str(getattr(config, "PROXY_SERVER", "") or "").strip()
-        if _proxy_server:
-            _proxy_cfg = {"server": _proxy_server}
-            _proxy_user = str(getattr(config, "PROXY_USERNAME", "") or "").strip()
-            _proxy_pass = str(getattr(config, "PROXY_PASSWORD", "") or "").strip()
-            if _proxy_user:
-                _proxy_cfg["username"] = _proxy_user
-            if _proxy_pass:
-                _proxy_cfg["password"] = _proxy_pass
-            logger.info("[BROWSER] proxy enabled: %s", _proxy_server)
+        # proxy: single static (PROXY_SERVER) or rotating chain (PROXY_CHAIN),
+        # resolved by the proxy_chain module so the logic stays out of this
+        # oversized file (workflow section 3); self._proxy_chain is kept for
+        # future re-route-on-block rotation.
+        self._ensure_proxy_chain()
+        _proxy_cfg = self._proxy_chain.current() if self._proxy_chain else None
+        if _proxy_cfg:
+            logger.info(
+                "[BROWSER] proxy enabled: %s (chain=%d)",
+                _proxy_cfg.get("server", ""),
+                len(self._proxy_chain),
+            )
 
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_path.resolve()),
@@ -1769,11 +1700,10 @@ if (!window.chrome) {
     window.chrome = { runtime: {} };
 }
 
-// 3. 伪造 plugins（真实浏览器通常有 3+ 个）
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3],
-    configurable: true,
-});
+// 3. navigator.plugins 不在此手写伪造：playwright_stealth 的 navigator_plugins
+//    evasion（默认开启，apply_stealth_async 注入，生成带 MimeType 的真实
+//    PluginArray）已统一接管。旧整数数组 [1,2,3] 既假又与库双重打补丁，
+//    按 backlog STEALTH-1/2 P2 移除（见 docs/vspider_architecture_backlog.md）。
 
 // 4. 伪造语言列表
 Object.defineProperty(navigator, 'languages', {
@@ -1783,6 +1713,18 @@ Object.defineProperty(navigator, 'languages', {
 """
         await self._context.add_init_script(_STEALTH_INIT_JS)
         logger.info("Stealth init script injected at context level")
+
+        # STEALTH-1: 对齐低熵 Client Hints，使 Sec-CH-UA 版本/平台与上面伪造的
+        # UA 完全一致（Cloudflare 会比对二者，不一致即判风险）。
+        try:
+            await self._context.set_extra_http_headers(_stealth_profile.client_hints)
+            logger.info(
+                "Client Hints aligned to UA (Chrome %d / %s)",
+                _stealth_profile.major,
+                _stealth_profile.platform,
+            )
+        except Exception as _ch_err:
+            logger.debug("set_extra_http_headers (client hints) skipped: %s", _ch_err)
 
         # ── 全局弹窗静默刺客：MutationObserver 自动隐藏常见牛皮癣浮层 ─────────
         # 策略：display:none 而非 remove()，避免触发页面业务 JS 的 DOM 依赖异常。
@@ -2178,6 +2120,69 @@ Object.defineProperty(navigator, 'languages', {
         self._closed = False
         await self.start(url)
 
+    def _ensure_proxy_chain(self):
+        """Build the proxy chain once and cache it (PROXY-4 build-once).
+
+        ``start()`` is re-entered by ``restart()``; rebuilding the chain there
+        would reset rotation state (``_idx`` / quarantine) back to the first
+        proxy, so a reroute-then-restart could never actually switch IPs. Build
+        only when absent so the advanced chain survives a restart. The chain
+        logic itself stays in the ``proxy_chain`` module (workflow §三).
+        """
+        if getattr(self, "_proxy_chain", None) is None:
+            try:
+                from visual_web_agent.proxy_chain import build_chain_from_config
+                self._proxy_chain = build_chain_from_config(config)
+            except Exception:
+                self._proxy_chain = None
+        return self._proxy_chain
+
+    async def reroute_proxy_on_block(
+        self,
+        url: str,
+        *,
+        result=None,
+        state=None,
+        reason: str = "bot challenge",
+    ) -> bool:
+        """Rotate to the next proxy and relaunch when a block warrants it (PROXY-4).
+
+        Consults the pure ``should_rotate_on_challenge`` policy (PROXY-3) over the
+        bot-challenge ``result`` / ``state``. When it says rotate AND a multi-proxy
+        chain is configured, the current proxy is marked failed (advancing to the
+        next healthy one) and the context is ``restart``ed so the relaunch picks up
+        the new proxy via the build-once chain. Returns True iff a reroute happened.
+
+        No-op (returns False) without a usable >1 proxy chain, so single-proxy /
+        no-proxy runs are unaffected. The decision lives in ``proxy_chain``; this
+        thin method is the only browser-substrate touch (workflow §三).
+        """
+        try:
+            from visual_web_agent.proxy_chain import should_rotate_on_challenge
+        except Exception:
+            return False
+        chain = getattr(self, "_proxy_chain", None)
+        if chain is None or len(chain) < 2:
+            return False
+        if not should_rotate_on_challenge(result, state):
+            return False
+        # PROXY-4b: bound reroutes per run so a permanently-flagged target can't
+        # spin the whole chain endlessly (state carries reroute_count + cap).
+        max_reroute = getattr(state, "max_reroute_per_run", None)
+        if max_reroute is not None and int(getattr(state, "reroute_count", 0) or 0) >= int(max_reroute):
+            return False
+        before = (chain.current() or {}).get("server", "")
+        chain.mark_failed()
+        if state is not None and hasattr(state, "reroute_count"):
+            try:
+                state.reroute_count += 1
+            except Exception:
+                pass
+        after = (chain.current() or {}).get("server", "")
+        logger.warning("[PROXY] reroute on block (%s): %s -> %s", reason, before, after)
+        await self.restart(url, reason=f"proxy reroute: {reason}")
+        return True
+
     async def refresh_auth_sentinel(self) -> str:
         """
         Run generic auth-surface detection and build a prompt note.
@@ -2307,161 +2312,23 @@ Object.defineProperty(navigator, 'languages', {
         except Exception:
             return False  # 检测失败时不干预，让 VLM 自己判断
 
-    @staticmethod
-    def _format_som_element(el: dict) -> str:
-        """
-        将 SoM v6 单条元素字典格式化为标准化描述行。
 
-        输出格式：
-          [ID: 15] Role: button, Name: "提交表单", State: disabled | type=submit | 关联信息: ...
+    # _format_som_element -> browser_som.BrowserSoMMixin
+    # _screenshot_looks_visually_blank -> browser_som.BrowserSoMMixin
+    # _should_reload_visual_blank -> browser_som.BrowserSoMMixin
 
-        兼容 v5：如果缺少 role/name/state 字段，回退到 tag+text 格式。
-        """
-        eid = el.get("id", "?")
-        role = (el.get("role") or el.get("tag") or "?").strip()
-        name = (el.get("name") or el.get("text") or "").strip()
-        state_str = (el.get("state") or "").strip()
-
-        # 主体行：[ID: N] Role: xxx, Name: "yyy", State: zzz
-        parts = [f"Role: {role}"]
-        if name:
-            parts.append(f'Name: "{name[:80]}"')
-        if state_str:
-            parts.append(f"State: {state_str}")
-
-        line = f"[ID: {eid}] " + ", ".join(parts)
-
-        # 附加 inputDesc
-        desc = (el.get("inputDesc") or "").strip()
-        if desc:
-            line += f" | {desc}"
-
-        # 附加 parentContext
-        parent_ctx = (el.get("parentContext") or "").strip()
-        if parent_ctx:
-            line += f" | 关联信息: {parent_ctx}"
-
-        # 风险提示：语音/拍照/扫码等辅助入口
-        risk_text = " ".join(part for part in (name, desc, parent_ctx) if part)
-        if re.search(
-            r"语音|麦克风|microphone|voice|camera|相机|拍照|图片搜索|以图搜图|扫码|扫一扫|lens",
-            risk_text,
-            flags=re.IGNORECASE,
-        ):
-            line += (
-                " | 风险提示: 语音/拍照/扫码等辅助入口，"
-                "除非目标明确要求，否则不要优先点击"
-            )
-
-        return line
-
-    def _screenshot_looks_visually_blank(self, screenshot_bytes: bytes) -> tuple[bool, str]:
-        """Heuristic visual blank detector for pages whose DOM exists but paint is white.
-
-        It intentionally detects only extreme cases. Many real sites use white
-        backgrounds, so this is combined with DOM text checks before reloading.
-        """
-        try:
-            import io
-            from PIL import Image
-        except Exception:
-            return False, "Pillow unavailable"
-
-        try:
-            with Image.open(io.BytesIO(screenshot_bytes)) as img:
-                rgb = img.convert("RGB")
-                width, height = rgb.size
-                if width <= 0 or height <= 0:
-                    return False, "invalid image size"
-
-                # Sample every N pixels instead of scanning the whole bitmap.
-                step = max(1, int(((width * height) / 12000) ** 0.5))
-                total = 0
-                near_white = 0
-                dark_or_colored = 0
-                content_total = 0
-                content_near_white = 0
-                content_signal = 0
-                content_y_start = min(height - 1, max(80, int(height * 0.18)))
-                # Ignore the first 80px less aggressively by still sampling it;
-                # navigation bars are useful but should not hide a blank body.
-                for y in range(0, height, step):
-                    for x in range(0, width, step):
-                        r, g, b = rgb.getpixel((x, y))
-                        total += 1
-                        if r >= 245 and g >= 245 and b >= 245:
-                            near_white += 1
-                        if min(r, g, b) < 180 or (max(r, g, b) - min(r, g, b)) > 35:
-                            dark_or_colored += 1
-                        if y >= content_y_start and x < width - 24:
-                            content_total += 1
-                            if r >= 245 and g >= 245 and b >= 245:
-                                content_near_white += 1
-                            if min(r, g, b) < 180 or (max(r, g, b) - min(r, g, b)) > 35:
-                                content_signal += 1
-
-                if total == 0:
-                    return False, "empty sample"
-                white_ratio = near_white / total
-                signal_ratio = dark_or_colored / total
-                content_white_ratio = (
-                    content_near_white / content_total if content_total else 0.0
-                )
-                content_signal_ratio = (
-                    content_signal / content_total if content_total else 1.0
-                )
-                is_blank = (
-                    (white_ratio >= 0.78 and signal_ratio <= 0.12)
-                    or (content_white_ratio >= 0.88 and content_signal_ratio <= 0.06)
-                )
-                return (
-                    is_blank,
-                    f"white_ratio={white_ratio:.2f}, signal_ratio={signal_ratio:.2f}, "
-                    f"content_white={content_white_ratio:.2f}, "
-                    f"content_signal={content_signal_ratio:.2f}, sample={total}",
-                )
-        except Exception as e:
-            return False, f"visual blank probe failed: {e}"
-
-    async def _should_reload_visual_blank(
-        self,
-        page: Page,
-        screenshot_bytes: bytes,
-        total_elements: int,
-    ) -> tuple[bool, str]:
-        looks_blank, visual_reason = self._screenshot_looks_visually_blank(screenshot_bytes)
-        if not looks_blank:
-            return False, visual_reason
-
-        try:
-            stats = await page.evaluate(
-                """() => ({
-                    bodyTextLength: (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().length,
-                    readyState: document.readyState,
-                    title: document.title || '',
-                    url: location.href
-                })"""
-            )
-        except Exception as e:
-            return False, f"{visual_reason}; dom probe failed: {e}"
-
-        body_len = int((stats or {}).get("bodyTextLength") or 0)
-        ready = str((stats or {}).get("readyState") or "")
-        if body_len < 500:
-            return False, f"{visual_reason}; bodyText={body_len}, readyState={ready}"
-
-        # If SoM marked many visible elements, it may simply be a white-themed page.
-        if total_elements > 20:
-            return False, f"{visual_reason}; bodyText={body_len}, som={total_elements}"
-
-        return True, f"{visual_reason}; bodyText={body_len}, som={total_elements}, readyState={ready}"
-
-    async def mark_and_screenshot(self, step: int = 0) -> tuple[str, str]:
+    async def mark_and_screenshot(self, step: int = 0, *, scope="viewport") -> tuple[str, str]:
         """
         注入 SoM 标记脚本并截取全屏截图。
+
+        Args:
+            step: 当前回合编号（截图文件名 / 日志）。
+            scope: SoM 选区（E2 局部 SoM）。``"viewport"``（默认，只标视口内元素）
+                / ``"full"``（全页，含折叠下方）/ ``{"selector": "..."}``（只标容器子树）。
         Returns:
             (screenshot_b64, input_descriptions)
         """
+        _scope_label = "selector" if isinstance(scope, dict) else str(scope or "viewport")
         page = await self._ensure_active_page(reason="before screenshot")
         if not page:
             raise RuntimeError("No active page available for screenshot.")
@@ -2515,7 +2382,7 @@ Object.defineProperty(navigator, 'languages', {
         _som_t0 = time.time()
         for frame in frames_to_eval:
             try:
-                result = await frame.evaluate(self._som_js, current_id)
+                result = await frame.evaluate(self._som_js, {"startIndex": current_id, "scope": scope})
                 if result and isinstance(result, dict):
                     injected_frames += 1
                     current_id = result.get('nextId', current_id)
@@ -2533,6 +2400,8 @@ Object.defineProperty(navigator, 'languages', {
 
         # 缓存本轮 SoM 结果，供翻页引导等后续逻辑查找特定元素
         self._last_som_elements = all_som_elements
+        # E2：记录本轮选区，供 target_id 幻觉校验补「视口外」提示
+        self._last_som_scope = _scope_label
 
         # H1 性能记账：常态 INFO，慢页 / 重页升级 WARN，并通过 broadcast_phase
         # 把数据推给前端（让大页面的 perf 问题立刻可见）。
@@ -2603,7 +2472,7 @@ Object.defineProperty(navigator, 'languages', {
 
                 for frame in frames_to_eval:
                     try:
-                        result = await frame.evaluate(self._som_js, current_id)
+                        result = await frame.evaluate(self._som_js, {"startIndex": current_id, "scope": scope})
                         if result and isinstance(result, dict):
                             injected_frames += 1
                             current_id = result.get("nextId", current_id)
@@ -2752,184 +2621,9 @@ Object.defineProperty(navigator, 'languages', {
 
         return screenshot_b64, desc_text
 
-    async def assess_page_complexity(self) -> tuple[bool, str]:
-        """
-        视口感知嗅探器：注入轻量 JS 评估当前可视区域的页面复杂度，
-        决定本步应使用"极速纯文本降级模式"还是"高精度视觉模式"。
+    # assess_page_complexity -> browser_som.BrowserSoMMixin
 
-        Returns:
-            (is_simple_page, reason)
-              is_simple_page=True  → 页面简单，走纯文本模式
-              is_simple_page=False → 页面复杂，走视觉截图模式
-        """
-        page = await self._ensure_active_page(reason="before assess_page_complexity")
-        if not page:
-            return False, "无活跃页面，兜底走视觉模式"
-
-        sniffer_js = """
-        () => {
-            // 1. 检查可视区域内是否存在大面积 Canvas / SVG（图表、画布类应用）
-            const mediaElements = document.querySelectorAll('canvas, svg');
-            let hasComplexMedia = false;
-            for (let el of mediaElements) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width * rect.height > 40000) {
-                    hasComplexMedia = true;
-                    break;
-                }
-            }
-
-            // 2. 只统计当前屏幕可视区域内的交互元素数量（视口过滤）
-            const interactives = document.querySelectorAll(
-                'input, button, a, select, textarea, [role="button"]'
-            );
-            let visibleCount = 0;
-            const wh = window.innerHeight || document.documentElement.clientHeight;
-            const ww = window.innerWidth  || document.documentElement.clientWidth;
-
-            for (let el of interactives) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 &&
-                    rect.top <= wh && rect.bottom >= 0 &&
-                    rect.left <= ww && rect.right  >= 0) {
-                    visibleCount++;
-                }
-            }
-
-            return { hasComplexMedia: hasComplexMedia, elementCount: visibleCount };
-        }
-        """
-        try:
-            stats = await page.evaluate(sniffer_js)
-
-            # 条件 1：存在大型图表/画布，纯文本模式无法感知，必须走视觉
-            if stats["hasComplexMedia"]:
-                return False, f"检测到大面积图表/画布渲染"
-
-            # 条件 2：可视交互元素超过黄金阈值 60，SoM 标注密集易重叠，必须走视觉
-            if stats["elementCount"] > 60:
-                return False, f"可视区交互元素过多 ({stats['elementCount']} 个)"
-
-            # 条件 3：结构简单，走极速纯文本降级模式
-            return True, f"页面结构简单 (可视元素 {stats['elementCount']} 个)"
-
-        except Exception as e:
-            # 嗅探异常时保守兜底：走视觉模式，避免盲目降级
-            logger.warning(f"[COMPLEXITY] 嗅探异常，兜底走视觉模式: {e}")
-            return False, f"嗅探异常兜底: {e}"
-
-    async def detect_blank_content_shell(self) -> tuple[bool, str]:
-        """
-        检测"导航还在，但正文区几乎空白"的壳页状态。
-        这类页面常见于内容区加载失败、错误跳转到空壳首页、或站点短暂渲染异常。
-
-        冷静期守门员（防止误伤 Bing/Google 等结果页正在渲染的场景）：
-          1. 必须 document.readyState === 'complete'
-          2. 优先等 networkidle（最多 5s）
-          3. 首次采样"空"后，等 4s 再重采一次；仍然空才判定壳页
-          4. 两次采样都要跨过 readyState=complete 才计数
-        """
-        page = await self._ensure_active_page(reason="before detect_blank_content_shell")
-        if not page:
-            return False, "no active page"
-
-        # ── 冷静期守门：给页面充分渲染时间，避免抢跑判空 ─────────────────────
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=3000)
-        except Exception:
-            pass
-        try:
-            await page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass  # 长连接页面永远不会 idle，允许继续
-
-        js = """
-        () => {
-            function isVisible(el) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) return false;
-                const cs = window.getComputedStyle(el);
-                if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') <= 0.01) {
-                    return false;
-                }
-                return true;
-            }
-
-            const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
-            const blocks = document.querySelectorAll(
-                'main, article, section, #content, .content, .main, .container, .wrapper, h1, h2, h3, p, li, td, div'
-            );
-
-            let meaningfulBlocks = 0;
-            let maxContentTextLength = 0;
-            for (const el of blocks) {
-                if (!isVisible(el)) continue;
-                if (el.closest('header, nav, footer, [role="navigation"]')) continue;
-                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-                if (text.length >= 8) meaningfulBlocks++;
-                if (text.length > maxContentTextLength) maxContentTextLength = text.length;
-            }
-
-            return {
-                bodyTextLength: bodyText.length,
-                meaningfulBlocks,
-                maxContentTextLength,
-                readyState: document.readyState,
-                title: document.title || ''
-            };
-        }
-        """
-
-        def _eval_stats(raw: dict) -> tuple[int, int, int, str]:
-            return (
-                int(raw.get("bodyTextLength", 0) or 0),
-                int(raw.get("meaningfulBlocks", 0) or 0),
-                int(raw.get("maxContentTextLength", 0) or 0),
-                str(raw.get("readyState", "") or ""),
-            )
-
-        try:
-            stats = await page.evaluate(js)
-        except Exception as e:
-            return False, f"detection failed: {e}"
-
-        body_len, block_count, max_text, ready_state = _eval_stats(stats)
-
-        # 页面尚未 complete → 一律视为非空壳（让 loading 继续，不要误杀）
-        if ready_state != "complete":
-            logger.debug(
-                f"[assess] readyState={ready_state!r}，尚未 complete，跳过空壳判定"
-            )
-            return False, f"readyState={ready_state}, bodyText={body_len}, blocks={block_count}"
-
-        # 第一次采样判为"疑似空" → 延长冷静期 4 秒再采一次
-        # 必须两次采样都空才算真空壳（屏蔽渲染中间态）
-        is_blank_first = body_len < 180 and block_count < 8 and max_text < 120
-        if is_blank_first:
-            logger.debug(
-                f"[assess] 首采判疑似空壳 (bodyText={body_len}, blocks={block_count}, "
-                f"maxBlock={max_text})，延长 4 秒冷静期后二次采样..."
-            )
-            await asyncio.sleep(4)
-            try:
-                stats2 = await page.evaluate(js)
-                body_len, block_count, max_text, ready_state = _eval_stats(stats2)
-                logger.debug(
-                    f"[assess] 二采结果: bodyText={body_len}, blocks={block_count}, "
-                    f"maxBlock={max_text}, readyState={ready_state}"
-                )
-            except Exception:
-                pass
-
-            if ready_state != "complete":
-                return False, (
-                    f"readyState regressed to {ready_state} after wait; "
-                    f"bodyText={body_len}, blocks={block_count}"
-                )
-
-        is_blank = body_len < 180 and block_count < 8 and max_text < 120
-        reason = f"bodyText={body_len}, blocks={block_count}, maxBlockText={max_text}"
-        return is_blank, reason
+    # detect_blank_content_shell -> browser_som.BrowserSoMMixin
 
     async def extract_text_dom(self) -> str:
         """
@@ -3108,78 +2802,8 @@ Object.defineProperty(navigator, 'languages', {
     # AX Tree 相比 HTML DOM 的优势：过滤 style/script/class 等视觉噪音，
     # 天然只保留语义节点，Token 消耗显著降低。
 
-    @staticmethod
-    def _flatten_ax_tree_for_extract(
-        node: dict, out: list[str], depth: int = 0, max_depth: int = 15,
-    ) -> None:
-        """
-        递归扁平化 AX Tree 节点为纯语义文本行（专用于数据提取）。
-
-        与 _flatten_ax_tree() 的区别：
-        - 不输出 Role/State 等交互属性标签，只保留 name/value 纯文本
-        - 更深的递归层数（15 层 vs 12 层），确保不遗漏嵌套内容
-        - 去重：连续重复的文本行不重复输出
-        """
-        if not isinstance(node, dict) or depth > max_depth:
-            return
-
-        name = (node.get("name") or "").strip()
-        value = (node.get("value") or "").strip()
-
-        # 只输出有语义内容的节点
-        text = name or value
-        if text:
-            line = "  " * min(depth, 4) + text[:200]
-            # 去重：避免父子节点的 name 完全相同导致重复行
-            if not out or out[-1].strip() != line.strip():
-                out.append(line)
-
-        for child in node.get("children") or []:
-            BrowserEnv._flatten_ax_tree_for_extract(child, out, depth + 1, max_depth)
-
-    async def extract_page_text_via_ax_tree(self) -> str:
-        """
-        通过无障碍树 (AX Tree) 提取页面全部语义文本（专用于数据提取场景）。
-
-        相比 document.body.innerText 的优势：
-        - 天然过滤 script/style/class/广告脚本等噪音
-        - 只保留语义节点的纯文本内容
-        - 覆盖全页（不受视口限制）
-        - 结构化缩进保留层级关系
-
-        相比截图 + VLM 的优势：
-        - 不受 1280×800 视口限制，一次拿到整页 20+ 条数据
-        - 纯文本 token 效率远高于图片
-
-        Returns:
-            页面语义文本（纯文本，无 Role/State 标签），最大 16000 字符。
-            失败时返回空字符串。
-        """
-        page = await self._ensure_active_page(reason="ax tree extraction for data")
-        if not page:
-            return ""
-
-        try:
-            # interesting_only=False 获取更完整的语义树
-            # 包括 StaticText 等纯文本节点，确保列表数据不遗漏
-            ax_root = await self._get_ax_tree_via_cdp(page, interesting_only=False)
-            if not ax_root:
-                logger.warning("[AX Extract] accessibility.snapshot 返回空")
-                return ""
-
-            lines: list[str] = []
-            self._flatten_ax_tree_for_extract(ax_root, lines)
-
-            text = "\n".join(lines)
-            logger.info(
-                f"[AX Extract] 从 AX Tree 提取 {len(lines)} 行语义文本 "
-                f"({len(text)} 字符)"
-            )
-            return text[:16000]
-
-        except Exception as e:
-            logger.warning(f"[AX Extract] AX Tree 提取失败: {e}")
-            return ""
+    # _flatten_ax_tree_for_extract → browser_ax.BrowserAXMixin
+    # extract_page_text_via_ax_tree → browser_ax.BrowserAXMixin
 
     async def probe_data_shape(self) -> dict:
         """Lightweight DOM probe used to route extraction without prompt keywords."""
@@ -3264,251 +2888,8 @@ Object.defineProperty(navigator, 'languages', {
             logger.debug("[DATA SHAPE] probe failed: %s", e)
             return {}
 
-    @staticmethod
-    def _flatten_ax_tree(
-        node: dict, out: list[str], depth: int = 0, max_depth: int = 12
-    ) -> None:
-        """递归扁平化 Playwright AX 快照节点为缩进文本行。"""
-        if not isinstance(node, dict) or depth > max_depth:
-            return
-
-        role = (node.get("role") or "").strip()
-        name = (node.get("name") or "").strip()
-        value = (node.get("value") or "").strip()
-        description = (node.get("description") or "").strip()
-
-        # 过滤规则：role 为 RootWebArea/generic/none 且无 name/value/desc 的纯容器节点
-        # 不输出，但子节点继续递归（保留语义深度不破坏）。
-        is_noise_container = (
-            role in ("RootWebArea", "generic", "none", "") and not (name or value or description)
-        )
-
-        if not is_noise_container:
-            parts = [f"Role: {role or '?'}"]
-            if name:
-                parts.append(f'Name: "{name[:80]}"')
-            if value:
-                parts.append(f'Value: "{value[:40]}"')
-            if description and description != name:
-                parts.append(f'Desc: "{description[:60]}"')
-
-            states: list[str] = []
-            if node.get("disabled"):
-                states.append("disabled")
-            checked = node.get("checked")
-            if checked in (True, "true", "mixed"):
-                states.append(f"checked={checked}")
-            expanded = node.get("expanded")
-            if expanded in (True, False, "true", "false"):
-                states.append(f"expanded={expanded}")
-            if node.get("focused"):
-                states.append("focused")
-            if node.get("required"):
-                states.append("required")
-            if node.get("selected"):
-                states.append("selected")
-            if states:
-                parts.append(f"State: {','.join(states)}")
-
-            out.append("  " * depth + ", ".join(parts))
-
-        # 噪音容器不加深度，避免层级被 generic 不必要地拉深
-        next_depth = depth if is_noise_container else depth + 1
-        for child in node.get("children") or []:
-            BrowserEnv._flatten_ax_tree(child, out, next_depth, max_depth)
-
-    async def extract_accessibility_tree(self) -> str:
-        """
-        提取页面的无障碍语义树，用作 VLM 图文融合决策的文本侧输入。
-
-        前置条件：与旧版 extract_text_dom 相同，调用前 mark_and_screenshot 需已完成，
-        确保 [data-som-id] 已注入 —— 只有这样 ID 映射段才能拿到红框一一对应的编号。
-
-        Returns:
-            多行字符串，由两段组成：
-              [交互元素 (SoM ID 映射)]  ← 每行一个 `[ID: N] Role/Name/Value/State`
-              [页面语义快照 (AX Tree)]  ← Playwright accessibility.snapshot 的缩进平铺
-            若两段都空，返回 ""（调用方负责降级）。
-        """
-        page = await self._ensure_active_page(reason="before extract_accessibility_tree")
-        if not page:
-            raise RuntimeError("No active page available for AX tree extraction.")
-
-        await self._wait_for_page_stable()
-        await self._dismiss_permission_surfaces(reason="before ax tree extraction")
-
-        # ── [A] ID 映射段：按 ARIA 规范从 DOM 属性推导 role/name ──
-        # 不调用 `accessibility.snapshot(root=handle)` 的原因：每元素一次 CDP 往返，
-        # 50 个元素 ≈ 50 次 round-trip。这里一次 page.evaluate 批量搞定。
-        _ID_MAP_JS = r"""
-(() => {
-    const marked = Array.from(document.querySelectorAll('[data-som-id]'));
-    marked.sort((a, b) => {
-        const ai = parseInt(a.getAttribute('data-som-id'), 10);
-        const bi = parseInt(b.getAttribute('data-som-id'), 10);
-        return (isNaN(ai) ? 0 : ai) - (isNaN(bi) ? 0 : bi);
-    });
-
-    function deriveRole(el) {
-        const explicit = el.getAttribute('role');
-        if (explicit) return explicit.trim();
-        const tag = el.tagName.toLowerCase();
-        if (tag === 'a' && el.hasAttribute('href')) return 'link';
-        if (tag === 'button') return 'button';
-        if (tag === 'input') {
-            const t = (el.getAttribute('type') || 'text').toLowerCase();
-            if (['button', 'submit', 'reset'].includes(t)) return 'button';
-            if (t === 'checkbox') return 'checkbox';
-            if (t === 'radio') return 'radio';
-            if (t === 'search') return 'searchbox';
-            if (t === 'range') return 'slider';
-            return 'textbox';
-        }
-        if (tag === 'textarea') return 'textbox';
-        if (tag === 'select') return 'combobox';
-        if (el.isContentEditable) return 'textbox';
-        return tag;
-    }
-
-    function deriveName(el) {
-        const ariaLabelledBy = el.getAttribute('aria-labelledby');
-        if (ariaLabelledBy) {
-            const parts = ariaLabelledBy.split(/\s+/)
-                .map(id => document.getElementById(id))
-                .filter(Boolean)
-                .map(n => (n.textContent || '').trim());
-            const joined = parts.join(' ').trim();
-            if (joined) return joined;
-        }
-        const ariaLabel = el.getAttribute('aria-label');
-        if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
-        const title = el.getAttribute('title');
-        if (title && title.trim()) return title.trim();
-        const placeholder = el.getAttribute('placeholder');
-        if (placeholder && placeholder.trim()) return placeholder.trim();
-        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        if (txt) return txt;
-        const alt = el.getAttribute('alt');
-        if (alt && alt.trim()) return alt.trim();
-        return '';
-    }
-
-    return marked.map(el => ({
-        id: el.getAttribute('data-som-id'),
-        role: deriveRole(el),
-        name: deriveName(el).slice(0, 80),
-        value: (el.value !== undefined && el.value !== null && String(el.value).trim())
-            ? String(el.value).slice(0, 40) : '',
-        disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
-        checked: el.getAttribute('aria-checked') === 'true' || el.checked === true,
-        selected: el.selected === true || el.getAttribute('aria-selected') === 'true',
-        expanded: el.getAttribute('aria-expanded'),
-        required: el.required === true || el.getAttribute('aria-required') === 'true',
-        readonly: el.readOnly === true || el.getAttribute('aria-readonly') === 'true',
-    }));
-})()
-"""
-        id_rows: list[dict] = []
-        try:
-            raw = await page.evaluate(_ID_MAP_JS)
-            if isinstance(raw, list):
-                id_rows = [r for r in raw if isinstance(r, dict) and r.get("id")]
-        except Exception as e:
-            logger.debug(f"[AX Tree] ID 映射段提取失败: {e}")
-
-        # 可交互角色白名单：只把这些角色写进 @eN 紧凑快照（VLM 决策用）。
-        # 其它如 heading/text/img/generic 等落入第二段 AX Tree 作上下文。
-        _INTERACTIVE_ROLES = {
-            "button", "link", "textbox", "searchbox", "combobox",
-            "checkbox", "radio", "switch", "slider",
-            "tab", "menuitem", "menuitemcheckbox", "menuitemradio",
-            "option", "treeitem",
-        }
-
-        # 每轮刷新 @eN 映射；ID 采用 SoM 序号，与截图红框数字同源。
-        self.element_mapping.clear()
-        compact_lines: list[str] = []
-        for row in id_rows:
-            role = (row.get("role") or "").strip().lower()
-            if role not in _INTERACTIVE_ROLES:
-                continue
-            try:
-                som_id_int = int(row["id"])
-            except (TypeError, ValueError):
-                continue
-            ref = f"@e{som_id_int}"
-            name = (row.get("name") or "").strip()
-            value = (row.get("value") or "").strip()
-            states: list[str] = []
-            if row.get("disabled"):
-                states.append("disabled")
-            if row.get("checked"):
-                states.append("checked")
-            if row.get("selected"):
-                states.append("selected")
-            expanded = row.get("expanded")
-            if expanded in ("true", "false"):
-                states.append(f"expanded={expanded}")
-            if row.get("required"):
-                states.append("required")
-            if row.get("readonly"):
-                states.append("readonly")
-
-            parts = [ref, f"[{role or '?'}]"]
-            if name:
-                parts.append(f'"{name}"')
-            if value:
-                parts.append(f'value="{value}"')
-            if states:
-                parts.append("{" + ",".join(states) + "}")
-            compact_lines.append(" ".join(parts))
-            self.element_mapping[ref] = {
-                "som_id": som_id_int,
-                "role": role,
-                "name": name,
-                "selector": f'[data-som-id="{som_id_int}"]',
-            }
-
-        # ── [B] 页面语义快照段：CDP AX Tree ──
-        ax_lines: list[str] = []
-        try:
-            ax_root = await self._get_ax_tree_via_cdp(page, interesting_only=True)
-            if ax_root:
-                self._flatten_ax_tree(ax_root, ax_lines, depth=0, max_depth=12)
-        except Exception as e:
-            logger.debug(f"[AX Tree] CDP snapshot 失败，跳过语义段: {e}")
-
-        # 语义段上限 120 行（避免长页面 AX Tree 撑爆 Token；ID 映射段不限）
-        MAX_SEMANTIC_LINES = 120
-        truncated_semantic = ax_lines[:MAX_SEMANTIC_LINES]
-
-        sections: list[str] = []
-        if compact_lines:
-            sections.append(
-                "【可交互元素 (@eN 语义快照)】\n"
-                "格式：@eN [role] \"name\" value=\"...\" {states}；@eN 中的数字 = 截图红框序号。\n"
-                "操作时 target_id 直接填这个数字（如 @e5 → target_id=5）。\n"
-                + "\n".join(compact_lines)
-            )
-        if truncated_semantic:
-            hint = ""
-            if len(ax_lines) > MAX_SEMANTIC_LINES:
-                hint = f"\n...[AX Tree 过长，已截断 {len(ax_lines) - MAX_SEMANTIC_LINES} 行]..."
-            sections.append(
-                "【页面语义快照 (AX Tree)】\n" + "\n".join(truncated_semantic) + hint
-            )
-
-        if not sections:
-            logger.warning(
-                "[AX Tree] @eN 映射段与语义段均为空；mark_and_screenshot 可能未注入 data-som-id"
-            )
-            return ""
-
-        logger.info(
-            f"[AX Tree] Emitted {len(compact_lines)} @eN refs + "
-            f"{len(truncated_semantic)}/{len(ax_lines)} semantic lines"
-        )
-        return "\n\n".join(sections)
+    # _flatten_ax_tree → browser_ax.BrowserAXMixin
+    # extract_accessibility_tree → browser_ax.BrowserAXMixin
 
     # 元素定位超时：改短以 fail fast，页面已刷新时不再苦等
     _LOCATOR_TIMEOUT = 3000
@@ -3698,6 +3079,7 @@ Object.defineProperty(navigator, 'languages', {
             page=page,
             rpa_required_keys=rpa_required_keys,
             rpa_template_value=rpa_template_value,
+            session_router=getattr(self, "_session_router", None),
         )
         try:
             handler_result = await handler.execute(ctx)
@@ -4062,7 +3444,12 @@ Object.defineProperty(navigator, 'languages', {
             
             print(f"\n✅ [底层拦截] 成功拦截文件下载并静默保存至: \033[36m{final_path.resolve()}\033[0m\n")
             logger.info(f"[DOWNLOAD INTERCEPT] Saved native file: {final_path.resolve()}")
-            register_artifact(final_path)
+            register_download_artifact(
+                final_path,
+                source_url=str(getattr(download, "url", "") or ""),
+                produced_by="browser_download",
+                step_id="native_download",
+            )
         except Exception as e:
             logger.error(f"[DOWNLOAD INTERCEPT] Failed to save file: {e}")
 
@@ -4071,29 +3458,33 @@ Object.defineProperty(navigator, 'languages', {
     def configure_interceptor(
         self,
         enabled: bool = True,
-        filename: str = "output.xlsx",
+        filename: str = "output",
         unique_key: str | list[str] = None,
         min_list_size: int = 5,
         url_pattern: str | None = None,
+        output_contract: dict | None = None,
     ) -> None:
         """
         配置 XHR/Fetch 拦截器参数。
 
         Args:
             enabled:     是否启用通用拦截（--xhr 参数控制）
-            filename:    通用拦截数据保存的 Excel 文件名
+            filename:    通用拦截数据保存的文件名（后缀随容器改写）
             unique_key:  去重字段（如 "id"）
             min_list_size: 启发式探测阈值——JSON 中列表长度 >= 此值才认为是数据
             url_pattern: 精准截胡关键词（子串匹配）。
                          匹配到此关键词的响应 URL 会触发"主引擎"分支：
                          数据存入 self._intercepted_data，main.py 检测后直接保存跳过 VLM。
                          独立于 enabled，即使 enabled=False 也可单独启用精准截胡。
+            output_contract: 本次 run 的 output_contract.v1 dict；决定拦截数据
+                         的落盘容器（xlsx/csv/jsonl），缺省时落 jsonl（不默认 xlsx）。
         """
         self._intercept_enabled = enabled
         self._intercept_filename = filename
         self._intercept_unique_key = unique_key
         self._intercept_min_list_size = min_list_size
         self._intercept_url_pattern = url_pattern.strip() if url_pattern else None
+        self._intercept_output_contract = dict(output_contract) if isinstance(output_contract, dict) else None
         # 每次重新配置时清空上次缓存，防止旧数据触发误判
         self._intercepted_data = None
         self._intercept_seen_row_keys.clear()
@@ -4104,6 +3495,11 @@ Object.defineProperty(navigator, 'languages', {
             f"file={filename} | unique_key={unique_key} | "
             f"min_list={min_list_size} | url_pattern={self._intercept_url_pattern!r}"
         )
+
+    def set_interceptor_output_contract(self, output_contract: dict | None) -> None:
+        """Refresh the run's output_contract after late goal inference,
+        without resetting dedup state the way configure_interceptor does."""
+        self._intercept_output_contract = dict(output_contract) if isinstance(output_contract, dict) else None
 
     def configure_network_intelligence(self, run_id: str | None) -> None:
         """Enable per-run network candidate indexing.
@@ -4231,6 +3627,7 @@ Object.defineProperty(navigator, 'languages', {
                             json_list=new_rows,
                             filename=self._intercept_filename,
                             unique_key=self._intercept_unique_key,
+                            output_contract=self._intercept_output_contract,
                         )
                         self._intercept_count += len(new_rows)
                     except Exception as save_err:
@@ -4289,51 +3686,29 @@ Object.defineProperty(navigator, 'languages', {
             f"score={score} fp={fingerprint[:80]} from: {url[:120]}..."
         )
 
-        # 保存到 Excel
+        # 按 output_contract 容器保存（无契约时落 jsonl，不默认 xlsx）
         try:
             save_intercepted_data(
                 json_list=new_rows,
                 filename=self._intercept_filename,
                 unique_key=self._intercept_unique_key,
+                output_contract=self._intercept_output_contract,
             )
             self._intercept_count += len(new_rows)
         except Exception as e:
             logger.error(f"[XHR INTERCEPT] Failed to save data: {e}")
 
     def _stable_json_hash(self, value) -> str:
-        raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        return stable_json_hash(value)
 
     def _row_dedup_key(self, row: dict) -> str:
-        if self._intercept_unique_key:
-            keys = (
-                [self._intercept_unique_key]
-                if isinstance(self._intercept_unique_key, str)
-                else list(self._intercept_unique_key)
-            )
-            values = [row.get(k) for k in keys if k in row and row.get(k) not in (None, "")]
-            if values:
-                return "key:" + self._stable_json_hash(values)
-        return "hash:" + self._stable_json_hash(row)
+        return row_dedup_key(row, self._intercept_unique_key)
 
     def _dedupe_intercept_rows(self, rows: list[dict]) -> list[dict]:
-        new_rows: list[dict] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            key = self._row_dedup_key(row)
-            if key in self._intercept_seen_row_keys:
-                continue
-            self._intercept_seen_row_keys.add(key)
-            new_rows.append(row)
-        return new_rows
+        return dedupe_intercept_rows(rows, self._intercept_unique_key, self._intercept_seen_row_keys)
 
     def _schema_fingerprint(self, rows: list[dict]) -> str:
-        key_set: set[str] = set()
-        for row in rows[:5]:
-            if isinstance(row, dict):
-                key_set.update(str(k) for k in row.keys())
-        return "|".join(sorted(key_set))
+        return schema_fingerprint(rows)
 
     def _remember_intercept_schema(self, rows: list[dict]) -> None:
         fp = self._schema_fingerprint(rows)
@@ -4341,106 +3716,15 @@ Object.defineProperty(navigator, 'languages', {
             self._intercept_schema_fingerprints.add(fp)
 
     def _score_intercept_candidate(self, url: str, rows: list[dict]) -> tuple[int, str]:
-        fingerprint = self._schema_fingerprint(rows)
-        if not fingerprint:
-            return 0, ""
-
-        score = 0
-        row_count = len(rows)
-        keys = set(fingerprint.split("|"))
-        lower_url = (url or "").lower()
-
-        if row_count >= self._intercept_min_list_size:
-            score += 2
-        if row_count >= 20:
-            score += 2
-        if row_count >= 50:
-            score += 1
-
-        url_markers = (
-            "api", "ajax", "xhr", "search", "query", "list", "page", "record",
-            "item", "order", "table", "data", "result", "export",
+        return score_intercept_candidate(
+            url, rows,
+            min_list_size=self._intercept_min_list_size,
+            schema_fingerprints=self._intercept_schema_fingerprints,
+            endpoint_scores=self._intercept_endpoint_scores,
         )
-        if any(marker in lower_url for marker in url_markers):
-            score += 2
-
-        business_keys = {
-            "id", "uuid", "uid", "url", "link", "title", "name", "price", "amount",
-            "date", "time", "status", "type", "code", "no", "number", "order_id",
-            "created_at", "updated_at",
-        }
-        if keys & business_keys:
-            score += 2
-        if len(keys) >= 3:
-            score += 1
-
-        if fingerprint in self._intercept_schema_fingerprints:
-            score += 5
-
-        noise_keys = {
-            "children", "routes", "menus", "permissions", "locale", "i18n",
-            "config", "settings", "schema",
-        }
-        if keys & noise_keys and row_count < 20:
-            score -= 3
-
-        endpoint_key = re.sub(
-            r"([?&](page|current|offset|limit|size|pageSize)=)[^&]+",
-            r"\1*",
-            lower_url,
-        )
-        self._intercept_endpoint_scores[endpoint_key] = max(
-            score, self._intercept_endpoint_scores.get(endpoint_key, 0)
-        )
-        return score, fingerprint
 
     def _extract_data_list(self, json_body) -> list[dict] | None:
-        """
-        启发式探测 JSON 响应中的数据列表。
-
-        检查策略（按优先级）：
-        1. json_body 本身是 list[dict] 且长度 >= 阈值
-        2. json_body 是 dict，遍历所有值，找第一个符合条件的 list[dict]
-        3. 递归检查常见嵌套路径：data.rows, data.list, data.records, result.data 等
-        """
-        threshold = self._intercept_min_list_size
-
-        # 情况 1：顶层就是列表
-        if isinstance(json_body, list):
-            if len(json_body) >= threshold and isinstance(json_body[0], dict):
-                return json_body
-            return None
-
-        # 情况 2：dict，遍历所有值
-        if isinstance(json_body, dict):
-            # 优先检查常见键名
-            priority_keys = [
-                "data", "rows", "list", "records", "items",
-                "result", "results", "content", "details",
-            ]
-            # 先查优先键
-            for key in priority_keys:
-                val = json_body.get(key)
-                if isinstance(val, list) and len(val) >= threshold:
-                    if val and isinstance(val[0], dict):
-                        return val
-                # 可能嵌套一层：data.rows, data.list
-                if isinstance(val, dict):
-                    for sub_key in priority_keys:
-                        sub_val = val.get(sub_key)
-                        if isinstance(sub_val, list) and len(sub_val) >= threshold:
-                            if sub_val and isinstance(sub_val[0], dict):
-                                return sub_val
-
-            # 兜底：遍历所有值
-            for key, val in json_body.items():
-                if key.startswith("_"):
-                    continue
-                if isinstance(val, list) and len(val) >= threshold:
-                    if val and isinstance(val[0], dict):
-                        return val
-
-        return None
+        return extract_data_list(json_body, self._intercept_min_list_size)
 
     @property
     def current_url(self) -> str:
@@ -4532,6 +3816,34 @@ Object.defineProperty(navigator, 'languages', {
         if url:
             parts.append(f"URL: {url[:120]}")
         return " | ".join(parts)
+
+    async def dom_signature(self) -> str:
+        """E1 感知复用探针：href + DOM 节点数 + body 文本长度 + 可交互元素数 拼 sha1。
+
+        一次轻量 evaluate（<5ms）；失败 / 无页面时安静返回空串——调用方视为
+        "无法判定"并走全量感知，探针绝不影响主链路。
+        """
+        page = await self._ensure_active_page(reason="dom signature probe")
+        if not page:
+            return ""
+        try:
+            raw = await page.evaluate(
+                """() => {
+                    const body = document.body;
+                    const interactive = document.querySelectorAll(
+                        'a,button,input,select,textarea,[role=\"button\"],[onclick],[contenteditable]'
+                    ).length;
+                    return [
+                        location.href,
+                        document.getElementsByTagName('*').length,
+                        body ? (body.innerText || '').length : 0,
+                        interactive,
+                    ].join('|');
+                }"""
+            )
+        except Exception:
+            return ""
+        return hashlib.sha1(str(raw).encode("utf-8")).hexdigest()
 
     async def reload_active_page(self, reason: str = "") -> bool:
         """对当前页做一次轻量重载，并等待重新稳定。"""

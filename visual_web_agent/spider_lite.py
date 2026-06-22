@@ -3,18 +3,28 @@ from __future__ import annotations
 import time
 import uuid
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urldefrag, urljoin, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from visual_web_agent.artifact_manager import artifact_url, register_artifact, resolve_artifact_path
 from visual_web_agent.extraction_engine import generic
-from visual_web_agent.page_cache import PageCacheMissError, PageResponseCache
+from visual_web_agent import run_registry as _run_registry
+from visual_web_agent.io_contract import (
+    build_input_contract,
+    ensure_contract_skeleton,
+    infer_output_contract,
+    write_input_contract,
+    write_output_contract,
+)
+from visual_web_agent.page_cache import PageResponseCache
 from visual_web_agent.robots_policy import RobotsPolicyManager
 from visual_web_agent.crawl_frontier import build_frontier, normalize_keywords
+from visual_web_agent.url_guard import build_guarded_opener, check_url
 
 
 @dataclass
@@ -72,6 +82,137 @@ class _LinkParser(HTMLParser):
 
 
 Fetcher = Callable[[str], FetchResult | dict[str, Any] | str]
+
+
+def _spider_goal(config: dict[str, Any]) -> str:
+    return str(config.get("goal") or "Spider Lite crawl")
+
+
+def _spider_persistence_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("persist_run_contracts") or config.get("persist_contracts"))
+
+
+def _spider_contract_base_dir(config: dict[str, Any]) -> str:
+    return str(config.get("contracts_base_dir") or config.get("base_dir") or "").strip()
+
+
+def _spider_constraints(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "max_pages": config.get("max_pages"),
+        "max_depth": config.get("max_depth"),
+        "follow_links": config.get("follow_links"),
+        "robots_txt_obey": config.get("robots_txt_obey"),
+        "delay_seconds": config.get("delay_seconds"),
+        "crawl_strategy": config.get("crawl_strategy"),
+        "cache_mode": config.get("cache_mode"),
+        "export": config.get("export"),
+        "export_format": config.get("export_format"),
+    }
+
+
+def _persist_spider_run_start(config: dict[str, Any]) -> bool:
+    """Best-effort contracts + registry entry for API-visible spider runs."""
+
+    if not _spider_persistence_enabled(config):
+        return False
+    run_id = str(config.get("run_id") or "").strip()
+    if not run_id:
+        return False
+    base_dir = _spider_contract_base_dir(config) or None
+    goal = _spider_goal(config)
+    start_urls = list(config.get("start_urls") or [])
+    try:
+        ensure_contract_skeleton(run_id, base_dir=base_dir)
+        input_contract = build_input_contract(
+            goal=goal,
+            urls=start_urls,
+            constraints=_spider_constraints(config),
+            source="spider_lite",
+        )
+        write_input_contract(run_id, input_contract, base_dir=base_dir)
+        output_contract = infer_output_contract(
+            goal,
+            user_explicit_kind="dataset_records",
+            user_explicit_container="jsonl",
+        )
+        write_output_contract(run_id, output_contract, base_dir=base_dir)
+    except Exception:
+        pass
+
+    try:
+        if _run_registry.load_run(run_id) is not None:
+            return False
+        _run_registry.create_run(
+            run_id=run_id,
+            target_url=start_urls[0] if start_urls else "",
+            prompt=goal,
+            mode="spider_lite",
+            urls=start_urls,
+            constraints=_spider_constraints(config),
+            status="running",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _complete_spider_registry(run_id: str, *, owned: bool, success: bool, error: str = "") -> None:
+    if not owned:
+        return
+    try:
+        _run_registry.complete_run(run_id, success=success, error=error)
+    except Exception:
+        pass
+
+
+def _register_spider_artifact(path: Path, run: dict[str, Any], *, feed_format: str) -> None:
+    config = run.get("config") if isinstance(run.get("config"), dict) else {}
+    if not _spider_persistence_enabled(config):
+        register_artifact(path)
+        return
+    run_id = str(run.get("run_id") or config.get("run_id") or "").strip()
+    source_url = ""
+    starts = run.get("start_urls") if isinstance(run.get("start_urls"), list) else []
+    if starts:
+        source_url = str(starts[0] or "")
+    mime = "application/x-ndjson" if feed_format == "jsonl" else "application/json"
+    extra: dict[str, Any] = {
+        "row_count": int(run.get("item_count") or len(run.get("items") or [])),
+    }
+    fields = _spider_item_fields(run)
+    if fields:
+        extra["fields"] = fields
+    try:
+        register_artifact(
+            path,
+            run_id=run_id,
+            kind="dataset_records",
+            mime=mime,
+            source_url=source_url,
+            produced_by="spider_lite",
+            step_id="feed_export",
+            extra=extra,
+        )
+    except TypeError:
+        register_artifact(path)
+
+
+def _spider_item_fields(run: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+
+    pipeline = run.get("item_pipeline") if isinstance(run.get("item_pipeline"), dict) else {}
+    for field in pipeline.get("fields") or []:
+        add(field)
+    for item in run.get("items") or []:
+        if isinstance(item, dict):
+            for key in item.keys():
+                add(key)
+    return out
 
 
 class SpiderLiteManager:
@@ -152,7 +293,7 @@ class SpiderLiteManager:
                 }, ensure_ascii=False, separators=(",", ":")),
                 encoding="utf-8",
             )
-        register_artifact(path)
+        _register_spider_artifact(path, run, feed_format=feed_format)
         artifact = {"path": str(path), "url": artifact_url(path), "format": feed_format, "count": len(items)}
         run["artifact"] = artifact
         return artifact
@@ -161,6 +302,7 @@ class SpiderLiteManager:
         config = self._config(payload)
         self._apply_sitemap_seeds(config)
         run_id = config["run_id"]
+        registry_owned = _persist_spider_run_start(config)
         created_at = time.time()
         result: dict[str, Any] = {
             "run_id": run_id,
@@ -191,52 +333,51 @@ class SpiderLiteManager:
                 pending=resume_state.get("pending") or [],
             )
             result["resumed"] = True
+        concurrency = max(1, int(config.get("concurrency") or 1))
         while len(frontier) and len(result["pages"]) < config["max_pages"]:
-            url, depth = frontier.pop()
-            url = normalize_url(url)
-            if not url or url in seen:
+            budget = config["max_pages"] - len(result["pages"])
+            batch = self._pop_eligible_batch(
+                frontier, seen, config, result, limit=min(concurrency, budget)
+            )
+            if not batch:
                 continue
-            seen.add(url)
-            domain = domain_of(url)
-            if domain not in config["allowed_domains"]:
-                result["errors"].append({"url": url, "error": "domain not allowed"})
-                continue
-            if config["robots_txt_obey"]:
-                policy = self.robots_policy.reserve_url(url, obey=True, default_delay=config["delay_seconds"])
-                if not policy.get("allowed_by_robots"):
-                    result["errors"].append({"url": url, "error": "blocked by robots.txt", "policy": policy})
+            for url, depth, outcome, fetch_source in self._fetch_batch(batch, page_cache, concurrency):
+                if isinstance(outcome, Exception):
+                    result["errors"].append({"url": url, "error": str(outcome)})
                     continue
-            try:
-                fetched, fetch_source = self._fetch_with_cache(url, page_cache)
-            except Exception as exc:
-                result["errors"].append({"url": url, "error": str(exc)})
-                continue
-            page_record = {
-                "url": url,
-                "final_url": fetched.url,
-                "status_code": fetched.status_code,
-                "depth": depth,
-                "bytes": len(fetched.html.encode("utf-8", errors="ignore")),
-                "fetch_source": fetch_source,
-            }
-            result["pages"].append(page_record)
-            result["items"].extend(self._extract_items(fetched, config))
-            if config["follow_links"] and depth < config["max_depth"]:
-                for link, anchor_text in extract_links_with_anchors(fetched.html, fetched.url):
-                    if len(seen) + len(frontier) >= config["max_pages"] * 5:
-                        break
-                    if domain_of(link) in config["allowed_domains"] and link not in seen:
-                        frontier.push(link, depth + 1, anchor_text=anchor_text)
-            self._maybe_checkpoint(config, result, seen, frontier)
+                fetched = outcome
+                page_record = {
+                    "url": url,
+                    "final_url": fetched.url,
+                    "status_code": fetched.status_code,
+                    "depth": depth,
+                    "bytes": len(fetched.html.encode("utf-8", errors="ignore")),
+                    "fetch_source": fetch_source,
+                }
+                result["pages"].append(page_record)
+                result["items"].extend(self._extract_items(fetched, config))
+                if config["follow_links"] and depth < config["max_depth"]:
+                    for link, anchor_text in extract_links_with_anchors(fetched.html, fetched.url):
+                        if len(seen) + len(frontier) >= config["max_pages"] * 5:
+                            break
+                        if domain_of(link) in config["allowed_domains"] and link not in seen:
+                            frontier.push(link, depth + 1, anchor_text=anchor_text)
+                self._maybe_checkpoint(config, result, seen, frontier)
         self._maybe_checkpoint(config, result, seen, frontier, force=True)
         pipeline = self._apply_item_pipeline(result["items"], config["item_pipeline"])
         result["items"] = pipeline["items"]
         result["item_pipeline"] = pipeline["stats"]
+        self._apply_incremental_filter(config, result)
         result["status"] = "success"
         result["finished_at"] = time.time()
         result["page_count"] = len(result["pages"])
         result["item_count"] = len(result["items"])
         result["error_count"] = len(result["errors"])
+        result["fetch_stats"] = {
+            "network": sum(1 for p in result["pages"] if p.get("fetch_source") == "network"),
+            "cache": sum(1 for p in result["pages"] if p.get("fetch_source") == "cache"),
+            "concurrency": concurrency,
+        }
         result["page_cache"] = page_cache.public_state()
         result["artifact"] = None
         if config["export"]:
@@ -245,6 +386,7 @@ class SpiderLiteManager:
                 format=str(config.get("export_format") or "jsonl"),
                 filename=str(config.get("export_filename") or ""),
             )
+        _complete_spider_registry(run_id, owned=registry_owned, success=True)
         return result
 
     def cache_state(self, session_id: str = "default") -> dict[str, Any]:
@@ -311,15 +453,90 @@ class SpiderLiteManager:
             },
         }
 
-    def _fetch_with_cache(self, url: str, page_cache: PageResponseCache) -> tuple[FetchResult, str]:
-        if page_cache.mode == "replay":
-            cached = page_cache.lookup(url)
-            if cached is not None:
-                return FetchResult(url=cached.final_url, status_code=cached.status_code, html=cached.html), "cache"
-        fetched = coerce_fetch_result(self.fetcher(url), fallback_url=url)
-        if page_cache.mode == "record":
-            page_cache.store(url, final_url=fetched.url, status_code=fetched.status_code, html=fetched.html)
-        return fetched, "network"
+    def _pop_eligible_batch(
+        self,
+        frontier: Any,
+        seen: set[str],
+        config: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        limit: int,
+    ) -> list[tuple[str, int]]:
+        """Pop up to ``limit`` URLs that pass the seen/domain/robots gates.
+
+        Always consumes at least one frontier entry per outer-loop iteration
+        (filtered entries are dropped), so the crawl loop cannot spin.
+        """
+        batch: list[tuple[str, int]] = []
+        while len(frontier) and len(batch) < max(1, limit):
+            url, depth = frontier.pop()
+            url = normalize_url(url)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            domain = domain_of(url)
+            if domain not in config["allowed_domains"]:
+                result["errors"].append({"url": url, "error": "domain not allowed"})
+                continue
+            if config["robots_txt_obey"]:
+                policy = self.robots_policy.reserve_url(url, obey=True, default_delay=config["delay_seconds"])
+                if not policy.get("allowed_by_robots"):
+                    result["errors"].append({"url": url, "error": "blocked by robots.txt", "policy": policy})
+                    continue
+            batch.append((url, depth))
+        return batch
+
+    def _fetch_batch(
+        self,
+        batch: list[tuple[str, int]],
+        page_cache: PageResponseCache,
+        concurrency: int,
+    ) -> list[tuple[str, int, FetchResult | Exception, str]]:
+        """S14: fetch a batch, parallelizing only the network leg.
+
+        Cache lookups (replay) and stores (record) run on the calling thread
+        so ``PageResponseCache`` needs no locking; results keep batch order.
+        Custom fetchers must be thread-safe when ``concurrency > 1``.
+        """
+        slots: list[tuple[str, int, FetchResult | Exception | None, str]] = []
+        network_idx: list[int] = []
+        for url, depth in batch:
+            if page_cache.mode == "replay":
+                try:
+                    cached = page_cache.lookup(url)
+                except Exception as exc:
+                    slots.append((url, depth, exc, "cache"))
+                    continue
+                if cached is not None:
+                    slots.append((
+                        url,
+                        depth,
+                        FetchResult(url=cached.final_url, status_code=cached.status_code, html=cached.html),
+                        "cache",
+                    ))
+                    continue
+            slots.append((url, depth, None, "network"))
+            network_idx.append(len(slots) - 1)
+
+        def _do_fetch(target: str) -> FetchResult | Exception:
+            try:
+                return coerce_fetch_result(self.fetcher(target), fallback_url=target)
+            except Exception as exc:
+                return exc
+
+        if network_idx:
+            urls = [slots[i][0] for i in network_idx]
+            if concurrency > 1 and len(network_idx) > 1:
+                with ThreadPoolExecutor(max_workers=min(concurrency, len(network_idx))) as pool:
+                    outcomes = list(pool.map(_do_fetch, urls))
+            else:
+                outcomes = [_do_fetch(url) for url in urls]
+            for i, outcome in zip(network_idx, outcomes):
+                url, depth, _, source = slots[i]
+                if isinstance(outcome, FetchResult) and page_cache.mode == "record":
+                    page_cache.store(url, final_url=outcome.url, status_code=outcome.status_code, html=outcome.html)
+                slots[i] = (url, depth, outcome, source)
+        return [(url, depth, outcome, source) for url, depth, outcome, source in slots if outcome is not None]
 
     def _page_cache(self, config: dict[str, Any]) -> PageResponseCache:
         cache = PageResponseCache(
@@ -365,6 +582,35 @@ class SpiderLiteManager:
             item.setdefault("url", fetched.url)
             rows.append(item)
         return rows
+
+    def _apply_incremental_filter(self, config: dict[str, Any], result: dict[str, Any]) -> None:
+        """S13: cross-run incremental dedup (opt-in, no-op when off).
+
+        With ``incremental=True`` the run only keeps items never delivered by
+        any earlier run of the same scope (default scope: first allowed
+        domain). New signatures are committed so the next run skips them.
+        """
+        if not config.get("incremental"):
+            return
+        from visual_web_agent.incremental_state import IncrementalStore
+
+        scope = config.get("incremental_scope") or (
+            config["allowed_domains"][0] if config.get("allowed_domains") else config["run_id"]
+        )
+        key_fields = list(config.get("incremental_key_fields") or []) or None
+        store_kwargs: dict[str, Any] = {}
+        if config.get("incremental_dir"):
+            store_kwargs["base_dir"] = config["incremental_dir"]
+        store = IncrementalStore(scope, **store_kwargs)
+        fresh, skipped = store.filter_new(result["items"], key_fields=key_fields)
+        store.commit(fresh, key_fields=key_fields, run_id=config["run_id"])
+        result["items"] = fresh
+        result["incremental"] = {
+            **store.stats(),
+            "new_count": len(fresh),
+            "skipped_known": skipped,
+            "key_fields": key_fields or [],
+        }
 
     def _apply_sitemap_seeds(self, config: dict[str, Any]) -> None:
         """Opt-in: expand ``start_urls`` from a sitemap before crawling.
@@ -458,6 +704,7 @@ class SpiderLiteManager:
         run_id = str(payload.get("run_id") or f"spider_{uuid.uuid4().hex[:12]}")
         return {
             "run_id": run_id,
+            "goal": str(payload.get("goal") or payload.get("prompt") or "").strip(),
             "start_urls": start_urls,
             "allowed_domains": allowed_domains,
             "max_depth": max(0, min(int(payload.get("max_depth") or 0), 10)),
@@ -479,6 +726,13 @@ class SpiderLiteManager:
             "seed_sitemap": seed_sitemap,
             "resume_state_path": str(payload.get("resume_state_path") or payload.get("resume_state") or "").strip(),
             "checkpoint_every": max(1, min(int(payload.get("checkpoint_every") or 1), 1000)),
+            "concurrency": max(1, min(int(payload.get("concurrency") or payload.get("max_concurrency") or 1), 16)),
+            "incremental": bool(payload.get("incremental")),
+            "incremental_scope": str(payload.get("incremental_scope") or "").strip(),
+            "incremental_key_fields": normalize_string_list(payload.get("incremental_key_fields") or payload.get("incremental_key") or []),
+            "incremental_dir": str(payload.get("incremental_dir") or "").strip(),
+            "persist_run_contracts": bool(payload.get("persist_run_contracts") or payload.get("persist_contracts")),
+            "contracts_base_dir": str(payload.get("contracts_base_dir") or payload.get("base_dir") or "").strip(),
         }
 
     def _item_pipeline_config(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -505,8 +759,9 @@ def _crawl_strategy(payload: dict[str, Any]) -> str:
 
 
 def default_fetch(url: str) -> FetchResult:
+    check_url(url)  # SSRF guard: reject private/loopback/metadata hosts + non-http schemes
     req = Request(str(url), headers={"User-Agent": "VSpider-SpiderLite/1.0"})
-    with urlopen(req, timeout=15) as resp:
+    with build_guarded_opener().open(req, timeout=15) as resp:
         raw = resp.read(2_000_000)
         content_type = resp.headers.get("content-type", "")
         charset = "utf-8"

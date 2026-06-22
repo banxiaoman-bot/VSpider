@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ._base import (
+    dataset_extra,
     default_filename,
     finalize_file_artifact,
     run_artifacts_dir,
@@ -37,6 +38,14 @@ def write_json(
     else:
         payload = {"value": data}
 
+    records: list[Any]
+    if isinstance(payload, list):
+        records = list(payload)
+    elif isinstance(payload, dict):
+        records = [payload]
+    else:
+        records = []
+
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
     artifacts = run_artifacts_dir(run_id, base_dir=base_dir)
@@ -47,15 +56,16 @@ def write_json(
     )
     target = artifacts / filename
     target.write_bytes(body)
+    kind = output_kind or "dataset_records"
 
     return finalize_file_artifact(
         run_id=run_id,
         path=target,
-        kind=output_kind or "dataset_records",
+        kind=kind,
         mime="application/json",
         produced_by=produced_by,
         step_id=step_id,
         source_url=source_url,
-        extra=extra,
+        extra=dataset_extra(extra, output_kind=kind, rows=records),
         base_dir=base_dir,
     )

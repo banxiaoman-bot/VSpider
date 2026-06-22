@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .csv_writer import write_csv
-from ._base import default_filename
+from ._base import default_filename, run_artifacts_dir, safe_filename
 from .files_folder_writer import write_files_folder
 from .html_writer import write_html
 from .inline_text_writer import write_inline_text
@@ -38,6 +38,7 @@ from .json_writer import write_json
 from .jsonl_writer import write_jsonl
 from .markdown_writer import write_markdown
 from .xlsx_writer import write_xlsx
+from .zip_writer import write_zip
 
 
 WriterFn = Callable[..., dict[str, Any]]
@@ -52,13 +53,14 @@ CONTAINER_TO_WRITER: dict[str, WriterFn] = {
     "files_folder": write_files_folder,
     "inline_text":  write_inline_text,
     "xlsx":         write_xlsx,
-    # zip is intentionally NOT auto-registered -- archive output goes
-    # through files_folder + a downstream zipper so the contract layer
-    # never silently swallows multi-file payloads into one opaque blob.
+    # zip bundles multi-file payloads into one .zip (see zip_writer); the
+    # run-level packager (packaging.py) decides files_folder vs zip by count,
+    # so files_folder stays the default for <= threshold individual downloads.
+    "zip":          write_zip,
 }
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 
 
 def save_artifact(
@@ -138,10 +140,106 @@ def resolve_output_contract(*contracts: dict[str, Any] | None) -> dict[str, Any]
         for key, value in contract.items():
             if value not in (None, ""):
                 merged[key] = value
-    merged.setdefault("container", "xlsx")
     merged.setdefault("output_kind", "dataset_rows")
     merged.setdefault("mode", "default")
-    return merged
+    # mission §一-A: never blind-default to xlsx. Derive the container from the
+    # output_kind policy (default_container_for_kind) so a media / answer task
+    # without an explicit container lands as files_folder / inline_text instead
+    # of being forced into a spreadsheet. dataset_rows still maps to xlsx -- but
+    # by the sanctioned kind->container policy, not a hard-coded default.
+    try:
+        from ..io_contract.output_contract import (
+            default_container_for_kind,
+            normalize_output_contract_dict,
+        )
+    except (ImportError, ValueError):
+        from visual_web_agent.io_contract.output_contract import (
+            default_container_for_kind,
+            normalize_output_contract_dict,
+        )
+    if not merged.get("container"):
+        merged["container"] = default_container_for_kind(
+            str(merged.get("output_kind") or "dataset_rows")
+        )
+    return normalize_output_contract_dict(merged)
+
+
+def _coerce_to_rows(data: Any) -> list[dict[str, Any]]:
+    """Normalise arbitrary input into a list of dicts for DataFrame merge."""
+    if isinstance(data, dict):
+        return [dict(data)]
+    if isinstance(data, list):
+        return [r if isinstance(r, dict) else {"value": r} for r in data]
+    if data is None:
+        return []
+    return [{"value": data}]
+
+
+def _merge_and_dedupe_xlsx(
+    new_data: Any,
+    *,
+    run_id: str,
+    filename_hint: str,
+    produced_by: str,
+    unique_key: str | list[str],
+    base_dir: str | Path | None,
+) -> list[dict[str, Any]]:
+    """Pre-merge existing artifact + new rows with dedup before write.
+
+    Runs BEFORE ``save_artifact`` so every code path goes through
+    ``finalize_file_artifact`` and the manifest entry is guaranteed
+    (mission P0: no xlsx bypass without manifest).
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        return _coerce_to_rows(new_data)
+
+    rows = _coerce_to_rows(new_data)
+
+    filename = (
+        safe_filename(filename_hint, suffix=".xlsx")
+        if filename_hint
+        else default_filename(produced_by=produced_by or "extract", suffix=".xlsx")
+    )
+    target = run_artifacts_dir(run_id, base_dir=base_dir) / filename
+
+    if not target.exists():
+        return rows
+
+    try:
+        df_existing = pd.read_excel(target, engine="openpyxl")
+        df_new = pd.DataFrame(rows)
+        df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+
+        _TOOLTIP_SIGNAL = "__tooltip_trigger__"
+        if unique_key == _TOOLTIP_SIGNAL:
+            try:
+                from ..data_sanitizer import extract_tooltip_primary_key
+            except (ImportError, ValueError):
+                from visual_web_agent.data_sanitizer import extract_tooltip_primary_key
+            _TMP_COL = "__tooltip_trigger_key"
+            keys = []
+            for idx, row in df_combined.iterrows():
+                rd = {k: v for k, v in row.to_dict().items() if k != _TMP_COL}
+                key = extract_tooltip_primary_key(rd)
+                keys.append(key if key else f"row|{idx}")
+            df_combined[_TMP_COL] = keys
+            df_combined = df_combined.drop_duplicates(
+                subset=[_TMP_COL], keep="last"
+            ).reset_index(drop=True)
+            df_combined = df_combined.drop(columns=[_TMP_COL], errors="ignore")
+        else:
+            subset = [unique_key] if isinstance(unique_key, str) else list(unique_key)
+            valid_cols = [c for c in subset if c in df_combined.columns]
+            if valid_cols:
+                df_combined = df_combined.drop_duplicates(
+                    subset=valid_cols, keep="last"
+                ).reset_index(drop=True)
+
+        return df_combined.to_dict("records")
+    except Exception:
+        return rows
 
 
 def save_run_dataset(
@@ -159,28 +257,29 @@ def save_run_dataset(
 ) -> str:
     """Contract-aware save for the main agent loop.
 
-    Uses ``save_artifact`` for container dispatch. When ``unique_key`` is
-    set and container is xlsx, delegates to legacy ``save_to_excel`` so
-    tooltip upsert / append dedupe keeps working until xlsx_writer grows
-    the same semantics.
+    All paths go through ``save_artifact`` -> ``finalize_file_artifact``
+    so the run manifest is always updated.  When ``unique_key`` is set
+    and the container is xlsx, rows are pre-merged with any existing
+    artifact file and deduped before the writer runs.
     """
 
     contract = resolve_output_contract(output_contract)
-    container = str(contract.get("container") or "xlsx")
+    container = str(contract.get("container") or "files_folder")
     output_kind = str(contract.get("output_kind") or "dataset_rows")
 
+    actual_data = data
     if unique_key and container == "xlsx":
-        try:
-            from visual_web_agent.data_manager import save_to_excel
-        except ImportError:
-            from data_manager import save_to_excel
-
-        hint = filename_hint or default_filename(produced_by=produced_by or "extract", suffix=".xlsx")
-        saved = save_to_excel(data, filename=hint, unique_key=unique_key)
-        return str(saved or "")
+        actual_data = _merge_and_dedupe_xlsx(
+            data,
+            run_id=run_id,
+            filename_hint=filename_hint,
+            produced_by=produced_by,
+            unique_key=unique_key,
+            base_dir=base_dir,
+        )
 
     result = save_artifact(
-        data,
+        actual_data,
         run_id=run_id,
         container=container,
         output_kind=output_kind,

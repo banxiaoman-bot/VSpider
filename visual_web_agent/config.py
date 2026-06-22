@@ -54,6 +54,10 @@ AUTH_DIR = os.getenv(
 PROXY_SERVER = os.getenv("VSPIDER_PROXY_SERVER", "").strip()
 PROXY_USERNAME = os.getenv("VSPIDER_PROXY_USERNAME", "").strip()
 PROXY_PASSWORD = os.getenv("VSPIDER_PROXY_PASSWORD", "").strip()
+# 代理链（多代理轮换，遇阻即换路）。逗号分隔，每项支持 host:port /
+# scheme://host:port / user:pass@host:port；为空则回退到上面的单一 PROXY_SERVER。
+PROXY_CHAIN = [p.strip() for p in os.getenv("VSPIDER_PROXY_CHAIN", "").split(",") if p.strip()]
+PROXY_STRATEGY = os.getenv("VSPIDER_PROXY_STRATEGY", "round_robin").strip().lower()
 
 # ========== 可选第三方 CAPTCHA Solver ==========
 CAPTCHA_SOLVER = os.getenv("VSPIDER_CAPTCHA_SOLVER", "capsolver").strip().lower()
@@ -64,7 +68,7 @@ def apply_run_constraints(raw: dict | None) -> None:
     """Apply per-run ``input_contract.constraints`` onto module-level config."""
     if not raw:
         return
-    global PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD
+    global PROXY_SERVER, PROXY_USERNAME, PROXY_PASSWORD, PROXY_CHAIN, PROXY_STRATEGY
     proxy_server = str(raw.get("proxy_server") or raw.get("proxy") or "").strip()
     if proxy_server:
         PROXY_SERVER = proxy_server
@@ -74,6 +78,15 @@ def apply_run_constraints(raw: dict | None) -> None:
     proxy_pass = str(raw.get("proxy_password") or raw.get("proxy_pass") or "").strip()
     if proxy_pass:
         PROXY_PASSWORD = proxy_pass
+    proxy_chain = raw.get("proxy_chain")
+    if proxy_chain:
+        if isinstance(proxy_chain, str):
+            PROXY_CHAIN = [p.strip() for p in proxy_chain.split(",") if p.strip()]
+        elif isinstance(proxy_chain, (list, tuple)):
+            PROXY_CHAIN = [str(p).strip() for p in proxy_chain if str(p).strip()]
+    proxy_strategy = str(raw.get("proxy_strategy") or "").strip().lower()
+    if proxy_strategy:
+        PROXY_STRATEGY = proxy_strategy
 
 # ========== 页面稳定等待配置 ==========
 # SPA 页面加载等待超时（毫秒），用于 networkidle 检测
@@ -118,6 +131,11 @@ JUDGE_ENABLED = os.getenv("VSPIDER_JUDGE_ENABLED", "true").lower() in {"1", "tru
 
 # ========== A11y Enhancer（无障碍树增强）配置 ==========
 A11Y_ENHANCER_ENABLED = os.getenv("VSPIDER_A11Y_ENHANCER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
+# ========== DC-2 Consent Guard（感知前置自动同意墙关闭）配置 ==========
+# 在 perception 入口对每个新 URL 自动调一次 dismiss_consent（幂等、按 URL 去重）。
+# 设 VSPIDER_CONSENT_GUARD_ENABLED=0 可关闭，回退为仅显式 dismiss_consent 动作。
+CONSENT_GUARD_ENABLED = os.getenv("VSPIDER_CONSENT_GUARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
 # ========== Response Cache（响应缓存 / Replay 模式）配置 ==========
 # off / record / replay

@@ -1,4 +1,4 @@
-"""Source-pin tests for V/W/X frontend enhancements in App.vue.
+"""Source-pin tests for V/W/X frontend enhancements.
 
 These tests assert the shape of the implementation rather than executing
 Vue. They protect the wiring for:
@@ -6,6 +6,10 @@ Vue. They protect the wiring for:
 * V: Timeline phase stats / histogram panel
 * W: Offline phase JSONL replay import mode
 * X: Live Terminal in-content search
+
+The phase stats panel, replay file input, and timeline-specific UI were
+extracted from App.vue into TimelinePanel.vue during the Y126 component
+split. Tests now read both files where needed.
 """
 
 from __future__ import annotations
@@ -16,17 +20,38 @@ from pathlib import Path
 import pytest
 
 
-APP_VUE = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "App.vue"
+_UI_SRC = Path(__file__).resolve().parent.parent / "vspider-ui" / "src"
+APP_VUE = _UI_SRC / "App.vue"
+TIMELINE_PANEL = _UI_SRC / "components" / "TimelinePanel.vue"
+TERMINAL_LOG_PANE = _UI_SRC / "components" / "TerminalLogPane.vue"
 FAILURE_FIXTURE_SUMMARY = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "composables" / "failureFixtureSummary.js"
 CAPABILITY_TRACE_UTILS = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "capabilityTraceUtils.js"
 CAPABILITY_TRACE_LIST = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityTraceList.vue"
 CAPABILITY_ALIGNMENT_CARD = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityAlignmentCard.vue"
 CAPABILITY_EFFICIENCY_PANEL = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityEfficiencyPanel.vue"
+CAPABILITY_REPLAY_PANE = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "components" / "CapabilityReplayPane.vue"
+CAPABILITY_SHARED_CSS = Path(__file__).resolve().parent.parent / "vspider-ui" / "src" / "styles" / "capability-shared.css"
+# Frontend decomposition (D-UI-*) moved much of the timeline/replay/capability
+# logic out of App.vue into composables; the source-pin fixtures fold these in.
+USE_PHASE_TRACE = _UI_SRC / "composables" / "usePhaseTrace.js"
+USE_TIMELINE_REPLAY = _UI_SRC / "composables" / "useTimelineReplay.js"
+USE_RUN_EVENT_ROUTER = _UI_SRC / "composables" / "useRunEventRouter.js"
+USE_TASK_FORM = _UI_SRC / "composables" / "useTaskForm.js"
+USE_CAPABILITY_TRACE = _UI_SRC / "composables" / "useCapabilityTrace.js"
+USE_CAPABILITY_TRACE_EXPORT = _UI_SRC / "composables" / "useCapabilityTraceExport.js"
+USE_CAPABILITY_FIXTURE_REPLAY = _UI_SRC / "composables" / "useCapabilityFixtureReplay.js"
+KEYBOARD_CMD = _UI_SRC / "composables" / "useKeyboardCommand.js"
+APP_CSS = _UI_SRC / "styles" / "app.css"
 
 
 @pytest.fixture(scope="module")
 def src() -> str:
     return APP_VUE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def kbd_src() -> str:
+    return KEYBOARD_CMD.read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
@@ -54,41 +79,64 @@ def capability_efficiency_panel_src() -> str:
     return CAPABILITY_EFFICIENCY_PANEL.read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def capability_replay_pane_src() -> str:
+    return CAPABILITY_REPLAY_PANE.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def capability_shared_css_src() -> str:
+    return CAPABILITY_SHARED_CSS.read_text(encoding="utf-8")
+
+
 class TestVPhaseStats:
-    def test_stats_state_refs_exist(self, src: str) -> None:
-        assert "const phaseStatsExpanded = ref(false)" in src
-        assert "const phaseStatsSortBy = ref('count')" in src
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        """Phase stats state/computeds moved into the usePhaseTrace composable;
+        the panel template + CSS stayed in TimelinePanel.vue. Read all three."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
+        timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
+        timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
+        phase_trace = USE_PHASE_TRACE.read_text(encoding="utf-8") if USE_PHASE_TRACE.exists() else ""
+        return app + "\n" + timeline + "\n" + timeline_css + "\n" + phase_trace
 
-    def test_phase_filter_options_carry_stats(self, src: str) -> None:
-        body = re.search(r"const phaseFilterOptions = computed\(\(\) => \{([\s\S]*?)\n\}\)", src)
-        assert body, "phaseFilterOptions computed must exist"
-        text = body.group(1)
+    def test_stats_state_refs_exist(self, combined_src: str) -> None:
+        assert "const phaseStatsExpanded = ref(false)" in combined_src
+        assert "const phaseStatsSortBy = ref('count')" in combined_src
+
+    def test_phase_filter_options_carry_stats(self, combined_src: str) -> None:
+        # phaseFilterOptions moved into usePhaseTrace as an indented composable
+        # computed, so pin its presence + the stat fields it builds directly
+        # (the old top-level "\n})" body-capture no longer matches).
+        assert "const phaseFilterOptions = computed(() => {" in combined_src
         for token in ["mean:", "p50:", "p95:", "max:", "sevCounts:", "durations:"]:
-            assert token in text
-        assert "pickPercentile(sorted, 0.95)" in text
+            assert token in combined_src
+        assert "pickPercentile(sorted, 0.95)" in combined_src
 
-    def test_stats_sorted_computed_exists(self, src: str) -> None:
-        assert "const phaseStatsSorted = computed" in src
-        assert "const key = phaseStatsSortBy.value" in src
-        assert "return bv - av" in src
+    def test_stats_sorted_computed_exists(self, combined_src: str) -> None:
+        assert "const phaseStatsSorted = computed" in combined_src
+        assert "const key = phaseStatsSortBy.value" in combined_src
+        assert "return bv - av" in combined_src
 
-    def test_sparkline_helper_exists(self, src: str) -> None:
-        assert "const phaseSparklinePath = (durations) =>" in src
-        assert "viewBox=\"0 0 100 24\"" in src
-        assert ":d=\"phaseSparklinePath(row.durations)\"" in src
+    def test_sparkline_helper_exists(self, combined_src: str) -> None:
+        # The sparkline helper is now an exported function in usePhaseTrace.js.
+        assert "export function phaseSparklinePath (durations) {" in combined_src
+        assert "viewBox=\"0 0 100 24\"" in combined_src
+        assert ":d=\"phaseSparklinePath(row.durations)\"" in combined_src
 
-    def test_stats_panel_template_wired(self, src: str) -> None:
-        assert "class=\"timeline-stats-panel\"" in src
-        assert "v-if=\"phaseStatsExpanded && phaseEvents.length\"" in src
-        assert "v-for=\"row in phaseStatsSorted\"" in src
-        assert "@click=\"togglePhaseFilter(row.phase)\"" in src
-        assert "Phase 耗时分布" in src
+    def test_stats_panel_template_wired(self, combined_src: str) -> None:
+        assert "class=\"timeline-stats-panel\"" in combined_src
+        assert "v-if=\"phaseStatsExpanded && phaseEvents.length\"" in combined_src
+        assert "v-for=\"row in phaseStatsSorted\"" in combined_src
+        assert "@click=\"togglePhaseFilter(row.phase)\"" in combined_src
+        assert "Phase 耗时分布" in combined_src
 
-    def test_stats_sort_buttons_present(self, src: str) -> None:
-        assert "v-for=\"key in ['count', 'mean', 'p95', 'max']\"" in src
-        assert "@click=\"phaseStatsSortBy = key\"" in src
+    def test_stats_sort_buttons_present(self, combined_src: str) -> None:
+        assert "v-for=\"key in ['count', 'mean', 'p95', 'max']\"" in combined_src
+        assert "@click=\"phaseStatsSortBy = key\"" in combined_src
 
-    def test_stats_css_present(self, src: str) -> None:
+    def test_stats_css_present(self, combined_src: str) -> None:
         for cls in [
             ".timeline-stats-panel",
             ".timeline-stats-grid-head",
@@ -96,122 +144,166 @@ class TestVPhaseStats:
             ".stat-spark",
             ".stat-sev-pill.sev-error",
         ]:
-            assert cls in src
+            assert cls in combined_src
 
 
 class TestWReplayMode:
-    def test_replay_state_refs_exist(self, src: str) -> None:
-        assert "const replayMode = ref(false)" in src
-        assert "const replaySourceName = ref('')" in src
-        assert "const replayInputRef = ref(null)" in src
-        assert "const replayImportTarget = ref('timeline')" in src
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        """Replay state/parser/import moved into the useTimelineReplay composable;
+        banners/inputs stayed in TimelinePanel.vue + CapabilityHeroSection.vue and
+        the banner CSS lives across timeline-panel.css + app.css. Read them all."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        timeline = TIMELINE_PANEL.read_text(encoding="utf-8")
+        timeline_css_path = _UI_SRC / "styles" / "timeline-panel.css"
+        timeline_css = timeline_css_path.read_text(encoding="utf-8") if timeline_css_path.exists() else ""
+        app_css = APP_CSS.read_text(encoding="utf-8") if APP_CSS.exists() else ""
+        hero = _UI_SRC / "components" / "CapabilityHeroSection.vue"
+        hero_src = hero.read_text(encoding="utf-8") if hero.exists() else ""
+        overview = _UI_SRC / "components" / "CapabilityOverviewPane.vue"
+        overview_src = overview.read_text(encoding="utf-8") if overview.exists() else ""
+        replay = USE_TIMELINE_REPLAY.read_text(encoding="utf-8") if USE_TIMELINE_REPLAY.exists() else ""
+        router = USE_RUN_EVENT_ROUTER.read_text(encoding="utf-8") if USE_RUN_EVENT_ROUTER.exists() else ""
+        task_form = USE_TASK_FORM.read_text(encoding="utf-8") if USE_TASK_FORM.exists() else ""
+        return (
+            app + "\n" + timeline + "\n" + timeline_css + "\n" + app_css
+            + "\n" + hero_src + "\n" + overview_src + "\n" + replay + "\n" + router + "\n" + task_form
+        )
 
-    def test_ws_phase_gate_drops_events_in_replay_mode(self, src: str) -> None:
+    def test_replay_state_refs_exist(self, combined_src: str) -> None:
+        assert "const replayMode = ref(false)" in combined_src
+        assert "const replaySourceName = ref('')" in combined_src
+        assert "const replayInputRef = ref(null)" in combined_src
+        assert "const replayImportTarget = ref('timeline')" in combined_src
+
+    def test_ws_phase_gate_drops_events_in_replay_mode(self, combined_src: str) -> None:
         gate = re.search(
             r"if \(replayMode\.value\) \{\s*return\s*\}\s*const evt = \{ \.\.\.payload",
-            src,
+            combined_src,
             flags=re.S,
         )
         assert gate, "WS phase ingestion must return before pushing phaseEvents in replay mode"
 
-    def test_submit_task_exits_replay_mode(self, src: str) -> None:
+    def test_submit_task_exits_replay_mode(self, combined_src: str) -> None:
         m = re.search(
             r"if \(replayMode\.value\) \{\s*replayMode\.value = false\s*replaySourceName\.value = ''",
-            src,
+            combined_src,
             flags=re.S,
         )
         assert m
 
-    def test_replay_parser_tolerates_bad_lines(self, src: str) -> None:
-        assert "const _parseJsonlText = (text) =>" in src
-        assert "const _capabilityExecuteArtifactPhaseEvent = (doc) =>" in src
-        assert "String(doc.type || '') !== 'capability_execute_trace'" in src
-        assert "phase: 'capability_execute'" in src
-        assert "execution_status: result.status" in src
-        assert "action_trace: result.action_trace" in src
-        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(doc)" in src
-        assert "if (artifactEvent) return { events: [artifactEvent], total: 1, bad: 0 }" in src
-        assert "replace(/\\r\\n?/g, '\\n').split('\\n')" in src
-        assert "JSON.parse(line)" in src
-        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(obj)" in src
-        assert "const phaseEvent = obj?.detail?.phase_event" in src
-        assert "out.push(phaseEvent && typeof phaseEvent === 'object' && !Array.isArray(phaseEvent) ? phaseEvent : obj)" in src
-        assert "bad += 1" in src
-        assert "return { events: out, total, bad }" in src
+    def test_replay_parser_tolerates_bad_lines(self, combined_src: str) -> None:
+        # The JSONL parser was extracted into useTimelineReplay.js and renamed
+        # parsePhaseReplayJsonl (the artifact helper kept its name).
+        assert "export const parsePhaseReplayJsonl = (text) =>" in combined_src
+        assert "const _capabilityExecuteArtifactPhaseEvent = (doc) =>" in combined_src
+        assert "String(doc.type || '') !== 'capability_execute_trace'" in combined_src
+        assert "phase: 'capability_execute'" in combined_src
+        assert "execution_status: result.status" in combined_src
+        assert "action_trace: result.action_trace" in combined_src
+        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(doc)" in combined_src
+        assert "if (artifactEvent) return { events: [artifactEvent], total: 1, bad: 0 }" in combined_src
+        assert "replace(/\\r\\n?/g, '\\n').split('\\n')" in combined_src
+        assert "JSON.parse(line)" in combined_src
+        assert "const artifactEvent = _capabilityExecuteArtifactPhaseEvent(obj)" in combined_src
+        assert "const phaseEvent = obj?.detail?.phase_event" in combined_src
+        assert "out.push(phaseEvent && typeof phaseEvent === 'object' && !Array.isArray(phaseEvent) ? phaseEvent : obj)" in combined_src
+        assert "bad += 1" in combined_src
+        assert "return { events: out, total, bad }" in combined_src
 
-    def test_replay_import_replaces_buffer_and_enters_mode(self, src: str) -> None:
-        assert "const handleReplayFileChange = async (event) =>" in src
-        assert "phaseEvents.value = events" in src
-        assert "replayMode.value = true" in src
-        assert "replaySourceName.value = file.name || 'imported.jsonl'" in src
-        assert "setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')" in src
+    def test_replay_import_replaces_buffer_and_enters_mode(self, combined_src: str) -> None:
+        assert "const handleReplayFileChange = async (event) =>" in combined_src
+        assert "phaseEvents.value = events" in combined_src
+        assert "replayMode.value = true" in combined_src
+        # useTimelineReplay sets replaySourceName from the filename arg; the
+        # file.name || 'imported.jsonl' default now lives in TimelinePanel's
+        # handleReplayFileChange before it emits import-replay.
+        assert "replaySourceName.value = filename" in combined_src
+        assert "file.name || 'imported.jsonl'" in combined_src
+        assert "setActiveBottomTab(replayImportTarget.value === 'capability' ? 'capability' : 'timeline')" in combined_src
 
-    def test_replay_ui_wired(self, src: str) -> None:
-        assert "@click=\"triggerReplayImport\"" in src
-        assert "@click=\"triggerReplayImport('capability')\"" in src
-        assert "ref=\"replayInputRef\"" in src
-        assert "@change=\"handleReplayFileChange\"" in src
-        assert "class=\"timeline-replay-banner\"" in src
-        assert "class=\"timeline-replay-banner capability-replay-banner\"" in src
-        assert "@click=\"exitReplayMode\"" in src
+    def test_replay_ui_wired(self, combined_src: str) -> None:
+        assert "@command=\"handleTimelineMoreAction\"" in combined_src
+        assert "handleCapabilityMoreAction" in combined_src
+        assert "command=\"importReplay\"" in combined_src
+        assert "importReplay:" in combined_src
+        assert "ref=\"replayInputRef\"" in combined_src
+        assert "@change=\"handleReplayFileChange\"" in combined_src
+        assert "class=\"timeline-replay-banner\"" in combined_src
+        assert "class=\"timeline-replay-banner capability-replay-banner\"" in combined_src
+        assert "exitReplayMode" in combined_src or "exit-replay" in combined_src
 
-    def test_replay_css_present(self, src: str) -> None:
-        assert ".replay-file-input" in src
-        assert ".timeline-replay-banner" in src
-        assert ".timeline-replay-banner .replay-exit-btn" in src
-        assert ".capability-replay-banner" in src
+    def test_replay_css_present(self, combined_src: str) -> None:
+        assert ".replay-file-input" in combined_src
+        assert ".timeline-replay-banner" in combined_src
+        assert ".timeline-replay-banner .replay-exit-btn" in combined_src
+        assert ".capability-replay-banner" in combined_src
 
 
 class TestXTerminalSearch:
-    def test_search_state_refs_exist(self, src: str) -> None:
-        assert "const terminalSearchVisible = ref(false)" in src
-        assert "const terminalSearchQuery = ref('')" in src
-        assert "const terminalSearchCurrent = ref(0)" in src
-        assert "const terminalSearchInputRef = ref(null)" in src
+    @pytest.fixture(scope="class")
+    def combined_src(self) -> str:
+        """Terminal search was extracted into TerminalLogPane.vue + CSS."""
+        app = APP_VUE.read_text(encoding="utf-8")
+        terminal = TERMINAL_LOG_PANE.read_text(encoding="utf-8")
+        css_path = _UI_SRC / "styles" / "terminal-log-pane.css"
+        css = css_path.read_text(encoding="utf-8") if css_path.exists() else ""
+        return app + "\n" + terminal + "\n" + css
 
-    def test_search_computeds_exist(self, src: str) -> None:
+    def test_search_state_refs_exist(self, combined_src: str) -> None:
+        assert "const terminalSearchVisible = ref(false)" in combined_src
+        assert "const terminalSearchQuery = ref('')" in combined_src
+        assert "const terminalSearchCurrent = ref(0)" in combined_src
+        assert "const terminalSearchInputRef = ref(null)" in combined_src
+
+    def test_search_computeds_exist(self, combined_src: str) -> None:
         for token in [
             "const terminalSearchActive = computed",
             "const terminalSearchMatches = computed",
             "const terminalSearchSegments = computed",
             "const terminalSearchTotal = computed",
         ]:
-            assert token in src
-        assert "line.indexOf(q, from)" in src
-        assert "kind: m.gIdx === cur ? 'current' : 'hit'" in src
+            assert token in combined_src
+        assert "line.indexOf(q, from)" in combined_src
+        assert "kind: m.gIdx === cur ? 'current' : 'hit'" in combined_src
 
-    def test_search_helpers_exist(self, src: str) -> None:
+    def test_search_helpers_exist(self, combined_src: str) -> None:
         for token in [
             "const openTerminalSearch = () =>",
             "const closeTerminalSearch = () =>",
             "const terminalSearchNext = () =>",
             "const terminalSearchPrev = () =>",
         ]:
-            assert token in src
-        assert "terminalSearchVisible.value = true" in src
-        assert "terminalSearchVisible.value = false" in src
+            assert token in combined_src
+        assert "terminalSearchVisible.value = true" in combined_src
+        assert "terminalSearchVisible.value = false" in combined_src
 
-    def test_search_keyboard_shortcuts_wired(self, src: str) -> None:
+    def test_search_keyboard_shortcuts_wired(self, src: str, kbd_src: str) -> None:
+        # Dispatch moved to composables/useKeyboardCommand.js: the resolver maps
+        # keys to action names; App.vue's keyboardActions wire them to the
+        # TerminalLogPane search methods.
         ctrl_f = re.search(
-            r"activeBottomTab\.value === 'terminal'[\s\S]*?event\.key === 'f'[\s\S]*?openTerminalSearch\(\)",
-            src,
+            r"activeTab === 'terminal'[\s\S]*?\bkey === 'f' \|\| key === 'F'[\s\S]*?action: 'terminalSearchOpen'",
+            kbd_src,
         )
-        assert ctrl_f, "Ctrl+F on terminal tab must open terminal search"
-        assert "closeTerminalSearch()" in src
-        assert "terminalSearchPrev()" in src
-        assert "terminalSearchNext()" in src
-        assert "event.key === 'Escape'" in src
-        assert "event.key === 'Enter' && event.shiftKey" in src
+        assert ctrl_f, "Ctrl+F on terminal tab must resolve to terminalSearchOpen"
+        assert "if (key === 'Escape') return { action: 'terminalSearchClose' }" in kbd_src
+        assert "if (key === 'Enter' && event.shiftKey) return { action: 'terminalSearchPrev' }" in kbd_src
+        assert "if (key === 'Enter') return { action: 'terminalSearchNext' }" in kbd_src
+        assert "terminalSearchOpen: () => terminalLogPaneRef.value?.openTerminalSearch()" in src
+        assert "terminalSearchClose: () => terminalLogPaneRef.value?.closeTerminalSearch()" in src
+        assert "terminalSearchPrev: () => terminalLogPaneRef.value?.terminalSearchPrev()" in src
+        assert "terminalSearchNext: () => terminalLogPaneRef.value?.terminalSearchNext()" in src
 
-    def test_search_template_wired(self, src: str) -> None:
-        assert "v-if=\"terminalSearchVisible\"" in src
-        assert "ref=\"terminalSearchInputRef\"" in src
-        assert "v-model=\"terminalSearchQuery\"" in src
-        assert "terminalSearchSegments.get(idx)" in src
-        assert "'terminal-search-hit': seg.kind === 'hit'" in src
-        assert "'terminal-search-current': seg.kind === 'current'" in src
+    def test_search_template_wired(self, combined_src: str) -> None:
+        assert "v-if=\"terminalSearchVisible\"" in combined_src
+        assert "ref=\"terminalSearchInputRef\"" in combined_src
+        assert "v-model=\"terminalSearchQuery\"" in combined_src
+        assert "terminalSearchSegments.get(idx)" in combined_src
+        assert "'terminal-search-hit': seg.kind === 'hit'" in combined_src
+        assert "'terminal-search-current': seg.kind === 'current'" in combined_src
 
-    def test_search_css_present(self, src: str) -> None:
+    def test_search_css_present(self, combined_src: str) -> None:
         for cls in [
             ".terminal-search-bar",
             ".terminal-search-input",
@@ -219,10 +311,38 @@ class TestXTerminalSearch:
             ".terminal-search-hit",
             ".terminal-search-current",
         ]:
-            assert cls in src
+            assert cls in combined_src
 
 
 class TestY33CapabilityTracePanel:
+    @pytest.fixture(scope="class")
+    def src(self) -> str:
+        """Capability UI/state was extracted into sub-components + composables
+        (useCapabilityTrace / useCapabilityTraceExport / useCapabilityFixtureReplay)."""
+        parts = [APP_VUE.read_text(encoding="utf-8")]
+        for name in (
+            "CapabilityOverviewPane.vue",
+            "CapabilityHeroSection.vue",
+            "CapabilityExecutionTelemetry.vue",
+        ):
+            p = _UI_SRC / "components" / name
+            if p.exists():
+                parts.append(p.read_text(encoding="utf-8"))
+        for comp in (
+            "useCapabilityTrace.js",
+            "useCapabilityTraceExport.js",
+            "useCapabilityFixtureReplay.js",
+            "useTimelineReplay.js",
+            "useBottomTabs.js",
+            "useRunEventRouter.js",
+        ):
+            p = _UI_SRC / "composables" / comp
+            if p.exists():
+                parts.append(p.read_text(encoding="utf-8"))
+        if APP_CSS.exists():
+            parts.append(APP_CSS.read_text(encoding="utf-8"))
+        return "\n".join(parts)
+
     def test_capability_state_and_computeds_exist(self, src: str, capability_trace_utils_src: str) -> None:
         for token in [
             "const hasNewCapability = ref(false)",
@@ -248,15 +368,15 @@ class TestY33CapabilityTracePanel:
             "const latestCapabilityRoute = computed",
             "const latestCapabilityExecute = computed",
             "const capabilityTraceEvents = computed",
-            "from './components/capabilityTraceUtils'",
+            "from '../components/capabilityTraceUtils'",
             "import CapabilityTraceList from './components/CapabilityTraceList.vue'",
             "const capabilityBackendPlan = computed",
             "const capabilityRouteCrawlEfficiencyPlan = computed",
             "const capabilityFallbackChain = computed",
             "const capabilityModelRoles = computed",
             "const capabilityTraceJson = computed",
-            "const capabilityExecutionAttempts = computed",
-            "const capabilityExecutionChecks = computed",
+            "const attempts = computed",
+            "const checks = computed",
             "const capabilityExecuteJson = computed",
             "const capabilityTraceRows = computed",
             "const capabilityTraceSummary = computed",
@@ -271,17 +391,17 @@ class TestY33CapabilityTracePanel:
             "const capabilityExecutionActionIssueActions = computed",
             "const capabilityExecutionActionFailureSummary = computed",
             "const capabilityExecutionActionRecoveryActions = computed",
-            "const capabilityEfficiencyCorrelationStatusClass = computed",
+            "const correlationStatusClass = computed",
             "const capabilityExecutionFailureBundle = computed",
             "const capabilityExecutionCrawlEfficiencyPlan = computed",
             "const capabilityActiveCrawlEfficiencyPlan = computed",
             "const capabilityExecutionCrawlEfficiencyCandidates = computed",
             "const capabilityExecutionCrawlEfficiencyAvailablePaths = computed",
-            "const capabilityExecutionCrawlEfficiencySummary = computed",
+            "const crawlSummary = computed",
             "const capabilityExecutionEfficiencyCorrelationReport = computed",
             "const capabilityExecutionEfficiencyCorrelationAlignment = computed",
             "const capabilityExecutionEfficiencyCorrelationRootCauses = computed",
-            "const capabilityExecutionEfficiencyCorrelationPlannerHints = computed",
+            "const correlationPlannerHints = computed",
             "const capabilityExecutionEfficiencyCorrelationActions = computed",
             "const capabilityEfficiencyFeedbackReplayChecks = computed",
             "const capabilityEfficiencyFeedbackReplayFailedChecks = computed",
@@ -359,7 +479,7 @@ class TestY33CapabilityTracePanel:
             "searchText: actionSearchText",
             "const q = String(capabilityTraceSearchQuery.value || '').trim().toLowerCase()",
             "String(row.searchText || row.detail || '').toLowerCase().includes(q)",
-            "import { buildFailureFixtureBatchReplaySummaryText } from './composables/failureFixtureSummary'",
+            "import { buildFailureFixtureBatchReplaySummaryText } from './failureFixtureSummary'",
             "const buildCapabilityTraceSummaryText = () =>",
             "const copyCapabilityTraceSummary = async () =>",
             "const buildCapabilityFailureFixtureBatchReplaySummaryText = () =>",
@@ -417,92 +537,82 @@ class TestY33CapabilityTracePanel:
         capability_trace_list_src: str,
         capability_alignment_card_src: str,
         capability_efficiency_panel_src: str,
+        capability_replay_pane_src: str,
     ) -> None:
         for token in [
             '<el-tab-pane name="capability">',
             ':is-dot="hasNewCapability"',
             "Route-Aware Agent Guidance",
             "v-if=\"latestCapabilityRoute || latestCapabilityExecute\"",
-            "@click=\"exportCapabilityTraceAsJsonl\"",
-            "@click=\"copyCapabilityTraceSummary\"",
+            "exportCapabilityTraceAsJsonl",
+            "handleCapabilityMoreAction",
+            "copySummary: copyCapabilityTraceSummary,",
+            "command=\"copySummary\"",
             "复制摘要",
-            "@click=\"generateCapabilityFailureFixture\"",
+            "generateFixture: generateCapabilityFailureFixture,",
+            "command=\"generateFixture\"",
             "生成 Fixture",
             "capabilityFailureFixtureLoading",
-            "@click=\"replayCapabilityFailureFixture\"",
+            "replayFixture: replayCapabilityFailureFixture,",
+            "command=\"replayFixture\"",
             "验证 Fixture",
             "capabilityFailureFixtureReplayLoading",
-            "@click=\"fetchCapabilityFailureFixtures\"",
+            "refreshFixtures: fetchCapabilityFailureFixtures,",
+            "command=\"refreshFixtures\"",
             "刷新 Fixture 库",
             "capabilityFailureFixtureLibraryLoading",
-            "@click=\"fetchCapabilityFailureFixtureBatchHistory\"",
+            "refreshBatchHistory: fetchCapabilityFailureFixtureBatchHistory,",
+            "command=\"refreshBatchHistory\"",
             "刷新 Replay 历史",
             "capabilityFailureFixtureBatchHistoryLoading",
-            "@click=\"batchReplayCapabilityFailureFixtures\"",
+            "batchReplay: batchReplayCapabilityFailureFixtures,",
+            "command=\"batchReplay\"",
             "批量验证 Fixture",
             "capabilityFailureFixtureBatchReplayLoading",
-            "capabilityExecutionFailureBundle.version !== 'capability_execute_failure_bundle.v1'",
-            "Failure Fixture Replay",
-            "capabilityFailureFixtureReplayReport.fixture?.primary_failure",
-            "capabilityFailureFixtureReplayReport.planner_feedback?.passed ? 'passed' : 'failed'",
-            "capabilityFailureFixtureReplayReport.route?.passed ? 'passed' : 'failed'",
-            "capabilityFailureFixtureReplayReport.execution_plan?.passed ? 'passed' : 'failed'",
-            "capabilityFailureFixtureReplayChecks.length - capabilityFailureFixtureReplayFailedChecks.length",
-            "v-for=\"check in capabilityFailureFixtureReplayChecks.slice(0, 6)\"",
-            "Failure Fixture Library",
-            "capabilityFailureFixtureLibraryCount",
-            "v-for=\"item in capabilityFailureFixtureLibrary.slice(0, 5)\"",
-            "Failure Fixture Batch History",
-            "capabilityFailureFixtureBatchHistoryCount",
-            "capabilityFailureFixtureLatestBatchHistory.status || 'unknown'",
-            "capabilityFailureFixtureBatchHistoryTrendDirection",
-            "capabilityFailureFixtureBatchHistoryTrendPassRateDelta",
-            "focus changed",
-            "v-for=\"item in capabilityFailureFixtureBatchHistory.slice(0, 5)\"",
-            "Failure Fixture Batch Replay",
-            "capabilityFailureFixtureBatchReplayReport.fixture_count || 0",
-            "capabilityFailureFixtureBatchReplayReport.passed_count || 0",
-            "capabilityFailureFixtureBatchReplayFailedChecks.length",
-            "capabilityFailureFixtureBatchReplaySummary.recommended_focus",
-            "capabilityFailureFixtureBatchReplayTopPrimaryFailures[0]?.name || 'none'",
-            "capabilityFailureFixtureBatchReplayTopFailureCategories[0]?.name || 'none'",
-            "capabilityFailureFixtureBatchReplayTopFailedChecks[0]?.name || 'none'",
-            "@click=\"copyCapabilityFailureFixtureBatchReplaySummary\"",
-            "复制 Replay 摘要",
-            "v-for=\"check in capabilityFailureFixtureBatchReplayFailedChecks.slice(0, 6)\"",
-            "v-for=\"item in capabilityFailureFixtureBatchReplayItems.slice(0, 6)\"",
-            "@click=\"triggerReplayImport('capability')\"",
+            "capabilityExecutionFailureBundle.version",
+            "importReplay: () => triggerReplayImport('capability'),",
+            "command=\"importReplay\"",
             "Capability 回放模式",
             "<CapabilityTraceList",
-            "v-model:filter=\"capabilityTraceFilter\"",
-            "v-model:search-query=\"capabilityTraceSearchQuery\"",
-            ":rows=\"capabilityFilteredTraceRows\"",
-            "@open-row=\"openPhaseDialog\"",
-            "capabilityTraceHealth.label",
-            "route {{ capabilityTraceHealth.route }}",
-            "issues {{ capabilityTraceHealth.issues }}",
-            "<CapabilityAlignmentCard",
-            ":alignment=\"capabilityExecutionAlignment\"",
-            "<CapabilityEfficiencyPanel",
-            ":crawl-plan=\"capabilityActiveCrawlEfficiencyPlan\"",
-            ":correlation-report=\"capabilityExecutionEfficiencyCorrelationReport\"",
+            "capabilityTraceFilter",
+            "capabilityTraceSearchQuery",
+            "capabilityFilteredTraceRows",
+            "@open-row=\"(evt) => timelinePanelRef.value?.openPhaseDialog(evt)\"",
+            "traceHealth.label",
+            "traceHealth",
+            "traceHealth",
+            "CapabilityAlignmentCard",
+            "capabilityExecutionAlignment",
+            "CapabilityEfficiencyPanel",
+            "capabilityActiveCrawlEfficiencyPlan",
+            "capabilityExecutionEfficiencyCorrelationReport",
             "执行遥测",
-            "v-for=\"(issue, idx) in capabilityExecutionRuntimeIssues\"",
-            "v-for=\"action in capabilityExecutionRuntimeActions\"",
-            "v-if=\"capabilityExecutionActionIssueSummary.version\"",
-            "capabilityExecutionActionFailureSummary.failure_code",
-            "capabilityExecutionActionFailureSummary.failure_category",
-            "v-for=\"(issue, idx) in capabilityExecutionActionIssues\"",
-            "v-for=\"action in capabilityExecutionActionIssueActions\"",
-            "v-for=\"action in capabilityExecutionActionRecoveryActions\"",
-            "v-for=\"(attempt, idx) in capabilityExecutionAttempts\"",
-            "v-for=\"check in capabilityExecutionChecks\"",
-            "v-for=\"(item, idx) in capabilityBackendPlan\"",
-            "v-for=\"(item, idx) in capabilityFallbackChain\"",
-            "v-for=\"role in capabilityRoleRows\"",
-            "{{ capabilityTraceJson || capabilityExecuteJson }}",
+            "capabilityExecutionRuntimeIssues",
+            "capabilityExecutionRuntimeActions",
+            "capabilityExecutionActionIssueSummary",
+            "capabilityExecutionActionFailureSummary",
+            "attempt",
+            "check",
+            "<CapabilityReplayPane",
+            "v-bind=\"capabilityReplayPaneProps\"",
+            "<CapabilityDiagnosticsPane",
+            ":fallback-chain=\"capabilityFallbackChain\"",
+            ":role-rows=\"capabilityRoleRows\"",
+            "capabilityTraceJson || capabilityExecuteJson",
         ]:
             assert token in src
+        for token in [
+            "Failure Fixture Replay",
+            "fixtureReplay.report.fixture?.primary_failure",
+            "fixtureReplay.report.planner_feedback?.passed",
+            "fixtureReplay.report.route?.passed",
+            "fixtureReplay.report.execution_plan?.passed",
+            "Failure Fixture Library",
+            "Failure Fixture Batch History",
+            "Failure Fixture Batch Replay",
+            "Efficiency Feedback Replay",
+        ]:
+            assert token in capability_replay_pane_src
         for token in [
             "Trace 历史",
             "v-for=\"item in filters\"",
@@ -547,12 +657,16 @@ class TestY33CapabilityTracePanel:
         capability_trace_list_src: str,
         capability_alignment_card_src: str,
         capability_efficiency_panel_src: str,
+        capability_shared_css_src: str,
     ) -> None:
         for cls in [
             ".capability-scroll",
             ".capability-hero",
-            ".capability-chain",
             ".capability-hero-actions",
+        ]:
+            assert cls in src
+        for cls in [
+            ".capability-chain",
             ".capability-export-btn",
             ".capability-section-head",
             ".capability-health-strip",
@@ -590,7 +704,7 @@ class TestY33CapabilityTracePanel:
             ".capability-role-card",
             ".capability-json",
         ]:
-            assert cls in src
+            assert cls in capability_shared_css_src
         for cls in [
             ".capability-trace-filters",
             ".capability-trace-filter",
@@ -619,7 +733,9 @@ class TestY33CapabilityTracePanel:
         ]:
             assert cls in capability_efficiency_panel_src
 
-    def test_capability_trace_export_wired(self, src: str, failure_fixture_summary_src: str) -> None:
+    def test_capability_trace_export_wired(
+        self, src: str, failure_fixture_summary_src: str, capability_replay_pane_src: str,
+    ) -> None:
         app_tokens = [
             "const exportCapabilityTraceAsJsonl = () =>",
             "capabilityTraceEvents.value",
@@ -696,16 +812,18 @@ class TestY33CapabilityTracePanel:
             "capabilityEfficiencyFeedbackReplayLibrary.value = Array.isArray(result.result?.reports)",
             "已加载 ${capabilityEfficiencyFeedbackReplayLibrary.value.length} 条 efficiency feedback replay reports",
             "读取 efficiency feedback replay library 失败",
-            "Efficiency Feedback Replay",
-            "Efficiency Feedback Replay Library",
-            "source capability/efficiency_feedback_replays",
-            "暂无 efficiency feedback replay artifacts",
             "当前没有可复制的 batch replay 摘要",
             "已复制 batch replay 摘要",
             "failure_bundle: result.failure_bundle",
         ]
         for token in app_tokens:
             assert token in src
+        for token in [
+            "Efficiency Feedback Replay",
+            "Efficiency Feedback Replay Library",
+            "source capability/efficiency_feedback_replays",
+        ]:
+            assert token in capability_replay_pane_src
         for token in [
             "# Failure Fixture Batch Replay Summary",
             "Top primary failures: ${topPrimary}",

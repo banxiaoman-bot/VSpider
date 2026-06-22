@@ -12,6 +12,7 @@ from visual_web_agent.task_templates import TaskTemplate
 class SuccessCriteria:
     signals: tuple[str, ...] = ()
     target_count: int | None = None
+    target_pages: int | None = None
     required_fields: tuple[str, ...] = ()
     artifact_required: bool = False
 
@@ -19,6 +20,7 @@ class SuccessCriteria:
         return {
             "signals": list(self.signals),
             "target_count": self.target_count,
+            "target_pages": self.target_pages,
             "required_fields": list(self.required_fields),
             "artifact_required": self.artifact_required,
         }
@@ -168,6 +170,7 @@ def _success_criteria(name: str, route: dict[str, Any]) -> SuccessCriteria:
     strategy = dict(route.get("strategy_context") or {})
     signals = dict(route.get("signals") or {})
     target_count = strategy.get("target_count")
+    target_pages = strategy.get("target_pages")
     required_fields = tuple(str(item) for item in (strategy.get("requested_fields") or []) if item)
     artifact_required = bool(signals.get("artifact_required") or (route.get("intent") or {}).get("requires_artifact"))
     if name in {"generic_extractor", "extractor_select", "spider_lite", "api_replay"}:
@@ -183,6 +186,7 @@ def _success_criteria(name: str, route: dict[str, Any]) -> SuccessCriteria:
     return SuccessCriteria(
         signals=observed,
         target_count=int(target_count) if isinstance(target_count, int) and target_count > 0 else None,
+        target_pages=int(target_pages) if isinstance(target_pages, int) and target_pages > 0 else None,
         required_fields=required_fields,
         artifact_required=artifact_required if name in {"generic_extractor", "extractor_select", "spider_lite", "feed_export", "artifact_manager"} else False,
     )
@@ -193,9 +197,17 @@ def _step_inputs(name: str, route: dict[str, Any]) -> dict[str, Any]:
     planner_feedback = dict(route.get("planner_feedback") or {})
     base = {"goal": route.get("goal") or "", "url": route.get("url") or ""}
     if name in {"generic_extractor", "extractor_select"}:
-        base.update({"requested_fields": strategy.get("requested_fields") or [], "target_count": strategy.get("target_count")})
+        base.update({
+            "requested_fields": strategy.get("requested_fields") or [],
+            "target_count": strategy.get("target_count"),
+            "target_pages": strategy.get("target_pages"),
+        })
     elif name == "spider_lite":
-        base.update({"start_url": route.get("url") or "", "max_pages": "planner_defined", "extract": "planner_defined"})
+        base.update({
+            "start_url": route.get("url") or "",
+            "max_pages": strategy.get("target_pages") or "planner_defined",
+            "extract": "planner_defined",
+        })
     elif name == "api_replay":
         base.update({"candidate_source": "network_intelligence"})
     elif name == "browser_control":
@@ -270,6 +282,8 @@ def _risk_flags(signals: dict[str, Any], steps: list[PlanStep], planner_feedback
     feedback = dict(planner_feedback or {})
     if signals.get("auth_or_captcha"):
         flags.append("auth_or_captcha_requires_guard")
+    if signals.get("bot_challenge"):
+        flags.append("anti_bot_challenge_guarded")
     if any(step.risk != "low" for step in steps):
         flags.append("medium_or_higher_risk_step")
     if any(not step.deterministic for step in steps):

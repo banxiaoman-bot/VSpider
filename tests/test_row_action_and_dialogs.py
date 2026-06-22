@@ -279,9 +279,9 @@ class TestRowActionHandlerRegistration:
         """The Pydantic schema must accept row_action so VLM emissions parse."""
         import inspect
 
-        from visual_web_agent import vlm_client
+        from visual_web_agent import vlm_models
 
-        src = inspect.getsource(vlm_client)
+        src = inspect.getsource(vlm_models)
         assert '"row_action"' in src
 
     def test_json_schema_advertises_row_action(self) -> None:
@@ -391,9 +391,9 @@ class TestHoverTooltipNotice:
     def test_actions_py_has_tooltip_read_marker(self) -> None:
         import inspect
 
-        from visual_web_agent import actions
+        from visual_web_agent.actions import click_and_type
 
-        src = inspect.getsource(actions)
+        src = inspect.getsource(click_and_type)
         # Must appear in BOTH the appeared branch AND the timeout fallback.
         assert src.count("[TOOLTIP READ]") == 2, (
             f"Expected 2 occurrences of [TOOLTIP READ], got "
@@ -410,9 +410,9 @@ class TestHoverTooltipNotice:
         """
         import inspect
 
-        from visual_web_agent import actions
+        from visual_web_agent.actions import click_and_type
 
-        src = inspect.getsource(actions)
+        src = inspect.getsource(click_and_type)
         legacy = "browser._tab_switch_notice = _tooltip_notice" in src
         migrated = "browser.set_tab_notice(\n" in src and "_tooltip_notice" in src
         assert legacy or migrated, (
@@ -432,9 +432,9 @@ class TestSetNativeValueFocus:
     def test_focus_called_before_value_set(self) -> None:
         import inspect
 
-        from visual_web_agent import actions
+        from visual_web_agent.actions import find_and_form
 
-        src = inspect.getsource(actions)
+        src = inspect.getsource(find_and_form)
         # The patched JS calls focus() and dispatches FocusEvent before
         # calling the React-native value setter.
         assert "el.focus?.({preventScroll: true})" in src

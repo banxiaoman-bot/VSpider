@@ -3,13 +3,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
+from .secret_redaction import redact_secret_mapping
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 _RUN_STATUS = {"queued", "running", "paused", "succeeded", "failed", "stopped", "error"}
 _TERMINAL_STATUS = {"succeeded", "failed", "stopped", "error"}
 
@@ -71,6 +74,10 @@ def _sanitize_vlm_options(vlm_options: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _sanitize_secret_mapping(value: dict[str, Any] | None) -> dict[str, Any]:
+    return redact_secret_mapping(value, drop_empty=True)
+
+
 def _derive_paths(run_id: str) -> dict[str, str]:
     rid = str(run_id or "").strip()
     return {
@@ -102,6 +109,10 @@ def create_run(
     semantic_model: str = "",
     vlm_model_type: str = "vl",
     vlm_options: dict[str, Any] | None = None,
+    urls: list[str] | None = None,
+    constraints: dict[str, Any] | None = None,
+    upload_sha256: str = "",
+    upload_mime: str = "",
     status: str = "running",
     base_dir: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -125,6 +136,10 @@ def create_run(
         "semantic_model": str(semantic_model or ""),
         "vlm_model_type": str(vlm_model_type or "vl"),
         "vlm_options": _sanitize_vlm_options(vlm_options),
+        "urls": [str(u) for u in (urls or []) if str(u or "")],
+        "constraints": _sanitize_secret_mapping(constraints),
+        "upload_sha256": str(upload_sha256 or ""),
+        "upload_mime": str(upload_mime or ""),
         "created_at": ts,
         "started_at": ts if st == "running" else None,
         "finished_at": None,
@@ -245,3 +260,57 @@ def list_runs(
         items.append(rec)
     items.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
     return items[:n]
+
+
+def delete_run(run_id: str, *, base_dir: str | Path | None = None) -> bool:
+    """Delete a run's registry record + ``runs/<id>/`` dir + ``logs/*_<id>.*``.
+
+    Pure file removal — NO status guard (callers enforce active-run protection).
+    Returns True iff the registry record existed. Raises ValueError on bad id.
+    """
+    rid = _safe_run_id(run_id)
+    reg = registry_root(base_dir)          # .../runs/registry
+    runs_root = reg.parent                  # .../runs
+    proj = runs_root.parent                 # project root (or tmp in tests)
+    reg_path = reg / f"{rid}.json"
+    existed = reg_path.exists()
+    reg_path.unlink(missing_ok=True)
+    run_dir = runs_root / rid
+    if run_dir.is_dir():
+        shutil.rmtree(run_dir, ignore_errors=True)
+    for rel in (f"run_log_{rid}.html", f"phase_{rid}.jsonl", f"event_stream_{rid}.jsonl"):
+        try:
+            (proj / "logs" / rel).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return existed
+
+
+def prune_runs(*, keep: int = 100, base_dir: str | Path | None = None) -> list[str]:
+    """Keep newest *keep* runs by created_at; delete older **terminal** ones.
+
+    Never deletes non-terminal (running/queued/paused) runs even if old.
+    Returns deleted run_ids.
+    """
+    try:
+        k = max(0, int(keep))
+    except (TypeError, ValueError):
+        k = 100
+    recs: list[dict[str, Any]] = []
+    for path in registry_root(base_dir).glob("*.json"):
+        if not path.is_file():
+            continue
+        rec = load_run(path.stem, base_dir)
+        if rec:
+            recs.append(rec)
+    recs.sort(key=lambda r: float(r.get("created_at") or 0), reverse=True)
+    deleted: list[str] = []
+    for rec in recs[k:]:
+        if rec.get("status") in _TERMINAL_STATUS:
+            rid = str(rec.get("run_id") or rec.get("task_id") or "")
+            try:
+                if rid and delete_run(rid, base_dir=base_dir):
+                    deleted.append(rid)
+            except ValueError:
+                continue
+    return deleted

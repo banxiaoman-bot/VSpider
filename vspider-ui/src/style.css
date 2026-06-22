@@ -31,40 +31,60 @@
   --rgb-warn-soft: 253 230 138;
   --rgb-surface-2: 13 17 24;
   --rgb-gold: 245 215 122;
+  /* brand cyan — the mascot's signature glow ring */
+  --rgb-cyan: 34 211 197;
+  --rgb-teal-deep: 36 59 66;
 
-  /* --- semantic / palette colors --- */
-  --vsp-bg: #101014;
-  --vsp-bg-deep: #0a0d12;
-  --vsp-surface: #18181c;
-  --vsp-surface-2: rgb(var(--rgb-surface-2));
-  --vsp-surface-sunken: #080a0d;
-  --vsp-surface-mint: #06110d;
-  --vsp-border: #2d2d30;
-  --vsp-slate-900: rgb(var(--rgb-ink));
-  --vsp-slate-950: rgb(var(--rgb-ink-deep));
+  /* --- semantic / palette colors (light theme — "modern console") --- */
+  --vsp-bg: #f4f7f7;
+  --vsp-bg-deep: #e9eeee;
+  --vsp-surface: #ffffff;
+  /* Tab 内「嵌入深盒」统一底色：比 --vsp-bg-deep 浅，保证深色文字对比清晰。
+     想更浅→靠近 #fafcfc / 想更有层次→靠近 #e9eeee，只改这一处即可。 */
+  --vsp-box-bg: #f7faf9;
+  /* 深盒内表头色带（比 box-bg 深一级，拉出层次，不用纯白/纯灰） */
+  --vsp-box-header-bg: #eef3f2;
+  /* 等宽字体栈：数据 / Run ID / KB / 时间 / 日志（数字对齐、ID 可读） */
+  --vsp-mono: "JetBrains Mono", Consolas, "SFMono-Regular", ui-monospace, monospace;
+  --vsp-surface-2: #1e1e2e;
+  --vsp-surface-sunken: #e7eced;
+  --vsp-surface-mint: #eaf7f2;
+  --vsp-border: #d2dadb;
+  --vsp-border-strong: #c2cccd;
+  --vsp-slate-900: #1e293b;
+  --vsp-slate-950: #0f172a;
   --vsp-slate-800: #1e293b;
   --vsp-gray-800: #1f2937;
   --vsp-gray-900: #111827;
   --vsp-slate-700: #334155;
   --vsp-slate-600: #475569;
-  --vsp-text: #f4f7fb;
+  --vsp-text: #1a1a2e;
   --vsp-slate-50: #f8fafc;
-  --vsp-text-strong: #f1f5f9;
-  --vsp-text-bright: #e6ecf3;
+  --vsp-text-strong: #111827;
+  --vsp-text-bright: #1e293b;
   --vsp-slate-200: #e2e8f0;
-  --vsp-text-label: #d8dee9;
-  --vsp-text-2: #cbd5e1;
-  --vsp-text-2-alt: #c9d4e1;
-  --vsp-text-2-alt2: #c8d0dc;
-  --vsp-text-muted: rgb(var(--rgb-slate));
-  --vsp-text-muted-alt: #9aa4b2;
-  --vsp-text-faint: #8f96a3;
-  --vsp-text-dim: #64748b;
-  --vsp-text-dim-alt: #626b79;
+  --vsp-text-label: #374151;
+  --vsp-text-2: #4b5563;
+  --vsp-text-2-alt: #4f5b6b;
+  --vsp-text-2-alt2: #525d6c;
+  --vsp-text-muted: #6b7280;
+  --vsp-text-muted-alt: #6b7280;
+  --vsp-text-faint: #9ca3af;
+  --vsp-text-dim: #9ca3af;
+  --vsp-text-dim-alt: #a0a7b4;
   --vsp-gray-500: #6b7280;
   --vsp-white: #fff;
-  --vsp-accent: rgb(var(--rgb-accent));
-  --vsp-accent-bright: #78edc6;
+  --vsp-accent: #10b981;
+  --vsp-accent-bright: #34d399;
+  --vsp-cyan: #1fd1c1;
+  --vsp-cyan-bright: #2ee6d6;
+  --vsp-cyan-soft: #c9f3ee;
+  --vsp-cyan-100: #e2f8f4;
+  --vsp-cyan-200: #bff0e8;
+  --vsp-cyan-300: #86e3d6;
+  --vsp-cyan-600: #0e9488;
+  --vsp-cyan-700: #0b7d74;
+  --vsp-teal-deep: #243b42;
   --vsp-success: #34d399;
   --vsp-success-soft: #86efac;
   --vsp-success-vivid: #00e676;
@@ -97,14 +117,121 @@
   --vsp-danger-pale: #f5d0d0;
 }
 
+/* ============================================================
+   Element Plus brand theme — remap el-* component variables onto
+   the VSpider palette so drawer/forms read on-brand (emerald-mint
+   + cyan) instead of stock Element Plus blue (#409eff) + cold gray.
+   The doubled :root:root selector raises specificity above Element
+   Plus' own :root defaults, so these win regardless of the order in
+   which the auto-imported component styles land in the bundle.
+   ============================================================ */
+:root:root {
+  /* primary → brand emerald, with the light/dark ramp EP expects */
+  --el-color-primary: var(--vsp-accent);
+  --el-color-primary-light-3: #58cea7;
+  --el-color-primary-light-5: #88dcc0;
+  --el-color-primary-light-7: #b7ead9;
+  --el-color-primary-light-8: #cff1e6;
+  --el-color-primary-light-9: #e7f8f2;
+  --el-color-primary-dark-2: #0d9467;
+
+  --el-color-success: #22c55e;
+  --el-color-success-light-3: #64d68e;
+  --el-color-success-light-5: #91e2af;
+  --el-color-success-light-7: #bdedcf;
+  --el-color-success-light-8: #d3f3df;
+  --el-color-success-light-9: #e9f9ef;
+  --el-color-success-dark-2: #1b9e4b;
+
+  --el-color-warning: #f59e0b;
+  --el-color-warning-light-3: #f8bb54;
+  --el-color-warning-light-5: #face85;
+  --el-color-warning-light-7: #fce2b6;
+  --el-color-warning-light-8: #fdecce;
+  --el-color-warning-light-9: #fef5e7;
+  --el-color-warning-dark-2: #c47e09;
+
+  --el-color-danger: #ef4444;
+  --el-color-danger-light-3: #f47c7c;
+  --el-color-danger-light-5: #f7a2a2;
+  --el-color-danger-light-7: #fac7c7;
+  --el-color-danger-light-8: #fcdada;
+  --el-color-danger-light-9: #fdecec;
+  --el-color-danger-dark-2: #bf3636;
+
+  --el-color-error: #ef4444;
+  --el-color-error-light-3: #f47c7c;
+  --el-color-error-light-5: #f7a2a2;
+  --el-color-error-light-7: #fac7c7;
+  --el-color-error-light-8: #fcdada;
+  --el-color-error-light-9: #fdecec;
+  --el-color-error-dark-2: #bf3636;
+
+  --el-color-info: #64748b;
+  --el-color-info-light-3: #939eae;
+  --el-color-info-light-5: #b2bac5;
+  --el-color-info-light-7: #d0d5dc;
+  --el-color-info-light-8: #e0e3e8;
+  --el-color-info-light-9: #f0f1f3;
+  --el-color-info-dark-2: #505d6f;
+
+  /* text ramp → VSpider ink scale (warmer, higher contrast than EP grays) */
+  --el-text-color-primary: var(--vsp-text);
+  --el-text-color-regular: var(--vsp-text-2);
+  --el-text-color-secondary: var(--vsp-text-muted);
+  --el-text-color-placeholder: var(--vsp-text-faint);
+  --el-text-color-disabled: #b8c0c2;
+
+  /* borders → brand-cooled neutrals so inputs match panels */
+  --el-border-color: var(--vsp-border);
+  --el-border-color-light: #dde3e3;
+  --el-border-color-lighter: #e6ebeb;
+  --el-border-color-extra-light: #eef2f2;
+  --el-border-color-dark: var(--vsp-border-strong);
+  --el-border-color-hover: var(--vsp-text-faint);
+
+  /* fills / surfaces → white inputs, mint hover wash */
+  --el-fill-color-blank: var(--vsp-surface);
+  --el-fill-color: #eef3f3;
+  --el-fill-color-light: var(--vsp-surface-mint);
+  --el-fill-color-lighter: #f1f7f5;
+  --el-bg-color: var(--vsp-surface);
+  --el-bg-color-page: var(--vsp-bg);
+  --el-bg-color-overlay: var(--vsp-surface);
+}
+
 @theme inline {
   --color-vsp-bg: var(--vsp-bg);
   --color-vsp-surface: var(--vsp-surface);
   --color-vsp-border: var(--vsp-border);
   --color-vsp-accent: var(--vsp-accent);
+  --color-vsp-cyan: var(--vsp-cyan);
   --color-vsp-info: var(--vsp-info);
   --color-vsp-success: var(--vsp-success);
   --color-vsp-warn: var(--vsp-warn);
   --color-vsp-danger: var(--vsp-danger);
   --color-vsp-text: var(--vsp-text);
+}
+
+/* ============================================================
+   数据表格统一样式（全局，穿透子组件 scoped）
+   - 行高/留白比颜色更能提升清晰度
+   - 表头色带比盒底深一级、文字弱化、克制
+   - .col-mono 数据列走等宽字体（Run ID / KB / 时间 / 耗时 / 步数）
+   ============================================================ */
+.artifact-table td.el-table__cell {
+  padding: 8px 0;
+  line-height: 1.5;
+  color: var(--vsp-text-2);
+}
+.artifact-table th.el-table__cell {
+  background: var(--vsp-box-header-bg) !important;
+  color: var(--vsp-text-muted);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.artifact-table .col-mono .cell {
+  font-family: var(--vsp-mono);
+  font-size: 12.5px;
+  color: var(--vsp-text-2);
 }

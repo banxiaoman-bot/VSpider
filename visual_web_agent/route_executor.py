@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from visual_web_agent.capability_router import route_task
+from visual_web_agent import api_replay
 from visual_web_agent.extraction_engine import generic
 from visual_web_agent.spider_lite import SpiderLiteManager
 from visual_web_agent.success_verifier import verify_route_success
@@ -38,12 +39,19 @@ def _normalise_per_step_systems(raw: Any) -> dict[str, dict[str, str]]:
 def _stamp_system_metadata(
     attempts: list[dict[str, Any]],
     capability_to_system: dict[str, dict[str, str]],
+    router: Any = None,
 ) -> tuple[list[str], dict[str, list[dict[str, Any]]]]:
     """Tag each attempt with its planned ``system_id`` and bucket per system.
 
     The legacy "no cross-system" path is preserved as
     ``systems_involved=["system_1"]`` so downstream consumers always see
     at least one system entry.
+
+    When a :class:`~visual_web_agent.session_router.SessionRouter` is
+    supplied (E1c-2), the effective ``auth_profile`` is resolved with the
+    router's precedence -- an explicit per-step profile wins, else the
+    system's profile declared in ``workflow_graph.systems``, else ``auto``
+    (which is left unstamped).
     """
 
     systems_involved: list[str] = []
@@ -53,8 +61,13 @@ def _stamp_system_metadata(
         info = capability_to_system.get(capability)
         system_id = (info or {}).get("system_id") or "system_1"
         attempt["system_id"] = system_id
-        if info and info.get("auth_profile") and info["auth_profile"] != "auto":
-            attempt["auth_profile"] = info["auth_profile"]
+        explicit_profile = str((info or {}).get("auth_profile") or "")
+        if router is not None:
+            resolved_profile = router.resolved_auth_profile(system_id, explicit_profile or "auto")
+        else:
+            resolved_profile = explicit_profile
+        if resolved_profile and resolved_profile != "auto":
+            attempt["auth_profile"] = resolved_profile
         if info and info.get("step_id"):
             attempt["step_id"] = info["step_id"]
         if system_id not in systems_involved:
@@ -64,6 +77,82 @@ def _stamp_system_metadata(
         systems_involved.append("system_1")
         system_attempts.setdefault("system_1", [])
     return systems_involved, system_attempts
+
+
+def _router_from_route(route: dict[str, Any]) -> Any:
+    """Build a (pool-less) SessionRouter from a route's workflow_graph.
+
+    Returns ``None`` on any failure so the executor degrades to the legacy
+    per-step-only auth handling instead of crashing.
+    """
+
+    try:
+        from .session_router import build_session_router
+
+        return build_session_router("route_executor", route)
+    except Exception:
+        return None
+
+
+def _build_session_plan(
+    systems_involved: list[str],
+    router: Any,
+) -> list[dict[str, Any]]:
+    """Resolve, per involved system, the session a downstream executor needs.
+
+    Each entry is ``{system_id, auth_profile, domain}``. This is plan-stepped
+    output: ``route_executor`` itself stays browserless, but E1c-3's reactive
+    loop can use this to pre-acquire / switch ``BrowserSession`` handles.
+    """
+
+    plan: list[dict[str, Any]] = []
+    for system_id in systems_involved:
+        if router is not None:
+            auth_profile = router.resolved_auth_profile(system_id)
+            domain = router.plan.domain_for(system_id)
+        else:
+            auth_profile = "auto"
+            domain = ""
+        plan.append({
+            "system_id": system_id,
+            "auth_profile": auth_profile,
+            "domain": domain,
+        })
+    return plan
+
+
+def _wire_data_bus(
+    outcome: dict[str, Any],
+    route: dict[str, Any],
+    completed: dict[str, Any],
+    *,
+    run_id: str,
+) -> None:
+    """S8: publish a completed capability's result onto the run's data bus.
+
+    The bus turns ``workflow_graph.data_edges`` from declaration into
+    runtime: downstream steps (possibly on another system, possibly in a
+    later executor call of the same run) can ``consume()`` these items
+    from memory instead of re-reading a file. Best-effort — a bus failure
+    must never fail the route itself.
+    """
+
+    try:
+        from .workflow_data_bus import get_run_bus
+
+        bus = get_run_bus(run_id, workflow_graph=route.get("workflow_graph"))
+        if bus is None:
+            return
+        capability = str(completed.get("capability") or "")
+        packets = bus.publish_by_capability(capability, completed.get("result"))
+        outcome["data_handoff"] = {
+            "run_id": run_id,
+            "published_capability": capability,
+            "published_edges": [p.edge_id for p in packets],
+            "bus": bus.snapshot(),
+        }
+    except Exception:
+        pass
 
 
 def _attempt_error(capability: str, exc: Exception) -> dict[str, Any]:
@@ -98,23 +187,36 @@ class DeterministicRouteExecutor:
         source = payload.get("source")
         if source is None:
             source = payload.get("html")
+        run_id = str(payload.get("run_id") or "route_executor")
+
+        def _finish(completed_payload: dict[str, Any]) -> dict[str, Any]:
+            outcome = self._completed(route, attempts, completed_payload, capability_to_system)
+            _wire_data_bus(outcome, route, completed_payload, run_id=run_id)
+            return outcome
+
         if source not in (None, ""):
             selector_result = self._try_selector(payload, source, route, attempts)
             if selector_result is not None:
-                return self._completed(route, attempts, selector_result, capability_to_system)
+                return _finish(selector_result)
             extract_result = self._try_extract(payload, source, route, attempts)
             if extract_result is not None:
-                return self._completed(route, attempts, extract_result, capability_to_system)
+                return _finish(extract_result)
         else:
             attempts.append({"capability": "generic_extractor", "status": "skipped", "reason": "source/html not provided"})
         if bool(payload.get("allow_network")):
+            api_result = self._try_api_replay(payload, route, attempts)
+            if api_result is not None:
+                return _finish(api_result)
             spider_result = self._try_spider(payload, route, attempts)
             if spider_result is not None:
-                return self._completed(route, attempts, spider_result, capability_to_system)
+                return _finish(spider_result)
         else:
+            if _api_replay_candidates(payload):
+                attempts.append({"capability": "api_replay", "status": "skipped", "reason": "allow_network is false"})
             attempts.append({"capability": "spider_lite", "status": "skipped", "reason": "allow_network is false"})
         status = "fallback" if any(item.get("status") == "attempted" for item in attempts) else "skipped"
-        systems_involved, system_attempts = _stamp_system_metadata(attempts, capability_to_system)
+        router = _router_from_route(route)
+        systems_involved, system_attempts = _stamp_system_metadata(attempts, capability_to_system, router)
         return {
             "status": status,
             "completed": False,
@@ -125,6 +227,7 @@ class DeterministicRouteExecutor:
             "fallback_reason": self._fallback_reason(attempts),
             "systems_involved": systems_involved,
             "system_attempts": system_attempts,
+            "session_plan": _build_session_plan(systems_involved, router),
         }
 
     def _try_selector(self, payload: dict[str, Any], source: Any, route: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -200,6 +303,76 @@ class DeterministicRouteExecutor:
             return None
         return {"capability": "generic_extractor", "result": result, "artifact": artifact, "verification": verification}
 
+    def _try_api_replay(self, payload: dict[str, Any], route: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        candidates = _api_replay_candidates(payload)
+        if not candidates:
+            return None
+        candidate = api_replay.choose_candidate(
+            candidates,
+            endpoint=str(payload.get("endpoint") or payload.get("api_endpoint") or ""),
+        )
+        if candidate is None:
+            attempts.append({"capability": "api_replay", "status": "skipped", "reason": "network candidate not provided"})
+            return None
+        headers = payload.get("api_headers") if isinstance(payload.get("api_headers"), dict) else payload.get("headers")
+        if not isinstance(headers, dict):
+            headers = {}
+        fetcher = payload.get("api_replay_fetcher") if callable(payload.get("api_replay_fetcher")) else None
+        target = _target_count(route) or 0
+        page_size = _positive_int(payload.get("page_size"), default=target or 50, max_value=500)
+        # S12: paginate when explicitly requested or when one page provably
+        # cannot satisfy the target row count.
+        paginate = bool(payload.get("paginate") or payload.get("auto_paginate")) or (
+            target > page_size
+        )
+        try:
+            if paginate:
+                result = api_replay.paginate_replay(
+                    run_id=str(payload.get("run_id") or "route_executor"),
+                    candidate=candidate,
+                    page_size=page_size,
+                    start_page=_positive_int(payload.get("page"), default=1),
+                    max_pages=_positive_int(payload.get("max_pages"), default=20, max_value=100),
+                    target_rows=target or None,
+                    timeout_s=float(payload.get("api_timeout_s") or payload.get("timeout_s") or 15.0),
+                    headers=dict(headers),
+                    fetcher=fetcher,
+                )
+            else:
+                result = api_replay.replay_candidate(
+                    run_id=str(payload.get("run_id") or "route_executor"),
+                    candidate=candidate,
+                    page=_positive_int(payload.get("page"), default=1),
+                    page_size=page_size,
+                    timeout_s=float(payload.get("api_timeout_s") or payload.get("timeout_s") or 15.0),
+                    headers=dict(headers),
+                    fetcher=fetcher,
+                )
+        except Exception as exc:
+            attempts.append(_attempt_error("api_replay", exc))
+            return None
+        artifact = result.get("artifact") if isinstance(result.get("artifact"), dict) else None
+        verification = verify_route_success(route, capability="api_replay", result=result, artifact=artifact, payload=payload)
+        attempt: dict[str, Any] = {
+            "capability": "api_replay",
+            "status": "attempted",
+            "row_count": verification.get("observed_count"),
+            "target_count": verification.get("target_count"),
+            "http_status": result.get("http_status"),
+            "completed": verification.get("passed"),
+            "verification": verification,
+            "verification_summary": verification.get("verification_summary"),
+            "reason": "" if verification.get("passed") else verification.get("summary"),
+        }
+        if paginate:
+            attempt["page_count"] = result.get("page_count")
+            attempt["stop_reason"] = result.get("stop_reason")
+            attempt["truncated"] = result.get("truncated")
+        attempts.append(attempt)
+        if not verification.get("passed"):
+            return None
+        return {"capability": "api_replay", "result": result, "artifact": artifact, "verification": verification}
+
     def _try_spider(self, payload: dict[str, Any], route: dict[str, Any], attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
         url = str(payload.get("url") or payload.get("target_url") or payload.get("start_url") or "")
         start_urls = payload.get("start_urls") or payload.get("urls") or ([url] if url else [])
@@ -210,12 +383,15 @@ class DeterministicRouteExecutor:
         spider_payload.setdefault("run_id", str(payload.get("run_id") or "route_executor"))
         spider_payload.setdefault("start_urls", start_urls)
         spider_payload.setdefault("max_depth", int(payload.get("max_depth") or 0))
-        spider_payload.setdefault("max_pages", int(payload.get("max_pages") or 10))
+        spider_payload.setdefault("max_pages", int(payload.get("max_pages") or _target_pages(route) or 10))
         if isinstance(payload.get("extract"), dict):
             spider_payload.setdefault("extract", dict(payload.get("extract") or {}))
         spider_payload.setdefault("export", bool(payload.get("export")) or _save_artifact_required(route, payload))
         if payload.get("item_pipeline") is not None:
             spider_payload.setdefault("item_pipeline", dict(payload.get("item_pipeline") or {}))
+        for key in ("incremental", "incremental_scope", "incremental_key_fields", "incremental_dir"):
+            if payload.get(key) is not None:
+                spider_payload.setdefault(key, payload.get(key))
         try:
             result = self.spider_lite.run(spider_payload)
         except Exception as exc:
@@ -227,6 +403,8 @@ class DeterministicRouteExecutor:
             "status": "attempted",
             "item_count": verification.get("observed_count"),
             "target_count": verification.get("target_count"),
+            "page_count": result.get("page_count"),
+            "target_pages": _target_pages(route),
             "completed": verification.get("passed"),
             "verification": verification,
             "verification_summary": verification.get("verification_summary"),
@@ -243,8 +421,9 @@ class DeterministicRouteExecutor:
         payload: dict[str, Any],
         capability_to_system: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
+        router = _router_from_route(route)
         systems_involved, system_attempts = _stamp_system_metadata(
-            attempts, capability_to_system or {}
+            attempts, capability_to_system or {}, router
         )
         return {
             "status": "completed",
@@ -258,6 +437,7 @@ class DeterministicRouteExecutor:
             "fallback_reason": "",
             "systems_involved": systems_involved,
             "system_attempts": system_attempts,
+            "session_plan": _build_session_plan(systems_involved, router),
         }
 
     def _fallback_reason(self, attempts: list[dict[str, Any]]) -> str:
@@ -277,6 +457,54 @@ def _target_count(route: dict[str, Any]) -> int | None:
     except Exception:
         value = 0
     return value if value > 0 else None
+
+
+def _target_pages(route: dict[str, Any]) -> int | None:
+    try:
+        value = int((route.get("strategy_context") or {}).get("target_pages") or 0)
+    except Exception:
+        value = 0
+    return value if value > 0 else None
+
+
+def _positive_int(value: Any, *, default: int, max_value: int | None = None) -> int:
+    try:
+        number = int(value or default)
+    except Exception:
+        number = default
+    number = max(1, number)
+    if max_value is not None:
+        number = min(number, max_value)
+    return number
+
+
+def _api_replay_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+
+    def add(raw: Any) -> None:
+        if isinstance(raw, dict):
+            if raw.get("endpoint") or raw.get("url"):
+                out.append(dict(raw))
+            return
+        if isinstance(raw, list):
+            for item in raw:
+                add(item)
+
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    for source in (
+        payload.get("network_candidate"),
+        payload.get("api_candidate"),
+        payload.get("candidate"),
+        payload.get("network_candidates"),
+        payload.get("candidates"),
+        context.get("network_candidate"),
+        context.get("api_candidate"),
+        context.get("candidate"),
+        context.get("network_candidates"),
+        context.get("candidates"),
+    ):
+        add(source)
+    return out
 
 
 def _save_artifact_required(route: dict[str, Any], payload: dict[str, Any]) -> bool:

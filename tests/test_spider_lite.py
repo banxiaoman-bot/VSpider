@@ -145,6 +145,57 @@ def test_spider_lite_exports_items_feed(monkeypatch, local_tmp_path: Path) -> No
     assert data["items"][0]["value"] == "Hello world"
 
 
+def test_spider_lite_persists_contracts_registry_and_manifest(
+    monkeypatch,
+    local_tmp_path: Path,
+) -> None:
+    import visual_web_agent.spider_lite as spider_lite
+    from visual_web_agent import run_registry
+    from visual_web_agent.io_contract import persistence as _persistence
+
+    artifact_root = local_tmp_path / "artifacts"
+    runs_root = local_tmp_path / "runs"
+    registry_root = local_tmp_path / "registry"
+    monkeypatch.setattr(spider_lite, "resolve_artifact_path", lambda filename, subdir="": artifact_root / subdir / filename)
+    monkeypatch.setattr(spider_lite, "artifact_url", lambda path: "/download/" + Path(path).name)
+    monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+    monkeypatch.setattr(run_registry, "registry_root", lambda base_dir=None: registry_root)
+    monkeypatch.setattr(run_registry, "_run_path", lambda run_id, base_dir=None: registry_root / f"{run_id}.json")
+
+    manager = SpiderLiteManager(fetcher=fake_fetch)
+    result = manager.run({
+        "run_id": "spider_contract",
+        "goal": "爬取 quote 文本并导出 JSONL",
+        "start_urls": ["https://example.com/"],
+        "max_depth": 0,
+        "extract": {"selector": ".quote .text::text"},
+        "export": True,
+        "export_filename": "spider_contract.jsonl",
+        "persist_run_contracts": True,
+    })
+
+    input_contract = json.loads((runs_root / "spider_contract" / "input_contract.json").read_text(encoding="utf-8"))
+    output_contract = json.loads((runs_root / "spider_contract" / "output_contract.json").read_text(encoding="utf-8"))
+    manifest = json.loads((runs_root / "spider_contract" / "manifest.json").read_text(encoding="utf-8"))
+    rec = run_registry.load_run("spider_contract", base_dir=registry_root)
+
+    assert result["status"] == "success"
+    assert input_contract["version"] == "input_contract.v1"
+    assert input_contract["source"] == "spider_lite"
+    assert input_contract["urls"][0]["url"] == "https://example.com/"
+    assert input_contract["constraints"]["max_pages"] == 10
+    assert output_contract["output_kind"] == "dataset_records"
+    assert output_contract["container"] == "jsonl"
+    assert manifest["items"][0]["kind"] == "dataset_records"
+    assert manifest["items"][0]["produced_by"] == "spider_lite"
+    assert manifest["items"][0]["extra"]["row_count"] == 1
+    assert manifest["items"][0]["extra"]["fields"] == ["url", "value"]
+    assert rec is not None
+    assert rec["mode"] == "spider_lite"
+    assert rec["status"] == "succeeded"
+    assert rec["target_url"] == "https://example.com/"
+
+
 def test_spider_lite_item_pipeline_dedupe_fields_and_required() -> None:
     pages = {
         "https://example.com/": """
@@ -220,11 +271,17 @@ def test_spider_lite_utility_functions() -> None:
 def test_spider_lite_api_wiring(monkeypatch, local_tmp_path: Path) -> None:
     import api_server
     import visual_web_agent.spider_lite as spider_lite
+    from visual_web_agent import run_registry
+    from visual_web_agent.io_contract import persistence as _persistence
 
     artifact_root = local_tmp_path / "artifacts"
+    runs_root = local_tmp_path / "runs"
+    registry_root = local_tmp_path / "registry"
     monkeypatch.setattr(spider_lite, "resolve_artifact_path", lambda filename, subdir="": artifact_root / subdir / filename)
-    monkeypatch.setattr(spider_lite, "register_artifact", lambda path: None)
     monkeypatch.setattr(spider_lite, "artifact_url", lambda path: "/download/" + Path(path).name)
+    monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+    monkeypatch.setattr(run_registry, "registry_root", lambda base_dir=None: registry_root)
+    monkeypatch.setattr(run_registry, "_run_path", lambda run_id, base_dir=None: registry_root / f"{run_id}.json")
 
     manager = SpiderLiteManager(fetcher=fake_fetch)
     monkeypatch.setattr(api_server, "_spider_lite", manager)
@@ -262,6 +319,8 @@ def test_spider_lite_api_wiring(monkeypatch, local_tmp_path: Path) -> None:
     assert items_resp.json()["result"]["count"] == 1
     assert items_resp.json()["result"]["items"] == [{"value": "Hello world"}]
     assert detail_resp.json()["result"]["run_id"] == "api_spider"
+    assert (runs_root / "api_spider" / "input_contract.json").exists()
+    assert run_registry.load_run("api_spider", base_dir=registry_root)["status"] == "succeeded"
 
 
 def test_spider_lite_source_wiring() -> None:
@@ -273,13 +332,14 @@ def test_spider_lite_source_wiring() -> None:
 
     assert "from visual_web_agent.spider_lite import SpiderLiteManager" in api_src
     assert "_spider_lite = SpiderLiteManager(robots_policy=_robots_policy)" in api_src
-    assert '@app.post("/api/spider/run"' in api_src
-    assert '@app.get("/api/spider/runs"' in api_src
-    assert '@app.get("/api/spider/page_cache/{session_id}"' in api_src
-    assert '@app.get("/api/spider/page_cache/{session_id}/entries"' in api_src
-    assert '@app.post("/api/spider/{run_id}/export"' in api_src
-    assert '@app.get("/api/spider/{run_id}/items"' in api_src
-    assert '@app.get("/api/spider/{run_id}"' in api_src
+    spider_api_src = (root / "api_routes" / "spider_api.py").read_text(encoding="utf-8")
+    assert '@app.post("/api/spider/run"' in spider_api_src
+    assert '@app.get("/api/spider/runs"' in spider_api_src
+    assert '@app.get(' in spider_api_src and "page_cache/{session_id}" in spider_api_src
+    assert '@app.get(' in spider_api_src and "page_cache/{session_id}/entries" in spider_api_src
+    assert '@app.post(' in spider_api_src and "{run_id}/export" in spider_api_src
+    assert '@app.get(' in spider_api_src and "{run_id}/items" in spider_api_src
+    assert '@app.get(' in spider_api_src and "spider/{run_id}" in spider_api_src
     assert "class SpiderLiteManager:" in spider_src
     assert "PageResponseCache" in spider_src
     assert "def cache_entries(" in spider_src

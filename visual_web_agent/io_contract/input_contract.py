@@ -95,6 +95,16 @@ def _is_array_json_payload(sample: bytes | None) -> bool:
     return head.startswith(b"[") or head.startswith(b"\n[")
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -163,9 +173,10 @@ class Constraints:
     proxy_server: str = ""
     proxy_username: str = ""
     proxy_password: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "max_runs": int(self.max_runs or 0),
             "rate_limit_qps": float(self.rate_limit_qps or 0.0),
             "allow_cross_system": bool(self.allow_cross_system),
@@ -174,6 +185,11 @@ class Constraints:
             "proxy_username": str(self.proxy_username or ""),
             "proxy_password": str(self.proxy_password or ""),
         }
+        for key, value in (self.extra or {}).items():
+            skey = str(key)
+            if skey and skey not in payload:
+                payload[skey] = _json_safe(value)
+        return payload
 
 
 @dataclass
@@ -278,6 +294,39 @@ def parse_urls_field(raw: Any) -> list[UrlSpec]:
         return out
 
     return []
+
+
+def _url_host(url: str) -> str:
+    try:
+        return urlparse(url).netloc.split("@")[-1].split(":")[0].strip().lower()
+    except Exception:
+        return ""
+
+
+def assign_system_ids(url_specs: list[UrlSpec]) -> list[UrlSpec]:
+    """S7: give multi-host contracts deterministic per-host ``system_id``s.
+
+    When a contract spans more than one host, every ``system_id="auto"``
+    entry gets ``sys_<host-slug>`` (same host -> same id) so the workflow
+    graph and SessionRouter can treat each host as a first-class system.
+    Single-host contracts and user-provided ids are left untouched, keeping
+    the legacy single-system behaviour byte-identical. Mutates in place and
+    returns the same list for chaining.
+    """
+
+    hosts = {_url_host(spec.url) for spec in url_specs if _url_host(spec.url)}
+    if len(hosts) <= 1:
+        return url_specs
+    for spec in url_specs:
+        if (spec.system_id or "auto") != "auto":
+            continue
+        host = _url_host(spec.url)
+        if not host:
+            continue
+        slug = re.sub(r"[^a-z0-9]+", "_", host).strip("_")
+        if slug:
+            spec.system_id = f"sys_{slug}"
+    return url_specs
 
 
 def _url_from_dict(item: dict[str, Any]) -> UrlSpec:
@@ -595,15 +644,15 @@ def build_input_contract(
 ) -> InputContract:
     """Build a normalized :class:`InputContract` from raw API form-style inputs.
 
-    ``target_url`` is treated as a legacy alias for ``urls=[{url}]``. When both
-    are supplied, ``urls`` wins and ``target_url`` is merged in only if absent.
+    ``target_url`` is treated as a legacy alias for ``urls=[{url}]``. When
+    ``urls`` contains entries, it is authoritative and ``target_url`` is ignored.
     """
 
     goal_text = (goal or "").strip()
 
     url_specs: list[UrlSpec] = parse_urls_field(urls)
     tu = (target_url or "").strip()
-    if tu and not any(u.url == tu for u in url_specs):
+    if not url_specs and tu:
         url_specs.insert(0, UrlSpec(url=tu, role="start"))
 
     if not url_specs:
@@ -612,6 +661,10 @@ def build_input_contract(
 
     for spec in url_specs:
         spec.role = spec.role if spec.role in URL_ROLES else "unknown"
+
+    # S7: multi-host submissions get deterministic per-host system ids so
+    # cross-system scheduling has stable identities from the contract on.
+    assign_system_ids(url_specs)
 
     attachment_specs: list[AttachmentSpec] = []
     for raw in attachments or []:
@@ -664,6 +717,16 @@ def build_input_contract(
     )
 
     cons = constraints or {}
+    known_constraint_keys = {
+        "max_runs", "rate_limit_qps", "allow_cross_system", "max_steps",
+        "proxy_server", "proxy", "proxy_username", "proxy_user",
+        "proxy_password", "proxy_pass",
+    }
+    constraint_extra = {
+        str(k): _json_safe(v)
+        for k, v in cons.items()
+        if str(k) not in known_constraint_keys and v is not None
+    }
     constraint_obj = Constraints(
         max_runs=int(cons.get("max_runs") or 0),
         rate_limit_qps=float(cons.get("rate_limit_qps") or 0.0),
@@ -672,6 +735,7 @@ def build_input_contract(
         proxy_server=str(cons.get("proxy_server") or cons.get("proxy") or ""),
         proxy_username=str(cons.get("proxy_username") or cons.get("proxy_user") or ""),
         proxy_password=str(cons.get("proxy_password") or cons.get("proxy_pass") or ""),
+        extra=constraint_extra,
     )
 
     return InputContract(

@@ -88,14 +88,16 @@ def test_robots_policy_source_wiring() -> None:
 
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    route_src = (root / "api_routes" / "robots_api.py").read_text(encoding="utf-8")
     policy_src = (root / "visual_web_agent" / "robots_policy.py").read_text(encoding="utf-8")
 
     assert "from visual_web_agent.robots_policy import RobotsPolicyManager" in api_src
     assert "_robots_policy = RobotsPolicyManager()" in api_src
-    assert '@app.post("/api/robots/set"' in api_src
-    assert '@app.post("/api/robots/check"' in api_src
-    assert '@app.post("/api/robots/reserve"' in api_src
-    assert '@app.get("/api/robots/{domain}"' in api_src
+    assert "register_robots_routes" in api_src
+    assert '@app.post("/api/robots/set"' in route_src
+    assert '@app.post("/api/robots/check"' in route_src
+    assert '@app.post("/api/robots/reserve"' in route_src
+    assert '@app.get("/api/robots/{domain}"' in route_src
     assert "class RobotsPolicyManager:" in policy_src
     assert "def parse_robots(" in policy_src
     assert "def is_allowed(" in policy_src

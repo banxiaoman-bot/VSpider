@@ -1,4 +1,6 @@
 .env
+# Model config (apiKey 明文落盘，单套全局；spec 2026-06-22 方案 B)
+model_config.json
 __pycache__/
 *.py[cod]
 
@@ -31,9 +33,17 @@ pytest-cache-files-*/
 tmp*/
 .tmp_*/
 
+# Build output
+dist/
+
 # IDE / tooling
 .claude/
 .qoder/
+
+# Coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
 
 # Temporary generated artifacts
 auto_extract_fallback_*

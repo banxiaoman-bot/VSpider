@@ -130,6 +130,8 @@ class TestCsvWriter:
         assert target_item["step_id"] == "3"
         assert target_item["size"] == len(body)
         assert target_item["sha256"] == hashlib.sha256(body).hexdigest()
+        assert target_item["extra"]["row_count"] == 2
+        assert target_item["extra"]["fields"] == ["title", "url", "score"]
 
     def test_csv_extension_is_csv(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers import save_artifact
@@ -170,6 +172,8 @@ class TestJsonlWriter:
         manifest = _read_manifest(tmp_path, "run_jsonl")
         target = next(it for it in manifest["items"] if it["mime"].startswith("application/"))
         assert target["mime"] == "application/x-ndjson"
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +195,10 @@ class TestJsonWriter:
         parsed = json.loads(body)
         assert isinstance(parsed, list) and len(parsed) == 2
         assert parsed[0]["title"] == "First"
+        manifest = _read_manifest(tmp_path, "run_json")
+        target = next(it for it in manifest["items"] if it["kind"] == "dataset_records")
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
     def test_writes_single_record_when_given_dict(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers import save_artifact
@@ -227,6 +235,10 @@ class TestMarkdownWriter:
         assert "| title |" in body or "| title " in body
         assert "First" in body
         assert "---" in body
+        manifest = _read_manifest(tmp_path, "run_md")
+        target = next(it for it in manifest["items"] if it["kind"] == "dataset_rows")
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
     def test_writes_plain_markdown_for_string(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers import save_artifact
@@ -363,6 +375,8 @@ class TestXlsxWriter:
         assert target["mime"] == (
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        assert target["extra"]["row_count"] == 2
+        assert target["extra"]["fields"] == ["title", "url", "score"]
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +449,47 @@ class TestSaveRunDataset:
         assert merged["container"] == "csv"
         assert merged["output_kind"] == "dataset_rows"
 
+    def test_resolve_output_contract_normalizes_field_aliases(self) -> None:
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract(
+            {"output_kind": "dataset_rows", "required_fields": ["title"]},
+            {"requested_fields": "title, price"},
+        )
+        assert merged["fields"] == ["title", "price"]
+        assert merged["required_fields"] == ["title", "price"]
+        assert merged["requested_fields"] == ["title", "price"]
+
+    def test_resolve_output_contract_media_kind_is_not_blind_xlsx(self) -> None:
+        """mission §一-A: a media task must never be forced into xlsx. When the
+        contract carries a media ``output_kind`` but no explicit container, the
+        default must follow the kind (files_folder), not a blind xlsx."""
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "media_image"})
+        assert merged["container"] == "files_folder"
+
+    def test_resolve_output_contract_answer_text_is_inline(self) -> None:
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "answer_text"})
+        assert merged["container"] == "inline_text"
+
+    def test_resolve_output_contract_dataset_rows_keeps_xlsx_policy(self) -> None:
+        """Pure tabular small dataset still defaults to xlsx -- this is the
+        sanctioned kind->container policy (default_container_for_kind), not the
+        old blind hard-coded default."""
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "dataset_rows"})
+        assert merged["container"] == "xlsx"
+
+    def test_resolve_output_contract_explicit_container_wins_over_kind(self) -> None:
+        from visual_web_agent.data_writers.dispatch import resolve_output_contract
+
+        merged = resolve_output_contract({"output_kind": "media_image", "container": "zip"})
+        assert merged["container"] == "zip"
+
     def test_save_run_dataset_honors_container(self, tmp_path: Path) -> None:
         from visual_web_agent.data_writers.dispatch import save_run_dataset
 
@@ -448,25 +503,93 @@ class TestSaveRunDataset:
         assert path.endswith(".csv")
         assert Path(path).exists()
 
-    def test_save_run_dataset_unique_key_uses_legacy_xlsx(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    def test_save_run_dataset_unique_key_xlsx_via_save_artifact(
+        self, tmp_path: Path
     ) -> None:
+        """unique_key + xlsx now goes through save_artifact (not legacy save_to_excel),
+        ensuring manifest is always written via finalize_file_artifact."""
         pytest.importorskip("pandas")
-        from visual_web_agent import data_manager as dm
         from visual_web_agent.data_writers.dispatch import save_run_dataset
 
-        monkeypatch.setattr(
-            dm,
-            "resolve_artifact_path",
-            lambda filename, subdir="": tmp_path / Path(filename).name,
-            raising=True,
-        )
         path = save_run_dataset(
             [{"tooltip": "one"}],
             run_id="run_tooltip",
             output_contract={"container": "xlsx"},
             filename_hint="tips.xlsx",
             unique_key="tooltip",
+            base_dir=tmp_path,
         )
         assert path.endswith("tips.xlsx")
         assert Path(path).exists()
+
+        manifest_path = tmp_path / "run_tooltip" / "manifest.json"
+        assert manifest_path.exists(), "manifest.json must be written"
+
+    def test_save_run_dataset_unique_key_dedupes_on_second_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Two saves with the same unique_key should dedupe rows."""
+        pytest.importorskip("pandas")
+        import pandas as pd
+        from visual_web_agent.data_writers.dispatch import save_run_dataset
+
+        contract = {"container": "xlsx"}
+        save_run_dataset(
+            [{"id": "a", "val": 1}, {"id": "b", "val": 2}],
+            run_id="run_dedup",
+            output_contract=contract,
+            filename_hint="dedup.xlsx",
+            unique_key="id",
+            base_dir=tmp_path,
+        )
+        path = save_run_dataset(
+            [{"id": "a", "val": 99}, {"id": "c", "val": 3}],
+            run_id="run_dedup",
+            output_contract=contract,
+            filename_hint="dedup.xlsx",
+            unique_key="id",
+            base_dir=tmp_path,
+        )
+        df = pd.read_excel(path, engine="openpyxl")
+        ids = sorted(df["id"].tolist())
+        assert ids == ["a", "b", "c"], f"expected deduped ids, got {ids}"
+        row_a = df[df["id"] == "a"].iloc[0]
+        assert row_a["val"] == 99, "last write wins for duplicated key"
+
+
+# ---------------------------------------------------------------------------
+# OUTPUT-DEFAULT-2: safe_filename must not double a pre-existing extension.
+# A filename_hint carrying an extension (e.g. main.py's _vlm_output =
+# "output_<ts>.xlsx") previously produced "output_<ts>.xlsx.csv" for a csv
+# container -- a wrong/misleading extension that buries the real container and
+# violates mission §一-A (output must reflect output_contract.container).
+# ---------------------------------------------------------------------------
+
+class TestSafeFilenameExtension:
+    def test_strips_known_extension_before_applying_suffix(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        assert safe_filename("output_123.xlsx", suffix=".csv") == "output_123.csv"
+        assert safe_filename("xhr_2026.xlsx", suffix=".jsonl") == "xhr_2026.jsonl"
+
+    def test_does_not_double_same_extension(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        assert safe_filename("output_123.xlsx", suffix=".xlsx") == "output_123.xlsx"
+
+    def test_extensionless_stem_unchanged(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        assert safe_filename("clean_stem", suffix=".jsonl") == "clean_stem.jsonl"
+
+    def test_preserves_non_extension_trailing_dot_token(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        # 'v1.2_data' ends with a token that is NOT a known file extension -> kept
+        assert safe_filename("v1.2_data", suffix=".csv") == "v1.2_data.csv"
+
+    def test_no_suffix_keeps_existing_name(self) -> None:
+        from visual_web_agent.data_writers._base import safe_filename
+
+        # without a suffix the helper must not strip anything (back-compat)
+        assert safe_filename("report.csv") == "report.csv"

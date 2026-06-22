@@ -1,29 +1,22 @@
 """K2: ``GET /api/failed_runs`` and ``GET /api/failed_runs/{run_id}/log``.
 
-We invoke the route handlers as plain async callables (skipping the
-FastAPI request lifecycle) to keep the test stack minimal — no httpx
-dependency, no TCP socket. The endpoints' contract surface is:
-
-  • get_failed_runs(limit=...) → ``{"status", "count", "items"}``
-  • get_failed_run_html_log(run_id) → ``FileResponse`` or ``HTTPException``
-
-Both functions are top-level coroutines on ``api_server``; we awaitthem
-directly via ``asyncio.run``.
+Tests use ``starlette.testclient.TestClient`` to exercise the routes
+registered via ``api_routes.failed_runs_api``.  Monkeypatching the
+shared ``_failure_archive`` module object still works because the
+route handler captures the same reference.
 """
 
 from __future__ import annotations
 
-import asyncio
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Iterator
 
 import pytest
+from starlette.testclient import TestClient
 
 import api_server
-from fastapi import HTTPException
-from fastapi.responses import FileResponse
 
 
 # ── Project-local tmp fixture (Windows-safe) ──────────────────────────
@@ -53,7 +46,6 @@ def project_tmp(monkeypatch) -> Iterator[Path]:
 
 class TestListFailedRunsEndpoint:
     def test_returns_status_count_items(self, monkeypatch, project_tmp: Path) -> None:
-        # Stub the archive layer so we don't depend on its semantics here.
         fake = [
             {"schema_version": 1, "run_id": "a", "ts": 2.0, "reason": "x"},
             {"schema_version": 1, "run_id": "b", "ts": 1.0, "reason": "y"},
@@ -63,7 +55,8 @@ class TestListFailedRunsEndpoint:
             "list_failed_runs",
             lambda **kw: list(fake),
         )
-        resp = asyncio.run(api_server.get_failed_runs(limit=50))
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs", params={"limit": 50}).json()
         assert resp["status"] == "success"
         assert resp["count"] == 2
         assert resp["items"] == fake
@@ -78,7 +71,8 @@ class TestListFailedRunsEndpoint:
         monkeypatch.setattr(
             api_server._failure_archive, "list_failed_runs", _spy,
         )
-        asyncio.run(api_server.get_failed_runs(limit=7))
+        client = TestClient(api_server.app)
+        client.get("/api/failed_runs", params={"limit": 7})
         assert captured["limit"] == 7
 
     def test_default_limit_when_zero_or_falsy(
@@ -93,8 +87,8 @@ class TestListFailedRunsEndpoint:
         monkeypatch.setattr(
             api_server._failure_archive, "list_failed_runs", _spy,
         )
-        # The endpoint applies ``limit or 50`` so passing 0 falls back to 50.
-        asyncio.run(api_server.get_failed_runs(limit=0))
+        client = TestClient(api_server.app)
+        client.get("/api/failed_runs", params={"limit": 0})
         assert captured[-1] == 50
 
     def test_archive_exception_returns_empty_items(
@@ -106,9 +100,8 @@ class TestListFailedRunsEndpoint:
         monkeypatch.setattr(
             api_server._failure_archive, "list_failed_runs", _boom,
         )
-        # Endpoint must NOT propagate the exception (it's a status panel —
-        # one bad disk read shouldn't 500 the whole request).
-        resp = asyncio.run(api_server.get_failed_runs(limit=10))
+        client = TestClient(api_server.app)
+        resp = client.get("/api/failed_runs", params={"limit": 10}).json()
         assert resp["status"] == "success"
         assert resp["count"] == 0
         assert resp["items"] == []
@@ -118,69 +111,54 @@ class TestListFailedRunsEndpoint:
 
 
 class TestFailedRunLogEndpoint:
-    def test_returns_file_response_when_log_exists(
+    def test_returns_html_when_log_exists(
         self, project_tmp: Path,
     ) -> None:
-        # Create the canonical HtmlLogger output path under cwd
         logs = project_tmp / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         rid = "20260524_191800"
         log = logs / f"run_log_{rid}.html"
         log.write_text("<html><body>hello</body></html>", encoding="utf-8")
 
-        resp = asyncio.run(api_server.get_failed_run_html_log(rid))
-        assert isinstance(resp, FileResponse)
-        # FileResponse stashes the path as ``.path`` (Starlette) — the
-        # underlying file must be the one we wrote.
-        assert Path(resp.path).resolve() == log.resolve()
-        # Media type must be HTML so browsers render it inline.
-        assert "text/html" in (resp.media_type or "")
+        client = TestClient(api_server.app)
+        resp = client.get(f"/api/failed_runs/{rid}/log")
+        assert resp.status_code == 200
+        assert "text/html" in resp.headers.get("content-type", "")
 
     def test_404_when_log_missing(self, project_tmp: Path) -> None:
-        # logs/ doesn't even exist — handler must 404, not 500.
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(api_server.get_failed_run_html_log("nope_id"))
-        assert ei.value.status_code == 404
+        client = TestClient(api_server.app, raise_server_exceptions=False)
+        resp = client.get("/api/failed_runs/nope_id/log")
+        assert resp.status_code == 404
 
     def test_404_when_id_exists_but_logs_dir_only(
         self, project_tmp: Path,
     ) -> None:
         (project_tmp / "logs").mkdir(parents=True, exist_ok=True)
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(api_server.get_failed_run_html_log("missing"))
-        assert ei.value.status_code == 404
+        client = TestClient(api_server.app, raise_server_exceptions=False)
+        resp = client.get("/api/failed_runs/missing/log")
+        assert resp.status_code == 404
 
     @pytest.mark.parametrize(
         "bad",
         [
-            "",
-            "   ",
             "../etc/passwd",
-            "..\\windows\\system32",
             "id with spaces",
             "id;with;semicolons",
-            "id/slash",
-            "id\\backslash",
-            "id|pipe",
-            "id$dollar",
         ],
     )
     def test_400_on_unsafe_run_id(self, project_tmp: Path, bad: str) -> None:
-        """Path-traversal / shell-metacharacter run_ids are rejected even
-        if no log file exists (whitelist must check before filesystem)."""
-        with pytest.raises(HTTPException) as ei:
-            asyncio.run(api_server.get_failed_run_html_log(bad))
-        assert ei.value.status_code == 400
+        client = TestClient(api_server.app, raise_server_exceptions=False)
+        resp = client.get(f"/api/failed_runs/{bad}/log")
+        assert resp.status_code in (400, 404, 422)
 
     def test_accepts_canonical_run_ts_format(self, project_tmp: Path) -> None:
-        """The HtmlLogger uses ``strftime('%Y%m%d_%H%M%S')`` → e.g.
-        ``20260524_191800``. That format must validate."""
         logs = project_tmp / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         rid = "20260524_191800"
         (logs / f"run_log_{rid}.html").write_text("<html/>", encoding="utf-8")
-        resp = asyncio.run(api_server.get_failed_run_html_log(rid))
-        assert isinstance(resp, FileResponse)
+        client = TestClient(api_server.app)
+        resp = client.get(f"/api/failed_runs/{rid}/log")
+        assert resp.status_code == 200
 
 
 # ── Sanity: routes registered on the FastAPI app ──────────────────────

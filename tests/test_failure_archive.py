@@ -352,6 +352,94 @@ class TestListFailedRunsPathsExist:
         assert out[0]["paths_exist"]["event_jsonl"] is False
 
 
+class TestListFailedRunsContractsSummary:
+    def test_contracts_summary_includes_manifest_artifacts(self, archive_tmp: Path) -> None:
+        target = archive_tmp / fa.FAILED_SUBDIR_NAME
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "r.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "r",
+                    "ts": 1.0,
+                    "reason": "x",
+                    "paths": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_dir = archive_tmp / "r"
+        artifacts_dir = run_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "input_contract.json").write_text(
+            json.dumps({"version": "input_contract.v1"}),
+            encoding="utf-8",
+        )
+        (run_dir / "output_contract.json").write_text(
+            json.dumps({"version": "output_contract.v1"}),
+            encoding="utf-8",
+        )
+        (artifacts_dir / "items.jsonl").write_text('{"id":1}\n', encoding="utf-8")
+        (run_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": "manifest.v1",
+                    "run_id": "r",
+                    "items": [
+                        {
+                            "kind": "dataset_records",
+                            "path": "runs/r/artifacts/items.jsonl",
+                            "size": 9,
+                            "sha256": "abc123",
+                            "mime": "application/x-ndjson",
+                            "source_url": ["https://example.com/items"],
+                            "produced_by": "api_replay",
+                            "step_id": "network_replay",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = fa.list_failed_runs(base_dir=archive_tmp, project_root=archive_tmp)
+        contracts = out[0]["contracts"]
+
+        assert contracts["summary"]["has_input_contract"] is True
+        assert contracts["summary"]["has_output_contract"] is True
+        assert contracts["summary"]["has_manifest"] is True
+        assert contracts["summary"]["manifest_items"] == 1
+        assert contracts["summary"]["artifacts"] == 1
+        assert contracts["paths"]["manifest"] == "runs/r/manifest.json"
+        assert contracts["manifest_items"][0]["kind"] == "dataset_records"
+        assert contracts["manifest_items"][0]["mime"] == "application/x-ndjson"
+        assert contracts["manifest_items"][0]["source_url"] == [
+            "https://example.com/items"
+        ]
+        assert contracts["manifest_items"][0]["produced_by"] == "api_replay"
+        assert contracts["manifest_items"][0]["step_id"] == "network_replay"
+
+    def test_contracts_summary_is_empty_for_unsafe_run_id(self, archive_tmp: Path) -> None:
+        target = archive_tmp / fa.FAILED_SUBDIR_NAME
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "bad.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": "../bad",
+                    "ts": 1.0,
+                    "reason": "x",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        out = fa.list_failed_runs(base_dir=archive_tmp, project_root=archive_tmp)
+
+        assert out[0]["contracts"]["summary"]["has_manifest"] is False
+        assert out[0]["contracts"]["manifest_items"] == []
+
+
 # ── Integration: record then list ─────────────────────────────────────
 
 

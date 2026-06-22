@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -58,6 +60,64 @@ def test_browser_pool_exhaustion() -> None:
         assert "exhausted" in str(exc)
     else:
         raise AssertionError("expected pool exhaustion")
+
+
+def test_browser_pool_acquire_is_atomic_under_thread_race() -> None:
+    """Concurrent acquires must never oversubscribe max_contexts.
+
+    A slow env_factory widens the check->insert window: without a lock every
+    thread passes the capacity check before any of them registers its lease.
+    """
+
+    def slow_factory() -> FakeBrowser:
+        time.sleep(0.05)
+        return FakeBrowser()
+
+    pool = BrowserPool(max_contexts=1, env_factory=slow_factory)
+    leases: list = []
+    errors: list = []
+
+    def worker() -> None:
+        try:
+            leases.append(pool.acquire(run_id="race"))
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(pool.active) <= pool.max_contexts
+    assert len(leases) == 1
+    assert len(errors) == 7
+    assert all("exhausted" in str(exc) for exc in errors)
+
+
+def test_browser_pool_thread_storm_keeps_state_consistent() -> None:
+    """Mixed acquire/release storm across threads must conserve counters."""
+
+    pool = BrowserPool(max_contexts=4, env_factory=FakeBrowser)
+
+    def worker() -> None:
+        for _ in range(50):
+            try:
+                lease = pool.acquire(run_id="storm")
+            except RuntimeError:
+                continue
+            asyncio.run(pool.release(lease))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    status = pool.status()
+    assert status["active_count"] == 0
+    assert status["total_acquired"] == status["total_released"]
+    assert status["total_failed"] == 0
 
 
 def test_browser_pool_release_failure_is_recorded() -> None:
@@ -303,8 +363,11 @@ def test_browser_pool_source_wiring() -> None:
     main_src = (root / "visual_web_agent" / "main.py").read_text(encoding="utf-8")
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
     pool_src = (root / "visual_web_agent" / "browser_pool.py").read_text(encoding="utf-8")
-    app_src = (root / "vspider-ui" / "src" / "App.vue").read_text(encoding="utf-8")
+    _app_raw = (root / "vspider-ui" / "src" / "App.vue").read_text(encoding="utf-8")
+    _overview_pane = root / "vspider-ui" / "src" / "components" / "CapabilityOverviewPane.vue"
+    app_src = _app_raw + ("\n" + _overview_pane.read_text(encoding="utf-8") if _overview_pane.exists() else "")
     runtime_panel_src = (root / "vspider-ui" / "src" / "components" / "CapabilityRuntimePanel.vue").read_text(encoding="utf-8")
+    browser_runtime_src = (root / "vspider-ui" / "src" / "composables" / "useBrowserRuntimeStatus.js").read_text(encoding="utf-8")
 
     assert "from .browser_pool import acquire_browser, release_browser" in main_src
     assert "browser_lease = acquire_browser(run_id=_run_ts)" in main_src
@@ -312,8 +375,9 @@ def test_browser_pool_source_wiring() -> None:
     assert "await release_browser(" in main_src
     assert "from visual_web_agent.browser_pool import get_browser_pool_status as _get_browser_pool_status" in api_src
     assert "from visual_web_agent.browser_pool import get_browser_runtime_status as _get_browser_runtime_status" in api_src
-    assert '@app.get("/api/browser_pool"' in api_src
-    assert '"runtime": _get_browser_runtime_status(pool_status=pool, backend_status=backend)' in api_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/browser_pool"' in tq_src
+    assert "get_browser_runtime_status(" in tq_src
     assert "class BrowserPool" in pool_src
     assert "max_contexts: int = 1" in pool_src
     assert "def resolve_browser_pool_config(*, workload_contexts: int = 1)" in pool_src
@@ -331,12 +395,16 @@ def test_browser_pool_source_wiring() -> None:
     assert "backend_unhealthy" in pool_src
     assert "VSPIDER_BROWSER_MAX_CONTEXTS" in pool_src
     assert "VSPIDER_EXPERIMENTAL_PARALLEL_RUNS" in pool_src
-    assert "const browserRuntimeStatus = ref(null)" in app_src
-    assert "const fetchBrowserRuntimeStatus = async () => {" in app_src
-    assert "/api/browser_pool" in app_src
-    assert "const browserRuntimeStatusClass = computed(" in app_src
-    assert "const browserRuntimeHealthLabel = computed(" in app_src
-    assert "const browserRuntimeHealthCacheLabel = computed(" in app_src
+    # Browser-runtime state/fetch/computeds were extracted into
+    # composables/useBrowserRuntimeStatus.js (D-UI-11); App.vue now consumes the
+    # composable. Pin the implementation in the composable + the App.vue wiring.
+    assert "useBrowserRuntimeStatus({ appendLog })" in app_src
+    assert "const browserRuntimeStatus = ref(null)" in browser_runtime_src
+    assert "const fetchBrowserRuntimeStatus = async () => {" in browser_runtime_src
+    assert "/api/browser_pool" in browser_runtime_src
+    assert "const browserRuntimeStatusClass = computed(" in browser_runtime_src
+    assert "const browserRuntimeHealthLabel = computed(" in browser_runtime_src
+    assert "const browserRuntimeHealthCacheLabel = computed(" in browser_runtime_src
     assert "import CapabilityRuntimePanel from './components/CapabilityRuntimePanel.vue'" in app_src
     assert "<CapabilityRuntimePanel" in app_src
     assert "Browser Runtime" in runtime_panel_src

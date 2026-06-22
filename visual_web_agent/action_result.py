@@ -8,12 +8,12 @@ handler to change at once.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
 def _utc_now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -23,6 +23,83 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+def _safe_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _clip(value: Any, limit: int = 120) -> str:
+    text = _safe_str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _coerce_result_dict(result: Any) -> dict[str, Any]:
+    if result is None:
+        return {}
+    if isinstance(result, ActionResult):
+        return result.to_dict()
+    if isinstance(result, dict):
+        return dict(result)
+    to_dict = getattr(result, "to_dict", None)
+    if callable(to_dict):
+        try:
+            data = to_dict()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:
+            return {}
+    return {}
+
+
+def action_result_evidence_parts(
+    result: Any = None,
+    *,
+    download_path: str = "",
+    download_name: str = "",
+) -> list[str]:
+    """Return short artifact/download evidence strings for VLM history."""
+
+    data = _coerce_result_dict(result)
+    parts: list[str] = []
+    rows = _safe_int(data.get("extracted_rows"))
+    if rows:
+        parts.append(f"rows={rows}")
+    output_file = _safe_str(data.get("output_file"))
+    if output_file:
+        parts.append(f"artifact path={_clip(output_file, 160)}")
+    output_kind = _safe_str(data.get("output_kind"))
+    if output_kind:
+        parts.append(f"artifact kind={_clip(output_kind, 60)}")
+    output_container = _safe_str(data.get("output_container"))
+    if output_container:
+        parts.append(f"container={_clip(output_container, 60)}")
+    output_size = _safe_int(data.get("output_size"))
+    if output_size:
+        parts.append(f"size={output_size}")
+
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        artifact_path = _safe_str(
+            metadata.get("artifact_path")
+            or metadata.get("path")
+            or metadata.get("manifest_path")
+        )
+        if artifact_path and artifact_path != output_file:
+            parts.append(f"artifact path={_clip(artifact_path, 160)}")
+
+    if download_path:
+        name = (
+            _safe_str(download_name)
+            or _safe_str(download_path).rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        )
+        label = f"download_completed path={_clip(download_path, 160)}"
+        if name:
+            label += f" name={_clip(name, 80)}"
+        parts.append(label)
+    return parts
 
 
 @dataclass

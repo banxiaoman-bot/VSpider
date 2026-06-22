@@ -27,6 +27,11 @@ def test_parse_url_contains() -> None:
     assert any(item["type"] == "url_contains" for item in criteria)
 
 
+def test_parse_page_count() -> None:
+    criteria = parse_exit_criteria("extract first 3 pages")
+    assert any(item.get("type") == "page_count" and item.get("target") == 3 for item in criteria)
+
+
 def test_evaluate_exit_criteria_all_required() -> None:
     criteria = [
         {"type": "row_count", "target": 5},
@@ -39,6 +44,15 @@ def test_evaluate_exit_criteria_all_required() -> None:
     )
     assert out["passed"] is True
     assert set(out["matched"]) == {"row_count", "answer_ready"}
+
+
+def test_evaluate_page_count_exit_criteria() -> None:
+    out = evaluate_exit_criteria(
+        [{"type": "page_count", "target": 3}],
+        total_pages=3,
+    )
+    assert out["passed"] is True
+    assert out["matched"] == ["page_count"]
 
 
 def test_current_subgoal_criteria_uses_task_plan_index() -> None:

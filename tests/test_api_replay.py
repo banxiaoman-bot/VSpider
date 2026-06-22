@@ -86,6 +86,47 @@ def test_replay_candidate_with_fetcher_exports_jsonl(monkeypatch: pytest.MonkeyP
     assert artifact.read_text(encoding="utf-8").splitlines()[0] == '{"id":1,"title":"A"}'
 
 
+def test_replay_candidate_registers_run_manifest(monkeypatch: pytest.MonkeyPatch, local_tmp_path: Path) -> None:
+    import api_server
+    from visual_web_agent.artifact_manager import register_artifact as real_register_artifact
+    from visual_web_agent.io_contract import persistence as _persistence
+
+    artifact_root = local_tmp_path / "artifacts"
+    runs_root = local_tmp_path / "runs"
+    run_id = "run_replay_manifest"
+    replay_url = "https://api.example.com/items?page=1&limit=2"
+
+    monkeypatch.setattr(api_replay, "resolve_artifact_path", lambda filename, subdir="": artifact_root / subdir / filename)
+    monkeypatch.setattr(api_replay, "register_artifact", real_register_artifact)
+    monkeypatch.setattr(api_replay, "artifact_url", lambda path: "/download/" + Path(path).name)
+    monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+    monkeypatch.setattr(api_server, "broadcast_new_artifact", lambda _path: None)
+
+    def fake_fetcher(url: str, headers: dict[str, str], timeout_s: float, method: str, body: str):
+        assert url == replay_url
+        return 200, {"content-type": "application/json"}, json.dumps({"data": [{"id": 1, "title": "A"}]})
+
+    result = api_replay.replay_candidate(
+        run_id=run_id,
+        candidate={"endpoint": "https://api.example.com/items?page=*&limit=*", "method": "GET"},
+        page=1,
+        page_size=2,
+        fetcher=fake_fetcher,
+    )
+    manifest = json.loads((runs_root / run_id / "manifest.json").read_text(encoding="utf-8"))
+    item = manifest["items"][0]
+
+    assert result["status"] == "success"
+    assert item["kind"] == "dataset_records"
+    assert item["mime"] == "application/x-ndjson"
+    assert item["source_url"] == [replay_url]
+    assert item["produced_by"] == "api_replay"
+    assert item["step_id"] == "network_replay"
+    assert item["extra"]["row_count"] == 1
+    assert item["extra"]["fields"] == ["id", "title"]
+    assert str(runs_root / run_id / "artifacts") in item["path"]
+
+
 def test_replay_candidate_posts_body_and_method(monkeypatch: pytest.MonkeyPatch, local_tmp_path: Path) -> None:
     monkeypatch.setattr(api_replay, "resolve_artifact_path", lambda filename, subdir="": local_tmp_path / subdir / filename)
     monkeypatch.setattr(api_replay, "register_artifact", lambda path: None)
@@ -159,7 +200,8 @@ def test_api_replay_dry_run_endpoint(monkeypatch: pytest.MonkeyPatch, local_tmp_
 def test_api_replay_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    runs_src = (root / "api_routes" / "runs_api.py").read_text(encoding="utf-8")
     assert "from visual_web_agent import api_replay as _api_replay" in api_src
-    assert '@app.post("/api/runs/{run_id}/network/replay"' in api_src
-    assert "_api_replay.build_replay_plan" in api_src
-    assert "_api_replay.replay_candidate" in api_src
+    assert '@app.post(' in runs_src and "network/replay" in runs_src
+    assert "api_replay.build_replay_plan" in runs_src
+    assert "api_replay.replay_candidate" in runs_src

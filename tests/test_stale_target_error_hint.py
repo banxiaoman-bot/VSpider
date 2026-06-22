@@ -28,7 +28,15 @@ from visual_web_agent.actions import ClickHandler, TypeHandler
 from visual_web_agent.vlm_client import VSpiderAction
 
 
-ACTIONS_PATH = Path(__file__).resolve().parent.parent / "visual_web_agent" / "actions.py"
+ACTIONS_PKG = Path(__file__).resolve().parent.parent / "visual_web_agent" / "actions"
+
+
+def _read_all_actions_source() -> str:
+    """Read all .py files in the actions package as a single concatenated source."""
+    parts = []
+    for py in sorted(ACTIONS_PKG.glob("*.py")):
+        parts.append(py.read_text(encoding="utf-8"))
+    return "\n".join(parts)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -39,7 +47,7 @@ ACTIONS_PATH = Path(__file__).resolve().parent.parent / "visual_web_agent" / "ac
 
 class TestSourceInvariant:
     def test_hint_replaces_all_terse_messages(self) -> None:
-        src = ACTIONS_PATH.read_text(encoding="utf-8")
+        src = _read_all_actions_source()
         # The hint must be present at every "Element #N not found" call.
         terse = len(re.findall(
             r'f"Element #\{target_id\} not found on active page or its iframes"\s*$',
@@ -54,7 +62,7 @@ class TestSourceInvariant:
         )
 
     def test_hint_recommendations_present(self) -> None:
-        src = ACTIONS_PATH.read_text(encoding="utf-8")
+        src = _read_all_actions_source()
         # Must mention both recovery paths
         assert "click_text" in src
         assert "SoM ID 失效" in src

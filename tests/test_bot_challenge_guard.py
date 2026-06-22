@@ -8,8 +8,10 @@ from typing import Any
 from visual_web_agent.bot_challenge_guard import (
     BotChallengeState,
     classify_probe_payload,
+    clearance_from_cookies,
     handle_bot_challenge_step,
     probe_bot_challenge,
+    url_left_challenge,
 )
 
 
@@ -139,3 +141,113 @@ def test_probe_bot_challenge_returns_none_on_clean() -> None:
     }])
     out = asyncio.run(probe_bot_challenge(br))
     assert out is None
+
+
+# --- P1: early-clearance signals (cf_clearance cookie / URL leaves challenge) ---
+
+
+def test_clearance_from_cookies_detects_cf_clearance() -> None:
+    assert clearance_from_cookies([{"name": "cf_clearance", "value": "abc"}]) is True
+
+
+def test_clearance_from_cookies_ignores_empty_value() -> None:
+    assert clearance_from_cookies([{"name": "cf_clearance", "value": ""}]) is False
+
+
+def test_clearance_from_cookies_ignores_other_and_empty() -> None:
+    assert clearance_from_cookies([{"name": "session", "value": "x"}]) is False
+    assert clearance_from_cookies([]) is False
+    assert clearance_from_cookies(None) is False
+
+
+def test_url_left_challenge_from_explicit_challenge_url() -> None:
+    assert url_left_challenge("https://site.com/home", "https://site.com/cdn-cgi/challenge") is True
+
+
+def test_url_left_challenge_same_url_not_cleared() -> None:
+    assert url_left_challenge("https://site.com/", "https://site.com/") is False
+
+
+def test_url_left_challenge_still_on_challenge_false() -> None:
+    assert url_left_challenge(
+        "https://site.com/cdn-cgi/challenge", "https://site.com/cdn-cgi/challenge"
+    ) is False
+
+
+def test_url_left_challenge_navigated_to_new_page() -> None:
+    assert url_left_challenge("https://site.com/dashboard", "https://site.com/login") is True
+
+
+def test_url_left_challenge_empty_current_false() -> None:
+    assert url_left_challenge("", "https://site.com/cdn-cgi/challenge") is False
+
+
+class _StubCtx:
+    def __init__(self, cookies: list[dict[str, Any]]) -> None:
+        self._cookies = cookies
+
+    async def cookies(self) -> list[dict[str, Any]]:
+        return list(self._cookies)
+
+
+class _StubBrowserSignals(_StubBrowser):
+    """Stub browser that also exposes cookies + current_url for P1 signals."""
+
+    def __init__(self, payloads, *, cookies=None, current_url="") -> None:
+        super().__init__(payloads)
+        self._context = _StubCtx(cookies or [])
+        self.current_url = current_url
+
+
+def test_passive_wait_releases_on_cf_clearance_cookie() -> None:
+    cf = {
+        "url": "https://site.com/",
+        "title": "Just a moment...",
+        "vendor": "cloudflare",
+        "detected": True,
+        "cloudflare": True,
+    }
+    # DOM probe still shows the challenge, but the clearance cookie is set:
+    # must release on the cookie signal rather than escalate to HITL.
+    br = _StubBrowserSignals(
+        [cf, cf, cf, cf],
+        cookies=[{"name": "cf_clearance", "value": "granted"}],
+        current_url="https://site.com/",
+    )
+    state = BotChallengeState()
+    hitl_called: list[str] = []
+
+    async def _hitl(reason: str) -> None:
+        hitl_called.append(reason)
+
+    result = asyncio.run(
+        handle_bot_challenge_step(
+            br, state, hitl_callback=_hitl, passive_wait_seconds=0.05, poll_interval=0.01,
+        )
+    )
+    assert result.cleared is True
+    assert result.action == "passive_wait"
+    assert hitl_called == []
+
+
+def test_passive_wait_releases_on_url_leaving_challenge() -> None:
+    cf = {
+        "url": "https://site.com/cdn-cgi/challenge",
+        "title": "Just a moment...",
+        "vendor": "cloudflare",
+        "detected": True,
+        "cloudflare": True,
+    }
+    br = _StubBrowserSignals(
+        [cf, cf, cf, cf],
+        cookies=[],
+        current_url="https://site.com/home",
+    )
+    state = BotChallengeState()
+    result = asyncio.run(
+        handle_bot_challenge_step(
+            br, state, passive_wait_seconds=0.05, poll_interval=0.01,
+        )
+    )
+    assert result.cleared is True
+    assert result.action == "passive_wait"

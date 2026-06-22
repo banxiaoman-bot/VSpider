@@ -15,30 +15,28 @@ that slot when they need a manifest target. The slot is reset in the
 
 Design notes
 ============
-- This module is **the only** intentionally process-global state we add
-  for the contract layer.
-- ``contextvars.ContextVar`` would be slightly safer under asyncio, but
-  every VSpider run is single-task on its own thread, so a plain global
-  is enough and easier to reason about during patching.
-- Helpers always swallow caller mistakes (e.g. setting an invalid
-  run_id silently degrades to "no current run") so they never raise
-  into the agent loop.
+- ``ContextVar`` keeps concurrent asyncio sub-runs isolated while retaining the
+  old "call current_run_id()" API for legacy writers.
+- Helpers always swallow caller mistakes (e.g. setting an invalid run_id
+  silently degrades to "no current run") so they never raise into the agent loop.
 """
 
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 
 
-_STATE: dict[str, Any] = {
-    "run_id": "",
-    "base_dir": None,
-}
+_RUN_ID: ContextVar[str] = ContextVar("vspider_io_contract_run_id", default="")
+_BASE_DIR: ContextVar[str | Path | None] = ContextVar(
+    "vspider_io_contract_base_dir",
+    default=None,
+)
 
 
 def set_current_run(run_id: str, *, base_dir: str | Path | None = None) -> None:
@@ -51,24 +49,24 @@ def set_current_run(run_id: str, *, base_dir: str | Path | None = None) -> None:
     if not rid or not _RUN_ID_RE.fullmatch(rid):
         clear_current_run()
         return
-    _STATE["run_id"] = rid
-    _STATE["base_dir"] = base_dir
+    _RUN_ID.set(rid)
+    _BASE_DIR.set(base_dir)
 
 
 def clear_current_run() -> None:
     """Reset the slot. Always safe to call (including from ``finally``)."""
-    _STATE["run_id"] = ""
-    _STATE["base_dir"] = None
+    _RUN_ID.set("")
+    _BASE_DIR.set(None)
 
 
 def current_run_id() -> str:
     """Return the published run id, or ``""`` when no run is active."""
-    return str(_STATE.get("run_id") or "")
+    return str(_RUN_ID.get() or "")
 
 
 def current_base_dir() -> str | Path | None:
     """Return the optional base_dir override used by tests."""
-    return _STATE.get("base_dir")
+    return _BASE_DIR.get()
 
 
 def current_run_context() -> dict[str, Any]:

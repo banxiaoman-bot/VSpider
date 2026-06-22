@@ -63,6 +63,10 @@ GOAL_MAX_LEN = 400  # truncation cap for the persisted goal field
 REASON_MAX_LEN = 2000  # safety cap; some Python tracebacks are huge
 DEFAULT_BASE_DIR_NAME = "runs"
 FAILED_SUBDIR_NAME = "failed"
+INPUT_CONTRACT_FILENAME = "input_contract.json"
+OUTPUT_CONTRACT_FILENAME = "output_contract.json"
+MANIFEST_FILENAME = "manifest.json"
+ARTIFACTS_DIRNAME = "artifacts"
 
 
 def _project_root() -> Path:
@@ -243,6 +247,103 @@ def _read_one(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _runs_root(base_dir: str | Path | None = None) -> Path:
+    if base_dir is None:
+        return _project_root() / DEFAULT_BASE_DIR_NAME
+    return Path(base_dir)
+
+
+def _safe_contract_run_id(run_id: str) -> str:
+    rid = str(run_id or "").strip()
+    allowed = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+    if not rid or any(ch not in allowed for ch in rid):
+        return ""
+    return rid
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _manifest_item_summary(item: dict[str, Any]) -> dict[str, Any]:
+    source_url = item.get("source_url")
+    if isinstance(source_url, list):
+        urls = [str(url) for url in source_url if str(url or "")]
+    else:
+        urls = [str(source_url)] if source_url else []
+    return {
+        "kind": str(item.get("kind") or ""),
+        "path": str(item.get("path") or ""),
+        "mime": str(item.get("mime") or ""),
+        "size": _safe_int(item.get("size")),
+        "sha256": str(item.get("sha256") or ""),
+        "source_url": urls,
+        "produced_by": str(item.get("produced_by") or ""),
+        "step_id": str(item.get("step_id") or ""),
+    }
+
+
+def _run_contracts_summary(run_id: str, *, base_dir: str | Path | None = None) -> dict[str, Any]:
+    rid = _safe_contract_run_id(run_id)
+    empty = {
+        "summary": {
+            "has_input_contract": False,
+            "has_output_contract": False,
+            "has_manifest": False,
+            "manifest_items": 0,
+            "artifacts": 0,
+        },
+        "paths": {},
+        "manifest_items": [],
+    }
+    if not rid:
+        return empty
+
+    run_path = _runs_root(base_dir) / rid
+    paths = {
+        "input_contract": f"runs/{rid}/{INPUT_CONTRACT_FILENAME}",
+        "output_contract": f"runs/{rid}/{OUTPUT_CONTRACT_FILENAME}",
+        "manifest": f"runs/{rid}/{MANIFEST_FILENAME}",
+        "artifacts_dir": f"runs/{rid}/{ARTIFACTS_DIRNAME}",
+    }
+    input_contract = _read_json_dict(run_path / INPUT_CONTRACT_FILENAME)
+    output_contract = _read_json_dict(run_path / OUTPUT_CONTRACT_FILENAME)
+    manifest = _read_json_dict(run_path / MANIFEST_FILENAME)
+    raw_items = manifest.get("items") if isinstance(manifest, dict) else []
+    items = [item for item in (raw_items or []) if isinstance(item, dict)] if isinstance(raw_items, list) else []
+    artifacts_dir = run_path / ARTIFACTS_DIRNAME
+    artifact_count = 0
+    if artifacts_dir.exists() and artifacts_dir.is_dir():
+        try:
+            artifact_count = sum(1 for path in artifacts_dir.rglob("*") if path.is_file())
+        except Exception:
+            artifact_count = 0
+    return {
+        "summary": {
+            "has_input_contract": input_contract is not None,
+            "has_output_contract": output_contract is not None,
+            "has_manifest": manifest is not None,
+            "manifest_items": len(items),
+            "artifacts": artifact_count,
+        },
+        "paths": paths,
+        "manifest_items": [_manifest_item_summary(item) for item in items[:8]],
+    }
+
+
 def list_failed_runs(
     *,
     limit: int = 50,
@@ -299,6 +400,7 @@ def list_failed_runs(
                 except Exception:
                     exist_map[k] = False
         rec["paths_exist"] = exist_map
+        rec["contracts"] = _run_contracts_summary(str(rec.get("run_id") or ""), base_dir=base_dir)
         entries.append((sort_key, rec))
 
     entries.sort(key=lambda t: t[0], reverse=True)

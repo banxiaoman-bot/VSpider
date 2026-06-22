@@ -15,6 +15,10 @@ class WorkflowSystem:
     url: str = ""
     auth_required: bool = False
     capabilities: tuple[str, ...] = ()
+    # input_contract.urls[].auth_profile flows through here so SessionRouter's
+    # SystemAuthPlan (which reads workflow_graph["systems"][i]["auth_profile"])
+    # stops resolving everything to "auto".
+    auth_profile: str = "auto"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -25,6 +29,7 @@ class WorkflowSystem:
             "url": self.url,
             "auth_required": self.auth_required,
             "capabilities": list(self.capabilities),
+            "auth_profile": self.auth_profile or "auto",
         }
 
 
@@ -147,7 +152,11 @@ def build_workflow_graph(route: dict[str, Any]) -> dict[str, Any]:
             id=f"session_{idx + 1}",
             system_id=system.id,
             type="browser" if system.type == "web" else "logical",
-            auth_profile="required" if system.auth_required else "default",
+            auth_profile=(
+                system.auth_profile
+                if system.auth_profile not in ("", "auto")
+                else ("required" if system.auth_required else "default")
+            ),
         )
         for idx, system in enumerate(systems)
     )
@@ -172,8 +181,45 @@ def build_workflow_graph(route: dict[str, Any]) -> dict[str, Any]:
     return graph.to_dict()
 
 
+def _contract_url_candidates(route: dict[str, Any]) -> list[dict[str, Any]]:
+    """``input_contract.urls[]`` as system candidates (S6).
+
+    The user's declared URLs are the authoritative source for system
+    identity: explicit ``system_id`` / ``auth_profile`` must survive dedup
+    against planner- or goal-derived candidates, so these entries are
+    prepended to the candidate list. ``role=api`` keeps ``type=web`` (the
+    network hop still belongs to that web system).
+    """
+
+    contract = route.get("input_contract")
+    if not isinstance(contract, dict):
+        context = route.get("context") if isinstance(route.get("context"), dict) else {}
+        contract = context.get("input_contract")
+    if not isinstance(contract, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for item in contract.get("urls") or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        candidate: dict[str, Any] = {"type": "web", "url": url}
+        system_id = str(item.get("system_id") or "").strip()
+        if system_id and system_id != "auto":
+            candidate["id"] = system_id
+        auth_profile = str(item.get("auth_profile") or "").strip()
+        if auth_profile and auth_profile != "auto":
+            candidate["auth_profile"] = auth_profile
+            # a concrete profile implies the system needs authenticated state
+            candidate["auth_required"] = True
+        candidates.append(candidate)
+    return candidates
+
+
 def _build_systems(route: dict[str, Any], execution_plan: dict[str, Any]) -> list[WorkflowSystem]:
     candidates: list[dict[str, Any]] = []
+    candidates.extend(_contract_url_candidates(route))
     if isinstance(execution_plan.get("systems"), list):
         candidates.extend(item for item in execution_plan["systems"] if isinstance(item, dict))
     context = route.get("context") if isinstance(route.get("context"), dict) else {}
@@ -185,18 +231,30 @@ def _build_systems(route: dict[str, Any], execution_plan: dict[str, Any]) -> lis
         urls.insert(0, str(route.get("url") or ""))
     for url in urls:
         candidates.append({"type": "web", "url": url})
-    seen_domains: set[str] = set()
+    seen_keys: set[str] = set()
     systems: list[WorkflowSystem] = []
     auth_required = bool((route.get("signals") or {}).get("auth_or_captcha"))
     for item in candidates:
         url = str(item.get("url") or "")
         parsed = urlparse(url)
         domain = str(item.get("domain") or parsed.netloc.split("@")[-1].split(":", 1)[0] or "")
-        key = domain or str(item.get("name") or item.get("id") or len(systems) + 1)
-        if key in seen_domains:
-            continue
-        seen_domains.add(key)
-        system_id = str(item.get("id") or f"system_{len(systems) + 1}")
+        explicit_id = str(item.get("id") or "").strip()
+        if explicit_id:
+            # Explicit system_id (e.g. from input_contract.urls[]) dedups by
+            # id only, so two declared systems may share a domain (cross-
+            # account on one host); its domain still shadows later derived
+            # candidates of the same domain.
+            if explicit_id in seen_keys:
+                continue
+            seen_keys.add(explicit_id)
+            if domain:
+                seen_keys.add(domain)
+        else:
+            key = domain or str(item.get("name") or len(systems) + 1)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+        system_id = explicit_id or f"system_{len(systems) + 1}"
         systems.append(WorkflowSystem(
             id=system_id,
             type=str(item.get("type") or "web"),
@@ -205,6 +263,7 @@ def _build_systems(route: dict[str, Any], execution_plan: dict[str, Any]) -> lis
             url=url,
             auth_required=auth_required or bool(item.get("auth_required")),
             capabilities=tuple(str(cap) for cap in item.get("capabilities") or [] if cap),
+            auth_profile=str(item.get("auth_profile") or "auto").strip() or "auto",
         ))
     if not systems:
         systems.append(WorkflowSystem(id="system_1", type="logical", name="default_task_context"))

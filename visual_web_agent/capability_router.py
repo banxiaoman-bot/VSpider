@@ -6,6 +6,11 @@ from urllib.parse import urlparse
 
 from visual_web_agent.action_ref import action_ref_schema
 from visual_web_agent.action_registry import build_default_action_registry
+from visual_web_agent.agent_strategy import (
+    parse_goal_requested_fields,
+    parse_goal_target_count,
+    parse_goal_target_pages,
+)
 from visual_web_agent.browser_pool import build_browser_runtime_preflight, get_browser_runtime_status
 from visual_web_agent.capability_manifest import summarize_capabilities
 from visual_web_agent.crawl_efficiency import build_crawl_efficiency_plan
@@ -32,13 +37,41 @@ _MARKDOWN_RE = re.compile(
     r"\b(markdown|readable|reader[ -]?mode|clean text|main content|rag|llm[ -]?friendly)\b|正文提取|转\s*markdown|网页转\s*md|可读正文|喂给?大模型",
     re.I,
 )
+_VSCROLL_RE = re.compile(
+    r"\b(virtual\s*(?:scroll|list|table)|virtuali[sz]ed?|infinite\s*scroll|react-window|vue-virtual)\b"
+    r"|虚拟滚动|虚拟列表|虚拟表格|无限滚动|滚动加载|滚动采集|全量采集",
+    re.I,
+)
+_SNAPSHOT_RE = re.compile(
+    r"\b(screenshot|page\s*snapshot|html\s*snapshot|save\s+(the\s+)?(page|html))\b"
+    r"|截图|截屏|屏幕截图|整页截图|保存截图|网页快照|页面快照|保存网页|保存页面|另存网页|存为\s*html",
+    re.I,
+)
 _FORM_RE = re.compile(r"\b(form|fill|submit|register|input|textbox)\b|表单|填写|填入|提交|输入", re.I)
 _CHAT_RE = re.compile(r"\b(chatgpt|claude|kimi|deepseek|gemini|copilot|chat|ai answer)\b|文心|豆包|通义|元宝|智谱|助手|聊天|对话|AI", re.I)
 _FILE_RE = re.compile(r"\b(upload|download|file|excel|csv|xlsx)\b|上传|下载|文件|导入|导出", re.I)
 _CACHE_RE = re.compile(r"\b(cache|record|replay|debug|dev mode)\b|缓存|录制|回放|调试", re.I)
-_QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|metrics)\b|批量|队列|重试|恢复|暂停|指标|监控", re.I)
+_QUEUE_RE = re.compile(r"\b(batch|queue|retry|resume|recover|watchdog|worker|metrics|checkpoint)\b|批量|队列|重试|恢复|续跑|断点|续传|暂停|指标|监控", re.I)
+_RESUME_RE = re.compile(r"\bresume\b|\bcontinue\s+(the\s+)?(last|previous|prior)\b|continue\s+where|left\s+off|pick\s+up\s+where|断点续跑|断点续传|接着上次|继续上次|上次没做完|上次没完成|接着之前|继续之前", re.I)
 _BROWSER_RE = re.compile(r"\b(click|scroll|hover|tab|cookie|storage|console|screenshot|browser|locator|selector|similar)\b|点击|滚动|悬停|标签页|浏览器|选择器|相似元素", re.I)
 _AUTH_RE = re.compile(r"\b(login|signin|auth|captcha|2fa|otp)\b|登录|认证|验证码|短信", re.I)
+_CONSENT_RE = re.compile(
+    r"\b(cookie\s*(banner|consent|notice|wall)?|consent|gdpr|ccpa|onetrust|cookiebot|trustarc|didomi|usercentrics|quantcast)\b"
+    r"|cookie\s*弹窗|同意墙|隐私弹窗|接受全部\s*cookie|关闭\s*cookie|cookie\s*横幅|同意\s*cookie",
+    re.I,
+)
+_CHALLENGE_RE = re.compile(
+    r"\b(cloudflare|turnstile|recaptcha|hcaptcha|datadome|perimeterx|akamai|anti[- ]?bot|bot[- ]?detection|bot[- ]?challenge|waf)\b"
+    r"|人机验证|滑块|拼图|点选验证|反爬|风控|五秒盾|防护盾",
+    re.I,
+)
+
+_SEARCH_NAV_RE = re.compile(
+    r"\b(search\s+and\s+open|open\s+(the\s+)?(first|top)\s+result|search\s+results?|serp)\b"
+    r"|搜索并打开|搜索后打开|先搜索|打开第一个结果|打开搜索结果|第一个结果|首个结果|最相关的结果|用搜索引擎",
+    re.I,
+)
+
 
 _TASK_TEMPLATE_REGISTRY = TaskTemplateRegistry()
 
@@ -228,11 +261,13 @@ def route_task(
     else:
         route_context = dict(context or {})
     target_count = _parse_target_count(text)
-    requested_fields = _parse_requested_fields(text)
+    target_pages = _parse_target_pages(goal)
+    requested_fields = _parse_requested_fields(goal)
     strategy_context = infer_goal_strategy_context(
         goal,
         url=url,
         target_count=target_count,
+        target_pages=target_pages,
         requested_fields=requested_fields,
         data_shape=route_context.get("data_shape"),
     )
@@ -316,6 +351,7 @@ def route_task(
                 selected_tools = [forced, *selected_tools]
     signals = _signals(text, strategy_context)
     signals.update(_semantic_signals_patch)
+    _apply_capture_fixture_probe(signals, strategy_context, url)
     planner_feedback = _planner_feedback_from_context(route_context)
     failure_repair_feedback = {}
     failure_bundle = route_context.get("failure_bundle") or route_context.get("capability_execute_failure_bundle") or route_context.get("last_failure_bundle")
@@ -486,13 +522,19 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
     api = bool(_API_RE.search(text))
     full_content = bool(_FULL_CONTENT_RE.search(text))
     markdown_doc = bool(_MARKDOWN_RE.search(text))
+    vscroll = bool(_VSCROLL_RE.search(text))
+    snapshot = bool(_SNAPSHOT_RE.search(text))
     form = bool(_FORM_RE.search(text) or "form" in strategy_context.get("capabilities", []))
     chat = bool(_CHAT_RE.search(text) or "chat" in strategy_context.get("capabilities", []))
     file_io = bool(_FILE_RE.search(text))
     cache = bool(_CACHE_RE.search(text))
     queue = bool(_QUEUE_RE.search(text))
+    resume = bool(_RESUME_RE.search(text))
     browser_interaction = bool(_BROWSER_RE.search(text) or form or chat or file_io)
     auth = bool(_AUTH_RE.search(text))
+    consent = bool(_CONSENT_RE.search(text))
+    bot_challenge = bool(_CHALLENGE_RE.search(text))
+    search_nav = bool(_SEARCH_NAV_RE.search(text))
     output_contract = strategy_context.get("output_contract") or infer_goal_output_contract(text)
     return {
         "structured": structured,
@@ -500,13 +542,19 @@ def _signals(text: str, strategy_context: dict[str, Any]) -> dict[str, Any]:
         "api_or_network": api or full_content,
         "full_content_preferred": full_content,
         "markdown_preferred": markdown_doc,
+        "vscroll_capture_preferred": vscroll,
+        "snapshot_preferred": snapshot,
         "form": form,
         "chat": chat,
         "file_io": file_io,
         "cache_or_replay": cache,
         "queue_or_ops": queue,
+        "resume_preferred": resume,
         "browser_interaction": browser_interaction,
         "auth_or_captcha": auth,
+        "consent_preferred": consent,
+        "bot_challenge": bot_challenge,
+        "search_nav_preferred": search_nav,
         "visual_required": browser_interaction and not (api or crawl),
         "domain": parsed.netloc.split('@')[-1].split(':', 1)[0] if parsed.netloc else "",
         "output_mode": strategy_context.get("output_mode") or output_contract.get("mode") or "default",
@@ -532,6 +580,16 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "item_pipeline", "post_processing", "Y28", ["GET /api/spider/{run_id}/items"], "Validate fields, required values, dedupe, empty rows, and pagination of extracted items.", "runtime_guards")
     if signals.get("markdown_preferred"):
         _add(plan, "page_to_markdown", "extraction", "Y-FITMD", ["ActionRegistry: page_to_markdown"], "Convert the current page into denoised LLM-friendly Markdown (readability denoise + density prune + numbered link references + optional BM25 focus query) for question-answering / RAG feeds instead of full-page screenshots.", "deterministic_router")
+    if signals.get("vscroll_capture_preferred"):
+        _add(plan, "vscroll_capture", "extraction", "VSCROLL-ACTION", ["ActionRegistry: vscroll_capture"], "Deterministically harvest every row of a virtualised / infinite-scroll list (main document first, then same-origin child iframes) in one mid-run call - alternate row snapshots with container nudges and dedup recycled rows - instead of one VLM round per viewport.", "deterministic_router")
+    if signals.get("snapshot_preferred"):
+        _add(plan, "page_snapshot", "artifact", "S4", ["ActionRegistry: html_snapshot", "ActionRegistry: screenshot"], "Persist the page HTML and/or a screenshot as run artifacts recorded in manifest.json (kind=html_snapshot / screenshot) when the deliverable is a snapshot, instead of leaving debug screenshots outside the manifest.", "deterministic_router")
+    if signals.get("consent_preferred"):
+        _add(plan, "dismiss_consent", "browser_actions", "DC-1", ["ActionRegistry: dismiss_consent"], "When a cookie/GDPR consent wall blocks the page, deterministically click the CMP 'Accept all' control (OneTrust/Cookiebot/TrustArc/... + scoped multilingual accept text, reject excluded, iframe fallback, verified by overlay disappearance) before any extraction, instead of asking the VLM to visually find and click it.", "deterministic_router")
+    if signals.get("search_nav_preferred"):
+        _add(plan, "open_top_search_result", "navigation", "SEARCH-NAV", ["ActionRegistry: open_top_search_result"], "When the goal carried no URL and the agent lands on a search-results page, deterministically open the first non-ad organic result (ads / sponsored / paid-click redirects / same-engine internal links excluded, with a landing-page second pass + candidate rotation) instead of letting the VLM guess a link.", "deterministic_router")
+    if signals.get("resume_preferred"):
+        _add(plan, "resume_run", "resume", "RUN-RESUME1", ["ActionRegistry: resume_run"], "Read the prior run checkpoint / resume state and continue from where the previous run left off (dedup already-captured rows, skip already-completed sub-goals) instead of restarting from scratch.", "deterministic_router")
     if signals.get("crawl") or (signals.get("structured") and signals.get("artifact_required")):
         _add(plan, "robots_throttle", "crawl_guard", "Y23", ["POST /api/robots/check", "POST /api/robots/reserve"], "Check robots/throttle before spidering or repeated domain fetches.", "runtime_guards")
         _add(plan, "spider_lite", "crawl_extract", "Y24", ["POST /api/spider/run", "GET /api/spider/{run_id}", "GET /api/spider/{run_id}/items"], "Use Spider Lite for multi-page structured extraction with selectors and item pipeline.", "deterministic_router")
@@ -546,15 +604,76 @@ def _backend_plan(signals: dict[str, Any], strategy_context: dict[str, Any], sel
         _add(plan, "selector_generator", "locator_recovery", "Y26", ["POST /api/browser_control/selector", "POST /api/browser_control/similar"], "Generate stable selectors and similar element refs when DOM shifts or visual target needs recovery.", "deterministic_router")
     if selected_tools:
         _add(plan, "action_registry_macros", "agent_tools", "legacy+Y18", [tool.get("name", "") for tool in selected_tools[:6]], "Use registered deterministic macros/tools selected from the full task goal before generic VLM browsing.", "deterministic_router")
-    if signals.get("auth_or_captcha"):
-        _add(plan, "human_guard", "safety", "existing", ["ask_human", "prelogin/session guards"], "Auth walls, CAPTCHA, 2FA, and stale sessions must escalate instead of blind retries.", "runtime_guards", risk="medium")
+    if signals.get("bot_challenge") or signals.get("auth_or_captcha"):
+        _add(
+            plan,
+            "bot_challenge_guard",
+            "anti_bot_guard",
+            "BOT-CHL",
+            ["bot_challenge_guard.probe_bot_challenge", "handle_bot_challenge_step"],
+            "Deterministically probe Cloudflare/Turnstile/reCAPTCHA/hCaptcha/滑块 every perception step, passive-wait then optional third-party solver then HITL escalation, harvest cleared storage_state for reuse, and reroute proxy on persistent blocks — never feed a challenge/风控 page to the VLM as a normal page.",
+            "runtime_guards",
+            risk="medium",
+        )
+    if signals.get("auth_or_captcha") or signals.get("bot_challenge"):
+        _add(plan, "human_guard", "safety", "existing", ["ask_human", "prelogin/session guards"], "Auth walls, CAPTCHA, 2FA, bot challenges, and stale sessions must escalate instead of blind retries.", "runtime_guards", risk="medium")
     _add(plan, "semantic_planner_reflector", "model_reasoning", "existing", ["VLMClient.make_plan", "VLMClient.reflect"], "Use text model for task decomposition and stalled-run audit, not low-level endpoint selection.", "semantic_model")
     _add(plan, "vision_agent", "visual_grounding", "existing", ["VLMClient.ask with screenshot+AX"], "Use vision model for final visual grounding when deterministic routes cannot complete safely.", "vision_model", risk="medium")
     return plan
 
 
+def _apply_capture_fixture_probe(signals: dict[str, Any], strategy_context: dict[str, Any], url: str) -> None:
+    """E6: lift api_replay when this host already has a usable capture.
+
+    Probes the cross-run capture index for data-flavoured goals only; a hit
+    sets ``signals.api_replay_available`` plus ``strategy_context.
+    api_replay_capture`` evidence (both additive). Probe failures stay quiet
+    so routing never degrades because of index I/O.
+
+    Also probes the selector_action_cache for browser-interaction tasks:
+    a cache hit signals that selector replay can skip VLM rounds.
+    """
+    host = urlparse(str(url or "")).netloc.split("@")[-1].split(":", 1)[0].lower()
+    if not host:
+        return
+    if signals.get("structured") or signals.get("crawl") or signals.get("api_or_network"):
+        try:
+            from visual_web_agent import network_intelligence as _network_intel
+
+            hits = _network_intel.find_candidates_for_host(host, limit=5)
+        except Exception:
+            hits = []
+        if hits:
+            top = hits[0]
+            signals["api_replay_available"] = True
+            strategy_context["api_replay_capture"] = {
+                "host": host,
+                "candidates": len(hits),
+                "source_run_id": str(top.get("run_id") or ""),
+                "top_endpoint": str(top.get("endpoint") or top.get("url") or ""),
+                "top_score": int(top.get("score") or 0),
+            }
+    if signals.get("browser_interaction") or signals.get("form"):
+        try:
+            from visual_web_agent.selector_action_cache import get_cache as _get_sel_cache
+
+            cache = _get_sel_cache(url)
+            stats = cache.stats()
+            if stats.get("entries", 0) > 0:
+                signals["selector_cache_available"] = True
+                strategy_context["selector_action_cache"] = {
+                    "host": host,
+                    "cached_entries": stats["entries"],
+                    "total_hits": stats["total_hits"],
+                }
+        except Exception:
+            pass
+
+
 def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], backend_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
     chain: list[dict[str, Any]] = []
+    if signals.get("api_replay_available"):
+        chain.append(_step("api_replay", "Replay the existing capture fixture for this host before launching a browser (capture index hit)."))
     if signals.get("api_or_network"):
         chain.extend([
             _step("network_intelligence", "Use captured API/XHR candidates if present."),
@@ -568,6 +687,8 @@ def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], b
             _step("spider_lite", "Follow links/pages and extract items with cache/pipeline support."),
         ])
     if signals.get("browser_interaction"):
+        if signals.get("selector_cache_available"):
+            chain.append(_step("selector_action_cache", "Replay verified selector→action pairs from cache before VLM probing (cross-run cache hit)."))
         chain.extend([
             _step("browser_backend_abstraction", "Check active browser backend and configured remote/stealth backend slots."),
             _step("action_registry_macros", "Try selected deterministic browser macro/tool."),
@@ -577,6 +698,8 @@ def _fallback_chain(signals: dict[str, Any], strategy_context: dict[str, Any], b
         ])
     if signals.get("artifact_required"):
         chain.append(_step("feed_export", "Export only after item validation passes."))
+    if signals.get("bot_challenge") or signals.get("auth_or_captcha"):
+        chain.append(_step("bot_challenge_guard", "Probe vendor, passive-wait, optional third-party solver, then HITL; reuse harvested storage_state and reroute proxy before blind retries."))
     chain.extend([
         _step("semantic_reflector", "Ask semantic model to audit failure signals and choose continue/retry/abort."),
         _step("vision_agent", "Use screenshot+AX VLM for ambiguous visual grounding."),
@@ -648,30 +771,15 @@ def _step(capability: str, condition: str) -> dict[str, Any]:
 
 
 def _parse_target_count(text: str) -> int | None:
-    m = re.search(r"(?:前|top\s*)\s*(\d+)\s*(?:条|个|项|页|rows?|items?)?", text, re.I)
-    if not m:
-        m = re.search(r"(\d+)\s*(?:条|个|项|rows?|items?)", text, re.I)
-    if not m:
-        return None
-    try:
-        value = int(m.group(1))
-        return value if value > 0 else None
-    except Exception:
-        return None
+    return parse_goal_target_count(text)
+
+
+def _parse_target_pages(text: str) -> int | None:
+    return parse_goal_target_pages(text)
 
 
 def _parse_requested_fields(text: str) -> list[str]:
-    m = re.search(r"(?:fields?|字段|列)[:：]\s*([^。；;\n]+)", text, re.I)
-    if not m:
-        return []
-    raw = m.group(1)
-    parts = re.split(r"[,，、/|]\s*", raw)
-    out: list[str] = []
-    for part in parts:
-        value = part.strip(" []()（）\"'")
-        if value and value not in out:
-            out.append(value)
-    return out[:20]
+    return parse_goal_requested_fields(text)[:20]
 
 
 def _first_url(text: str) -> str:

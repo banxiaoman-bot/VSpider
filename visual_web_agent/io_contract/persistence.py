@@ -28,9 +28,10 @@ from typing import Any, Iterable
 from .input_contract import InputContract, build_input_contract
 from .output_contract import OutputContract, OutputPrediction
 from .manifest import Manifest, ManifestItem, append_item, new_manifest
+from ..secret_redaction import redact_secret_mapping
 
 
-_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_.-]+$")
+_RUN_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")  # no "." => blocks ./.. path traversal
 
 
 INPUT_CONTRACT_FILENAME = "input_contract.json"
@@ -100,6 +101,26 @@ def _read_json(target: Path) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _redact_input_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    # Mask secrets before input_contract.json is written to disk. In-memory
+    # InputContract objects keep the real values; only the persisted record is
+    # masked, mirroring the run_registry / queue_state secret handling.
+    #
+    # Walk the whole contract tree (model_overrides, constraints, urls,
+    # attachments, auth_profiles) so api_key/password/secret/token at any depth
+    # and URL-embedded credentials are masked -- not just the top-level
+    # constraints block and the model_overrides api_key fields.
+    if not isinstance(payload, dict):
+        return payload
+    redacted = redact_secret_mapping(payload)
+    # Keep the human-readable goal verbatim for reproducibility: it is the
+    # user's task text, never a secret container, and proxy-userinfo stripping
+    # could otherwise mangle a goal that happens to contain "a:b@c".
+    if "goal" in payload:
+        redacted["goal"] = payload["goal"]
+    return redacted
+
+
 def write_input_contract(
     run_id: str,
     contract: InputContract | dict[str, Any],
@@ -107,6 +128,7 @@ def write_input_contract(
     base_dir: str | Path | None = None,
 ) -> Path:
     payload = contract.to_dict() if isinstance(contract, InputContract) else dict(contract or {})
+    payload = _redact_input_contract_payload(payload)
     target = run_dir(run_id, base_dir=base_dir) / INPUT_CONTRACT_FILENAME
     _atomic_write_json(target, payload)
     return target
@@ -166,7 +188,7 @@ def ensure_input_contract_skeleton(
         constraints=constraints or None,
         source=source,
     )
-    _atomic_write_json(target, contract.to_dict())
+    _atomic_write_json(target, _redact_input_contract_payload(contract.to_dict()))
     return target
 
 

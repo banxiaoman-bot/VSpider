@@ -40,10 +40,11 @@ class TestRunDir:
         assert (d / ARTIFACTS_DIRNAME).exists()
 
     def test_invalid_run_id_raises(self, tmp_path: Path) -> None:
-        with pytest.raises(ValueError):
-            run_dir("../escape", base_dir=tmp_path)
-        with pytest.raises(ValueError):
-            run_dir("", base_dir=tmp_path)
+        # run_id is a single path component; "." / ".." must never traverse,
+        # and path separators / dotted ids are rejected outright.
+        for bad in ("../escape", "", "..", ".", "a.b", "x/y", "..\\x"):
+            with pytest.raises(ValueError):
+                run_dir(bad, base_dir=tmp_path)
 
 
 class TestInputContractIO:
@@ -62,6 +63,112 @@ class TestInputContractIO:
 
     def test_read_missing_returns_none(self, tmp_path: Path) -> None:
         assert read_input_contract("nonexistent", base_dir=tmp_path) is None
+
+    def test_secrets_masked_on_disk_but_not_in_object(self, tmp_path: Path) -> None:
+        c = build_input_contract(
+            goal="hello",
+            target_url="https://a.com",
+            vlm_options={"api_key": "vlm-secret", "semantic_api_key": "sem-secret"},
+            constraints={
+                "proxy_server": "http://proxy-user:proxy-pass@proxy.example:3128",
+                "proxy_password": "proxy-secret",
+            },
+        )
+        write_input_contract("run_sec", c, base_dir=tmp_path)
+        raw = (tmp_path / "run_sec" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        assert "vlm-secret" not in raw
+        assert "sem-secret" not in raw
+        assert "proxy-secret" not in raw
+        assert "proxy-user" not in raw
+        assert "proxy-pass" not in raw
+        assert "***" in raw
+        assert "http://proxy.example:3128" in raw  # non-secret endpoint survives
+        # the in-memory object still holds the real secrets
+        assert c.model_overrides.vlm["api_key"] == "vlm-secret"
+        assert c.constraints.proxy_server == "http://proxy-user:proxy-pass@proxy.example:3128"
+        assert c.constraints.proxy_password == "proxy-secret"
+
+    def test_extra_constraint_secrets_masked_on_disk(self, tmp_path: Path) -> None:
+        c = build_input_contract(
+            goal="hello",
+            target_url="https://a.com",
+            constraints={
+                "resume": True,
+                "captcha_api_token": "captcha-secret",
+                "proxy_chain": [
+                    "http://chain-user:chain-pass@p1.example:8080",
+                    "bare-user:bare-pass@p2.example:8080",
+                ],
+            },
+        )
+        write_input_contract("run_sec_extra", c, base_dir=tmp_path)
+        raw = (tmp_path / "run_sec_extra" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+
+        assert payload["constraints"]["resume"] is True
+        assert payload["constraints"]["proxy_chain"] == [
+            "http://p1.example:8080",
+            "p2.example:8080",
+        ]
+        assert payload["constraints"]["captcha_api_token"] == "***"
+        assert "captcha-secret" not in raw
+        assert "chain-user" not in raw
+        assert "chain-pass" not in raw
+        assert "bare-user" not in raw
+        assert "bare-pass" not in raw
+
+    def test_skeleton_also_masks_secrets(self, tmp_path: Path) -> None:
+        ensure_input_contract_skeleton(
+            "run_sk",
+            goal="g",
+            target_url="https://a.com",
+            vlm_options={"api_key": "k-secret"},
+            constraints={"proxy_password": "p-secret"},
+            base_dir=tmp_path,
+        )
+        raw = (tmp_path / "run_sk" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        assert "k-secret" not in raw
+        assert "p-secret" not in raw
+
+    def test_full_tree_secrets_masked_on_disk(self, tmp_path: Path) -> None:
+        # Redaction must walk the whole contract tree, not just constraints and
+        # model_overrides api_key: non-api_key secrets in model_overrides and
+        # URL-embedded credentials in urls must also be masked on disk.
+        payload = {
+            "version": "input_contract.v1",
+            "goal": "scrape a:b@c verbatim",
+            "urls": [
+                {"url": "https://u-user:u-pass@secure.example.com/path", "role": "start"},
+            ],
+            "attachments": [],
+            "auth_profiles": [],
+            "model_overrides": {
+                "vlm": {"api_key": "vlm-key-secret", "token": "vlm-token-secret"},
+                "semantic": {"password": "sem-pass-secret", "base_url": "https://api.example.com"},
+            },
+            "constraints": {},
+            "source": "api",
+        }
+        write_input_contract("run_full_tree", payload, base_dir=tmp_path)
+        raw = (tmp_path / "run_full_tree" / INPUT_CONTRACT_FILENAME).read_text(encoding="utf-8")
+        data = json.loads(raw)
+
+        # non-api_key secrets inside model_overrides are masked
+        assert "vlm-token-secret" not in raw
+        assert "sem-pass-secret" not in raw
+        assert data["model_overrides"]["vlm"]["token"] == "***"
+        assert data["model_overrides"]["semantic"]["password"] == "***"
+        # api_key still masked
+        assert "vlm-key-secret" not in raw
+        assert data["model_overrides"]["vlm"]["api_key"] == "***"
+        # URL-embedded credentials stripped, endpoint survives
+        assert "u-user" not in raw
+        assert "u-pass" not in raw
+        assert data["urls"][0]["url"] == "https://secure.example.com/path"
+        # non-secret endpoints survive
+        assert data["model_overrides"]["semantic"]["base_url"] == "https://api.example.com"
+        # the human-readable goal is preserved verbatim
+        assert data["goal"] == "scrape a:b@c verbatim"
 
 
 class TestOutputContractIO:

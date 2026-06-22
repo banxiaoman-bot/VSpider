@@ -26,6 +26,7 @@ try:
         ActionRegistry,
     )
     from .extraction_engine.fit_markdown import FitMarkdownResult, html_to_fit_markdown
+    from .extraction_engine.chunking import chunk_markdown, score_chunks
 except ImportError:  # pragma: no cover - flat-layout fallback, mirrors actions.py
     from actions import (  # type: ignore[no-redef]
         ActionContext,
@@ -37,6 +38,7 @@ except ImportError:  # pragma: no cover - flat-layout fallback, mirrors actions.
         FitMarkdownResult,
         html_to_fit_markdown,
     )
+    from extraction_engine.chunking import chunk_markdown, score_chunks  # type: ignore[no-redef]
 
 
 @ActionRegistry.register("page_to_markdown")
@@ -66,6 +68,11 @@ class PageToMarkdownHandler(ActionHandler):
         entry = self._persist(result, base_url=base_url)
         output_path = (entry or {}).get("path", "")
 
+        chunks = chunk_markdown(result.markdown, strategy="heading")
+        chunk_records = self._chunk_records(chunks, query)
+        chunks_entry = self._persist_chunks(chunk_records, base_url=base_url)
+        chunks_path = (chunks_entry or {}).get("path", "")
+
         mem_key = (ctx.action.memory_key or "").strip() or "page_markdown"
         try:
             ctx.workflow_memory[mem_key] = {
@@ -75,6 +82,8 @@ class PageToMarkdownHandler(ActionHandler):
                 "links": result.links,
                 "source_url": base_url,
                 "query": query,
+                "chunk_count": len(chunk_records),
+                "chunks_path": chunks_path,
             }
         except Exception:  # pragma: no cover - memory is a plain dict in practice
             pass
@@ -91,6 +100,8 @@ class PageToMarkdownHandler(ActionHandler):
                         "removed_blocks": result.removed_blocks,
                         "output_kind": "markdown_doc",
                         "output_path": output_path,
+                        "chunk_count": len(chunk_records),
+                        "chunks_path": chunks_path,
                     }
                 )
             )
@@ -98,6 +109,36 @@ class PageToMarkdownHandler(ActionHandler):
             pass
 
         return None
+
+    @staticmethod
+    def _chunk_records(chunks: list, query: str) -> list[dict]:
+        """Serialize chunks to jsonl-ready dicts (FITMD-4 query-rank).
+
+        With no focus ``query`` the records stay in document order and carry no
+        ``score`` key (byte-identical to FITMD-3). With a focus query -- the same
+        ``type_value`` BM25 query already used to fit the markdown -- the records
+        are reordered most-relevant-first and each carries a rounded BM25
+        ``score``, so a downstream RAG / QA step can take the top chunks without
+        re-scoring (mission §一 "高效 / 精准"; closes FITMD-3's named "query-rank"
+        gap). ``index`` always reflects the original document position.
+        """
+        if not query:
+            return [
+                {"index": c.index, "heading": c.heading, "word_count": c.word_count, "text": c.text}
+                for c in chunks
+            ]
+        scores = score_chunks(chunks, query)
+        order = sorted(range(len(chunks)), key=lambda i: (-scores[i], i))
+        return [
+            {
+                "index": chunks[i].index,
+                "heading": chunks[i].heading,
+                "word_count": chunks[i].word_count,
+                "score": round(float(scores[i]), 4),
+                "text": chunks[i].text,
+            }
+            for i in order
+        ]
 
     @staticmethod
     def _persist(result: "FitMarkdownResult", *, base_url: str) -> Optional[dict]:
@@ -123,6 +164,37 @@ class PageToMarkdownHandler(ActionHandler):
             result.markdown,
             run_id=run_id,
             output_kind="markdown_doc",
+            produced_by="page_to_markdown",
+            source_url=base_url,
+            base_dir=current_base_dir(),
+        )
+
+    @staticmethod
+    def _persist_chunks(chunk_records: list, *, base_url: str) -> Optional[dict]:
+        """Write the RAG chunks as a ``markdown_chunks`` jsonl artifact.
+
+        Returns ``None`` with no run context or no chunks; the agent still gets
+        ``chunk_count`` via ``workflow_memory``.
+        """
+        if not chunk_records:
+            return None
+        try:
+            from .data_writers import write_jsonl
+            from .io_contract import current_base_dir, current_run_id
+        except ImportError:  # pragma: no cover - flat-layout fallback
+            from data_writers import write_jsonl  # type: ignore[no-redef]
+            from io_contract import (  # type: ignore[no-redef]
+                current_base_dir,
+                current_run_id,
+            )
+
+        run_id = current_run_id()
+        if not run_id:
+            return None
+        return write_jsonl(
+            chunk_records,
+            run_id=run_id,
+            output_kind="markdown_chunks",
             produced_by="page_to_markdown",
             source_url=base_url,
             base_dir=current_base_dir(),

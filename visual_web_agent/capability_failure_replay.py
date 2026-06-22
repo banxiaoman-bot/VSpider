@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from visual_web_agent.action_reliability import build_action_reliability_score
 from visual_web_agent.capability_router import planner_feedback_from_failure_bundle, route_task
 from visual_web_agent.planner_contract import build_execution_plan
 
@@ -9,6 +10,7 @@ from visual_web_agent.planner_contract import build_execution_plan
 _CAPABILITY_FAILURE_FIXTURE_REPLAY_REPORT_VERSION = "capability_failure_fixture_replay_report.v1"
 _CAPABILITY_FAILURE_FIXTURE_REPLAY_BATCH_REPORT_VERSION = "capability_failure_fixture_replay_batch_report.v1"
 _CAPABILITY_FAILURE_REGRESSION_FIXTURE_VERSION = "capability_failure_regression_fixture.v1"
+_CAPABILITY_FAILURE_RECOVERY_DECISION_REPLAY_VERSION = "capability_failure_recovery_decision_replay.v1"
 
 
 def replay_capability_failure_fixture(fixture: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -33,6 +35,7 @@ def replay_capability_failure_fixture(fixture: dict[str, Any] | None = None) -> 
         execution_plan = build_execution_plan(route)
     checks = _replay_checks(data, failure_bundle, expected, planner_feedback, route, execution_plan)
     passed = all(bool(item.get("passed")) for item in checks)
+    recovery_decision = replay_recovery_decision(failure_bundle)
     return {
         "version": _CAPABILITY_FAILURE_FIXTURE_REPLAY_REPORT_VERSION,
         "fixture": {
@@ -62,7 +65,45 @@ def replay_capability_failure_fixture(fixture: dict[str, Any] | None = None) -> 
             "planner_feedback": dict(execution_plan.get("planner_feedback") or {}),
         },
         "checks": checks,
+        "recovery_decision": recovery_decision,
         "passed": passed,
+    }
+
+
+def replay_recovery_decision(failure_bundle: dict[str, Any] | None = None) -> dict[str, Any]:
+    """C2: offline recovery-decision replay.
+
+    Feeds the captured failure's ``action_trace`` back through the self-healing
+    policy builder and reports whether a concrete recovery decision *would* be
+    produced. Purely additive — it never gates the planner-feedback loop, so the
+    locked FIXTURE-AUDIT-1 ``report['passed']`` contract is unaffected.
+    """
+    bundle = dict(failure_bundle or {}) if isinstance(failure_bundle, dict) else {}
+    action_trace = bundle.get("action_trace")
+    has_action_trace = isinstance(action_trace, dict) and bool(action_trace)
+    browser_state = bundle.get("browser_state") if isinstance(bundle.get("browser_state"), dict) else {}
+    history = bundle.get("action_history") or bundle.get("history")
+    score = build_action_reliability_score(
+        action_trace if isinstance(action_trace, dict) else {},
+        browser_state,
+        history,
+    )
+    policy = dict(score.get("self_healing_policy") or {})
+    recommended_actions = [str(item) for item in (policy.get("recommended_actions") or []) if str(item or "")]
+    concrete_actions = [item for item in recommended_actions if item != "continue"]
+    risk_level = str(score.get("risk_level") or "low")
+    has_recovery_decision = bool(has_action_trace and (concrete_actions or risk_level in {"medium", "high"}))
+    return {
+        "version": _CAPABILITY_FAILURE_RECOVERY_DECISION_REPLAY_VERSION,
+        "has_action_trace": bool(has_action_trace),
+        "risk_level": risk_level,
+        "score": float(score.get("score") or 0.0),
+        "retry_allowed": bool(policy.get("retry_allowed")),
+        "requires_snapshot_refresh": bool(policy.get("requires_snapshot_refresh")),
+        "requires_planner_replan": bool(policy.get("requires_planner_replan")),
+        "recommended_action": str(policy.get("recommended_action") or ""),
+        "recommended_actions": recommended_actions,
+        "has_recovery_decision": has_recovery_decision,
     }
 
 
@@ -111,6 +152,11 @@ def replay_capability_failure_fixtures(fixtures: list[dict[str, Any]] | None = N
         })
     passed_count = sum(1 for item in items if bool(item.get("passed")))
     failed_count = len(items) - passed_count
+    recovery_decision_count = sum(
+        1
+        for item in items
+        if bool(((item.get("report") or {}).get("recovery_decision") or {}).get("has_recovery_decision"))
+    )
     failed_checks = _count_rows(failed_check_counts)
     status = "empty" if not items else "passed" if failed_count == 0 else "failed"
     top_primary_failures = _count_rows(primary_failure_counts)
@@ -129,6 +175,7 @@ def replay_capability_failure_fixtures(fixtures: list[dict[str, Any]] | None = N
         "summary": {
             "status": status,
             "blocking": failed_count > 0,
+            "recovery_decision_count": recovery_decision_count,
             "top_primary_failures": top_primary_failures,
             "top_failure_categories": _count_rows(failure_category_counts),
             "top_actions": _count_rows(action_counts),

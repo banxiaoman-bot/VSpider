@@ -142,6 +142,83 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+_FIELD_KEY_RE = re.compile(r"[^0-9A-Za-z_\u4e00-\u9fff]+")
+
+
+def _field_key(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().lower().replace("-", "_")
+    text = _FIELD_KEY_RE.sub("_", text).strip("_")
+    return text
+
+
+def _iter_field_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_iter_field_values(item))
+        return out
+    text = str(value or "").strip()
+    if not text:
+        return []
+    if any(sep in text for sep in (",", "，", "、", ";", "；", "\n")):
+        return [
+            item.strip()
+            for item in re.split(r"[,，、;；\n]+", text)
+            if item.strip()
+        ]
+    return [text]
+
+
+def normalize_output_fields(*values: Any) -> list[str]:
+    """Canonical ordered field list for output contracts and their aliases."""
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in _iter_field_values(value):
+            key = _field_key(item)
+            if key and key not in seen:
+                out.append(item)
+                seen.add(key)
+    return out
+
+
+def output_contract_fields(contract: "OutputContract | dict[str, Any] | None") -> list[str]:
+    """Return the canonical field constraints carried by an output contract."""
+
+    if isinstance(contract, OutputContract):
+        return normalize_output_fields(contract.fields)
+    if not isinstance(contract, dict):
+        return []
+    values: list[Any] = [
+        contract.get("fields"),
+        contract.get("required_fields"),
+        contract.get("requested_fields"),
+    ]
+    pipeline = contract.get("item_pipeline")
+    if isinstance(pipeline, dict):
+        values.extend([
+            pipeline.get("fields"),
+            pipeline.get("required_fields"),
+            pipeline.get("requested_fields"),
+        ])
+    return normalize_output_fields(*values)
+
+
+def normalize_output_contract_dict(contract: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize legacy field aliases into the canonical ``fields`` key."""
+
+    data = dict(contract or {}) if isinstance(contract, dict) else {}
+    fields = output_contract_fields(data)
+    if fields:
+        data["fields"] = fields
+        data["required_fields"] = list(fields)
+        data["requested_fields"] = list(fields)
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Data class
 # ---------------------------------------------------------------------------
@@ -159,13 +236,19 @@ class OutputContract:
     created_at: str = field(default_factory=_now_iso)
     version: str = VERSION
 
+    def __post_init__(self) -> None:
+        self.fields = normalize_output_fields(self.fields)
+
     def to_dict(self) -> dict[str, Any]:
+        fields = normalize_output_fields(self.fields)
         return {
             "version": self.version,
             "mode": self.mode,
             "output_kind": self.output_kind if self.output_kind in OUTPUT_KINDS else "mixed",
             "container": self.container if self.container in CONTAINERS else "files_folder",
-            "fields": list(self.fields or []),
+            "fields": fields,
+            "required_fields": list(fields),
+            "requested_fields": list(fields),
             "post_process": list(self.post_process or []),
             "user_explicit": bool(self.user_explicit),
             "reasons": list(self.reasons or []),
@@ -316,7 +399,7 @@ def infer_output_contract(
     mode = str(legacy.get("mode") or "default")
     reasons: list[str] = [str(r) for r in (legacy.get("reasons") or [])]
 
-    fields_list: list[str] = [str(f) for f in (requested_fields or []) if f]
+    fields_list: list[str] = normalize_output_fields(requested_fields)
     post_process: list[str] = []
     user_explicit = False
 

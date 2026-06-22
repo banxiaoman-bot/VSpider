@@ -56,6 +56,8 @@ def test_enqueue_task_creates_queued_registry(api_with_tmp_registry, local_tmp_p
         file_path="",
         mode="single",
         vlm_options={"api_key": "secret"},
+        urls=["https://extra.example.com"],
+        constraints={"max_runs": 2, "proxy_password": "secret-pass"},
     )
 
     assert should_start is True
@@ -68,14 +70,23 @@ def test_enqueue_task_creates_queued_registry(api_with_tmp_registry, local_tmp_p
     assert persisted["queue"][0]["task_id"] == item["task_id"]
     assert "execution_queue" in persisted
     assert persisted["execution_queue"][0]["task_id"] == item["task_id"]
-    assert persisted["execution_queue"][0]["vlm_options"]["api_key"] == "secret"
+    assert persisted["execution_queue"][0]["vlm_options"]["api_key"] == "***"
+    assert persisted["execution_queue"][0]["urls"] == ["https://extra.example.com"]
+    assert persisted["execution_queue"][0]["constraints"]["max_runs"] == 2
+    assert persisted["execution_queue"][0]["constraints"]["proxy_password"] == "***"
     assert "vlm_options" not in persisted["queue"][0]
+    assert "constraints" not in persisted["queue"][0]
+    raw_state = api_server._queue_state.queue_state_path().read_text(encoding="utf-8")
+    assert "secret" not in raw_state
 
     rec = api_server._run_registry.load_run(item["task_id"], base_dir=local_tmp_path)
     assert rec is not None
     assert rec["status"] == "queued"
     assert rec["started_at"] is None
     assert rec["vlm_options"]["api_key"] == "***"
+    assert rec["urls"] == ["https://extra.example.com"]
+    assert rec["constraints"]["max_runs"] == 2
+    assert rec["constraints"]["proxy_password"] == "***"
 
 
 def test_cancel_queued_task_updates_registry(api_with_tmp_registry, local_tmp_path: Path) -> None:
@@ -359,6 +370,10 @@ def test_retry_run_as_queued_task_creates_new_queued_run(api_with_tmp_registry, 
         prompt="retry this",
         status="failed",
         vlm_options={"api_key": "secret", "temperature": 0.2},
+        urls=["https://retry-extra.example.com"],
+        constraints={"max_runs": 2, "proxy_password": "proxy-secret"},
+        upload_sha256="abc123",
+        upload_mime="text/csv",
         base_dir=local_tmp_path,
     )
 
@@ -372,6 +387,13 @@ def test_retry_run_as_queued_task_creates_new_queued_run(api_with_tmp_registry, 
     snapshot = api_server._queue_snapshot()
     assert snapshot["queue_length"] == 1
     assert snapshot["queue"][0]["task_id"] == retry["task_id"]
+    with api_server._TASK_LOCK:
+        queued_item = api_server.active_tasks["queue"][0]
+    assert queued_item["urls"] == ["https://retry-extra.example.com"]
+    assert queued_item["constraints"]["max_runs"] == 2
+    assert "proxy_password" not in queued_item["constraints"]
+    assert queued_item["upload_sha256"] == "abc123"
+    assert queued_item["upload_mime"] == "text/csv"
     retried = api_server._run_registry.load_run(retry["task_id"], base_dir=local_tmp_path)
     assert retried is not None
     assert retried["status"] == "queued"
@@ -379,9 +401,128 @@ def test_retry_run_as_queued_task_creates_new_queued_run(api_with_tmp_registry, 
     assert retried["retry_source_status"] == "failed"
     assert retried["vlm_options"]["temperature"] == 0.2
     assert "api_key" not in retried["vlm_options"]
+    assert retried["urls"] == ["https://retry-extra.example.com"]
+    assert retried["constraints"]["max_runs"] == 2
+    assert "proxy_password" not in retried["constraints"]
     original = api_server._run_registry.load_run("failed_source", base_dir=local_tmp_path)
     assert original is not None
     assert original["status"] == "failed"
+
+
+def test_retry_run_backfills_from_input_contract(
+    api_with_tmp_registry,
+    local_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_server = api_with_tmp_registry
+    from visual_web_agent.io_contract import (
+        build_input_contract,
+        write_input_contract,
+    )
+    from visual_web_agent.io_contract import persistence as _persistence
+
+    runs_root = local_tmp_path / "runs_root"
+    monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+
+    source = api_server._run_registry.create_run(
+        run_id="legacy_contract_source",
+        target_url="https://legacy-primary.example.com",
+        prompt="retry legacy",
+        status="failed",
+        base_dir=local_tmp_path,
+    )
+    contract = build_input_contract(
+        goal="retry legacy",
+        urls=[
+            "https://legacy-primary.example.com",
+            "https://legacy-extra.example.com",
+        ],
+        auth_profiles=["admin"],
+        constraints={
+            "resume": True,
+            "max_runs": 2,
+            "proxy_password": "proxy-secret",
+        },
+    )
+    write_input_contract(source["run_id"], contract, base_dir=runs_root)
+
+    ok, message, retry = api_server.retry_run_as_queued_task(source["run_id"])
+
+    assert ok is True
+    assert message == "retry task queued"
+    with api_server._TASK_LOCK:
+        queued_item = api_server.active_tasks["queue"][0]
+    assert queued_item["target_url"] == "https://legacy-primary.example.com"
+    assert queued_item["urls"] == ["https://legacy-extra.example.com"]
+    assert queued_item["auth_profiles"] == "admin"
+    assert queued_item["constraints"]["resume"] is True
+    assert queued_item["constraints"]["max_runs"] == 2
+    assert "proxy_password" not in queued_item["constraints"]
+
+    retried = api_server._run_registry.load_run(retry["task_id"], base_dir=local_tmp_path)
+    assert retried is not None
+    assert retried["urls"] == ["https://legacy-extra.example.com"]
+    assert retried["constraints"]["resume"] is True
+    assert "proxy_password" not in retried["constraints"]
+
+
+def test_retry_run_backfills_attachment_from_input_contract(
+    api_with_tmp_registry,
+    local_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_server = api_with_tmp_registry
+    from visual_web_agent.io_contract import (
+        build_input_contract,
+        write_input_contract,
+    )
+    from visual_web_agent.io_contract import persistence as _persistence
+
+    runs_root = local_tmp_path / "runs_root"
+    monkeypatch.setattr(_persistence, "default_runs_root", lambda: runs_root)
+    attachment = local_tmp_path / "legacy_upload.csv"
+    attachment.write_text("url\nhttps://a.example.com\n", encoding="utf-8")
+
+    source = api_server._run_registry.create_run(
+        run_id="legacy_attachment_source",
+        target_url="https://legacy-form.example.com",
+        prompt="retry attachment",
+        status="failed",
+        mode="batch",
+        base_dir=local_tmp_path,
+    )
+    contract = build_input_contract(
+        goal="retry attachment",
+        target_url="https://legacy-form.example.com",
+        attachments=[
+            {
+                "path": str(attachment),
+                "filename": attachment.name,
+                "mime": "text/csv",
+                "size": attachment.stat().st_size,
+                "sha256": "sha123",
+            }
+        ],
+    )
+    write_input_contract(source["run_id"], contract, base_dir=runs_root)
+
+    ok, message, retry = api_server.retry_run_as_queued_task(source["run_id"])
+
+    assert ok is True
+    assert message == "retry task queued"
+    with api_server._TASK_LOCK:
+        queued_item = api_server.active_tasks["queue"][0]
+    assert queued_item["mode"] == "batch"
+    assert queued_item["file_path"] == str(attachment)
+    assert queued_item["filename"] == attachment.name
+    assert queued_item["upload_sha256"] == "sha123"
+    assert queued_item["upload_mime"] == "text/csv"
+
+    retried = api_server._run_registry.load_run(retry["task_id"], base_dir=local_tmp_path)
+    assert retried is not None
+    assert retried["filename"] == attachment.name
+    assert retried["upload_sha256"] == "sha123"
+    assert retried["upload_mime"] == "text/csv"
 
 
 def test_retry_run_rejects_non_retryable_status(api_with_tmp_registry, local_tmp_path: Path) -> None:
@@ -750,6 +891,10 @@ def test_recover_queued_tasks_prefers_execution_queue_payload(api_with_tmp_regis
                     "file_size_kb": 12.5,
                     "vlm_model_type": "vl",
                     "vlm_options": {"api_key": "secret", "temperature": 0.1},
+                    "urls": ["https://extra.example.com"],
+                    "upload_sha256": "abc123",
+                    "upload_mime": "text/csv",
+                    "constraints": {"max_runs": 2, "proxy_password": "***"},
                 }
             ],
         }
@@ -763,7 +908,15 @@ def test_recover_queued_tasks_prefers_execution_queue_payload(api_with_tmp_regis
     assert restored["target_url"] == "https://full.example.com"
     assert restored["file_path"] == "temp_uploads/input.xlsx"
     assert restored["auth_profiles"] == "admin"
-    assert restored["vlm_options"]["api_key"] == "secret"
+    assert restored["urls"] == ["https://extra.example.com"]
+    assert restored["upload_sha256"] == "abc123"
+    assert restored["upload_mime"] == "text/csv"
+    assert restored["constraints"]["max_runs"] == 2
+    assert "proxy_password" not in restored["constraints"]
+    # api_key is masked on disk then dropped on recovery (a per-run secret never
+    # survives a restart); non-secret overrides like temperature still round-trip.
+    assert "api_key" not in restored["vlm_options"]
+    assert restored["vlm_options"]["temperature"] == 0.1
 
 
 def test_task_queue_recover_api(api_with_tmp_registry, local_tmp_path: Path) -> None:
@@ -804,38 +957,41 @@ def test_task_queue_recover_api(api_with_tmp_registry, local_tmp_path: Path) -> 
 def test_task_queue_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    qc_src = (root / "queue_core.py").read_text(encoding="utf-8")
 
-    assert "active_tasks: dict[str, Any] = {" in api_src
-    assert '"queue_worker_running": False' in api_src
-    assert '"queue_paused": False' in api_src
-    assert '"workers": {}' in api_src
-    assert "def _queue_worker_config() -> dict[str, Any]:" in api_src
-    assert "def _queue_heartbeat_config() -> dict[str, Any]:" in api_src
-    assert "def _queue_watchdog_scheduler_config() -> dict[str, Any]:" in api_src
+    assert "active_tasks: dict[str, Any] = {" in qc_src
+    assert '"queue_worker_running": False' in qc_src
+    assert '"queue_paused": False' in qc_src
+    assert '"workers": {}' in qc_src
+    assert "def _queue_worker_config() -> dict[str, Any]:" in qc_src
+    assert "def _queue_heartbeat_config() -> dict[str, Any]:" in qc_src
+    assert "def _queue_watchdog_scheduler_config() -> dict[str, Any]:" in qc_src
     assert "def _start_queue_workers(background_tasks: BackgroundTasks)" in api_src
-    assert "def pause_task_queue(reason: str = \"\") -> dict[str, Any]:" in api_src
-    assert "def resume_task_queue() -> tuple[dict[str, Any], bool]:" in api_src
-    assert "def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:" in api_src
-    assert "def queue_metrics(*, run_limit: int = 200) -> dict[str, Any]:" in api_src
-    assert "def _persist_queue_snapshot_safe() -> None:" in api_src
+    assert "def pause_task_queue(reason: str = \"\") -> dict[str, Any]:" in qc_src
+    assert "def resume_task_queue() -> tuple[dict[str, Any], bool]:" in qc_src
+    assert "def retry_run_as_queued_task(run_id: str) -> tuple[bool, str, dict[str, Any]]:" in qc_src
+    assert "def queue_metrics(*, run_limit: int = 200) -> dict[str, Any]:" in qc_src
+    assert "def _persist_queue_snapshot_safe() -> None:" in qc_src
     assert "async def _queue_worker_heartbeat(worker_id: str, stop_signal: asyncio.Event) -> None:" in api_src
     assert "async def _queue_watchdog_scheduler(stop_signal: asyncio.Event) -> None:" in api_src
-    assert '"heartbeat_config": heartbeat_config' in api_src
-    assert '"watchdog_config": watchdog_config' in api_src
-    assert '"stale_worker_count": sum(1 for worker in public_workers if worker.get("stale"))' in api_src
-    assert "def scan_stale_queue_workers() -> dict[str, Any]:" in api_src
-    assert 'VSPIDER_QUEUE_WATCHDOG_ENABLED' in api_src
-    assert "def recover_queued_tasks() -> dict[str, Any]:" in api_src
-    assert "from visual_web_agent import queue_state as _queue_state" in api_src
+    assert '"heartbeat_config": heartbeat_config' in qc_src
+    assert '"watchdog_config": watchdog_config' in qc_src
+    assert '"stale_worker_count": sum(1 for worker in public_workers if worker.get("stale"))' in qc_src
+    assert "def scan_stale_queue_workers() -> dict[str, Any]:" in qc_src
+    assert 'VSPIDER_QUEUE_WATCHDOG_ENABLED' in qc_src
+    assert "def recover_queued_tasks() -> dict[str, Any]:" in qc_src
+    assert "from visual_web_agent import queue_state as _queue_state" in qc_src
     assert "async def _queue_worker(worker_id: str = \"worker_default\") -> None:" in api_src
-    assert "def _enqueue_task(" in api_src
-    assert '@app.get("/api/task_queue"' in api_src
-    assert '@app.get("/api/task_queue/metrics"' in api_src
-    assert '"persisted": _queue_state.load_public_snapshot()' in api_src
-    assert 'snapshot["execution_queue"]' in api_src
-    assert '@app.post("/api/task_queue/pause"' in api_src
-    assert '@app.post("/api/task_queue/resume"' in api_src
-    assert '@app.post("/api/task_queue/recover"' in api_src
-    assert '@app.post("/api/task_queue/watchdog"' in api_src
-    assert '@app.post("/api/runs/{run_id}/retry"' in api_src
-    assert '@app.delete("/api/task_queue/{task_id}"' in api_src
+    assert "def _enqueue_task(" in qc_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    runs_src = (root / "api_routes" / "runs_api.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/task_queue"' in tq_src
+    assert '@app.get("/api/task_queue/metrics"' in tq_src
+    assert "queue_state.load_public_snapshot()" in tq_src
+    assert 'snapshot["execution_queue"]' in qc_src
+    assert '@app.post("/api/task_queue/pause"' in tq_src
+    assert '@app.post("/api/task_queue/resume"' in tq_src
+    assert '@app.post("/api/task_queue/recover"' in tq_src
+    assert '@app.post("/api/task_queue/watchdog"' in tq_src
+    assert '@app.post(' in runs_src and "retry" in runs_src
+    assert '@app.delete("/api/task_queue/{task_id}"' in tq_src

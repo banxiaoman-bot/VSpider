@@ -500,6 +500,41 @@ def build_default_action_registry() -> ActionRegistry:
         changes_state=False,
     ))
     register(ActionTool(
+        name="vscroll_capture",
+        capability="extract",
+        description=(
+            "Deterministically harvest every row of a virtualised / "
+            "infinite-scroll list (react-window, vue-virtual-scroller, "
+            "ag-grid, Element Plus virtual tables) by alternating row "
+            "snapshots with container nudges, deduplicating recycled rows "
+            "by text. Sweeps the main document first, then same-origin "
+            "child iframes. type_value is an optional row cap. Writes a "
+            "dataset_rows jsonl artifact + manifest entry and stores rows "
+            "in memory. Replaces ~1 VLM round per viewport with a single "
+            "mid-run call."
+        ),
+        actions=("vscroll_capture",),
+        aliases=(
+            "virtual list",
+            "virtual scroll",
+            "virtualized list",
+            "infinite scroll",
+            "react-window",
+            "vue-virtual-scroller",
+            "ag-grid",
+            "虚拟列表",
+            "虚拟滚动",
+            "无限滚动",
+            "滚动加载",
+            "全量采集",
+            "滚动采集",
+        ),
+        tags=("extract", "list", "virtual-scroll", "deterministic"),
+        evidence=("row_count", "passes", "complete", "container", "output_path"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
         name="page_to_markdown",
         capability="extract",
         description=(
@@ -530,6 +565,92 @@ def build_default_action_registry() -> ActionRegistry:
         ),
         tags=("extract", "markdown", "readability", "rag", "deterministic"),
         evidence=("output_path", "word_count", "link_count", "source_url"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
+        name="html_snapshot",
+        capability="snapshot",
+        description=(
+            "Persist the current tab's full HTML as a run artifact and record "
+            "it in manifest.json (kind=html_snapshot). type_value is an "
+            "optional filename hint. The saved path is written back to memory "
+            "so later steps (or the user) can reference the snapshot."
+        ),
+        actions=("html_snapshot",),
+        aliases=(
+            "save html",
+            "save page",
+            "page snapshot",
+            "html snapshot",
+            "保存网页",
+            "保存页面",
+            "网页快照",
+            "页面快照",
+            "存为html",
+            "存为 html",
+            "另存网页",
+        ),
+        tags=("snapshot", "artifact", "deterministic"),
+        evidence=("output_path", "size", "source_url"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
+        name="screenshot",
+        capability="snapshot",
+        description=(
+            "Capture a viewport (default) or full-page (type_value='full') "
+            "screenshot, persist it as a run artifact and record it in "
+            "manifest.json (kind=screenshot). The saved path is written back "
+            "to memory. Use when the goal asks for a screenshot deliverable, "
+            "not for perception (the agent loop already sees the page)."
+        ),
+        actions=("screenshot",),
+        aliases=(
+            "take screenshot",
+            "capture screen",
+            "截图",
+            "截屏",
+            "屏幕截图",
+            "整页截图",
+            "保存截图",
+        ),
+        tags=("snapshot", "artifact", "deterministic"),
+        evidence=("output_path", "size", "full_page", "source_url"),
+        deterministic=True,
+        changes_state=False,
+    ))
+    register(ActionTool(
+        name="resume_run",
+        capability="resume",
+        description=(
+            "Read back where a prior / interrupted run left off (turn, completed "
+            "steps, rows already captured) from the run checkpoint or the resume "
+            "state the loop published, and surface it into memory so the agent "
+            "continues toward the remaining goal instead of restarting from "
+            "scratch. Already-captured rows are deduped on a resumed run. "
+            "Deterministic and read-only (no page mutation). Use when the user "
+            "asks to 续跑 / 断点续跑 / 接着上次 / continue the last run."
+        ),
+        actions=("resume_run",),
+        aliases=(
+            "resume",
+            "resume run",
+            "resume last",
+            "continue last",
+            "continue previous",
+            "pick up where",
+            "续跑",
+            "断点续跑",
+            "接着上次",
+            "继续上次",
+            "上次没做完",
+            "接着之前",
+            "继续之前",
+        ),
+        tags=("resume", "checkpoint", "control", "deterministic"),
+        evidence=("resumed", "from_turn", "completed_steps", "item_count"),
         deterministic=True,
         changes_state=False,
     ))
@@ -655,4 +776,219 @@ def build_default_action_registry() -> ActionRegistry:
         enabled=False,
         risk="medium",
     ))
+
+    # ── VLM primitive actions ──
+    # Metadata-only entries so capability_router can recognise them.
+    # Execution goes through browser.execute_action (actions/ handlers).
+
+    register(ActionTool(
+        name="click_text",
+        capability="interaction",
+        description="Click an element identified by visible text content.",
+        actions=("click_text",),
+        aliases=("点击文字",),
+        tags=("click",),
+        evidence=("selector", "text"),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="type_text",
+        capability="interaction",
+        description="Type text into the focused or specified input element.",
+        actions=("type",),
+        aliases=("输入", "填写文本"),
+        tags=("input", "keyboard"),
+        evidence=("value_readback",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="scroll_page",
+        capability="navigation",
+        description="Scroll the page or a specific element.",
+        actions=("scroll", "smooth_scroll"),
+        aliases=("滚动", "翻页"),
+        tags=("scroll",),
+        evidence=("scroll_position",),
+        deterministic=False,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="click_point",
+        capability="interaction",
+        description="Click at precise viewport coordinates.",
+        actions=("click_point",),
+        aliases=("坐标点击",),
+        tags=("click", "coordinate"),
+        evidence=("point",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="click_new_tab",
+        capability="navigation",
+        description="Click a link that opens in a new tab and switch to it.",
+        actions=("click_new_tab",),
+        aliases=("新标签页打开",),
+        tags=("click", "tab"),
+        evidence=("url", "tab_id"),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="press_key",
+        capability="interaction",
+        description="Press a keyboard key or shortcut.",
+        actions=("press_key",),
+        aliases=("按键", "快捷键"),
+        tags=("keyboard",),
+        evidence=("key",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="find_text",
+        capability="perception",
+        description="Search for text on the current page.",
+        actions=("find_text",),
+        aliases=("查找", "搜索文本"),
+        tags=("search",),
+        evidence=("matches",),
+        deterministic=False,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="wait_action",
+        capability="control",
+        description="Wait for a specified duration or condition.",
+        actions=("wait",),
+        aliases=("等待",),
+        tags=("timing",),
+        evidence=("duration",),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="goto_url",
+        capability="navigation",
+        description="Navigate to a specified URL.",
+        actions=("goto",),
+        aliases=("跳转", "打开网址"),
+        tags=("navigation", "url"),
+        evidence=("url",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="switch_tab",
+        capability="navigation",
+        description="Switch to a different browser tab.",
+        actions=("switch_tab",),
+        aliases=("切换标签页",),
+        tags=("tab",),
+        evidence=("tab_id",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="close_tab",
+        capability="navigation",
+        description="Close the current or specified browser tab.",
+        actions=("close_tab",),
+        aliases=("关闭标签页",),
+        tags=("tab",),
+        evidence=("tab_id",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="select_option",
+        capability="interaction",
+        description="Select an option from a dropdown or listbox.",
+        actions=("select",),
+        aliases=("选择", "下拉选择"),
+        tags=("select", "dropdown"),
+        evidence=("value_readback",),
+        deterministic=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="done_signal",
+        capability="control",
+        description="Signal task completion to the agent loop.",
+        actions=("done",),
+        aliases=("完成",),
+        tags=("terminal",),
+        evidence=("summary",),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="ask_human",
+        capability="control",
+        description="Request human intervention for captchas, logins, or ambiguous decisions.",
+        actions=("ask_human",),
+        aliases=("人工介入", "验证码"),
+        tags=("hitl",),
+        evidence=("reason",),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="drag_and_drop",
+        capability="interaction",
+        description="Drag an element and drop it onto a target.",
+        actions=("drag_and_drop",),
+        aliases=("拖拽",),
+        tags=("drag",),
+        evidence=("source", "target"),
+        deterministic=False,
+        risk="medium",
+    ))
+    register(ActionTool(
+        name="save_to_memory",
+        capability="control",
+        description="Store extracted information in workflow memory for later use.",
+        actions=("save_to_memory",),
+        aliases=("记住", "保存到记忆"),
+        tags=("memory",),
+        evidence=("key", "value"),
+        deterministic=True,
+        changes_state=False,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="open_top_search_result",
+        capability="navigation",
+        description="On a search-results page, deterministically open the first non-ad organic result and navigate to it (ads / sponsored / paid-click redirects / same-engine internal links excluded, with a landing-page second pass + candidate rotation). Set target_id=2..5 to also surface the top-N clean results for browsing (capped, still one navigation).",
+        actions=("open_top_search_result",),
+        aliases=("打开搜索结果", "打开第一个结果", "搜索并打开", "open top result", "open first result"),
+        tags=("search", "navigation"),
+        evidence=("result_url", "result_title", "ads_skipped", "results_count"),
+        deterministic=True,
+        risk="low",
+    ))
+    register(ActionTool(
+        name="dismiss_consent",
+        capability="browser_actions",
+        description="Deterministically dismiss cookie/consent walls (CMP) by clicking 'Accept all', verified by overlay disappearance; idempotent no-op when absent.",
+        actions=("dismiss_consent",),
+        aliases=(
+            "cookie", "cookies", "consent", "accept all", "accept cookies",
+            "gdpr", "cookie banner", "同意", "接受全部", "全部接受",
+            "我知道了", "cookie 横幅", "隐私弹窗", "同意墙",
+        ),
+        tags=("overlay", "consent", "cookie", "unblock"),
+        evidence=("consent_dismissed.v1",),
+        deterministic=True,
+        changes_state=True,
+        risk="low",
+    ))
+
     return registry

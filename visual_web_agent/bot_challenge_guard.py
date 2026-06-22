@@ -79,6 +79,10 @@ class BotChallengeState:
     hitl_count: int = 0
     last_vendor: str = ""
     max_hitl_per_run: int = 3
+    # PROXY-4b: per-run proxy-reroute budget (bounds IP churn when a flagged
+    # proxy keeps drawing challenges); consumed by browser_env.reroute_proxy_on_block.
+    reroute_count: int = 0
+    max_reroute_per_run: int = 3
 
 
 @dataclass
@@ -140,6 +144,67 @@ async def probe_bot_challenge(browser: Any) -> BotChallengeProbe | None:
     return classify_probe_payload(payload)
 
 
+def clearance_from_cookies(cookies: list[dict[str, Any]] | None) -> bool:
+    """True when a non-empty Cloudflare ``cf_clearance`` cookie is present.
+
+    Cloudflare sets this token the instant a challenge is passed, making it the
+    earliest reliable "let through" signal -- usually before the DOM probe settles.
+    """
+    if not cookies:
+        return False
+    for cookie in cookies:
+        try:
+            if str(cookie.get("name") or "") == "cf_clearance" and str(cookie.get("value") or "").strip():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def url_left_challenge(current_url: str | None, original_url: str | None) -> bool:
+    """True when the address bar has moved off the interstitial to a clean page.
+
+    Same-URL Turnstile widgets never change the URL, so a bare non-challenge URL
+    only counts as cleared when it differs from the original or the original was
+    itself an explicit challenge URL.
+    """
+    if not current_url:
+        return False
+    current = str(current_url)
+    if _CF_URL_RE.search(current):
+        return False
+    original = str(original_url or "")
+    if original and _CF_URL_RE.search(original):
+        return True
+    if original and current != original:
+        return True
+    return False
+
+
+async def _read_cookies(browser: Any) -> list[dict[str, Any]]:
+    ctx = getattr(browser, "_context", None)
+    if ctx is None:
+        return []
+    try:
+        cookies = await ctx.cookies()
+    except Exception:
+        return []
+    return list(cookies or [])
+
+
+async def _detect_clearance_signal(browser: Any, original_url: str) -> str:
+    """Return a non-empty signal name when the challenge looks passed early."""
+    if clearance_from_cookies(await _read_cookies(browser)):
+        return "cf_clearance_cookie"
+    try:
+        current_url = str(getattr(browser, "current_url", "") or "")
+    except Exception:
+        current_url = ""
+    if url_left_challenge(current_url, original_url):
+        return "url_left_challenge"
+    return ""
+
+
 def _vendor_label(vendor: str) -> str:
     labels = {
         "cloudflare": "Cloudflare 人机验证",
@@ -194,14 +259,27 @@ async def handle_bot_challenge_step(
         probe.title[:80],
     )
 
-    # Phase 1: passive wait — real Chromium often clears CF interstitial alone
+    # Phase 1: passive wait — real Chromium often clears CF interstitial alone.
+    # Besides the DOM probe, watch for the cf_clearance cookie (Cloudflare's
+    # pass-granted token) and the address bar leaving the interstitial; either
+    # releases early instead of always burning the full timeout.
+    original_url = probe.url
     deadline = asyncio.get_event_loop().time() + passive_wait_seconds
     notice = _build_notice(probe, action="passive_wait")
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(poll_interval)
+        signal = await _detect_clearance_signal(browser, original_url)
+        if signal:
+            logger.info("[BOT CHALLENGE] cleared during passive wait (%s)", signal)
+            return BotChallengeStepResult(
+                detected=True,
+                cleared=True,
+                vendor=probe.vendor,
+                action="passive_wait",
+            )
         recheck = await probe_bot_challenge(browser)
         if recheck is None:
-            logger.info("[BOT CHALLENGE] cleared during passive wait")
+            logger.info("[BOT CHALLENGE] cleared during passive wait (probe)")
             return BotChallengeStepResult(
                 detected=True,
                 cleared=True,

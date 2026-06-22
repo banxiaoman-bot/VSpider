@@ -27,6 +27,7 @@ import pytest
 
 # Re-import for a clean module state per test session
 api_server = importlib.import_module("api_server")
+_broadcast_mod = importlib.import_module("broadcast")
 
 
 @pytest.fixture
@@ -43,7 +44,7 @@ def quiet_broadcast(monkeypatch):
         except Exception:
             pass
 
-    monkeypatch.setattr(api_server, "_schedule", _drop)
+    monkeypatch.setattr(_broadcast_mod, "_schedule", _drop)
     yield
 
 
@@ -155,7 +156,7 @@ class TestPayloadShape:
         def _schedule_sync(coro):
             asyncio.new_event_loop().run_until_complete(coro)
 
-        monkeypatch.setattr(api_server, "_schedule", _schedule_sync)
+        monkeypatch.setattr(_broadcast_mod, "_schedule", _schedule_sync)
 
         api_server.set_phase_log_run_id("20260601_120000")
         api_server.broadcast_phase(
@@ -194,6 +195,73 @@ class TestPayloadShape:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# WS-EGRESS-REDACT: mask secrets before disk / WebSocket egress
+# ════════════════════════════════════════════════════════════════════════
+
+
+class TestSecretRedaction:
+    """Secrets carried in phase ``extra`` / broadcast payloads must be masked
+    before they reach disk (``_persist_phase_event``) or the WebSocket
+    (``ConnectionManager.broadcast``). Opaque blobs like screenshot ``data``
+    must pass through untouched so the hot path stays cheap."""
+
+    def test_phase_event_persist_masks_secrets(self, tmp_logs, quiet_broadcast):
+        api_server.set_phase_log_run_id("20260601_120000")
+        api_server.broadcast_phase(
+            "vlm_call",
+            message="auth",
+            extra={
+                "vlm_api_key": "supersecret-key",
+                "endpoint": "https://u-user:u-pass@api.example.com/v1",
+                "model": "qwen-vl",
+            },
+        )
+        path = tmp_logs / "logs" / "phase_20260601_120000.jsonl"
+        raw = path.read_text(encoding="utf-8")
+        row = json.loads(raw.strip())
+        # secret masked on disk
+        assert "supersecret-key" not in raw
+        assert row["vlm_api_key"] == "***"
+        # url-embedded credentials stripped, endpoint survives
+        assert "u-user" not in raw
+        assert "u-pass" not in raw
+        assert row["endpoint"] == "https://api.example.com/v1"
+        # non-secret fields preserved
+        assert row["model"] == "qwen-vl"
+        assert row["phase"] == "vlm_call"
+
+    def test_ws_broadcast_masks_secrets_keeps_blob(self):
+        import asyncio
+
+        class _FakeWS:
+            def __init__(self):
+                self.sent: list[str] = []
+
+            async def send_text(self, text):
+                self.sent.append(text)
+
+        mgr = api_server.ConnectionManager()
+        ws = _FakeWS()
+        mgr.active.append(ws)
+        blob = "B" * 5000  # screenshot-sized opaque payload
+        payload = {
+            "type": "screenshot",
+            "vlm_api_key": "supersecret-key",
+            "data": blob,
+            "ok": 1,
+        }
+        asyncio.new_event_loop().run_until_complete(mgr.broadcast(payload))
+        assert ws.sent
+        text = ws.sent[-1]
+        # secret masked on the wire
+        assert "supersecret-key" not in text
+        assert '"vlm_api_key"' in text and "***" in text
+        # opaque blob preserved verbatim (not walked / not corrupted)
+        assert blob in text
+        assert '"ok"' in text
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Safety: write failures must not break the live broadcast
 # ════════════════════════════════════════════════════════════════════════
 
@@ -206,7 +274,7 @@ class TestSafety:
         def _boom(*_a, **_kw):
             raise PermissionError("simulated disk full")
 
-        path_obj = api_server._PHASE_LOG_PATH
+        path_obj = _broadcast_mod._PHASE_LOG_PATH
         assert path_obj is not None
         monkeypatch.setattr(type(path_obj), "open", _boom, raising=False)
         # Should NOT raise — best-effort persistence
@@ -231,13 +299,14 @@ class TestMainWiring:
     def test_main_calls_setter_after_run_ts(self) -> None:
         main_src = Path(__file__).resolve().parent.parent / "visual_web_agent" / "main.py"
         src = main_src.read_text(encoding="utf-8")
-        # The import + call must appear shortly after _run_ts assignment
-        ts_idx = src.find("_run_ts = datetime.now().strftime")
-        assert ts_idx != -1
-        # set_phase_log_run_id call must come within ~10 lines AFTER
+        # G1: _run_ts now comes from prepare_run_identity delegation
+        ts_idx = src.find("_run_ts = _run_ctx.run_ts")
+        if ts_idx == -1:
+            ts_idx = src.find("_run_ts = datetime.now().strftime")
+        assert ts_idx != -1, "main.py must set _run_ts (direct or via RunContext)"
         setter_idx = src.find("set_phase_log_run_id", ts_idx)
         assert setter_idx != -1, "main.py must call set_phase_log_run_id"
         between = src[ts_idx:setter_idx]
-        assert between.count("\n") < 10, (
-            "set_phase_log_run_id must be called within ~10 lines of _run_ts"
+        assert between.count("\n") < 15, (
+            "set_phase_log_run_id must be called within ~15 lines of _run_ts"
         )

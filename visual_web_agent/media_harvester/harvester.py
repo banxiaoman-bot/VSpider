@@ -26,6 +26,7 @@ from .downloader import (
     DownloadOutcome,
     StreamingClient,
     download_candidate,
+    gc_stale_parts,
 )
 
 
@@ -95,12 +96,16 @@ def harvest_to_run(
     produced_by: str = "media_harvester",
     step_id: str = "",
     extra_headers: dict[str, str] | None = None,
+    resume: bool = False,
 ) -> HarvestReport:
     """Download every candidate matching ``output_kind`` and append to manifest.
 
     ``base_dir`` overrides the default ``runs/`` root (useful for tests).
     ``client`` lets callers inject a custom streaming HTTP client (or a
     fake) instead of the default ``httpx.Client``.
+
+    ``resume=True`` threads HTTP Range / If-Range resume into each download
+    (DL-RESUME1); default ``False`` keeps the legacy single-pass behaviour.
     """
 
     run_path = run_dir(run_id, base_dir=base_dir)
@@ -127,6 +132,13 @@ def harvest_to_run(
     failed: list[DownloadOutcome] = []
     appended = 0
 
+    # DL-GC1: sweep stale .part/.meta from a prior interrupted harvest of this
+    # run before downloading (best-effort; recent/active parts are preserved).
+    try:
+        gc_stale_parts(artifacts_dir)
+    except Exception:
+        pass
+
     for candidate in selected:
         outcome = download_candidate(
             candidate,
@@ -135,6 +147,7 @@ def harvest_to_run(
             timeout=timeout,
             extra_headers=extra_headers,
             max_bytes=max_bytes_per_item,
+            resume=resume,
         )
         if not outcome.ok:
             failed.append(outcome)

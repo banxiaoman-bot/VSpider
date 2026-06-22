@@ -595,5 +595,20 @@
     "expected": {
       "success": true
     }
+  },
+  {
+    "id": "consent_wall_dismiss",
+    "category": "interaction",
+    "capability": [
+      "dismiss_consent",
+      "consent",
+      "cookie"
+    ],
+    "url": "https://www.bbc.com/news",
+    "goal": "页面如出现 cookie / GDPR 同意墙，使用 dismiss_consent 确定性点击「接受全部」关闭它（不要点拒绝/管理），随后确认页面主体内容已可见。",
+    "enable_xhr": false,
+    "expected": {
+      "success": true
+    }
   }
 ]

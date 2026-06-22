@@ -183,11 +183,45 @@ class TestPersistIOContractsSafe:
 
         ic = json.loads((tmp_path / "testrun_1" / "input_contract.json").read_text())
         oc = json.loads((tmp_path / "testrun_1" / "output_contract.json").read_text())
+        manifest = json.loads((tmp_path / "testrun_1" / "manifest.json").read_text())
         assert ic["version"] == "input_contract.v1"
         assert ic["urls"][0]["url"] == "https://a.com"
         assert ic["urls"][1]["url"] == "https://b.com"
         assert ic["attachments"][0]["intent"] in {"batch_rows", "prompt_context"}
         assert oc["version"] == "output_contract.v1"
+        assert manifest["version"] == "manifest.v1"
+
+    def test_records_child_run_in_parent_manifest(self, tmp_path: Path, monkeypatch) -> None:
+        from visual_web_agent.io_contract import persistence as _persistence
+
+        monkeypatch.setattr(
+            _persistence,
+            "default_runs_root",
+            lambda: tmp_path,
+        )
+
+        sbr._record_child_run_to_parent(
+            "parent_1",
+            {
+                "child_run_id": "parent_1_url0002",
+                "child_kind": "url",
+                "index": 2,
+                "total": 3,
+                "start_url": "https://b.com",
+                "success": True,
+            },
+        )
+
+        manifest = json.loads((tmp_path / "parent_1" / "manifest.json").read_text())
+        items = [
+            item for item in manifest["items"]
+            if item.get("extra", {}).get("entry_type") == "child_run"
+        ]
+        assert len(items) == 1
+        assert items[0]["path"] == "runs/parent_1_url0002/manifest.json"
+        assert items[0]["step_id"] == "url_0002"
+        assert items[0]["extra"]["child_run_id"] == "parent_1_url0002"
+        assert items[0]["extra"]["success"] is True
 
     def test_no_run_id_is_noop(self, tmp_path: Path, monkeypatch) -> None:
         from visual_web_agent.io_contract import persistence as _persistence

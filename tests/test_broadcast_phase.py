@@ -12,6 +12,7 @@ import inspect
 import pytest
 
 import api_server
+import broadcast as _broadcast_mod
 
 
 @pytest.fixture
@@ -21,12 +22,7 @@ def captured(monkeypatch):
     payloads: list[dict] = []
 
     def _fake_schedule(coro):
-        # Drive the coroutine just far enough to extract the payload arg.
         try:
-            # manager.broadcast(payload) returns a coroutine; awaiting it
-            # would push to websockets. We only need the *argument*.
-            # Peek at frame locals after a single .send(None) — that hits
-            # the first await, where 'message' is in scope.
             frame = inspect.getcoroutinelocals(coro)
             if "message" in frame:
                 payloads.append(frame["message"])
@@ -35,7 +31,7 @@ def captured(monkeypatch):
         finally:
             coro.close()
 
-    monkeypatch.setattr(api_server, "_schedule", _fake_schedule)
+    monkeypatch.setattr(_broadcast_mod, "_schedule", _fake_schedule)
     return payloads
 
 
@@ -127,7 +123,7 @@ class TestExtra:
 class TestSchedulingContract:
     def test_no_loop_silent_close(self, monkeypatch) -> None:
         """When _API_LOOP is None (CLI standalone), the coro must close cleanly."""
-        monkeypatch.setattr(api_server, "_API_LOOP", None)
+        monkeypatch.setattr(_broadcast_mod, "_API_LOOP", None)
         # Should not raise and should not warn about unawaited coroutine
         api_server.broadcast_phase("vlm_call", message="cli mode")
 
@@ -210,7 +206,7 @@ class TestNoticeSeverity:
             # Point the module-level path at our temp file (go direct
             # rather than through set_phase_log_run_id which builds its
             # own logs/phase_<run_id>.jsonl path).
-            monkeypatch.setattr(api_server, "_PHASE_LOG_PATH", jsonl)
+            monkeypatch.setattr(_broadcast_mod, "_PHASE_LOG_PATH", jsonl)
             api_server.broadcast_phase(
                 "action",
                 severity="info",

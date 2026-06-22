@@ -44,6 +44,15 @@ def test_save_and_load_queue_snapshot(local_tmp_path: Path) -> None:
                 "prompt": "collect queued",
                 "file_path": "private.xlsx",
                 "vlm_options": {"api_key": "secret"},
+                "urls": ["https://extra.example.org"],
+                "constraints": {
+                    "max_runs": 2,
+                    "proxy_password": "secret-pass",
+                    "proxy_server": "http://queue-user:queue-pass@proxy.example:3128",
+                    "proxy_chain": ["chain-user:chain-pass@proxy2.example:8080"],
+                },
+                "upload_sha256": "abc123",
+                "upload_mime": "text/csv",
             }
         ],
     }
@@ -64,12 +73,27 @@ def test_save_and_load_queue_snapshot(local_tmp_path: Path) -> None:
     assert "vlm_options" not in loaded["queue"][0]
     assert loaded["execution_queue"][0]["task_id"] == "t2"
     assert loaded["execution_queue"][0]["file_path"] == "private.xlsx"
-    assert loaded["execution_queue"][0]["vlm_options"]["api_key"] == "secret"
+    assert loaded["execution_queue"][0]["urls"] == ["https://extra.example.org"]
+    assert loaded["execution_queue"][0]["constraints"]["max_runs"] == 2
+    assert loaded["execution_queue"][0]["constraints"]["proxy_password"] == "***"
+    assert loaded["execution_queue"][0]["constraints"]["proxy_server"] == "http://proxy.example:3128"
+    assert loaded["execution_queue"][0]["constraints"]["proxy_chain"] == ["proxy2.example:8080"]
+    assert loaded["execution_queue"][0]["upload_sha256"] == "abc123"
+    assert loaded["execution_queue"][0]["upload_mime"] == "text/csv"
+    # secret is masked before the snapshot is persisted to disk
+    assert loaded["execution_queue"][0]["vlm_options"]["api_key"] == "***"
+    raw_state = queue_state.queue_state_path(local_tmp_path).read_text(encoding="utf-8")
+    assert "secret-pass" not in raw_state
+    assert "queue-user" not in raw_state
+    assert "queue-pass" not in raw_state
+    assert "chain-user" not in raw_state
+    assert "chain-pass" not in raw_state
 
     public = queue_state.load_public_snapshot(base_dir=local_tmp_path)
     assert public is not None
     assert "execution_queue" not in public
     assert "vlm_options" not in public["queue"][0]
+    assert "constraints" not in public["queue"][0]
 
 
 def test_load_missing_snapshot_returns_none(local_tmp_path: Path) -> None:
@@ -112,13 +136,15 @@ def test_public_snapshot_sanitizes_legacy_private_fields() -> None:
 def test_queue_state_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    qc_src = (root / "queue_core.py").read_text(encoding="utf-8")
     state_src = (root / "visual_web_agent" / "queue_state.py").read_text(encoding="utf-8")
 
-    assert "from visual_web_agent import queue_state as _queue_state" in api_src
-    assert "def _persist_queue_snapshot_safe() -> None:" in api_src
-    assert 'snapshot["execution_queue"]' in api_src
-    assert "_queue_state.save_snapshot(snapshot)" in api_src
-    assert "\"persisted\": _queue_state.load_public_snapshot()" in api_src
+    assert "from visual_web_agent import queue_state as _queue_state" in qc_src
+    assert "def _persist_queue_snapshot_safe() -> None:" in qc_src
+    assert 'snapshot["execution_queue"]' in qc_src
+    assert "_queue_state.save_snapshot(snapshot)" in qc_src
+    tq_src = (root / "api_routes" / "task_queue_api.py").read_text(encoding="utf-8")
+    assert "queue_state.load_public_snapshot()" in tq_src
     assert "def save_snapshot(" in state_src
     assert "def load_snapshot(" in state_src
     assert "def load_public_snapshot(" in state_src

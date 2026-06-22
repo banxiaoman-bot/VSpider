@@ -166,4 +166,5 @@ def test_browser_and_main_wiring_source_pins() -> None:
     assert "network_active = bool(self._network_run_id)" in browser_src
     assert "self._record_network_candidate_safe(" in browser_src
     assert "browser.configure_network_intelligence(_run_ts)" in main_src
-    assert '@app.get("/api/runs/{run_id}/network"' in api_src
+    runs_src = (root / "api_routes" / "runs_api.py").read_text(encoding="utf-8")
+    assert '@app.get(' in runs_src and "runs/{run_id}/network" in runs_src

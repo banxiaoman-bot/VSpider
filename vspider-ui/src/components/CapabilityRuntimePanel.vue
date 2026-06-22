@@ -143,7 +143,7 @@ const props = defineProps({
 <style scoped>
 .capability-section h4 {
   margin: 0 0 8px;
-  color: #f1f5f9;
+  color: var(--vsp-text-strong);
   font-size: 13px;
 }
 
@@ -168,13 +168,13 @@ const props = defineProps({
 .browser-runtime-card {
   padding: 9px 10px;
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.72);
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: var(--vsp-surface);
+  border: 1px solid var(--vsp-border);
 }
 
 .browser-runtime-card span {
   display: block;
-  color: #94a3b8;
+  color: var(--vsp-text-muted);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -183,14 +183,14 @@ const props = defineProps({
 .browser-runtime-card strong {
   display: block;
   margin-top: 3px;
-  color: #93c5fd;
+  color: var(--vsp-blue-500);
   font-size: 14px;
 }
 
 .browser-runtime-card small {
   display: block;
   margin-top: 3px;
-  color: #cbd5e1;
+  color: var(--vsp-text-2);
   font-size: 11.5px;
   line-height: 1.4;
 }

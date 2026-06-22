@@ -58,6 +58,60 @@ def test_run_evidence_bundle_summarizes_completed_extraction_run() -> None:
     assert "cross_system.transitions" not in bundle["debug"]["entrypoints"]
 
 
+def test_run_evidence_bundle_merges_manifest_artifact_metadata() -> None:
+    path = "runs/case-2/artifacts/items.jsonl"
+    bundle = build_run_evidence_bundle({
+        "run_id": "case-2",
+        "result": {
+            "status": "completed",
+            "completed": True,
+            "artifact": {"path": path, "url": "/download/runs/case-2/artifacts/items.jsonl"},
+        },
+        "manifest": {
+            "version": "manifest.v1",
+            "items": [
+                {
+                    "kind": "dataset_records",
+                    "path": path,
+                    "size": 123,
+                    "sha256": "abc123",
+                    "mime": "application/x-ndjson",
+                    "source_url": ["https://example.com/items"],
+                    "produced_by": "api_replay",
+                    "step_id": "network_replay",
+                },
+            ],
+        },
+        "contracts": {
+            "manifest": {
+                "version": "manifest.v1",
+                "items": [
+                    {
+                        "kind": "media_image",
+                        "path": "runs/case-2/artifacts/photo.jpg",
+                        "mime": "image/jpeg",
+                        "produced_by": "browser_action",
+                        "step_id": "download_image",
+                    },
+                ],
+            },
+        },
+    })
+
+    first = bundle["artifacts"]["items"][0]
+    second = bundle["artifacts"]["items"][1]
+    assert bundle["artifacts"]["count"] == 2
+    assert first["kind"] == "artifact"
+    assert first["manifest_kind"] == "dataset_records"
+    assert first["mime"] == "application/x-ndjson"
+    assert first["sha256"] == "abc123"
+    assert first["source_url"] == ["https://example.com/items"]
+    assert first["produced_by"] == "api_replay"
+    assert first["step_id"] == "network_replay"
+    assert second["kind"] == "media_image"
+    assert second["evidence_source"] == "manifest"
+
+
 def test_run_evidence_bundle_surfaces_cross_system_dimension() -> None:
     route = route_task(
         "从 https://a.example/list 抓取前 3 条数据，然后打开 https://b.example/form 填写表单并导出证据",

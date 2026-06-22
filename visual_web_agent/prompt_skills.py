@@ -221,8 +221,10 @@ COMPLETION_PROMPT = """
 - 每轮先看历史和当前子目标，避免把已经完成的步骤重做。
 - 如果页面已经是结果页、成功页、确认页或目标状态，直接 done 或 subgoal_status=completed。
 - 连续两轮页面无变化时，不要重复同一动作；换元素、等待、滚动、关闭遮挡或 ask_human。
-- 任务要求保存、下载、导出时，底层会把 extract/download 产物登记到 artifacts；不要为了“落盘”
-  反复提取同一批数据。
+- 任务要求保存、下载、导出时，目标不是口头说明“已保存”，而是让产物进入当前 run 的
+  `runs/<run_id>/manifest.json` / `artifacts/`。底层会把 extract/download/原生文件下载登记为 artifact。
+- done 前必须能从历史或动作结果看到 artifact 路径、download_completed、manifest 记录或等价完成信号；
+  如果刚点完导出但还没有完成信号，先 wait 一轮。不要编造文件名，也不要为了“落盘”反复提取同一批数据。
 
 🛡️【验收优先纪律（Verify-Before-Act）— 所有任务通用】
 在输出任何 action 之前，必须先完成"状态验收"三问：
@@ -250,7 +252,7 @@ EXTRACT_SKILL = """
 1. AX Tree 是文本数据第一来源；截图用于确认布局、顺序和遮挡。
 2. 按真实视觉顺序读取：从上到下、从左到右；列表/表格只提取当前屏幕可见且未重复的数据。
 3. 过滤条件必须严格执行，例如时间、价格、地区、状态、部门、关键词。
-4. extract 前若有广告、cookie 横幅、登录弹窗等遮挡，先 Escape/click 关闭或 remove_element。
+4. extract 前若有 cookie 同意墙优先用 `dismiss_consent`（确定性）；其它广告 / 登录弹窗遮挡再用 Escape/click 关闭或 remove_element。
 5. 红框编号不是数据。排名、热度、价格、日期等必须来自页面真实文本。
 6. 导航纪律：提取任务的默认工作区是当前 URL 的主体数据区。除非用户明确要求切换栏目/示例/分类，
    绝对不要点击左侧、顶部、底部导航菜单、示例链接、文档目录或站点全局入口。当前页短暂没看到数据时，
@@ -260,6 +262,8 @@ EXTRACT_SKILL = """
 8. 跨页/懒加载：当前页提取后优先 next_page；没有分页控件时再 smooth_scroll/scroll 加载新数据。
    若没有新数据或已到末尾，用 done 收束，不要无限翻页。
 9. 若页面有原生“导出/下载 Excel/CSV/PDF”按钮且符合目标，优先点击导出或下载。
+10. 对结构化或大批量数据，优先相信原生导出、网络/API 拦截、api_replay 或结构化 extractor 的产物；
+    只有这些不可用时，才用 VLM 逐行读屏作为兜底。
 """.strip()
 
 
@@ -269,8 +273,9 @@ BULK_EXTRACT_SKILL = """
 
 大批量提取时按以下优先级行动：
 1. 原生导出优先：先找“导出 Excel / 下载 CSV / Export / Download / 报表导出”等按钮。
-   如果按钮存在且符合目标，点击它；等待下载完成后 done。不要再逐页视觉提取。
+   如果按钮存在且符合目标，点击它；等待下载完成或 artifact/manifest 证据出现后 done。不要再逐页视觉提取。
 2. 网络/API 数据优先于视觉读屏：如果翻页会触发接口数据，正常点击分页即可，底层会尝试登记下载或拦截数据。
+   当历史显示 API/dataset artifact 已写入 manifest，或已到达目标数量/末页，即可 done。
 3. 当前 URL 锁定：除非用户明确要求切换分类、栏目或另一个页面，批量提取期间不要点击站点导航、文档目录、
    示例列表、顶部/左侧/底部菜单。若当前页面处于 loading 或表格尚未渲染，先 wait；若数据在下方，滚动主体区。
    不要因为一眼没看到表格就跳到其它示例页或全局导航页。
@@ -889,8 +894,11 @@ SEMANTIC_MAPPING_SKILL = """
 
 DOWNLOAD_SKILL = """
 ## Skill: Artifacts / Downloads
-- extract 成功后，系统会自动合并并保存结构化数据。
-- 点击下载、导出、download_image 或文件下载事件后，后端会登记 artifact。
+- extract 成功后，系统会自动合并结构化数据，并登记到当前 run 的 manifest/artifacts。
+- 点击下载、导出、download_image 或文件下载事件后，后端会登记 artifact，并写入
+  `runs/<run_id>/manifest.json` / `artifacts/`。
+- done 前确认动作结果或历史里有 artifact path、download_completed、manifest item 或等价输出证据。
+- 不要把聊天里的文件名、截图文字或口头总结当成已交付文件；没有证据时 wait 或继续触发正确下载/导出动作。
 - 不要为了文件列表面板可见而重复下载同一文件。
 """.strip()
 
@@ -1144,9 +1152,128 @@ PAGE_TO_MARKDOWN_SKILL = """
 """.strip()
 
 
+VSCROLL_CAPTURE_SKILL = """
+## Skill: Virtual List Capture（虚拟列表一键全量采集）
+适用：列表/表格只渲染可视窗口、往下滚旧行被回收（react-window / vue-virtual-scroller /
+ag-grid / Element Plus 虚拟表格），或任务说"无限滚动 / 滚到底 / 全量采集"。
+
+何时用 vscroll_capture（而不是 scroll+extract 逐屏循环）：
+- 往下滚后行数不变、旧行从 DOM 消失 → 逐屏 extract 会重复+遗漏。
+- 想一回合拿到全量行：本动作在浏览器内交替"收行 + 推进容器滚动"直到触底，按行文本去重。
+- 主文档没有可滚容器时自动扫同源子 iframe。
+
+用法：
+1. action=vscroll_capture，target_id=0。
+2. type_value 选填：行数上限（如 type_value="500"；默认 2000，触底即停）。
+3. memory_key 选填：默认写到 vscroll_rows；结果含 {rows, row_count, complete, passes,
+   container, where, output_path}。
+
+行为约定：
+1. 确定性动作：不靠截图，按 DOM 行文本采集去重；rows 落盘 jsonl 产物并登记 manifest。
+2. complete=true 表示滚到底已全量；false 表示按上限截断（row_count 已达 type_value）。
+3. 未发现带滚动余量的虚拟列表会报错——此时回到普通 extract / scroll 路径，不要重试本动作。
+4. 采集后页面停在列表底部；后续动作不要依赖原滚动位置。
+""".strip()
+
+
+SNAPSHOT_SKILL = """
+## Skill: Page Snapshot（HTML 快照 / 截图落盘）
+适用：任务要求"保存网页 / 网页快照 / 存为 html / 截图 / 整页截图 / 保存截图"等以快照为交付物的场景。
+
+何时用 html_snapshot / screenshot（而不是 extract / 继续浏览）：
+- 用户要的产物就是页面本身（HTML 或图片），不是结构化数据。
+- 需要给某一步留可校验的页面留证（如提交前后对比）。
+
+用法：
+1. action=html_snapshot，target_id=0：保存当前页完整 HTML。type_value 选填文件名；
+   memory_key 选填，默认写到 html_snapshot，结果含 {path, size, source_url}。
+2. action=screenshot，target_id=0：保存截图。type_value="full" 为整页截图，缺省只截视口；
+   memory_key 选填，默认写到 screenshot，结果含 {path, size, full_page, source_url}。
+
+行为约定：
+1. 两个动作都是只读、确定性动作：不改页面，落盘到 run 的 artifacts/ 并登记 manifest.json
+   （kind=html_snapshot / screenshot）——manifest 是产物唯一可信总表。
+2. 落盘后路径写回 memory，可用 {{html_snapshot.path}} / {{screenshot.path}} 引用。
+3. 空 HTML / 空截图会直接报错，不会产出空文件冒充成功。
+4. 不要用 screenshot 动作来"看页面"——感知截图由系统每回合自动提供，本动作只负责交付物落盘。
+""".strip()
+
+
+RESUME_RUN_SKILL = """
+## Skill: Resume Run（断点续跑 / 接着上次继续）
+适用：用户说“续跑 / 断点续跑 / 接着上次 / 继续上次没抓完的 / resume / continue last run”，或本次为中断后的重启。
+
+何时用 resume_run：
+- 上一轮 run 中途崩溃 / 被中止，本次要接着上次进度继续，而不是从头重来。
+- 想先确认“上次做到哪了、已抓了多少条”再决定下一步。
+
+用法：
+1. action=resume_run，target_id=0。
+2. memory_key 选填：默认写到 resume_status；结果含 {resumed, from_turn, completed_steps, item_count, prior_status, note, source}。
+
+行为约定：
+1. 只读动作，不改页面：读取上次 run_checkpoint / 已发布的续跑状态并写回 memory。
+2. 若 resumed=true：已抓数据已去重，禁止重复输出；按 note 从剩余目标继续，必要时重新导航/登录恢复前置条件，但不要重复已完成的提取或操作。
+3. 若 resumed=false（无可续跑进度）：按全新任务从头执行。
+4. 已完成的子目标会被自动跳过（best-effort）；你只需聚焦当前 active 子目标。
+""".strip()
+
+
+SEARCH_NAV_SKILL = """
+## Skill: 搜索结果页 → 确定性打开首个非广告结果（open_top_search_result）
+适用：
+- goal 没给网址、系统已自动落到搜索引擎结果页（Bing / Google / 百度 等）；
+- 或 goal 明说"搜索 X 后打开第一个 / 最相关的结果"。
+
+🎯 标准动作：当你处在搜索结果页（URL 含 ?q= / ?wd= / /search 等），**不要**用视觉去猜哪个链接是结果，直接调用：
+{"action":"open_top_search_result","target_id":<想浏览的结果条数:0/1=直接进首个,2~5=多挑几个>,"type_value":"<搜索关键词，可留空让系统从 URL ?q= 读取>","memory_key":"search_top_result", ...}
+
+📌 灵活条数（target_id 当条数用，硬上限 5）：
+- target_id 留 0 或 1 → 只进第一个干净结果（1 次导航）。
+- target_id = 2~5 → 额外把前 N 条干净有机结果（rank/title/url）写进 memory.search_top_result.results 供挑选；仍只导航第 1 条（不会点很多）。要读多条正文请用 fetch_links_batch 后台批量拉，**不要**逐个 click 进去。
+
+系统会确定性地：
+1. 按 DOM 结构 + 关键词相关性挑出有机结果（已排除：广告 / 赞助 / 推广 / sponsored 角标、nav/footer/侧栏、搜索引擎自身的 /search·/images·/aclick 内链）；
+2. 导航到首个候选，并做**落地二次校验**：若落地 URL 命中广告跳转域（doubleclick / googleadservices 等）/ 付费点击参数（gclid / msclkid / utm_medium=cpc）/ aclk·aclick·pagead 路径 → 自动跳过，轮替下一个候选；
+3. 落地到真实结果后写回 memory（url / title / query / ads_skipped）。
+
+🚫 反模式：
+- ❌ 在搜索结果页用 click / click_point 盲点第一个高亮链接（常点到广告位 / 竞价排名）
+- ❌ 把"搜索结果列表 / 相关推荐"当成目标内容直接 extract
+- ❌ 关键词留空但当前又不是带 ?q= 的搜索页（系统取不到关键词会报错）
+
+✅ 成功判据：动作后 URL 跳到一个**非搜索引擎、非广告跳转**的真实站点；memory.search_top_result.url 非空。
+""".strip()
+
+
+DISMISS_CONSENT_SKILL = """
+## Skill: Cookie / 同意墙确定性关闭（dismiss_consent）
+🍪 适用：页面出现 cookie 横幅 / 隐私同意墙 / "Accept all cookies" / "我们重视您的隐私" 等遮挡。
+
+🎯 标准动作：**优先输出确定性动作** `dismiss_consent`（target_id=0, type_value=""），不要用 click_point / click 视觉点击去找"接受"按钮。
+{"action":"dismiss_consent","target_id":0,"type_value":"","memory_key":""}
+
+系统会确定性地：
+1. 命中主流 CMP（OneTrust / Cookiebot / TrustArc / Quantcast / Didomi / Usercentrics / Osano / Klaro / Sourcepoint …）的「接受全部」按钮；
+2. 未知 CMP 时在同意容器内按多语肯定文本（Accept all / I agree / 接受全部 / 同意 / 我知道了 …）兜底，**绝不点"拒绝 / 管理 / 设置 / 仅必要"**；
+3. 子 iframe 兜底；点完校验弹层消失才算成功。
+
+📌 默认**接受全部**（爬取要的是解锁内容）。无同意墙时是干净 no-op，不会报错。
+
+🚫 反模式：
+- ❌ 用 click_point 视觉猜"接受"按钮坐标（违反确定性铁律）。
+- ❌ 同意墙挡住列表/表单还硬 extract——先 dismiss_consent，再继续原任务。
+""".strip()
+
+
 SKILL_PROMPTS = {
     "extract": EXTRACT_SKILL,
     "page_to_markdown": PAGE_TO_MARKDOWN_SKILL,
+    "vscroll_capture": VSCROLL_CAPTURE_SKILL,
+    "snapshot": SNAPSHOT_SKILL,
+    "search_nav": SEARCH_NAV_SKILL,
+    "dismiss_consent": DISMISS_CONSENT_SKILL,
+    "resume_run": RESUME_RUN_SKILL,
     "bulk_extract": BULK_EXTRACT_SKILL,
     "form": FORM_SKILL,
     "feed_ad_filter": FEED_AD_FILTER_SKILL,

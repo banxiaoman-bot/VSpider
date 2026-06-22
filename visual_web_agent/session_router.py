@@ -1,0 +1,497 @@
+"""Cross-system session routing (E1c-1).
+
+``run_system_tracker`` (E1b) resolves the *current URL* to a planned system
+and records transitions, but it is pure observability -- it never switches
+the browser context. ``browser_session_pool`` (E1) can hold one
+``BrowserSession`` per ``(run_id, system_id, auth_profile)`` triple, but it
+is unwired infrastructure: nothing decides *which* ``auth_profile`` a system
+should use, nor isolates each system's storage_state.
+
+:class:`SessionRouter` fills exactly that gap and nothing more. It is the
+pure coordination layer between the planned systems (from
+``capability_route["workflow_graph"]["systems"]``) and the pool:
+
+- resolve, per ``system_id``, the ``auth_profile`` to acquire with
+  (an explicit per-call override > the system's declared profile > ``auto``),
+- carve a merged storage_state down to the subset that belongs to a
+  system's domain (reusing ``auth_harvester``'s host filter so the rule
+  stays identical to ``apply_storage_state_to_context``),
+- delegate the actual ``BrowserSession`` acquire / release to the pool.
+
+The auth-resolution and storage_state-subset logic are pure (no browser, no
+IO). Acquiring a session does create a ``BrowserEnv`` via the pool, so the
+pool is injected to keep the unit under test free of Playwright. Wiring this
+router into ``route_executor`` (E1c-2) and the reactive agent loop (E1c-3)
+are deliberately separate slices; this module touches neither.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .browser_session_pool import BrowserSession, BrowserSessionPool
+
+
+VERSION = "session_router.v1"
+
+
+def _clean_profile(value: Any) -> str:
+    profile = str(value or "").strip()
+    return profile or "auto"
+
+
+def _host_of(url: Any) -> str:
+    """Lowercased host of a URL, sans userinfo / port (pure, stdlib).
+
+    Tolerant of scheme-less input (``alpha.com/x``) and junk -> "". Used to
+    resolve a goto target / current URL to a planned system by domain match.
+    """
+
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw and not raw.startswith("//"):
+        raw = "//" + raw
+    try:
+        from urllib.parse import urlsplit
+
+        netloc = urlsplit(raw).netloc
+    except Exception:
+        return ""
+    host = netloc.rsplit("@", 1)[-1].split(":", 1)[0]
+    return host.strip().lower()
+
+
+def _norm_url(url: Any) -> str:
+    """URL normalized for same-page comparison: fragment dropped, trailing
+    slash stripped (query kept -- it carries page state). Pure.
+    """
+
+    raw = str(url or "").strip().split("#", 1)[0]
+    return raw.rstrip("/")
+
+
+@dataclass
+class SystemAuthPlan:
+    """Per-system auth-profile + domain lookup built from planned systems.
+
+    ``systems`` is the ``workflow_graph["systems"]`` list; each entry is a
+    dict with at least ``id`` and optionally ``domain`` / ``auth_profile``
+    (see :class:`visual_web_agent.workflow_graph.WorkflowSystem`).
+    """
+
+    systems: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._by_id: dict[str, dict[str, Any]] = {}
+        for system in self.systems or []:
+            if not isinstance(system, dict):
+                continue
+            system_id = str(system.get("id") or "").strip()
+            if system_id and system_id not in self._by_id:
+                self._by_id[system_id] = system
+
+    def auth_profile_for(self, system_id: str) -> str:
+        system = self._by_id.get(str(system_id or "").strip())
+        if system is None:
+            return "auto"
+        return _clean_profile(system.get("auth_profile"))
+
+    def domain_for(self, system_id: str) -> str:
+        system = self._by_id.get(str(system_id or "").strip())
+        if system is None:
+            return ""
+        return str(system.get("domain") or "").strip().lower()
+
+    def known_system_ids(self) -> list[str]:
+        return list(self._by_id.keys())
+
+
+@dataclass
+class SessionRouter:
+    """Route ``(run_id, system_id)`` to a pooled :class:`BrowserSession`.
+
+    ``pool`` is injected so tests can pass a :class:`BrowserSessionPool` with
+    a stub ``env_factory``. When ``pool`` is ``None`` the module-level
+    singleton in ``browser_session_pool`` is used, matching how the rest of
+    the runtime reaches the default pool.
+    """
+
+    run_id: str
+    plan: SystemAuthPlan = field(default_factory=SystemAuthPlan)
+    pool: BrowserSessionPool | None = None
+    # session_ids already launched via activate_switch, so a revisit reuses the
+    # handle instead of re-starting its BrowserEnv (E1c-3b-2c).
+    _launched: set[str] = field(default_factory=set)
+
+    # ----- resolution (pure) ---------------------------------------------
+
+    def resolved_auth_profile(self, system_id: str, override: str = "auto") -> str:
+        """An explicit override wins, else the plan's profile, else ``auto``."""
+
+        chosen = _clean_profile(override)
+        if chosen != "auto":
+            return chosen
+        return self.plan.auth_profile_for(system_id)
+
+    def storage_state_for_system(
+        self, system_id: str, full_state: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Subset of ``full_state`` whose cookies / origins match the system.
+
+        Returns the empty state when the system declares no domain (or is
+        unknown), so a caller never accidentally applies another system's
+        cookies to it.
+        """
+
+        domain = self.plan.domain_for(system_id)
+        if not domain:
+            return {"cookies": [], "origins": []}
+        from .auth_harvester import _filter_state_to_host
+
+        filtered, _, _ = _filter_state_to_host(full_state or {}, domain)
+        return filtered
+
+    # ----- pool delegation ------------------------------------------------
+
+    def acquire(self, system_id: str, *, auth_profile: str = "auto") -> BrowserSession:
+        profile = self.resolved_auth_profile(system_id, auth_profile)
+        if self.pool is not None:
+            return self.pool.acquire_session(
+                run_id=self.run_id, system_id=system_id, auth_profile=profile
+            )
+        from .browser_session_pool import acquire_session as _acquire_session
+
+        return _acquire_session(
+            run_id=self.run_id, system_id=system_id, auth_profile=profile
+        )
+
+    def get_active(self, system_id: str, *, auth_profile: str = "auto") -> BrowserSession | None:
+        profile = self.resolved_auth_profile(system_id, auth_profile)
+        if self.pool is not None:
+            return self.pool.get_active_session(
+                self.run_id, system_id, auth_profile=profile
+            )
+        from .browser_session_pool import get_active_session as _get_active_session
+
+        return _get_active_session(self.run_id, system_id, auth_profile=profile)
+
+    def pre_acquire_sessions(
+        self,
+        system_ids: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """S9: pool-acquire one session per planned system, up-front.
+
+        Mirrors ``route_executor._build_session_plan`` entry-for-entry
+        (``system_id / auth_profile / domain``) and extends each entry with
+        ``session_id / acquired`` so main's hot loop can pre-stage every
+        system before the first cross-system hop instead of cold-starting
+        at switch time. Acquisition is idempotent per
+        ``(run_id, system_id, auth_profile)`` and never raises — a failed
+        acquire is reported in the entry's ``error`` so the run continues
+        with on-demand acquisition for that system.
+        """
+
+        ids = [str(s or "").strip() for s in (system_ids or self.plan.known_system_ids())]
+        out: list[dict[str, Any]] = []
+        for system_id in ids:
+            if not system_id:
+                continue
+            entry: dict[str, Any] = {
+                "system_id": system_id,
+                "auth_profile": self.resolved_auth_profile(system_id),
+                "domain": self.plan.domain_for(system_id),
+                "session_id": "",
+                "acquired": False,
+            }
+            try:
+                session = self.acquire(system_id)
+                entry["session_id"] = session.session_id
+                entry["acquired"] = True
+            except Exception as exc:
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            out.append(entry)
+        return out
+
+    def plan_switch(
+        self,
+        *,
+        to_system_id: str,
+        from_system_id: str = "",
+        to_system_name: str = "",
+    ) -> dict[str, Any]:
+        """Describe the session switch a cross-system hop implies (pure).
+
+        Returns a directive dict the reactive loop can record as evidence
+        (``session_switch`` event) and, in a later slice, act on. ``should_switch``
+        is False for a no-op hop (same system, or a blank target) so callers can
+        guard cheaply. No pool / browser side effects happen here.
+        """
+
+        target = str(to_system_id or "").strip()
+        should_switch = bool(target) and target != str(from_system_id or "").strip()
+        return {
+            "should_switch": should_switch,
+            "run_id": self.run_id,
+            "from_system_id": str(from_system_id or ""),
+            "to_system_id": target,
+            "to_system_name": str(to_system_name or "") or target,
+            "auth_profile": self.resolved_auth_profile(target) if should_switch else "auto",
+            "domain": self.plan.domain_for(target) if should_switch else "",
+        }
+
+    def system_for_url(self, url: str) -> str:
+        """Resolve a URL to a planned ``system_id`` by host/domain match (pure).
+
+        Matches the URL's host against each planned system's declared domain
+        (exact host or sub-domain of it); the longest matching domain wins so a
+        more specific system beats a broader one. Returns "" when no planned
+        system claims the host (or the URL is blank / unparseable), so a caller
+        treats an unknown destination as a normal same-context navigation. No
+        pool / browser side effects.
+        """
+
+        host = _host_of(url)
+        if not host:
+            return ""
+        best_id = ""
+        best_len = -1
+        for system_id in self.plan.known_system_ids():
+            domain = self.plan.domain_for(system_id)
+            if not domain:
+                continue
+            if (host == domain or host.endswith("." + domain)) and len(domain) > best_len:
+                best_id = system_id
+                best_len = len(domain)
+        return best_id
+
+    def plan_goto_interception(
+        self, target_url: str, current_system_id: str = ""
+    ) -> dict[str, Any]:
+        """Pre-navigation directive for a goto (A1, Path-2 -- pure).
+
+        Decides whether a ``goto`` to ``target_url`` is a cross-system hop that
+        the reactive loop should intercept *before* ``page.goto`` runs (so the
+        current system's page is preserved instead of being clobbered then
+        rebound post-hoc as in path-1). ``should_intercept`` is True only when
+        ``target_url`` resolves to a *known* planned system that differs from a
+        *known* ``current_system_id``; a blank current system (the first
+        navigation, which establishes home), a same-system goto, and an
+        unknown-domain goto all return False so they fall through to a normal
+        ``page.goto`` -- byte-identical behaviour when the cross-system flag is
+        off. The directive mirrors :meth:`plan_switch`'s evidence keys plus
+        ``should_intercept`` / ``target_url`` so the handler + loop share one
+        contract. No pool / browser side effects.
+        """
+
+        to_system = self.system_for_url(target_url)
+        current = str(current_system_id or "").strip()
+        should_intercept = bool(to_system) and bool(current) and to_system != current
+        chosen = to_system if should_intercept else ""
+        return {
+            "should_intercept": should_intercept,
+            "run_id": self.run_id,
+            "target_url": str(target_url or ""),
+            "from_system_id": current,
+            "to_system_id": chosen,
+            "to_system_name": chosen,
+            "auth_profile": self.resolved_auth_profile(chosen) if should_intercept else "auto",
+            "domain": self.plan.domain_for(chosen) if should_intercept else "",
+        }
+
+    def should_renavigate(self, current_url: str, target_url: str) -> bool:
+        """After a switch rebinds to the target browser, is a goto still needed?
+
+        Returns False when the target browser is already on ``target_url``
+        (trailing-slash / fragment insensitive) so the reactive loop skips the
+        re-navigation and preserves the page's exact state -- the home page on a
+        switch-back, and the freshly-launched target on a forward first hop
+        (which ``launch_for_switch`` already navigated). A blank target needs no
+        nav (False); a blank / unknown current is navigated to be safe (True).
+        Pure -- no pool / browser.
+        """
+
+        target = str(target_url or "").strip()
+        if not target:
+            return False
+        current = str(current_url or "").strip()
+        if not current:
+            return True
+        return _norm_url(current) != _norm_url(target)
+
+    def acquire_for_switch(
+        self,
+        *,
+        to_system_id: str,
+        from_system_id: str = "",
+        to_system_name: str = "",
+        full_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Pool-acquire the target session a cross-system hop needs (E1c-3b-1).
+
+        Extends :meth:`plan_switch` from a pure description to a real pool
+        acquisition: when ``should_switch`` is True the target
+        :class:`BrowserSession` is acquired (idempotent per
+        ``(run_id, system_id, auth_profile)`` triple) and the subset of
+        ``full_state`` belonging to the target domain is staged. The active
+        browser handle is **not** rebound here -- that physical context swap
+        is a later slice; this only proves the pool + storage_state path and
+        enriches the directive with ``session_id`` / ``staged`` /
+        ``cookie_count`` so the reactive loop can record it as evidence. A
+        no-op hop (same system / blank target) acquires nothing.
+        """
+
+        directive = self.plan_switch(
+            to_system_id=to_system_id,
+            from_system_id=from_system_id,
+            to_system_name=to_system_name,
+        )
+        directive["session_id"] = ""
+        directive["staged"] = False
+        directive["cookie_count"] = 0
+        if not directive["should_switch"]:
+            return directive
+        session = self.acquire(directive["to_system_id"])
+        subset = self.storage_state_for_system(directive["to_system_id"], full_state)
+        directive["session_id"] = session.session_id
+        directive["staged"] = True
+        directive["cookie_count"] = len(subset.get("cookies") or [])
+        return directive
+
+    def confirm_active(self, system_id: str, expected_session_id: str) -> bool:
+        """Readback: True iff the pool still holds ``expected_session_id`` live.
+
+        The cheap evidence check the reactive loop emits as
+        ``session_switch_verified`` right after :meth:`acquire_for_switch`:
+        it proves the acquired :class:`BrowserSession` is registered and
+        retrievable from the pool (not merely a returned object), guarding
+        session-id mismatch / eviction races. Pure pool lookup, no browser IO.
+        """
+
+        expected = str(expected_session_id or "").strip()
+        if not expected:
+            return False
+        active = self.get_active(system_id)
+        return bool(active is not None and active.session_id == expected)
+
+    async def launch_for_switch(
+        self,
+        session: BrowserSession,
+        url: str,
+        *,
+        user_data_dir: str = "",
+        full_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Launch a pooled target session under an isolated profile (E1c-3b-2b).
+
+        The async companion to :meth:`acquire_for_switch`: it starts the
+        acquired :class:`BrowserSession`'s browser on its own ``user_data_dir``
+        (so it never contends for the primary lease's persistent-context lock),
+        applies the subset of ``full_state`` belonging to the session's system,
+        and reads back the landed URL + applied cookie count as switch
+        evidence. A blank ``user_data_dir`` is passed through as ``None`` so the
+        browser falls back to the global profile. The active reactive-loop
+        handle is **not** rebound here -- that physical swap is the final slice.
+        """
+
+        result: dict[str, Any] = {
+            "session_id": session.session_id,
+            "system_id": session.system_id,
+            "launched": False,
+            "applied_cookies": 0,
+            "applied_origins": 0,
+            "final_url": "",
+        }
+        await session.browser.start(url, user_data_dir_override=user_data_dir or None)
+        result["launched"] = True
+        subset = self.storage_state_for_system(session.system_id, full_state)
+        context = getattr(session.browser, "_context", None)
+        if context is not None and (subset.get("cookies") or subset.get("origins")):
+            from .auth_manager import apply_storage_state_to_context
+
+            cookie_count, origin_count = await apply_storage_state_to_context(context, subset)
+            result["applied_cookies"] = int(cookie_count)
+            result["applied_origins"] = int(origin_count)
+        result["final_url"] = getattr(session.browser, "current_url", "") or ""
+        return result
+
+    async def activate_switch(
+        self,
+        directive: dict[str, Any],
+        *,
+        url: str,
+        user_data_dir_base: str = "",
+        full_state: dict[str, Any] | None = None,
+        home_system_id: str = "",
+        home_browser: Any = None,
+    ) -> Any | None:
+        """Resolve + execute the active-browser rebind for a hop (E1c-3b-2c).
+
+        Path-1 physical switch: returns the browser handle the reactive loop
+        should rebind to, or ``None`` when nothing should change. A hop back to
+        the home system returns ``home_browser`` (the primary lease) without
+        touching the pool; a hop to any other system launches that system's
+        pooled :class:`BrowserSession` once (isolated profile + staged state via
+        :meth:`launch_for_switch`) and returns its browser. Idempotent per
+        session: a revisit reuses the already-launched handle, never restarting.
+        """
+
+        if not directive.get("should_switch"):
+            return None
+        target = str(directive.get("to_system_id") or "").strip()
+        if not target:
+            return None
+        if home_system_id and target == str(home_system_id).strip():
+            return home_browser
+        session = self.get_active(target)
+        if session is None:
+            return None
+        if session.session_id not in self._launched:
+            isolated = (
+                f"{user_data_dir_base.rstrip('/')}/sys_{target}" if user_data_dir_base else ""
+            )
+            await self.launch_for_switch(
+                session, url, user_data_dir=isolated, full_state=full_state
+            )
+            self._launched.add(session.session_id)
+        return session.browser
+
+    async def release_all(self, *, error: str = "") -> list[str]:
+        if self.pool is not None:
+            return await self.pool.release_run(self.run_id, error=error)
+        from .browser_session_pool import release_run_sessions as _release_run_sessions
+
+        return await _release_run_sessions(self.run_id, error=error)
+
+
+def build_session_router(
+    run_id: str,
+    capability_route: dict[str, Any] | None,
+    *,
+    pool: BrowserSessionPool | None = None,
+) -> SessionRouter:
+    """Build a router from a capability route's ``workflow_graph.systems``.
+
+    Tolerant of missing / malformed input: an absent or empty systems list
+    yields an inert plan (every ``auth_profile`` resolves to ``auto``), so
+    the caller can construct the router unconditionally behind a
+    ``try/except`` and single-system runs see no behaviour change.
+    """
+
+    systems: list[dict[str, Any]] = []
+    if isinstance(capability_route, dict):
+        workflow_graph = capability_route.get("workflow_graph")
+        if isinstance(workflow_graph, dict):
+            raw_systems = workflow_graph.get("systems")
+            if isinstance(raw_systems, list):
+                systems = [s for s in raw_systems if isinstance(s, dict)]
+    return SessionRouter(run_id=run_id, plan=SystemAuthPlan(systems=systems), pool=pool)
+
+
+__all__ = [
+    "VERSION",
+    "SystemAuthPlan",
+    "SessionRouter",
+    "build_session_router",
+]
