@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
-import { Document, Refresh, View } from '@element-plus/icons-vue'
+import { Delete, Document, Refresh, View } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { API_BASE, apiFetch } from '../api/client.js'
 
 const props = defineProps({
@@ -153,6 +154,29 @@ const bundleHref = computed(() => {
   return `${API_BASE}/download/runs/${encodeURIComponent(runId)}/bundle.zip`
 })
 
+const deleteRun = async (row) => {
+  if (!row || !row.run_id) return
+  try {
+    const response = await apiFetch(`/api/runs/${encodeURIComponent(row.run_id)}`, { method: 'DELETE' })
+    if (response.status === 409) { ElMessage.warning('运行中的任务不可删除'); return }
+    if (response.status === 404) {
+      runs.value = runs.value.filter((r) => r.run_id !== row.run_id)
+      emit('loaded', runs.value)
+      ElMessage.info('记录已不存在，已从列表移除')
+      return
+    }
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok || result.status !== 'success') {
+      throw new Error(result.detail || result.message || 'delete failed')
+    }
+    runs.value = runs.value.filter((r) => r.run_id !== row.run_id)
+    emit('loaded', runs.value)
+    ElMessage.success('已删除')
+  } catch (err) {
+    ElMessage.error(`删除失败: ${String(err)}`)
+  }
+}
+
 const closeDialog = () => {
   dialogVisible.value = false
 }
@@ -210,7 +234,7 @@ watch(() => props.refreshToken, () => fetchRuns())
           {{ formatDuration(scope.row.duration_s) }}
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="92">
+      <el-table-column label="操作" width="158">
         <template #default="scope">
           <el-button
             size="small"
@@ -220,6 +244,17 @@ watch(() => props.refreshToken, () => fetchRuns())
           >
             详情
           </el-button>
+          <el-popconfirm
+            title="删除该 run 及其产物？不可恢复"
+            confirm-button-text="删除"
+            cancel-button-text="取消"
+            width="240"
+            @confirm="deleteRun(scope.row)"
+          >
+            <template #reference>
+              <el-button size="small" plain type="danger" :icon="Delete" @click.stop />
+            </template>
+          </el-popconfirm>
         </template>
       </el-table-column>
     </el-table>
