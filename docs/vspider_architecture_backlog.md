@@ -4224,3 +4224,35 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 测试: 新增 tests/test_extractor_api.py 10 例；source wiring nail 已 realign 到 route 文件。
 - 验证: 54 API-level tests passed；全量 pytest 4035 passed（2 wiring drift 已修复）。
 - 风险: 极低（逐字平移，同一实例注入，无逻辑变更）。
+
+## Slice D-UI-26 (M4 简便): keyboard wiring 从 App.vue 抽离 useAppKeyboard (done, P2)
+
+- 能力名: app_keyboard_extraction（focusPromptInput + keyboardActions + getKeyboardContext + useKeyboardCommand 调用抽成 composables/useAppKeyboard.js；导出纯逻辑 buildKeyboardActions / buildKeyboardContext）。
+- 影响层: vspider-ui（App.vue → composables/useAppKeyboard.js）。
+- 测试: 新增 tests/useAppKeyboard.test.js 10 例。
+- 验证: vitest 188 passed；npm run build 绿；lints clean。App.vue 977→911 行（-66）。
+- 风险: 低。
+
+## Slice D-UI-27 (M4 简便): capability-trace 聚合从 App.vue 抽离 useCapabilityTracePanel (done, P2)
+
+- 能力名: capability_trace_panel_extraction（useCapabilityTrace + useCapabilityFixtureReplay + useCapabilityTraceExport + clearPhaseEvents + handleCapabilityMoreAction 聚合抽成 composables/useCapabilityTracePanel.js；导出纯逻辑 buildCapabilityMoreActionHandler / makeClearPhaseEvents）。
+- 影响层: vspider-ui（App.vue → composables/useCapabilityTracePanel.js）。
+- 测试: 新增 tests/useCapabilityTracePanel.test.js 5 例。
+- 验证: vitest 193 passed；npm run build 绿；lints clean。App.vue 911→870 行（-41）。
+- 风险: 中（模板绑定面广，靠同名 destructure + 模板编译校验守回归）。
+
+## Slice D-UI-28 (M4 简便): WS+事件路由从 App.vue 抽离 useRunStream (done, P2)
+
+- 能力名: run_stream_extraction（scrollToBottom + useRunEventRouter + useWebSocket 接线抽成 composables/useRunStream.js；导出纯逻辑 buildWebSocketHandlers）。
+- 影响层: vspider-ui（App.vue → composables/useRunStream.js）。
+- 测试: 新增 tests/useRunStream.test.js 4 例。
+- 验证: vitest 197 passed；npm run build 绿；lints clean。App.vue 870→846 行（-24）。
+- 风险: 低。
+
+## Slice D-UI-29 (M4 简便): 启动序列+copy反馈从 App.vue 抽离 useAppBootstrap+useCopyFeedback (done, P2)
+
+- 能力名: app_bootstrap_extraction（onMounted 启动序列 → composables/useAppBootstrap.js + runBootstrap 纯逻辑；finalAnswerCopyState + timer 清理 → composables/useCopyFeedback.js）。
+- 影响层: vspider-ui（App.vue → composables/useAppBootstrap.js + composables/useCopyFeedback.js）。
+- 测试: 新增 tests/useAppBootstrap.test.js 4 例 + tests/useCopyFeedback.test.js 4 例。
+- 验证: vitest 205 passed；npm run build 绿；lints clean。App.vue 846→835 行（-11）。
+- 风险: 低。
