@@ -4164,6 +4164,17 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - 验证: py_compile 7 文件绿；pytest tests/test_dismiss_consent.py 15 passed；按字节 patch 保持各文件原 newline。
 - 风险: 低（默认不自动触发，纯新增动作；L2 容器作用域+整词+排除词三重防误点；提交只 add 本切片文件，未碰并发 R2/BBR/UI 改动）。
 
+## Slice DC-2 (M1 准确 + M2 高效): 自动同意墙守卫 perception-entry 接线 (done, P1)
+
+- 能力名: consent_guard（把 DC-1 dismiss_consent 接入感知段做自动、幂等、按 URL 去重的前置守卫——进页先点掉 cookie/同意墙再截图/SoM/AX，等价类人「进页先关弹窗再看」，省一个 VLM 回合视觉找「接受全部」）。接线点选型 A（perception.run() 顶部，避开 main.py / R2 extract 热区）。
+- 影响层: execution_kernel(actions/page_ops DismissConsentHandler 抽 scan_and_dismiss 纯核心——只收 page、无 browser 副作用，DC-1 动作与 DC-2 守卫共用单一真相源) + browser_substrate(phases/perception PerceptionPhase._maybe_dismiss_consent + _consent_handled_urls 去重 set，run() 顶部调用) + config(CONSENT_GUARD_ENABLED kill switch) + 新增 consent_guard 叶子模块(auto_dismiss_consent + _norm_url)。
+- 设计: ① scan_and_dismiss 纯核心保证 DC-1/DC-2 共用检测/点击逻辑（DRY）；② 按 _norm_url 去重（丢 fragment + path 末尾斜杠），每个新页至多 1 次 JS 探针，旧页零开销；③ 仅真正关墙时 append rpa_trail（tag source="perception_guard" 区分显式 VLM 动作），无墙路径不污染留痕；④ 守卫永不抛——scan 炸掉吞掉，感知核心循环绝不被守卫破坏；⑤ perception 入口先廉价预检 current_url 已守卫则跳过取 page 往返。
+- 新增 contract 字段: 无（复用 consent_dismissed.v1，仅 rpa_trail 条目加 source="perception_guard" 标记）。
+- kill switch: VSPIDER_CONSENT_GUARD_ENABLED=0 回退为仅显式 dismiss_consent 动作。
+- Tests: 新增 tests/test_consent_guard.py 11 例（scan_and_dismiss 纯核心返 result/clean no-op/无 browser 副作用；guard 关墙+留痕 source/同 URL 去重不重扫/clean 页不污染留痕但标记 URL/scan 异常吞掉/None 页返 None/_norm_url 去 fragment+尾斜杠；perception 接线按 URL 跑一次/kill switch 关闭不点击）。
+- 验证: pytest tests/test_consent_guard.py 11 passed；tests/test_dismiss_consent.py + tests/test_consent_guard.py 合计 26 passed（DC-1 零回归）；ReadLints clean（consent_guard/perception/config/test 四文件）。
+- 风险: 低（守卫永不抛 + 按 URL 去重防循环 + kill switch 兜底；接线选 A 避开 main.py / R2 extract 并发热区；scan_and_dismiss 纯核心重构有结构化 stub 测试守 DC-1 回归）。
+
 ## Slice D-UI-22 (M4 简便): 任务表单 + 提交链路从 App.vue 抽离 useTaskForm (done, P2)
 
 - 能力名: task_form_extraction（任务输入态 + settings drawer 开关 + 上传处理 + slash 输入胶水 + submitTask + forceStop 抽成 composables/useTaskForm.js）。
@@ -4197,3 +4208,19 @@ API replay(E6)、缓存不重抓(E4)。效率不以牺牲准确性为代价
 - Tests: 新增 tests/useOutputContractPreview.test.js 6 例（空 prompt 不触网清空 / success 取 formatted / 非 success 置 null / fetch 抛错 finally 复位 loading / watch 450ms 去抖单发 / 窗口内连改折叠为一发尾触发）。
 - 验证: vitest 21 文件 / 178 passed（+6）；npm run build 绿；ReadLints clean；App.vue 结构化 pytest 148 passed（含 co-evolve 后 test_app_vue_timer_cleanup 3 绿）+ core pytest 112 passed；App.vue 1010→977 行（-33），仍纯 CRLF。
 - 风险: 低（纯自包含叶子；TDD 红→绿 + 结构化 pytest co-evolve 守回归；只 add 本切片文件，未碰并发 consent_guard/page_ops/config/perception 改动）。
+
+## Slice B-API-1 (M4 简便): api_server.py 路由拆分 #1 robots (done, P2)
+
+- 能力名: api_route_extraction（/api/robots/set·check·reserve·read 四端点从 api_server.py 搬至 api_routes/robots_api.py，register_robots_routes() 注入 robots_policy 实例）。
+- 影响层: api(api_server.py -39 行) + 新增 api_routes/robots_api.py。
+- 测试: 新增 tests/test_robots_api.py 8 例；source wiring nail 已 realign 到 route 文件。
+- 验证: 54 API-level tests passed。
+- 风险: 极低（逐字平移，同一实例注入，无逻辑变更）。
+
+## Slice B-API-2 (M4 简便): api_server.py 路由拆分 #2 extractor (done, P2)
+
+- 能力名: api_route_extraction（/api/extractor/run Y6 + /api/extractor/select Y22 两端点从 api_server.py 搬至 api_routes/extractor_api.py，register_extractor_routes() 注入 extractor_engine 实例）。
+- 影响层: api(api_server.py -65 行) + 新增 api_routes/extractor_api.py。
+- 测试: 新增 tests/test_extractor_api.py 10 例；source wiring nail 已 realign 到 route 文件。
+- 验证: 54 API-level tests passed；全量 pytest 4035 passed（2 wiring drift 已修复）。
+- 风险: 极低（逐字平移，同一实例注入，无逻辑变更）。
