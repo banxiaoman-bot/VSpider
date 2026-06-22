@@ -1731,12 +1731,16 @@ class DismissConsentHandler(ActionHandler):
             return False
         return not bool(still)
 
-    async def execute(self, ctx: "ActionContext") -> "Optional[Page]":
-        browser = ctx.browser
-        page = ctx.page
-        if not page:
-            raise ActionExecutionError("dismiss_consent: 无活动页面。")
+    async def scan_and_dismiss(self, page: "Page") -> dict:
+        """Scan the page + child frames and click the consent 'Accept all' control.
 
+        Pure core extracted so the DC-2 perception auto-guard can reuse it
+        cheaply per new URL without an ``ActionContext``: it only takes a
+        ``page`` and returns the result dict (action/cmp/strategy/selector/
+        frame_url/dismissed/scanned_frames). It has **no** browser side effects
+        (no ``rpa_trail`` append, no ``_wait_after_action``); the caller decides
+        whether/how to record evidence. Idempotent no-op when no wall exists.
+        """
         result = {
             "action": "dismiss_consent", "cmp": "none", "strategy": "noop",
             "selector": "", "frame_url": "", "dismissed": False, "scanned_frames": 0,
@@ -1790,6 +1794,14 @@ class DismissConsentHandler(ActionHandler):
             "[DISMISS_CONSENT] strategy=%s cmp=%s dismissed=%s frames=%s",
             result["strategy"], result["cmp"], result["dismissed"], result["scanned_frames"],
         )
+        return result
+
+    async def execute(self, ctx: "ActionContext") -> "Optional[Page]":
+        browser = ctx.browser
+        page = ctx.page
+        if not page:
+            raise ActionExecutionError("dismiss_consent: 无活动页面。")
+        result = await self.scan_and_dismiss(page)
         browser.rpa_trail.append(ctx.with_rpa_meta(dict(result)))
         await browser._wait_after_action()
         return None

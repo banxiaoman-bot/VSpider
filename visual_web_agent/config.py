@@ -132,6 +132,11 @@ JUDGE_ENABLED = os.getenv("VSPIDER_JUDGE_ENABLED", "true").lower() in {"1", "tru
 # ========== A11y Enhancer（无障碍树增强）配置 ==========
 A11Y_ENHANCER_ENABLED = os.getenv("VSPIDER_A11Y_ENHANCER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
+# ========== DC-2 Consent Guard（感知前置自动同意墙关闭）配置 ==========
+# 在 perception 入口对每个新 URL 自动调一次 dismiss_consent（幂等、按 URL 去重）。
+# 设 VSPIDER_CONSENT_GUARD_ENABLED=0 可关闭，回退为仅显式 dismiss_consent 动作。
+CONSENT_GUARD_ENABLED = os.getenv("VSPIDER_CONSENT_GUARD_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
 # ========== Response Cache（响应缓存 / Replay 模式）配置 ==========
 # off / record / replay
 CACHE_MODE = os.getenv("VSPIDER_CACHE_MODE", "off").strip().lower()

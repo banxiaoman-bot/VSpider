@@ -14,16 +14,18 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 try:
-    from ..config import SCREENSHOT_DIR, A11Y_ENHANCER_ENABLED
+    from ..config import SCREENSHOT_DIR, A11Y_ENHANCER_ENABLED, CONSENT_GUARD_ENABLED
     from ..browser_state import BrowserStateSnapshot
+    from ..consent_guard import auto_dismiss_consent, _norm_url
     from ..a11y_enhancer import (
         A11yEnhancer,
         A11yEnhancerConfig,
         PageMetadata as A11yPageMetadata,
     )
 except ImportError:  # script-mode fallback (main.py non-package execution)
-    from config import SCREENSHOT_DIR, A11Y_ENHANCER_ENABLED
+    from config import SCREENSHOT_DIR, A11Y_ENHANCER_ENABLED, CONSENT_GUARD_ENABLED
     from browser_state import BrowserStateSnapshot
+    from consent_guard import auto_dismiss_consent, _norm_url
     from a11y_enhancer import (
         A11yEnhancer,
         A11yEnhancerConfig,
@@ -93,6 +95,30 @@ class PerceptionPhase:
         self._last_snapshot: PerceptionSnapshot | None = None
         self._reuse_streak: int = 0
         self._last_ax_lines: set[str] | None = None  # E3 AX 增量 diff
+        self._consent_handled_urls: set[str] = set()  # DC-2 自动同意墙守卫去重
+
+    async def _maybe_dismiss_consent(
+        self, browser: Any, recover_active_page: Callable[[str], Awaitable[Any]]
+    ) -> None:
+        """DC-2 守卫：每个新 URL 进入感知前自动关一次 cookie/同意墙（幂等、去重）。
+
+        放在 perception 入口最前：遇墙先点掉「接受全部」再截图/SoM/AX，等价
+        类人「进页先关弹窗再看」。按 URL 去重，旧页零开销；任何异常都吞掉，
+        绝不让守卫破坏核心感知循环（可用 VSPIDER_CONSENT_GUARD_ENABLED=0 关闭）。
+        """
+        if not CONSENT_GUARD_ENABLED:
+            return
+        try:
+            # 廉价预检：当前 URL 已守卫过则直接跳过，省去取 page 的往返。
+            current_url = getattr(browser, "current_url", "") or ""
+            if current_url and _norm_url(current_url) in self._consent_handled_urls:
+                return
+            page = await recover_active_page("before consent guard")
+            await auto_dismiss_consent(
+                browser, page, handled_urls=self._consent_handled_urls
+            )
+        except Exception as guard_err:
+            logger.debug("[PERCEPTION] consent guard skipped: %s", guard_err)
 
     async def _probe_signature(self, browser: Any) -> str:
         probe = getattr(browser, "dom_signature", None)
@@ -198,6 +224,9 @@ class PerceptionPhase:
         wait_for_human_resume: Callable[..., Awaitable[None]],
         bot_challenge_state: Any,
     ) -> PerceptionSnapshot:
+        # ── DC-2 自动同意墙守卫：进页先点掉 cookie/consent「接受全部」再感知（按 URL 去重）──
+        await self._maybe_dismiss_consent(browser, recover_active_page)
+
         # ── E1 感知复用：签名未变 + 上一动作未改页 → 跳过截图/SoM/AX，复用上一轮 ──
         _signature = await self._probe_signature(browser)
         if self._can_reuse(browser, _signature):
