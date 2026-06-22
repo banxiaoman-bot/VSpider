@@ -7,6 +7,7 @@ import { onMounted, onUnmounted, getCurrentInstance } from 'vue'
 export function runBootstrap (deps) {
   const {
     loadModelSettings,
+    loadServerModelConfig,
     registerBuiltinCommands, slashRegistry, slashCommandDeps,
     connectWebSocket,
     loadAuthProfiles,
@@ -17,6 +18,7 @@ export function runBootstrap (deps) {
   } = deps
 
   loadModelSettings()
+  if (typeof loadServerModelConfig === 'function') loadServerModelConfig()
   registerBuiltinCommands(slashRegistry, slashCommandDeps)
   connectWebSocket()
   loadAuthProfiles()

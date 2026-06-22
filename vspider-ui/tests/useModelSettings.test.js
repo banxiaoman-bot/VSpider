@@ -103,3 +103,102 @@ describe('useModelSettings.fetchRemoteModels', () => {
     expect(ElMessage.success).toHaveBeenCalled()
   })
 })
+
+describe('useModelSettings server persistence', () => {
+  it('auto-saves to server once after a successful connect (section provided)', async () => {
+    const ms = useModelSettings()
+    const target = ref([])
+    const loading = ref(false)
+    const calls = []
+    vi.stubGlobal('fetch', vi.fn(async (url, options) => {
+      const u = String(url)
+      const method = (options && options.method) || 'GET'
+      calls.push({ u, method })
+      if (u.includes('/api/model_config')) {
+        return { ok: true, json: async () => ({ status: 'success', result: { vlm: { has_api_key: true }, semantic: { has_api_key: false } } }) }
+      }
+      return { ok: true, json: async () => ({ data: [{ id: 'm1' }] }) }
+    }))
+    ms.modelBaseUrl.value = 'https://vlm.example/v1'
+    await ms.fetchRemoteModels('https://vlm.example/v1', 'sk-key', target, loading, 'vlm')
+    const posts = calls.filter(c => c.u.includes('/api/model_config') && c.method === 'POST')
+    expect(posts.length).toBe(1)
+    expect(ms.vlmHasSavedKey.value).toBe(true)
+  })
+
+  it('loadServerModelConfig prefills base_url/model + has-key flag, never fills plaintext key', async () => {
+    const ms = useModelSettings()
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (String(url).includes('/api/model_config')) {
+        return { ok: true, json: async () => ({ status: 'success', result: {
+          vlm: { base_url: 'https://saved.example/v1', model: 'qwen-vl-max', temperature: 0.3, max_tokens: 2048, api_key: 'sk-3****abcd', has_api_key: true },
+          semantic: { base_url: '', model: '', api_key: '', has_api_key: false },
+        } }) }
+      }
+      return { ok: false, json: async () => ({}) }
+    }))
+    await ms.loadServerModelConfig()
+    expect(ms.modelBaseUrl.value).toBe('https://saved.example/v1')
+    expect(ms.selectedModel.value).toBe('qwen-vl-max')
+    expect(ms.modelTemperature.value).toBe(0.3)
+    expect(ms.modelMaxTokens.value).toBe(2048)
+    expect(ms.vlmHasSavedKey.value).toBe(true)
+    expect(ms.modelApiKey.value).toBe('')  // masked key never written into the input
+  })
+})
+
+describe('useModelSettings connection status', () => {
+  it('idle by default', () => {
+    const ms = useModelSettings()
+    expect(ms.vlmConnStatus.value.state).toBe('idle')
+    expect(ms.semanticConnStatus.value.state).toBe('idle')
+  })
+
+  it('sets ok status with model count on a successful connect', async () => {
+    const ms = useModelSettings()
+    const target = ref([])
+    const loading = ref(false)
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (String(url).includes('/api/model_config')) {
+        return { ok: true, json: async () => ({ status: 'success', result: {} }) }
+      }
+      return { ok: true, json: async () => ({ data: [{ id: 'a' }, { id: 'b' }] }) }
+    }))
+    ms.modelBaseUrl.value = 'https://vlm.example/v1'
+    await ms.fetchRemoteModels('https://vlm.example/v1', 'sk-key', target, loading, 'vlm')
+    expect(ms.vlmConnStatus.value.state).toBe('ok')
+    expect(ms.vlmConnStatus.value.text).toContain('2')
+  })
+
+  it('sets error status with /v1 hint on HTTP 404', async () => {
+    const ms = useModelSettings()
+    const target = ref([])
+    const loading = ref(false)
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) })))
+    await ms.fetchRemoteModels('https://vlm.example', 'sk-key', target, loading, 'vlm')
+    expect(ms.vlmConnStatus.value.state).toBe('error')
+    expect(ms.vlmConnStatus.value.text).toContain('/v1')
+  })
+
+  it('auto-clears a terminal status back to idle after a few seconds', async () => {
+    vi.useFakeTimers()
+    try {
+      const ms = useModelSettings()
+      const target = ref([])
+      const loading = ref(false)
+      vi.stubGlobal('fetch', vi.fn(async (url) => {
+        if (String(url).includes('/api/model_config')) {
+          return { ok: true, json: async () => ({ status: 'success', result: {} }) }
+        }
+        return { ok: true, json: async () => ({ data: [{ id: 'a' }] }) }
+      }))
+      ms.modelBaseUrl.value = 'https://vlm.example/v1'
+      await ms.fetchRemoteModels('https://vlm.example/v1', 'sk-key', target, loading, 'vlm')
+      expect(ms.vlmConnStatus.value.state).toBe('ok')
+      vi.advanceTimersByTime(5000)
+      expect(ms.vlmConnStatus.value.state).toBe('idle')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
