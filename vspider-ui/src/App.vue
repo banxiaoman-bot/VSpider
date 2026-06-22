@@ -28,6 +28,7 @@ import HitlFormDialog from './components/HitlFormDialog.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import SpiderAssistant from './components/SpiderAssistant.vue'
 import RunScreenshotHistory from './components/RunScreenshotHistory.vue'
+import ArtifactsByRun from './components/ArtifactsByRun.vue'
 import {
   createSlashCommandRegistry,
   registerBuiltinCommands,
@@ -759,24 +760,7 @@ useAppBootstrap({
               </el-badge>
             </template>
             <div class="artifacts-box">
-            <el-table
-              :data="artifactList"
-              height="100%"
-              class="artifact-table"
-              header-cell-class-name="dark-table-header"
-              empty-text="暂无产物"
-            >
-              <el-table-column prop="name" label="文件" show-overflow-tooltip />
-              <el-table-column prop="size_kb" label="KB" width="64" class-name="col-mono" />
-              <el-table-column label="" width="72">
-                <template #header>
-                  <el-button text size="small" :icon="Refresh" @click="fetchArtifacts" />
-                </template>
-                <template #default="scope">
-                  <a :href="`${API_BASE}${scope.row.url}`" download class="download-link">下载</a>
-                </template>
-              </el-table-column>
-            </el-table>
+              <ArtifactsByRun :refresh-token="runHistoryRefreshToken" />
             </div>
           </el-tab-pane>
 
