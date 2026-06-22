@@ -292,3 +292,121 @@ def test_no_progress_complete_near_target_with_streak() -> None:
         no_progress_streak=2,
     )
     assert result["status"] == "complete"
+
+
+def test_dataset_rows_not_complete_when_subgoal_exit_passes_but_no_rows() -> None:
+    """空抽取守卫：dataset_rows 任务即便子目标退出条件(page_ready)满足，
+    若 0 行且 manifest 为空且未真正穷尽，则不得判定完成（防止提前 done）。"""
+    result = evaluate_completion(
+        goal="提取首页所有名言的文字和对应作者",
+        output_mode="artifact",
+        output_contract={
+            "output_kind": "dataset_rows",
+            "container": "xlsx",
+            "artifact_required": True,
+            "answer_required": False,
+        },
+        total_extracted_rows=0,
+        manifest_items=[],
+        exit_criteria=[{"type": "page_ready"}],
+        current_url="https://quotes.toscrape.com",
+    )
+    assert result["status"] == "continue"
+    assert result["recommended_action"] == "continue"
+
+
+def test_dataset_rows_subgoal_exit_completes_after_rows_extracted() -> None:
+    """有数据后，子目标退出条件可正常判定完成（守卫不误伤正常完成）。"""
+    result = evaluate_completion(
+        goal="提取首页所有名言的文字和对应作者",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_rows", "container": "xlsx"},
+        total_extracted_rows=10,
+        manifest_items=[
+            {
+                "kind": "dataset_rows",
+                "path": "runs/x/artifacts/data.xlsx",
+                "extra": {"row_count": 10},
+            }
+        ],
+        exit_criteria=[{"type": "page_ready"}],
+        current_url="https://quotes.toscrape.com",
+    )
+    assert result["status"] == "complete"
+
+
+def test_dataset_rows_subgoal_exit_allowed_when_genuinely_exhausted() -> None:
+    """真正穷尽(分页耗尽)时，空结果可放行完成，避免死循环。"""
+    result = evaluate_completion(
+        goal="提取列表",
+        output_mode="artifact",
+        output_contract={"output_kind": "dataset_rows", "container": "xlsx"},
+        total_extracted_rows=0,
+        manifest_items=[],
+        exit_criteria=[{"type": "page_ready"}],
+        current_url="https://example.com",
+        pagination_exhausted=True,
+    )
+    assert result["status"] == "complete"
+
+
+def test_has_recorded_dataset_rows_helper() -> None:
+    """确定性行证据判定：用于让 manifest 行数凌驾视觉 JUDGE 的视口计数。"""
+    from visual_web_agent.completion_kernel import has_recorded_dataset_rows
+
+    # 已抽到行 => True
+    assert has_recorded_dataset_rows(
+        {"output_kind": "dataset_rows"}, total_extracted_rows=10
+    ) is True
+    # manifest 记录了行数 => True
+    assert has_recorded_dataset_rows(
+        {"output_kind": "dataset_rows"},
+        manifest_items=[{"kind": "dataset_rows", "extra": {"row_count": 5}}],
+    ) is True
+    # 0 行且 manifest 空 => False
+    assert has_recorded_dataset_rows(
+        {"output_kind": "dataset_rows"}, total_extracted_rows=0, manifest_items=[]
+    ) is False
+    # 非结构化抽取类 => False（不适用该豁免）
+    assert has_recorded_dataset_rows(
+        {"output_kind": "answer_text"}, total_extracted_rows=10
+    ) is False
+
+
+def test_structured_extraction_requirement_unmet_helper() -> None:
+    """共享守卫函数的真值表（main.py plan gate 与 kernel 复用同一判定）。"""
+    from visual_web_agent.completion_kernel import (
+        structured_extraction_requirement_unmet,
+    )
+
+    # dataset_rows + 0 行 + 空 manifest + 未穷尽 => 未满足要求(True)
+    assert structured_extraction_requirement_unmet(
+        {"output_kind": "dataset_rows"}, total_extracted_rows=0, manifest_items=[]
+    ) is True
+    # 有行 => 满足
+    assert structured_extraction_requirement_unmet(
+        {"output_kind": "dataset_rows"}, total_extracted_rows=5
+    ) is False
+    # manifest 已有产物(无 row_count) => 视为有数据，满足
+    assert structured_extraction_requirement_unmet(
+        {"output_kind": "dataset_records"},
+        manifest_items=[{"kind": "dataset_records", "path": "x.jsonl"}],
+    ) is False
+    # 非结构化抽取类(answer_text) => 不适用，满足
+    assert structured_extraction_requirement_unmet(
+        {"output_kind": "answer_text"}, total_extracted_rows=0
+    ) is False
+    # 分页穷尽 => 真空结果可放行，满足
+    assert structured_extraction_requirement_unmet(
+        {"output_kind": "dataset_rows"},
+        total_extracted_rows=0,
+        manifest_items=[],
+        pagination_exhausted=True,
+    ) is False
+    # 连续无进展 >=3 => 真尝试过仍空，可放行，满足
+    assert structured_extraction_requirement_unmet(
+        {"output_kind": "dataset_rows"},
+        total_extracted_rows=0,
+        manifest_items=[],
+        no_progress_streak=3,
+    ) is False

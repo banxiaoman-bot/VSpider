@@ -160,6 +160,66 @@ def _manifest_dataset_row_count(manifest_items: list[dict[str, Any]] | None) -> 
     return rows
 
 
+def structured_extraction_requirement_unmet(
+    output_contract: dict[str, Any] | None,
+    *,
+    total_extracted_rows: int = 0,
+    manifest_items: list[dict[str, Any]] | None = None,
+    pagination_exhausted: bool = False,
+    no_progress_streak: int = 0,
+) -> bool:
+    """Return True when a structured-extraction contract still owes rows.
+
+    A ``dataset_rows`` / ``dataset_records`` task must not be accepted as ``done``
+    while it has produced zero rows and an empty manifest — that is the
+    "empty-extraction premature completion" failure. The guard releases (returns
+    False) once any data is present, or once the source is genuinely exhausted
+    (pagination exhausted / repeated no-progress) so truly empty pages can still
+    finish instead of looping forever.
+    """
+    contract = _as_dict(output_contract)
+    kind = str(contract.get("output_kind") or "")
+    if kind not in {"dataset_rows", "dataset_records"}:
+        return False
+    if not bool(contract.get("artifact_required", True)):
+        return False
+    if bool(contract.get("answer_required", False)):
+        return False
+    data_present = (
+        int(total_extracted_rows or 0) > 0
+        or _manifest_dataset_row_count(manifest_items) > 0
+        or _manifest_satisfies_contract(manifest_items, contract)
+    )
+    if data_present:
+        return False
+    if pagination_exhausted or int(no_progress_streak or 0) >= 3:
+        return False
+    return True
+
+
+def has_recorded_dataset_rows(
+    output_contract: dict[str, Any] | None,
+    *,
+    total_extracted_rows: int = 0,
+    manifest_items: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True when a structured-extraction contract already has recorded rows.
+
+    Deterministic row evidence (extracted rows / manifest row_count) is stronger
+    than a vision-only judge counting items visible in a viewport screenshot, so
+    callers use this to let the manifest override the visual judge for
+    ``dataset_rows`` / ``dataset_records`` tasks.
+    """
+    contract = _as_dict(output_contract)
+    kind = str(contract.get("output_kind") or "")
+    if kind not in {"dataset_rows", "dataset_records"}:
+        return False
+    return (
+        int(total_extracted_rows or 0) > 0
+        or _manifest_dataset_row_count(manifest_items) > 0
+    )
+
+
 def _normalize_field(value: Any) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip().lower().replace("-", "_")
     text = re.sub(r"[^0-9a-z_\u4e00-\u9fff]+", "_", text).strip("_")
@@ -449,6 +509,23 @@ def evaluate_completion(
         if subgoal_exit_complete:
             evidence.append("subgoal_exit:" + ",".join(exit_eval.get("matched") or []))
 
+    structured_unmet = structured_extraction_requirement_unmet(
+        contract,
+        total_extracted_rows=total_extracted_rows,
+        manifest_items=manifest_items,
+        pagination_exhausted=pagination_exhausted,
+        no_progress_streak=no_progress_streak,
+    )
+    subgoal_exit_complete_for_status = subgoal_exit_complete and not structured_unmet
+    if subgoal_exit_complete and structured_unmet:
+        checks.append(_check(
+            "structured_extraction_guard",
+            False,
+            "subgoal exit met but dataset manifest empty; blocking premature done",
+            output_kind=output_kind,
+            extracted_rows=total_extracted_rows,
+        ))
+
     extract_complete_for_status = (extract_complete or page_complete) and dataset_field_gate
     no_progress_complete_for_status = no_progress_complete and dataset_field_gate
 
@@ -460,7 +537,7 @@ def evaluate_completion(
         dataset_manifest_complete,
         route_complete and extract_complete_for_status,
         no_progress_complete_for_status,
-        subgoal_exit_complete,
+        subgoal_exit_complete_for_status,
     ])
 
     if complete:
@@ -487,7 +564,7 @@ def evaluate_completion(
         reasons.append("manifest_ready")
     if dataset_manifest_complete:
         reasons.append("dataset_manifest_ready")
-    if subgoal_exit_complete:
+    if subgoal_exit_complete_for_status:
         reasons.append("subgoal_exit_met")
     if no_progress_complete_for_status:
         reasons.append("pagination_stalled_with_enough_rows")

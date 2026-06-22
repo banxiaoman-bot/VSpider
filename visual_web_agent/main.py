@@ -4937,6 +4937,29 @@ async def run_agent(
                         )
                     except Exception as _ck_gate_err:
                         logger.debug("[COMPLETION KERNEL] plan gate skipped: %s", _ck_gate_err)
+                    # 空抽取守卫：结构化抽取任务(dataset_rows/records)若 0 行且 manifest 为空、
+                    # 又未真正穷尽，则否决所有"结构性放行 done"路径，强制先真正 extract，
+                    # 避免子目标退出条件(如 page_ready)把空结果伪装成完成。
+                    _structured_unmet = False
+                    try:
+                        from visual_web_agent.completion_kernel import (
+                            structured_extraction_requirement_unmet as _sx_unmet,
+                            load_manifest_items_for_run as _sx_load_manifest,
+                        )
+                        _structured_unmet = _sx_unmet(
+                            _goal_output_contract,
+                            total_extracted_rows=_xs.total_extracted_rows,
+                            manifest_items=_sx_load_manifest(_run_ts),
+                            pagination_exhausted=_xs.pagination_exhausted,
+                            no_progress_streak=_no_progress_tracker.streak,
+                        )
+                    except Exception as _sx_err:
+                        logger.debug("[PLAN GATE] structured guard skipped: %s", _sx_err)
+                    if _structured_unmet:
+                        _allow_done_via_final_subgoal = False
+                        _allow_done_via_terminal_tail = False
+                        _allow_done_via_answer_guard = False
+                        _allow_done_via_completion_kernel = False
                     # 允许 done 的条件：已完成子目标数 >= 总数 - 1（仅剩当前 = 最后一个）
                     # 或提取已达量（Fix B）
                     if _extraction_complete:
@@ -4990,7 +5013,24 @@ async def run_agent(
                         _task_plan.sub_goals[_cur_idx].status = "done"
                         for _tail_sg in _pending_tail:
                             _tail_sg.status = "done"
-                    if (
+                    if _structured_unmet:
+                        logger.warning(
+                            "[PLAN GATE] 拦截空抽取 done：dataset 任务 0 行且 manifest 为空，"
+                            "改为 wait 并要求真正 extract（不标记子目标完成）"
+                        )
+                        _broadcast_log_safe(
+                            "[PLAN GATE] 拦截空抽取 done（0 行）",
+                            level="warn",
+                        )
+                        decisions[0]["action"] = "wait"
+                        decisions[0]["type_value"] = "1"
+                        decisions[0].pop("subgoal_status", None)
+                        vlm.inject_error_feedback(
+                            "⚠️ 任务要求结构化数据（dataset_rows/records），但目前抽取到 0 行、"
+                            "产物清单为空，不能判定完成。请下一步对目标列表执行 list_extract / "
+                            "extract，真正抽取并填充 extracted_data 后再继续。"
+                        )
+                    elif (
                         _done_or_failed < _total - 1
                         and not _extraction_complete
                         and not _allow_done_via_final_subgoal
@@ -6861,7 +6901,34 @@ async def run_agent(
                             logger.info(f"[MEMORY] Final workflow_memory state: {workflow_memory}")
 
                         # ── Judge 验证：用独立 LLM 调用确认任务真正完成 ─────────
-                        if _judge.config.enabled and _judge_rejections < _judge.config.max_retries_after_fail:
+                        _judge_should_run = (
+                            _judge.config.enabled
+                            and _judge_rejections < _judge.config.max_retries_after_fail
+                        )
+                        # 确定性凌驾视觉：结构化抽取若 manifest/已抽行数已有数据，不让
+                        # JUDGE 按视口可见数（如仅 4 条）误判“缺数据”而拦截 done。
+                        if _judge_should_run:
+                            try:
+                                from visual_web_agent.completion_kernel import (
+                                    has_recorded_dataset_rows as _j_has_rows,
+                                    load_manifest_items_for_run as _j_load_manifest,
+                                )
+                                if _j_has_rows(
+                                    _goal_output_contract,
+                                    total_extracted_rows=_xs.total_extracted_rows,
+                                    manifest_items=_j_load_manifest(_run_ts),
+                                ):
+                                    _judge_should_run = False
+                                    logger.info(
+                                        "[JUDGE] 跳过视觉校验：结构化抽取已有确定性行数据"
+                                        "(manifest)，不以视口可见数覆盖 done"
+                                    )
+                            except Exception as _j_guard_err:
+                                logger.debug(
+                                    "[JUDGE] manifest override check skipped: %s",
+                                    _j_guard_err,
+                                )
+                        if _judge_should_run:
                             try:
                                 _judge_screenshot = getattr(browser, "_last_screenshot_b64", None)
                                 _judge_history = vlm._build_history_summary()

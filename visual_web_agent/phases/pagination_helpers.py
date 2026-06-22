@@ -195,6 +195,8 @@ def _goal_should_skip_rpa(goal: str) -> tuple[bool, str]:
 
 
 def _load_rpa_cache_payload(path: Path) -> dict | None:
+    # Lazy import to avoid an rpa_replay <-> pagination_helpers import cycle.
+    from .rpa_replay import _normalize_rpa_cache_payload, _write_rpa_cache_payload
     try:
         raw_payload = json.loads(path.read_text(encoding="utf-8"))
         normalized_payload = _normalize_rpa_cache_payload(raw_payload)

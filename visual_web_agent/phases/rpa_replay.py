@@ -141,6 +141,11 @@ async def _resolve_composite_locator(page, step: dict, timeout_ms: int):
 
 def _normalize_rpa_cache_payload(payload) -> dict:
     """兼容旧版 list 缓存与新版 dict 缓存。"""
+    # Lazy imports: these helpers live in sibling phase modules that also import
+    # rpa_replay, so module-level imports would create an import cycle.
+    from .auto_form import _semanticize_rpa_trail
+    from .goal_parser import _goal_is_form_fill
+    from .rpa_cache import _build_rpa_match_metadata, _trail_completes_form_goal
     if isinstance(payload, list):
         trail = _semanticize_rpa_trail(payload, "")
         return {

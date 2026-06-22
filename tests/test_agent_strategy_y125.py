@@ -43,6 +43,22 @@ def test_agent_strategy_parses_requested_fields_and_normalizes_keys() -> None:
     assert parse_goal_requested_fields("抓取前50条数据") == []
 
 
+def test_parse_requested_fields_prefers_explicit_spec_in_output_section() -> None:
+    """显式 '字段: name(描述)' 即便位于 【输出要求】 段（会被 extract_core_goal 剥离），
+    也应取机器字段名(name) 并去掉括号描述——否则字段名错配导致抽取行被全量丢弃。"""
+    goal = (
+        "提取首页所有名言的文字和对应作者\n\n"
+        "【输出要求】\n"
+        "字段: quote(名言文字), author(作者); 输出为结构化列表"
+    )
+    assert parse_goal_requested_fields(goal) == ["quote", "author"]
+
+
+def test_parse_requested_fields_strips_parenthetical_descriptions() -> None:
+    """括号描述应被去掉，保留机器字段名。"""
+    assert parse_goal_requested_fields("字段: title(标题), price(价格)") == ["title", "price"]
+
+
 def test_agent_strategy_normalizes_guard_url_without_query_or_fragment() -> None:
     assert normalize_guard_url("https://example.com/path/list?q=abc#top") == "https://example.com/path/list"
     assert normalize_guard_url("") == ""

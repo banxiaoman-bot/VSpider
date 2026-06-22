@@ -45,6 +45,10 @@ def _rpa_cache_path(url: str, goal: str, *, normalized: bool = True) -> Path:
 
 def _load_exact_rpa_cache(url: str, goal: str) -> tuple[Path, dict | None, str]:
     """Load normalized exact cache first, then fall back to legacy raw-key cache."""
+    # Lazy imports: the load/write helpers live in sibling phase modules that also
+    # import rpa_cache, so module-level imports would create an import cycle.
+    from .pagination_helpers import _load_rpa_cache_payload
+    from .rpa_replay import _write_rpa_cache_payload
     exact_path = _rpa_cache_path(url, goal, normalized=True)
     if exact_path.exists():
         payload = _load_rpa_cache_payload(exact_path)

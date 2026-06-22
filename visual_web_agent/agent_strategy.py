@@ -100,7 +100,8 @@ def normalize_output_field_key(value: object) -> str:
 
 def parse_goal_requested_fields(goal: str) -> list[str]:
     text = extract_core_goal(goal)
-    if not text:
+    full = str(goal or "")
+    if not full:
         return []
     patterns = (
         r"(?:字段|列名|列|表头|fields?|columns?)\s*(?:为|是|包括|包含|只要|仅保留|:|：|=)\s*([^。\n；;]+)",
@@ -108,8 +109,12 @@ def parse_goal_requested_fields(goal: str) -> list[str]:
         r"(?:with|including|only)\s+(?:fields?|columns?)\s*(?:[:：=])?\s*([^.\n;]+)",
     )
     raw = ""
+    # The explicit "字段:/fields:" spec is authoritative; search the FULL goal so a
+    # spec living in the 【输出要求】 section (which extract_core_goal strips) is
+    # still captured. Otherwise field names mis-parse from the natural-language
+    # goal and every extracted row is dropped as "under-complete".
     for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
+        match = re.search(pattern, full, flags=re.IGNORECASE)
         if match:
             raw = match.group(1)
             break
@@ -138,6 +143,10 @@ def parse_goal_requested_fields(goal: str) -> list[str]:
                 break
     if not raw:
         return []
+    # Drop parenthetical descriptions before splitting so "quote(名言文字), author(作者)"
+    # yields machine field names ["quote", "author"] (handled on the whole string to
+    # survive the trailing-bracket strip below).
+    raw = re.sub(r"[（(][^（()）]*[)）]", "", raw)
     raw = re.split(
         r"\s*(?:并(?:保存|导出|写入|存入)?|然后|再|保存到|导出到|写入|存入|to\s+excel|as\s+excel)\s*",
         raw,
