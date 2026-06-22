@@ -240,8 +240,11 @@ def test_user_message_warns_answer_tasks_not_to_export_search_lists() -> None:
 
 def test_answer_mode_runtime_does_not_save_excel_by_default() -> None:
     source = open("visual_web_agent/main.py", encoding="utf-8").read()
+    runtime_source = open(
+        "visual_web_agent/extraction_engine/runtime.py", encoding="utf-8"
+    ).read()
 
-    assert "answer-only result; not saving Excel artifact" in source
+    assert "answer-only result; not saving Excel artifact" in runtime_source
     assert "chat answer kept in run result" in source
     assert "answer-only auto extract kept in run result" in source
     assert "ANSWER_DONE_INTENT_GUARD" in source
