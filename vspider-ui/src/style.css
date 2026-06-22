@@ -39,6 +39,13 @@
   --vsp-bg: #f4f7f7;
   --vsp-bg-deep: #e9eeee;
   --vsp-surface: #ffffff;
+  /* Tab 内「嵌入深盒」统一底色：比 --vsp-bg-deep 浅，保证深色文字对比清晰。
+     想更浅→靠近 #fafcfc / 想更有层次→靠近 #e9eeee，只改这一处即可。 */
+  --vsp-box-bg: #f7faf9;
+  /* 深盒内表头色带（比 box-bg 深一级，拉出层次，不用纯白/纯灰） */
+  --vsp-box-header-bg: #eef3f2;
+  /* 等宽字体栈：数据 / Run ID / KB / 时间 / 日志（数字对齐、ID 可读） */
+  --vsp-mono: "JetBrains Mono", Consolas, "SFMono-Regular", ui-monospace, monospace;
   --vsp-surface-2: #1e1e2e;
   --vsp-surface-sunken: #e7eced;
   --vsp-surface-mint: #eaf7f2;
@@ -204,4 +211,27 @@
   --color-vsp-warn: var(--vsp-warn);
   --color-vsp-danger: var(--vsp-danger);
   --color-vsp-text: var(--vsp-text);
+}
+
+/* ============================================================
+   数据表格统一样式（全局，穿透子组件 scoped）
+   - 行高/留白比颜色更能提升清晰度
+   - 表头色带比盒底深一级、文字弱化、克制
+   - .col-mono 数据列走等宽字体（Run ID / KB / 时间 / 耗时 / 步数）
+   ============================================================ */
+.artifact-table td.el-table__cell {
+  padding: 8px 0;
+  line-height: 1.5;
+  color: var(--vsp-text-2);
+}
+.artifact-table th.el-table__cell {
+  background: var(--vsp-box-header-bg) !important;
+  color: var(--vsp-text-muted);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.artifact-table .col-mono .cell {
+  font-family: var(--vsp-mono);
+  font-size: 12.5px;
+  color: var(--vsp-text-2);
 }

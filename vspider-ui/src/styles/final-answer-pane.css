@@ -4,7 +4,7 @@
   height: 245px;
   padding: 12px;
   border-radius: 8px;
-  background: var(--vsp-bg-deep);
+  background: var(--vsp-box-bg);
   border: 1px solid rgb(var(--rgb-accent) / 0.18);
 }
 .final-pending {

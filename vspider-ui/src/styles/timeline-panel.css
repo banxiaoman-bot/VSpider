@@ -4,6 +4,10 @@
   height: 100%;
   min-height: 0;
   position: relative;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--vsp-box-bg);
+  border: 1px solid rgb(var(--rgb-accent) / 0.18);
 }
 .timeline-toolbar {
   display: flex;

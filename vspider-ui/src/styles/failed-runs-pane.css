@@ -3,10 +3,21 @@
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--vsp-box-bg);
+  border: 1px solid rgb(var(--rgb-accent) / 0.18);
 }
 .fr-table-fill {
   flex: 1;
   min-height: 0;
+}
+.failed-runs-table {
+  --el-table-bg-color: transparent;
+  background: transparent;
+}
+:deep(.failed-runs-table .el-table__inner-wrapper) {
+  background: transparent;
 }
 .artifact-toolbar {
   display: flex;

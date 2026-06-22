@@ -218,8 +218,8 @@ watch(() => props.refreshToken, () => fetchRuns())
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="run_id" label="Run ID" width="168" show-overflow-tooltip />
-      <el-table-column label="创建时间" width="138">
+      <el-table-column prop="run_id" label="Run ID" width="168" class-name="col-mono" show-overflow-tooltip />
+      <el-table-column label="创建时间" width="138" class-name="col-mono">
         <template #default="scope">
           {{ formatTime(scope.row.created_at) }}
         </template>
@@ -230,7 +230,7 @@ watch(() => props.refreshToken, () => fetchRuns())
           {{ scope.row.mode || '-' }}
         </template>
       </el-table-column>
-      <el-table-column label="耗时" width="92">
+      <el-table-column label="耗时" width="92" class-name="col-mono">
         <template #default="scope">
           {{ formatDuration(scope.row.duration_s) }}
         </template>
@@ -449,11 +449,24 @@ watch(() => props.refreshToken, () => fetchRuns())
   gap: 10px;
   height: 100%;
   min-height: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--vsp-box-bg);
+  border: 1px solid rgb(var(--rgb-accent) / 0.18);
 }
 
 .rr-table-fill {
   flex: 1;
   min-height: 0;
+}
+
+.run-registry-table {
+  --el-table-bg-color: transparent;
+  background: transparent;
+}
+
+:deep(.run-registry-table .el-table__inner-wrapper) {
+  background: transparent;
 }
 
 .run-registry-toolbar {

@@ -142,20 +142,20 @@ defineExpose({ fetchFailedRuns, failedRunsList, goToPrevFailedRun, goToNextFaile
     </div>
     <div class="fr-table-fill">
     <el-table :data="failedRunsList" height="100%" class="artifact-table failed-runs-table failed-runs-clickable" header-cell-class-name="dark-table-header" empty-text="目前还没有失败记录 🎉" @row-click="openFailedRunDetail">
-      <el-table-column label="时间" width="138">
+      <el-table-column label="时间" width="138" class-name="col-mono">
         <template #default="scope">{{ formatFailedRunTime(scope.row.ts) }}</template>
       </el-table-column>
-      <el-table-column prop="run_id" label="Run ID" width="158" show-overflow-tooltip />
+      <el-table-column prop="run_id" label="Run ID" width="158" class-name="col-mono" show-overflow-tooltip />
       <el-table-column label="目标" show-overflow-tooltip>
         <template #default="scope"><span :title="scope.row.goal || ''">{{ scope.row.goal || '—' }}</span></template>
       </el-table-column>
       <el-table-column label="原因" show-overflow-tooltip>
         <template #default="scope"><span class="failed-reason" :title="scope.row.reason || ''">{{ scope.row.reason || '—' }}</span></template>
       </el-table-column>
-      <el-table-column label="步数" width="62" align="center">
+      <el-table-column label="步数" width="62" align="center" class-name="col-mono">
         <template #default="scope">{{ Number.isFinite(scope.row.step_count) ? scope.row.step_count : '—' }}</template>
       </el-table-column>
-      <el-table-column label="耗时" width="86" align="center">
+      <el-table-column label="耗时" width="86" align="center" class-name="col-mono">
         <template #default="scope">{{ formatFailedRunDuration(scope.row.duration_s) }}</template>
       </el-table-column>
       <el-table-column label="操作" width="118">

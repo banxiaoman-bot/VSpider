@@ -758,6 +758,7 @@ useAppBootstrap({
                 <span>产物</span>
               </el-badge>
             </template>
+            <div class="artifacts-box">
             <el-table
               :data="artifactList"
               height="100%"
@@ -766,7 +767,7 @@ useAppBootstrap({
               empty-text="暂无产物"
             >
               <el-table-column prop="name" label="文件" show-overflow-tooltip />
-              <el-table-column prop="size_kb" label="KB" width="64" />
+              <el-table-column prop="size_kb" label="KB" width="64" class-name="col-mono" />
               <el-table-column label="" width="72">
                 <template #header>
                   <el-button text size="small" :icon="Refresh" @click="fetchArtifacts" />
@@ -776,6 +777,7 @@ useAppBootstrap({
                 </template>
               </el-table-column>
             </el-table>
+            </div>
           </el-tab-pane>
 
           <el-tab-pane name="runs">

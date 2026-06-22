@@ -531,7 +531,7 @@
   height: 100%;
   min-height: 0;
   border-radius: 8px;
-  background: var(--vsp-bg-deep);
+  background: var(--vsp-box-bg);
   border: 1px solid rgb(var(--rgb-cyan) / 0.22);
 }
 
@@ -658,14 +658,26 @@
  */
 
 
+/* 产物表「深盒」容器：与最终答案/能力追踪统一（--vsp-bg-deep + accent 细边） */
+.artifacts-box {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--vsp-box-bg);
+  border: 1px solid rgb(var(--rgb-accent) / 0.18);
+}
+
 .artifact-table {
   --el-table-bg-color: transparent;
   --el-table-tr-bg-color: transparent;
-  --el-table-header-bg-color: var(--vsp-slate-800);
-  --el-table-border-color: var(--vsp-slate-700);
-  --el-table-text-color: var(--vsp-text-muted);
-  --el-table-header-text-color: var(--vsp-text-strong);
+  --el-table-header-bg-color: var(--vsp-box-header-bg);
+  --el-table-border-color: var(--vsp-border);
+  --el-table-text-color: var(--vsp-text-2);
+  --el-table-header-text-color: var(--vsp-text-muted);
   background: transparent;
+  font-size: 13px;
 }
 
 :deep(.artifact-table .el-table__inner-wrapper::before) {
@@ -676,12 +688,30 @@
 :deep(.artifact-table tr),
 :deep(.artifact-table td.el-table__cell) {
   background: transparent;
-  border-bottom-color: var(--vsp-slate-700);
+  border-bottom-color: var(--vsp-border);
 }
 
-:deep(.artifact-table .dark-table-header) {
-  background: var(--vsp-bg) !important;
-  color: var(--vsp-text-label);
+/* 单元格行：拉开行高与上下留白，比颜色更能提升清晰度 */
+:deep(.artifact-table td.el-table__cell) {
+  padding: 8px 0;
+  line-height: 1.5;
+  color: var(--vsp-text-2);
+}
+
+/* 表头色带：比盒底深一级 + 弱化文字 + 小字母距，克制清爽 */
+:deep(.artifact-table .dark-table-header),
+:deep(.artifact-table th.el-table__cell) {
+  background: var(--vsp-box-header-bg) !important;
+  color: var(--vsp-text-muted);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* 等宽数据列（Run ID / KB / 时间 / 耗时）：数字对齐、ID 可读 */
+:deep(.artifact-table .col-mono .cell) {
+  font-family: var(--vsp-mono);
+  font-size: 12.5px;
+  color: var(--vsp-text-2);
 }
 
 .download-link {
