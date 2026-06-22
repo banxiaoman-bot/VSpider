@@ -516,7 +516,7 @@ useAppBootstrap({
               <el-input v-model="modelBaseUrl" clearable :disabled="isRunning" placeholder="Base URL (如 https://dashscope.aliyuncs.com/compatible-mode/v1)" size="small" />
               <div class="model-connect-row">
                 <el-input v-model="modelApiKey" clearable show-password :disabled="isRunning" :placeholder="vlmHasSavedKey ? '已保存（留空沿用）' : 'API Key'" size="small" />
-                <el-button size="small" :loading="vlmRemoteLoading" @click="fetchRemoteModels(modelBaseUrl, modelApiKey, vlmRemoteModels, vlmRemoteLoading, 'vlm')">连接</el-button>
+                <el-button size="small" :loading="vlmRemoteLoading" @click="fetchRemoteModels(modelBaseUrl, modelApiKey, 'vlm')">连接</el-button>
               </div>
               <el-tag v-if="vlmConnStatus.state !== 'idle'" :type="vlmConnStatus.state === 'ok' ? 'success' : vlmConnStatus.state === 'warning' ? 'warning' : vlmConnStatus.state === 'error' ? 'danger' : 'info'" size="small" style="margin-top:4px">{{ vlmConnStatus.text }}</el-tag>
               <el-select v-model="selectedModel" :disabled="isRunning" filterable allow-create default-first-option class="full-width" placeholder="选择模型">
@@ -540,7 +540,7 @@ useAppBootstrap({
               <el-input v-model="semanticBaseUrl" clearable :disabled="isRunning" placeholder="Base URL (如 https://api.deepseek.com)" size="small" />
               <div class="model-connect-row">
                 <el-input v-model="semanticApiKey" clearable show-password :disabled="isRunning" :placeholder="semanticHasSavedKey ? '已保存（留空沿用）' : 'API Key'" size="small" />
-                <el-button size="small" :loading="semanticRemoteLoading" @click="fetchRemoteModels(semanticBaseUrl, semanticApiKey, semanticRemoteModels, semanticRemoteLoading, 'semantic')">连接</el-button>
+                <el-button size="small" :loading="semanticRemoteLoading" @click="fetchRemoteModels(semanticBaseUrl, semanticApiKey, 'semantic')">连接</el-button>
               </div>
               <el-tag v-if="semanticConnStatus.state !== 'idle'" :type="semanticConnStatus.state === 'ok' ? 'success' : semanticConnStatus.state === 'warning' ? 'warning' : semanticConnStatus.state === 'error' ? 'danger' : 'info'" size="small" style="margin-top:4px">{{ semanticConnStatus.text }}</el-tag>
               <el-select v-model="selectedSemanticModel" :disabled="isRunning" filterable allow-create default-first-option class="full-width" placeholder="选择模型">
@@ -795,7 +795,7 @@ useAppBootstrap({
               </template>
             </RunRegistryPanel>
             <FailedRunsPane
-              v-show="runsSubView === 'failed'"
+              :visible="runsSubView === 'failed'"
               ref="failedRunsPaneRef"
             >
               <template #toolbar-extra>

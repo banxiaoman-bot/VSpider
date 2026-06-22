@@ -4,6 +4,9 @@ import { Refresh } from '@element-plus/icons-vue'
 import { API_BASE, apiFetch } from '../api/client.js'
 import { formatPhasePreviewSeverity, formatPhasePreviewTs } from '../composables/phasePreviewFormat.js'
 
+// visible 由父级 runsSubView 控制；v-show 落在内部单根 div，避免在多根组件上用指令（Vue warn）。
+defineProps({ visible: { type: Boolean, default: true } })
+
 const failedRunsList = ref([])
 const failedRunsLoading = ref(false)
 const selectedFailedRun = ref(null)
@@ -130,7 +133,7 @@ defineExpose({ fetchFailedRuns, failedRunsList, goToPrevFailedRun, goToNextFaile
 </script>
 
 <template>
-  <div>
+  <div v-show="visible">
     <div class="artifact-toolbar" style="display:flex;align-items:center;gap:8px">
       <el-button size="small" plain :icon="Refresh" :loading="failedRunsLoading" @click="fetchFailedRuns">刷新</el-button>
       <span class="failed-runs-count">{{ failedRunsList.length }} 条</span>

@@ -63,7 +63,11 @@ export function useModelSettings() {
     return s
   }
 
-  async function fetchRemoteModels (baseUrl, apiKey, targetRef, loadingRef, section = '') {
+  // 注意：模板传参会被 Vue 自动解包（ref → 原始值），因此不能从模板接收 targetRef/loadingRef。
+  // 改为按 section 使用本 composable 自己持有的内部 ref（vlm / semantic 各一套）。
+  async function fetchRemoteModels (baseUrl, apiKey, section = 'vlm') {
+    const targetRef = section === 'semantic' ? semanticRemoteModels : vlmRemoteModels
+    const loadingRef = section === 'semantic' ? semanticRemoteLoading : vlmRemoteLoading
     if (!baseUrl) {
       ElMessage.warning('请先填写 Base URL')
       _setConnStatus(section, 'warning', '请先填写 Base URL')
@@ -87,7 +91,7 @@ export function useModelSettings() {
       targetRef.value = models
       ElMessage.success(`获取到 ${models.length} 个模型`)
       _setConnStatus(section, 'ok', `已连通 · ${models.length} 个模型`)
-      if (section) await saveServerModelConfig(section)
+      await saveServerModelConfig(section)
     } catch (err) {
       const msg = _friendlyConnError(err)
       ElMessage.error(`连接失败: ${msg}`)
