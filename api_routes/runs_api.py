@@ -27,6 +27,7 @@ def register_runs_routes(
     queue_state: Any,
     retry_run_as_queued_task: Callable,
     start_queue_workers: Callable,
+    is_run_active: Callable,
 ) -> None:
 
     @app.get("/api/runs", summary="列出任务运行记录")
@@ -135,6 +136,19 @@ def register_runs_routes(
             "run": rec,
             "contracts": load_run_contract_bundle(run_id),
         }
+
+    @app.delete("/api/runs/{run_id}", summary="删除运行记录及其产物（RUN-DEL-1）")
+    async def delete_run_record(run_id: str) -> dict:
+        rec = run_registry.load_run(run_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        if is_run_active(run_id):
+            raise HTTPException(status_code=409, detail="cannot delete a running run")
+        try:
+            run_registry.delete_run(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid run_id") from exc
+        return {"status": "success", "deleted": run_id}
 
     @app.post(
         "/api/runs/{run_id}/retry",

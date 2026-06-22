@@ -303,6 +303,10 @@ async def _run_batch_task(
             )
         except Exception as exc:
             logger.debug("[RUN REGISTRY] complete_run failed for %s: %s", task_id, exc)
+        try:
+            _run_registry.prune_runs(keep=RUN_RETENTION_KEEP)
+        except Exception as exc:
+            logger.debug("[RUN REGISTRY] prune_runs failed: %s", exc)
 
         if stop_event.is_set():
             broadcast_log("[TASK] 任务已被强制终止", level="warn")
@@ -1353,6 +1357,20 @@ _register_task_queue_routes(
 )
 
 
+RUN_RETENTION_KEEP = int(os.getenv("VSPIDER_RUN_RETENTION_KEEP", "100"))
+
+
+def _is_active_run(run_id: str) -> bool:
+    """True iff *run_id* is the currently-executing task (live signal)."""
+    try:
+        if not _task_snapshot().get("running"):
+            return False
+    except Exception:
+        return False
+    cur = active_tasks.get("current_task") or {}
+    return str(cur.get("task_id") or "") == str(run_id or "")
+
+
 from api_routes.runs_api import register_runs_routes as _register_runs_routes  # noqa: E402
 _register_runs_routes(
     app,
@@ -1366,6 +1384,7 @@ _register_runs_routes(
     queue_state=_queue_state,
     retry_run_as_queued_task=retry_run_as_queued_task,
     start_queue_workers=_start_queue_workers,
+    is_run_active=_is_active_run,
 )
 
 
