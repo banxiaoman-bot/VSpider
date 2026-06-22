@@ -688,6 +688,83 @@ async def get_artifacts_list() -> dict:
     return {"status": "success", "root": str(ARTIFACT_DIR), "files": files}
 
 
+_LABEL_FILLERS = ("请帮我", "请帮忙", "帮我", "帮忙", "麻烦", "请", "把", "将", "需要", "我想", "我要")
+
+
+def _derive_task_label(prompt: str, target_url: str = "", limit: int = 14) -> str:
+    """Rule-based short task label for display only (no model, no path use)."""
+    text = str(prompt or "").strip()
+    if not text:
+        try:
+            from urllib.parse import urlparse
+            return urlparse(str(target_url or "")).netloc
+        except Exception:
+            return ""
+    changed = True
+    while changed:
+        changed = False
+        for filler in _LABEL_FILLERS:
+            if text.startswith(filler):
+                text = text[len(filler):].lstrip()
+                changed = True
+                break
+    parts = re.split(r"[。！？\n，、；,.!?;]", text, maxsplit=1)
+    head = (parts[0] if parts else text).strip() or text.strip()
+    if len(head) > limit:
+        head = head[:limit] + "…"
+    return head
+
+
+@app.get("/api/run_artifacts", summary="按 run 分组列出任务产物（ART-RUN-1）")
+async def get_run_artifacts(limit: int = 50) -> dict:
+    from visual_web_agent.io_contract.persistence import ARTIFACTS_DIRNAME
+    try:
+        runs = _run_registry.list_runs(limit=limit)
+    except Exception as exc:
+        logger.warning("[RUN ARTIFACTS] list_runs failed: %s", exc)
+        raise HTTPException(status_code=500, detail="run registry read failed") from exc
+    groups: list[dict[str, Any]] = []
+    for rec in runs:
+        rid = str(rec.get("run_id") or "")
+        if not rid:
+            continue
+        bundle = _load_run_contract_bundle(rid)
+        manifest = bundle.get("manifest") or {}
+        items = manifest.get("items") if isinstance(manifest, dict) else None
+        if not items:
+            continue
+        arts: list[dict[str, Any]] = []
+        marker = f"/{ARTIFACTS_DIRNAME}/"
+        for it in items:
+            raw_path = str(it.get("path") or "").replace("\\", "/")
+            rel = raw_path.split(marker, 1)[1] if marker in raw_path else raw_path.rsplit("/", 1)[-1]
+            if not rel:
+                continue
+            size = it.get("size")
+            arts.append({
+                "filename": rel.rsplit("/", 1)[-1],
+                "rel": rel,
+                "kind": str(it.get("kind") or "other"),
+                "size_kb": round(float(size) / 1024, 2) if isinstance(size, (int, float)) else None,
+                "produced_by": str(it.get("produced_by") or ""),
+                "download_url": f"/download/runs/{rid}/artifacts/{rel}",
+            })
+        if not arts:
+            continue
+        label = _derive_task_label(str(rec.get("prompt") or ""), str(rec.get("target_url") or "")) or rid
+        groups.append({
+            "run_id": rid,
+            "label": label,
+            "status": str(rec.get("status") or ""),
+            "created_at": rec.get("created_at"),
+            "target_url": str(rec.get("target_url") or ""),
+            "goal": str(rec.get("prompt") or ""),
+            "artifacts": arts,
+        })
+    groups.sort(key=lambda g: float(g.get("created_at") or 0), reverse=True)
+    return {"status": "success", "count": len(groups), "runs": groups}
+
+
 
 
 # Capability artifact persistence helpers (extracted to own module)
