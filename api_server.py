@@ -985,55 +985,16 @@ async def select_extractor(payload: dict[str, Any] = Body(...)) -> dict:
     }
 
 
-@app.post("/api/robots/set", summary="设置 robots.txt 规则缓存（Y23）")
-async def set_robots_policy(payload: dict[str, Any] = Body(...)) -> dict:
-    try:
-        result = _robots_policy.set_robots(
-            str(payload.get("domain") or payload.get("url") or ""),
-            str(payload.get("robots_txt") or payload.get("text") or ""),
-            user_agent=str(payload.get("user_agent") or "*"),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "success", "result": result}
-
-
-@app.post("/api/robots/check", summary="检查 URL 的 robots/throttle 状态（Y23）")
-async def check_robots_policy(payload: dict[str, Any] = Body(...)) -> dict:
-    try:
-        result = _robots_policy.check_url(
-            str(payload.get("url") or ""),
-            obey=bool(payload.get("obey", True)),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "success", "result": result}
-
-
-@app.post("/api/robots/reserve", summary="预约 URL 抓取并更新域名节流（Y23）")
-async def reserve_robots_policy(payload: dict[str, Any] = Body(...)) -> dict:
-    try:
-        result = _robots_policy.reserve_url(
-            str(payload.get("url") or ""),
-            obey=bool(payload.get("obey", True)),
-            default_delay=float(payload.get("default_delay") or 0.0),
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "success", "result": result}
-
-
-@app.get("/api/robots/{domain}", summary="读取域名 robots/throttle 规则（Y23）")
-async def get_robots_policy(domain: str) -> dict:
-    return {"status": "success", "result": _robots_policy.public_rules(domain)}
-
-
 from api_routes.spider_api import register_spider_routes as _register_spider_routes  # noqa: E402
 _register_spider_routes(app, get_spider_lite=lambda: _spider_lite)
 
 
 from api_routes.failed_runs_api import register_failed_runs_routes as _register_failed_runs_routes  # noqa: E402
 _register_failed_runs_routes(app, failure_archive=_failure_archive)
+
+
+from api_routes.robots_api import register_robots_routes as _register_robots_routes  # noqa: E402
+_register_robots_routes(app, robots_policy=_robots_policy)
 
 
 @app.post("/api/start_batch", summary="启动批处理任务（后台执行）")
