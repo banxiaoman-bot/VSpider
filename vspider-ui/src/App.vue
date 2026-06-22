@@ -760,7 +760,7 @@ useAppBootstrap({
             </template>
             <el-table
               :data="artifactList"
-              height="220"
+              height="100%"
               class="artifact-table"
               header-cell-class-name="dark-table-header"
               empty-text="暂无产物"

@@ -202,9 +202,10 @@ watch(() => props.refreshToken, () => fetchRuns())
       <slot name="toolbar-extra" />
     </div>
 
+    <div class="rr-table-fill">
     <el-table
       :data="runs"
-      height="190"
+      height="100%"
       class="artifact-table run-registry-table"
       header-cell-class-name="dark-table-header"
       empty-text="暂无运行记录"
@@ -258,6 +259,7 @@ watch(() => props.refreshToken, () => fetchRuns())
         </template>
       </el-table-column>
     </el-table>
+    </div>
 
     <el-dialog
       v-model="dialogVisible"
@@ -445,6 +447,13 @@ watch(() => props.refreshToken, () => fetchRuns())
   display: flex;
   flex-direction: column;
   gap: 10px;
+  height: 100%;
+  min-height: 0;
+}
+
+.rr-table-fill {
+  flex: 1;
+  min-height: 0;
 }
 
 .run-registry-toolbar {
