@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, onUnmounted, ref } from 'vue'
+import { ref } from 'vue'
 import {
   Close,
   Refresh,
@@ -36,6 +36,8 @@ import {
 import { createTerminalLogBuffer } from './composables/useTerminalLog.js'
 import { useModelSettings } from './composables/useModelSettings.js'
 import { useRunStream } from './composables/useRunStream.js'
+import { useCopyFeedback } from './composables/useCopyFeedback.js'
+import { useAppBootstrap } from './composables/useAppBootstrap.js'
 import { useAppKeyboard } from './composables/useAppKeyboard.js'
 import { useCapabilityTracePanel } from './composables/useCapabilityTracePanel.js'
 import { useTimelineReplay } from './composables/useTimelineReplay.js'
@@ -222,8 +224,7 @@ const {
 } = useSlashCommand(slashRegistry)
 const cmdPaletteRef = ref(null)
 
-const finalAnswerCopyState = ref('idle') // 'idle' | 'ok' | 'err'
-let finalAnswerCopyTimer = null // F1: reset-to-idle debounce; cleared on unmount
+const { finalAnswerCopyState } = useCopyFeedback()
 
 const {
   url,
@@ -379,9 +380,11 @@ const { helpDialogVisible, focusPromptInput } = useAppKeyboard({
   exportCapabilityTraceAsJsonl, promptInputRef,
 })
 
-onMounted(() => {
-  loadModelSettings()
-  registerBuiltinCommands(slashRegistry, {
+useAppBootstrap({
+  loadModelSettings,
+  registerBuiltinCommands,
+  slashRegistry,
+  slashCommandDeps: {
     selectedModel,
     selectedSemanticModel,
     modelApiKey,
@@ -400,28 +403,14 @@ onMounted(() => {
     targetUrl: url,
     forceStop,
     showMessage: (type, msg) => ElMessage[type]?.(msg),
-  })
-  connectWebSocket()
-  loadAuthProfiles()
-  loadCaptchaSolverStatus()
-  fetchArtifacts()
-  fetchBrowserRuntimeStatus()
-  // K3: seed the failed-runs drawer with historic records so the
-  // tab is informative even before the user runs anything in this session.
-  failedRunsPaneRef.value?.fetchFailedRuns()
-})
-
-onUnmounted(() => {
-  disconnectWebSocket()
-  // S: cancel any pending Timeline chip single-click dialog-open so the
-  // callback doesn't fire after the component is gone (would touch
-  // selectedPhaseEvent/phaseDialogVisible refs and crash on detached state).
-  // F1: cancel the pending copy-feedback reset so it can't write
-  // finalAnswerCopyState on a detached component after unmount.
-  if (finalAnswerCopyTimer) {
-    clearTimeout(finalAnswerCopyTimer)
-    finalAnswerCopyTimer = null
-  }
+  },
+  connectWebSocket,
+  disconnectWebSocket,
+  loadAuthProfiles,
+  loadCaptchaSolverStatus,
+  fetchArtifacts,
+  fetchBrowserRuntimeStatus,
+  failedRunsPaneRef,
 })
 
 </script>
