@@ -205,12 +205,14 @@ def test_api_extractor_missing_source_returns_400() -> None:
 def test_extractor_source_wiring() -> None:
     root = Path(__file__).resolve().parent.parent
     api_src = (root / "api_server.py").read_text(encoding="utf-8")
+    route_src = (root / "api_routes" / "extractor_api.py").read_text(encoding="utf-8")
     init_src = (root / "visual_web_agent" / "extraction_engine" / "__init__.py").read_text(encoding="utf-8")
 
     assert "from visual_web_agent.extraction_engine import generic as _extractor_engine" in api_src
-    assert '@app.post("/api/extractor/run"' in api_src
-    assert '@app.post("/api/extractor/select"' in api_src
-    assert "_extractor_engine.extract" in api_src
-    assert "_extractor_engine.select" in api_src
-    assert "_extractor_engine.export_jsonl" in api_src
+    assert "register_extractor_routes" in api_src
+    assert '@app.post("/api/extractor/run"' in route_src
+    assert '@app.post("/api/extractor/select"' in route_src
+    assert "extractor_engine.extract" in route_src
+    assert "extractor_engine.select" in route_src
+    assert "extractor_engine.export_jsonl" in route_src
     assert "from .generic import export_jsonl, extract, extract_html_cards, extract_html_tables, select" in init_src
