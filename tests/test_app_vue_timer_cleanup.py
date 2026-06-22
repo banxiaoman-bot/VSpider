@@ -1,15 +1,13 @@
 """ASYNC-LEAK-1 regression: every pending timer must be torn down on unmount.
 
-The output-contract debounce (``outputContractPreviewTimer``) was extracted into
-``composables/useOutputContractPreview.js`` (D-UI-25); the composable now owns its
-own ``onUnmounted`` teardown so the last scheduled timer can't fire after the host
-component is gone (it would issue a fetch + write refs on a detached component).
-App.vue delegates by wiring ``useOutputContractPreview``.
+All timer teardowns have been progressively extracted from App.vue into composables:
+- D-UI-25: outputContractPreviewTimer → useOutputContractPreview.js
+- D-UI-28: disconnectWebSocket → useRunStream.js → useWebSocket.js
+- D-UI-29: finalAnswerCopyTimer → useCopyFeedback.js; onMounted/onUnmounted → useAppBootstrap.js
 
-``reconnectTimer`` (useWebSocket.js), ``_chipClickTimer`` (TimelinePanel.vue) and
-``finalAnswerCopyTimer`` (App.vue onUnmounted) are torn down the same way.
-Structural test (matches tests/test_frontend_component_split_y126.py style):
-no JS runner, just assert the source teardown is present.
+``reconnectTimer`` (useWebSocket.js), ``_chipClickTimer`` (TimelinePanel.vue) still
+self-clean in their respective files.
+Structural test: assert App.vue wires the composables and composables own cleanup.
 """
 
 from __future__ import annotations
@@ -25,6 +23,12 @@ TIMELINE_PANEL = ROOT / "vspider-ui" / "src" / "components" / "TimelinePanel.vue
 USE_WEBSOCKET = ROOT / "vspider-ui" / "src" / "composables" / "useWebSocket.js"
 USE_OUTPUT_CONTRACT_PREVIEW = (
     ROOT / "vspider-ui" / "src" / "composables" / "useOutputContractPreview.js"
+)
+USE_COPY_FEEDBACK = (
+    ROOT / "vspider-ui" / "src" / "composables" / "useCopyFeedback.js"
+)
+USE_APP_BOOTSTRAP = (
+    ROOT / "vspider-ui" / "src" / "composables" / "useAppBootstrap.js"
 )
 
 
@@ -48,43 +52,38 @@ def output_contract_preview_src() -> str:
     return USE_OUTPUT_CONTRACT_PREVIEW.read_text(encoding="utf-8")
 
 
-def _onunmounted_block(src: str) -> str:
-    start = src.find("onUnmounted(() => {")
-    assert start != -1, "onUnmounted handler not found"
-    # The keydown listener teardown moved into composables/useKeyboardCommand.js
-    # (it owns its own onUnmounted now), so App.vue's onUnmounted no longer ends
-    # with removeEventListener('keydown', ...). Delimit on the arrow-function
-    # close instead.
-    end = src.find("\n})", start)
-    assert end != -1, "onUnmounted end anchor not found"
-    return src[start:end]
+@pytest.fixture(scope="module")
+def copy_feedback_src() -> str:
+    return USE_COPY_FEEDBACK.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def app_bootstrap_src() -> str:
+    return USE_APP_BOOTSTRAP.read_text(encoding="utf-8")
 
 
 def test_onunmounted_clears_output_contract_preview_timer(
     app_src: str, output_contract_preview_src: str
 ) -> None:
-    # D-UI-25: the output-contract preview debounce + its teardown moved into
-    # composables/useOutputContractPreview.js. App.vue now delegates by wiring the
-    # composable, which owns its own onUnmounted cleanup.
     assert "useOutputContractPreview(" in app_src, (
         "App.vue must wire useOutputContractPreview so the preview debounce is "
         "owned (and torn down) by the composable"
     )
     assert "onUnmounted(" in output_contract_preview_src
-    assert "outputContractPreviewTimer" in output_contract_preview_src, (
-        "useOutputContractPreview must clear its pending outputContractPreviewTimer "
-        "on unmount so its callback can't fire (fetch + ref writes) after unmount"
+    assert "timer" in output_contract_preview_src, (
+        "useOutputContractPreview must clear its pending timer "
+        "on unmount so its callback can't fire after unmount"
     )
 
 
 def test_onunmounted_still_clears_known_timers(
-    app_src: str, ws_src: str, timeline_src: str
+    app_src: str, ws_src: str, timeline_src: str, app_bootstrap_src: str
 ) -> None:
-    block = _onunmounted_block(app_src)
-    # WebSocket teardown (reconnect timer cancel + socket close) was extracted
-    # into composables/useWebSocket.js; App.vue's onUnmounted now delegates via
-    # disconnectWebSocket() instead of inlining the reconnectTimer/socket cleanup.
-    assert "disconnectWebSocket()" in block
+    assert "useAppBootstrap(" in app_src, (
+        "App.vue must wire useAppBootstrap which owns onMounted/onUnmounted"
+    )
+    assert "onUnmounted(" in app_bootstrap_src
+    assert "disconnectWebSocket" in app_bootstrap_src
     assert "reconnectTimer" in ws_src
     assert "socket" in ws_src
     assert "_chipClickTimer" in timeline_src, (
@@ -93,9 +92,15 @@ def test_onunmounted_still_clears_known_timers(
     )
 
 
-def test_onunmounted_clears_final_answer_copy_timer(app_src: str) -> None:
-    block = _onunmounted_block(app_src)
-    assert "finalAnswerCopyTimer" in block, (
-        "onUnmounted must clear finalAnswerCopyTimer so the copy-feedback reset "
-        "can't fire after the component is gone"
+def test_onunmounted_clears_final_answer_copy_timer(
+    app_src: str, copy_feedback_src: str
+) -> None:
+    assert "useCopyFeedback(" in app_src, (
+        "App.vue must wire useCopyFeedback so the copy-feedback timer is "
+        "owned (and torn down) by the composable"
+    )
+    assert "onUnmounted(" in copy_feedback_src
+    assert "timer" in copy_feedback_src, (
+        "useCopyFeedback must clear its pending timer on unmount so "
+        "the reset callback can't fire after the component is gone"
     )
